@@ -1,0 +1,22 @@
+# Allow only build/runtime inputs. In particular, never send Git history or local state.
+**
+!package.json
+!package-lock.json
+!.npmrc
+!tsconfig.json
+!tsconfig.base.json
+!LICENSE
+!packages/
+!packages/**
+!scripts/
+!scripts/container.mjs
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.scratch
+**/state
+**/.abele-node
+**/workspaces
+**/*.sqlite*
+**/*.log
+**/.env*

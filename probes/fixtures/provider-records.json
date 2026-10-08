@@ -1,0 +1,100 @@
+{
+  "description": "Trimmed stage 0 observations, not exhaustive provider schemas. IDs and pi provider/model labels are replaced with fixture values; signatures, paths, usage, and unrelated fields are omitted.",
+  "versions": {
+    "claude": "2.1.285",
+    "claude_model": "claude-haiku-4-5-20251001",
+    "pi": "0.87.0",
+    "pi_model": "fixture-provider/fixture-model"
+  },
+  "records": [
+    {
+      "type": "assistant",
+      "parent_tool_use_id": null,
+      "message": {
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "fixture-bash",
+            "name": "Bash",
+            "input": { "command": "ls", "description": "List files in current directory" }
+          }
+        ]
+      }
+    },
+    {
+      "type": "user",
+      "parent_tool_use_id": null,
+      "message": {
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "fixture-bash",
+            "content": "(Bash completed with no output)",
+            "is_error": false
+          }
+        ]
+      }
+    },
+    {
+      "type": "user",
+      "parent_tool_use_id": "fixture-agent",
+      "message": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Respond with exactly: CHILD_OK\n\nDo not use any tools. Do not perform any searches or reads. Just respond with those two words."
+          }
+        ]
+      }
+    },
+    {
+      "type": "assistant",
+      "parent_tool_use_id": "fixture-agent",
+      "message": { "content": [{ "type": "text", "text": "CHILD_OK" }] }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "delta": { "type": "thinking_delta", "thinking": "", "estimated_tokens": 50 }
+      }
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "result": "DENIED",
+      "permission_denials": [
+        {
+          "tool_name": "Bash",
+          "tool_use_id": "fixture-denied-bash",
+          "tool_input": { "command": "printf hello > hello.txt" }
+        }
+      ]
+    },
+    {
+      "method": "tools/call",
+      "args": {
+        "tool_name": "Bash",
+        "input": { "command": "printf hello > hello.txt" },
+        "tool_use_id": "fixture-approved-bash"
+      },
+      "allow": true
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "fixture-pi-bash|fixture-pi-bash",
+          "name": "bash",
+          "arguments": { "command": "printf pi-probe" }
+        }
+      ],
+      "stopReason": "toolUse"
+    },
+    {
+      "role": "toolResult",
+      "content": [{ "type": "text", "text": "Stage 0 denies execution (no remote answer)" }]
+    }
+  ]
+}

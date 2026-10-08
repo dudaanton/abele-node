@@ -1,0 +1,26 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../provider-claude" },
+    { "path": "../channel-client" },
+    {
+      "path": "../node-core"
+    },
+    {
+      "path": "../node-protocol"
+    },
+    {
+      "path": "../channel-protocol"
+    },
+    {
+      "path": "../channel-server"
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+# Each version was audited before install: >=3 days old, established adoption, no OSV vulnerabilities.
+version: 1
+dependencies:
+  - {
+      name: vite,
+      ecosystem: npm,
+      version: '8.3.2',
+      released: 2026-10-01,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 773371097,
+      project_age_days: 2359,
+      vulns_at_install: [],
+      why: 'Required Vitest 5 peer; 8.0.9 failed OSV check',
+    }
+  - {
+      name: vitest,
+      ecosystem: npm,
+      version: '5.0.2',
+      released: 2026-09-25,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 454419379,
+      project_age_days: 1768,
+      vulns_at_install: [],
+      why: 'Test runner; replaces advisory-affected 3.2.7',
+    }
+  - {
+      name: zod,
+      ecosystem: npm,
+      version: '3.25.76',
+      released: 2025-07-08,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 1261303206,
+      project_age_days: 2403,
+      vulns_at_install: [],
+      why: 'Runtime validation of network and durable records',
+    }
+  - {
+      name: fastify,
+      ecosystem: npm,
+      version: '5.12.5',
+      released: 2026-09-16,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 57915651,
+      project_age_days: 3650,
+      vulns_at_install: [],
+      why: 'Loopback HTTP/WebSocket daemon',
+    }
+  - {
+      name: '@fastify/websocket',
+      ecosystem: npm,
+      version: '11.3.0',
+      released: 2026-07-08,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 8979652,
+      project_age_days: 1623,
+      vulns_at_install: [],
+      why: 'Bounded WebSocket upgrades on Fastify',
+    }
+  - {
+      name: ws,
+      ecosystem: npm,
+      version: '8.21.3',
+      released: 2026-08-07,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 1149630804,
+      project_age_days: 5420,
+      vulns_at_install: [],
+      why: 'Binary records, ping and bounded server buffering',
+    }
+  - {
+      name: '@types/ws',
+      ecosystem: npm,
+      version: '8.18.1',
+      released: 2025-04-01,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 307129672,
+      project_age_days: 3793,
+      vulns_at_install: [],
+      why: 'Server WebSocket typing only',
+    }
+  - {
+      name: '@types/node',
+      ecosystem: npm,
+      version: '22.20.1',
+      released: 2026-07-08,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 1843836518,
+      project_age_days: 3793,
+      vulns_at_install: [],
+      why: 'Node 22 SQLite and daemon typing',
+    }
+  - {
+      name: typescript,
+      ecosystem: npm,
+      version: '5.9.3',
+      released: 2025-09-30,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 1211471899,
+      project_age_days: 5118,
+      vulns_at_install: [],
+      why: 'Strict referenced builds and browser declarations',
+    }
+  - {
+      name: prettier,
+      ecosystem: npm,
+      version: '3.9.6',
+      released: 2026-07-21,
+      installed: 2026-10-06,
+      checked: 2026-10-06,
+      downloads_month: 560904750,
+      project_age_days: 3553,
+      vulns_at_install: [],
+      why: 'Repository formatting',
+    }

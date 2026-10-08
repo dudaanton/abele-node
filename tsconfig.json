@@ -1,0 +1,29 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/node-protocol"
+    },
+    {
+      "path": "packages/channel-protocol"
+    },
+    {
+      "path": "packages/channel-client"
+    },
+    {
+      "path": "packages/channel-server"
+    },
+    {
+      "path": "packages/provider-claude"
+    },
+    {
+      "path": "packages/node-core"
+    },
+    {
+      "path": "packages/node-client"
+    },
+    {
+      "path": "packages/node-daemon"
+    }
+  ]
+}

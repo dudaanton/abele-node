@@ -1,0 +1,33 @@
+services:
+  abele-node:
+    image: ghcr.io/dudaanton/abele-node:0.1.0
+    build:
+      context: .
+    restart: unless-stopped
+    # Keep this exact host port: admission checks Host 127.0.0.1:7777.
+    ports:
+      - '127.0.0.1:7777:7778'
+    volumes:
+      - state:/home/node/.local/state/abele-node
+      - workspaces:/workspaces
+      # Optional: mount ONLY the Git projects you want to register, read-write.
+      # - ./projects:/projects
+    environment:
+      ABELE_CLAUDE_PROFILE: inherited
+      # No provider binary is included; add your own Linux CLI before enabling execution.
+      # ABELE_CLAUDE_PATH: /opt/provider/claude
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - daemon
+
+volumes:
+  state:
+  workspaces:
+
+# Do not attach untrusted sibling services to this network.
+networks:
+  daemon:
