@@ -7,7 +7,16 @@ it('runs the reproducible CLI status/doctor/restart acceptance with the fake SDK
     timeout: 60000,
     maxBuffer: 65536,
   })
-  expect(result.status, result.stderr + '\n' + result.stdout).toBe(0)
+  let diagnostic = result.stderr + '\n' + result.stdout
+  if (result.status !== 0 && result.stdout.trim()) {
+    try {
+      const summary = JSON.parse(result.stdout.trim().split('\n').at(-1)!)
+      diagnostic += '\n' + readFileSync(summary.report, 'utf8')
+    } catch {
+      // Retain raw startup/timeout diagnostics when no report was written.
+    }
+  }
+  expect(result.status, diagnostic).toBe(0)
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1)!)
   expect(summary).toMatchObject({ outcome: 'passed', live_pi_user_turns: 0, claude_live_turns: 0 })
   const report = JSON.parse(readFileSync(summary.report, 'utf8'))
