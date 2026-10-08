@@ -9,6 +9,7 @@
   "include": ["src"],
   "references": [
     { "path": "../provider-claude" },
+    { "path": "../provider-pi" },
     {
       "path": "../node-protocol"
     },

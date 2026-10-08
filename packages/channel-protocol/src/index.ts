@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { PairedRecordSchemas, type PublicKey } from './paired.js'
+export * from './paired.js'
 
 export const LIMITS = Object.freeze({
   record_bytes: 256 * 1024,
@@ -82,6 +84,7 @@ export const WelcomeSchema = z
   })
   .strict()
 export const RecordSchema = z.union([
+  ...PairedRecordSchemas,
   z
     .object({
       kind: z.literal('auth'),
@@ -128,13 +131,24 @@ export interface RecordTransport {
 }
 export interface AuthorityContext {
   installation_id: string
+  profile?: 'local-token-v1' | 'paired-wss-v1'
+  device_key?: string
 }
-export interface NodeConnection {
-  url: string
-  token: string
-  expected_node_id?: string
-  profile: 'local-token-v1'
-}
+export type NodeConnection =
+  | {
+      url: string
+      token: string
+      expected_node_id?: string
+      profile: 'local-token-v1'
+    }
+  | {
+      url: string
+      profile: 'paired-wss-v1'
+      expected_node_id: string
+      node_fingerprint: string
+      installation_id: string
+      public_key: PublicKey
+    }
 export interface AuthenticatedChannel {
   transport: RecordTransport
   authority: AuthorityContext

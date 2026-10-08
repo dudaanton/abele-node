@@ -121,3 +121,27 @@ dependencies:
       vulns_at_install: [],
       why: 'Repository formatting',
     }
+  - name: '@earendil-works/pi-coding-agent'
+    ecosystem: npm
+    version: '0.87.0'
+    released: 2026-09-21
+    installed: 2026-10-08
+    checked: 2026-10-08
+    downloads_month: 13959626
+    project_age_days: 153
+    vulns_at_install: []
+    why: >-
+      pi SDK provider
+    policy_override: >-
+      project age is measured from the 2026-05-07 rename; the same project was published as @mariozechner/pi-coding-agent since 2025-11-12 (now deprecated in favour of this name); exact pin, OSV clean
+  - name: 'brace-expansion'
+    ecosystem: npm
+    version: '5.0.12'
+    released: 2026-09-14
+    installed: 2026-10-08
+    checked: 2026-10-08
+    downloads_month: 2579033272
+    project_age_days: 4742
+    vulns_at_install: []
+    why: >-
+      Patch pi SDK minimatch transitive CPU/stack exhaustion advisories; exact audited override

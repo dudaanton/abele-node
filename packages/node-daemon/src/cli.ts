@@ -13,8 +13,9 @@ import {
   statSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { startDaemon, readRuntime, offlineToken } from './index.js'
-import { ClaudeProviderAdapter } from '@abele/node-core'
+import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
+import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
+import { ClaudeProviderAdapter, PiProviderAdapter } from '@abele/node-core'
 
 const args = process.argv.slice(2)
 function option(name: string, fallback: string) {
@@ -27,6 +28,19 @@ function option(name: string, fallback: string) {
 }
 const state = resolve(option('--state-dir', join(homedir(), '.local/state/abele-node')))
 const port = Number(option('--port', '7777'))
+const pairedConfigPath = option('--paired-config', '')
+const pairedConfig = pairedConfigPath
+  ? PairedListenerSchema.parse(JSON.parse(readFileSync(resolve(pairedConfigPath), 'utf8')))
+  : undefined
+const tailscalePath = option(
+  '--tailscale-path',
+  process.env.ABELE_TAILSCALE_PATH ?? '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
+)
+const pairInstallation = option('--pair-installation', '')
+const policyFlag = args.indexOf('--tailnet-policy-verified')
+const policyVerified = policyFlag >= 0
+if (policyVerified) args.splice(policyFlag, 1)
+const tailscale = new TailscaleServeManager(tailscaleRunner(tailscalePath))
 const configuredWorktreeRoot = option('--worktree-root', '')
 const worktreeRoot = configuredWorktreeRoot ? resolve(configuredWorktreeRoot) : undefined
 const claudePath = resolve(
@@ -36,6 +50,22 @@ const claudeProfile = option('--claude-profile', 'inherited')
 const claudeBudget = Number(option('--claude-budget', '0.35'))
 const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
 const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
+const piProvider = option('--pi-provider', '')
+const piModel = option('--pi-model', '')
+const piAgentDir = resolve(option('--pi-agent-dir', join(homedir(), '.pi/agent')))
+const piProfile = option('--pi-profile', 'inherited')
+const piDeadline = Number(option('--pi-deadline-ms', '120000'))
+const piMaxTokens = Number(option('--pi-max-tokens', '4096'))
+if (!['inherited', 'isolated'].includes(piProfile)) throw new Error('invalid_pi_configuration')
+const piOptions = {
+  agentDir: piAgentDir,
+  provider: piProvider,
+  model: piModel,
+  profile: piProfile as 'inherited' | 'isolated',
+  maxTokens: piMaxTokens,
+  deadlineMs: piDeadline,
+  permissionTtlMs: permissionTtl,
+}
 if (
   !['inherited', 'isolated'].includes(claudeProfile) ||
   !Number.isFinite(claudeBudget) ||
@@ -70,11 +100,19 @@ const escape = (s: string) =>
 async function main() {
   switch (args[0]) {
     case 'start': {
-      const daemon = await startDaemon(state, port, worktreeRoot, claudeOptions)
+      const daemon = await startDaemon(
+        state,
+        port,
+        worktreeRoot,
+        claudeOptions,
+        pairedConfig,
+        tailscalePath,
+        piOptions
+      )
       output({
         type: 'listening',
         pid: process.pid,
-        ...{ port: daemon.port, node_id: daemon.node_id },
+        ...{ port: daemon.port, paired_port: daemon.paired_port, node_id: daemon.node_id },
       })
       let stopping = false
       const stop = () => {
@@ -104,9 +142,21 @@ async function main() {
       output({ stopping: running?.pid ?? null })
       return
     }
-    case 'status':
-      output({ running: !!readRuntime(state), ...readRuntime(state), state_dir: state })
+    case 'status': {
+      const running = readRuntime(state)
+      const paired = running?.paired ?? pairedConfig
+      output({
+        running: !!running,
+        ...running,
+        state_dir: state,
+        tailscale: await tailscale.doctor(
+          paired?.endpoint,
+          paired?.backend_port,
+          running?.port ?? port
+        ),
+      })
       return
+    }
     case 'doctor': {
       const running = readRuntime(state)
       output({
@@ -117,9 +167,60 @@ async function main() {
         running: !!running,
         launch_agent: existsSync(join(homedir(), 'Library/LaunchAgents', label + '.plist')),
         profile: 'local-token-v1 (loopback only)',
+        paired: running?.paired ?? pairedConfig ?? null,
+        tailscale: await tailscale.doctor(
+          (running?.paired ?? pairedConfig)?.endpoint,
+          (running?.paired ?? pairedConfig)?.backend_port,
+          running?.port ?? port
+        ),
         encrypted_at_rest: false,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
+        pi: running?.pi ?? new PiProviderAdapter({ ...piOptions, stateDir: state }).capabilities(),
       })
+      return
+    }
+    case 'pair': {
+      const action = args[1],
+        installation_id = args[2]
+      if (action === 'invite') {
+        const endpoint = (readRuntime(state)?.paired ?? pairedConfig)?.endpoint
+        if (!endpoint) throw new Error('paired_config_required')
+        output(
+          await offlineToken(state, {
+            action: 'pairing.issue',
+            endpoint,
+            label: args[2] ?? 'device',
+            ...(pairInstallation ? { installation_id: pairInstallation } : {}),
+          })
+        )
+      } else if (action === 'list' || action === 'rotate')
+        output(
+          await offlineToken(state, {
+            action: action === 'list' ? 'pairing.list' : 'pairing.rotate',
+          })
+        )
+      else if (action === 'confirm' && installation_id && args[3])
+        output(
+          await offlineToken(state, {
+            action: 'pairing.confirm',
+            installation_id,
+            device_fingerprint: args[3],
+          })
+        )
+      else if (action === 'revoke' && installation_id)
+        output(await offlineToken(state, { action: 'pairing.revoke', installation_id }))
+      else
+        throw new Error(
+          'Usage: pair invite LABEL | list | confirm INSTALLATION_ID FINGERPRINT | revoke INSTALLATION_ID | rotate'
+        )
+      return
+    }
+    case 'serve': {
+      if (!readRuntime(state)) throw new Error('running_paired_daemon_required')
+      if (args[1] === 'enable' && policyVerified)
+        output(await control(state, { action: 'tailscale.enable', policy_verified: true }))
+      else if (args[1] === 'disable') output(await control(state, { action: 'tailscale.disable' }))
+      else throw new Error('Usage: serve enable --tailnet-policy-verified | disable')
       return
     }
     case 'token': {
@@ -183,6 +284,9 @@ async function main() {
         '--port',
         String(port),
         ...(worktreeRoot ? ['--worktree-root', worktreeRoot] : []),
+        ...(pairedConfigPath ? ['--paired-config', resolve(pairedConfigPath)] : []),
+        '--tailscale-path',
+        tailscalePath,
         '--claude-path',
         claudePath,
         '--claude-profile',
@@ -193,6 +297,18 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
+        '--pi-provider',
+        piProvider,
+        '--pi-model',
+        piModel,
+        '--pi-agent-dir',
+        piAgentDir,
+        '--pi-profile',
+        piProfile,
+        '--pi-deadline-ms',
+        String(piDeadline),
+        '--pi-max-tokens',
+        String(piMaxTokens),
       ]
       const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string></dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
       writeFileSync(destination, plist, { mode: 0o600 })

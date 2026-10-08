@@ -16,6 +16,7 @@
     {
       "path": "packages/provider-claude"
     },
+    { "path": "packages/provider-pi" },
     {
       "path": "packages/node-core"
     },

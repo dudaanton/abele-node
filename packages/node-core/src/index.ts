@@ -10,6 +10,7 @@ import {
 } from '@abele/channel-protocol'
 import {
   validateParams,
+  PairingMethodSchemas,
   NodeEventSchema,
   MUTATIONS,
   type Method,
@@ -23,8 +24,12 @@ import {
 } from '@abele/node-protocol'
 
 import { ResourceServices } from './resources.js'
-import { ClaudeSessions } from './claude.js'
-import type { ClaudeProviderAdapter } from '@abele/provider-claude'
+import { PairingService } from './pairing.js'
+export { PairingService, IdentityStore } from './pairing.js'
+import { ProviderSessions } from './claude.js'
+import type { ProviderAdapter } from './providers.js'
+export type { ProviderAdapter } from './providers.js'
+export { PiProviderAdapter } from '@abele/provider-pi'
 export { ClaudeProviderAdapter } from '@abele/provider-claude'
 export {
   ResourceServices,
@@ -68,13 +73,23 @@ export class AuthorityService {
       .prepare('SELECT installation_id FROM installations WHERE token_hash=? AND revoked=0')
       .get(digest(token)) as Row | undefined
     if (!row) throw new ChannelError('unauthorized')
-    return { installation_id: String(row.installation_id) }
+    return { installation_id: String(row.installation_id), profile: 'local-token-v1' }
   }
   check(actor: AuthorityContext, _action: string, _resource?: string): void {
     if (
       !this.db
         .prepare('SELECT 1 FROM installations WHERE installation_id=? AND revoked=0')
         .get(actor.installation_id)
+    )
+      throw new ChannelError('unauthorized')
+    if (
+      actor.profile === 'paired-wss-v1' &&
+      (!actor.device_key ||
+        !this.db
+          .prepare(
+            "SELECT 1 FROM paired_devices WHERE installation_id=? AND public_key=? AND state='confirmed'"
+          )
+          .get(actor.installation_id, actor.device_key))
     )
       throw new ChannelError('unauthorized')
   }
@@ -103,16 +118,19 @@ export class FakeProvider {
 export class NodeCore implements JournalStore, OperationStore, SessionQueue, PromptService {
   readonly db: DatabaseSync
   readonly authority: AuthorityService
+  readonly pairing: PairingService
   readonly node_id: string
   readonly provider = new FakeProvider()
   readonly resources: ResourceServices
-  readonly claude: ClaudeSessions
+  readonly execution: ProviderSessions
+  /** Compatibility alias; both providers share this dispatcher. */
+  readonly claude: ProviderSessions
   fault?: (point: 'before_commit' | 'after_commit') => void
   private closed = false
   private storageFailed = false
   constructor(
     readonly stateDir: string,
-    options: { worktreeRoot?: string; claude?: ClaudeProviderAdapter } = {}
+    options: { worktreeRoot?: string; claude?: ProviderAdapter; pi?: ProviderAdapter } = {}
   ) {
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     chmodSync(stateDir, 0o700)
@@ -121,7 +139,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 9) {
+    if (version > 10) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -215,11 +233,17 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         'BEGIN IMMEDIATE; DROP TABLE legacy_file_recoveries; PRAGMA user_version=9; COMMIT;'
       )
     }
+    if (version < 10)
+      this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE provider_native_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), provider TEXT NOT NULL CHECK(provider='pi'), native_session_id TEXT NOT NULL, session_file TEXT UNIQUE NOT NULL);
+      INSERT INTO provider_native_sessions SELECT session_id,'pi',json_extract(body,'$.native_session_id'),json_extract(body,'$.native_session_file') FROM sessions WHERE json_extract(body,'$.provider')='pi' AND json_extract(body,'$.native_session_file') IS NOT NULL;
+      PRAGMA user_version=10; COMMIT;`)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
     if (!identity) this.db.prepare("INSERT INTO meta VALUES('node_id',?)").run(this.node_id)
     this.authority = new AuthorityService(this.db)
+    this.pairing = new PairingService(this)
     try {
       this.resources = new ResourceServices(this, options.worktreeRoot)
       this.resources.mutations.recover()
@@ -245,7 +269,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.resolvePrompt(prompt, 'invalidated', 'deny', null)
       }
     })
-    this.claude = new ClaudeSessions(this, options.claude)
+    this.execution = new ProviderSessions(this, options.claude, options.pi)
+    this.claude = this.execution
     this.protectFiles()
   }
   protectFiles() {
@@ -347,20 +372,22 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     return {
       ...this.provider.capabilities(),
       provider: 'node',
-      provider_version: '4B',
-      providers: [this.provider.capabilities(), claude],
+      provider_version: '5',
+      providers: [this.provider.capabilities(), claude, this.claude.capabilities('pi')],
       capabilities: {
         ...this.provider.capabilities().capabilities,
         workspace_files: { status: 'supported', evidence: 'bounded-no-follow-files-v1' },
         workspace_editing: { status: 'supported', evidence: 'preconditioned-in-place-writes-v2' },
         immutable_diffs: { status: 'supported', evidence: 'persisted-patch-snapshots-v1' },
         review_batches: { status: 'supported', evidence: 'validated-idempotent-input-v1' },
-        execution: this.claude.available
-          ? {
-              status: 'supported',
-              evidence: 'supervised-cli-v1; inspect provider compatibility gates',
-            }
-          : this.provider.capabilities().capabilities.execution,
+        execution:
+          this.claude.available || this.claude.isAvailable('pi')
+            ? {
+                status: 'supported',
+                evidence:
+                  'shared-supervised-providers-v1; inspect per-provider compatibility gates',
+              }
+            : this.provider.capabilities().capabilities.execution,
       },
     }
   }
@@ -378,6 +405,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   request(actor: AuthorityContext, method: string, raw: unknown, operation?: string): unknown {
     this.authority.check(actor, 'request')
+    if (method === 'pairing.list' || method === 'pairing.confirm') {
+      if (actor.profile !== 'local-token-v1') throw new ChannelError('local_owner_required')
+      const parsed = PairingMethodSchemas[method].safeParse(raw)
+      if (!parsed.success) throw new ChannelError('invalid_params')
+      if (method === 'pairing.list') return this.pairing.list()
+      const p = parsed.data as { installation_id: string; device_fingerprint: string }
+      return this.pairing.confirm(p.installation_id, p.device_fingerprint)
+    }
     let params: Record<string, unknown>
     try {
       params = validateParams(method, raw) as Record<string, unknown>
@@ -448,7 +483,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         return {
           node_id: this.node_id,
           capabilities: this.capabilities(),
-          providers: [this.provider.capabilities(), this.claude.capabilities()],
+          providers: [
+            this.provider.capabilities(),
+            this.claude.capabilities(),
+            this.claude.capabilities('pi'),
+          ],
         }
       case 'session.list':
         return (
@@ -516,12 +555,13 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       installation_id: actor.installation_id,
     } as const
     if (method === 'session.create') {
-      if (p.provider === 'claude') {
+      if (p.provider === 'claude' || p.provider === 'pi') {
         if (!p.workspace_id) throw new ChannelError('workspace_required')
         const workspace = this.resources.workspaces.get(String(p.workspace_id))
         if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')
           throw new ChannelError('project_untrusted')
-        if (!this.claude.available) throw new ChannelError('provider_unavailable')
+        if (!this.claude.isAvailable(String(p.provider)))
+          throw new ChannelError('provider_unavailable')
       }
       const session = SessionSchema.parse({
         session_id: randomUUID(),
@@ -571,9 +611,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (method === 'session.send') {
       const current = this.session(session)
-      if (current.provider === 'claude') {
+      if (current.provider !== 'fake') {
         if (!current.workspace_id) throw new ChannelError('workspace_required')
-        if (!this.claude.available) throw new ChannelError('provider_unavailable')
+        if (!this.claude.isAvailable(current.provider))
+          throw new ChannelError('provider_unavailable')
         if (canonical(p.script) !== canonical([{ kind: 'echo' }]))
           throw new ChannelError('invalid_params')
       }
@@ -609,11 +650,23 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         throw new ChannelError('prompt_expired')
       if (prompt.state === 'resolved') return prompt
       if (prompt.expires_at <= Date.now()) throw new ChannelError('prompt_expired')
+      if (p.choice === 'allow') {
+        if (
+          prompt.kind === 'select' &&
+          (typeof p.value !== 'string' || !prompt.options?.includes(p.value))
+        )
+          throw new ChannelError('invalid_params')
+        if (prompt.kind === 'input' && typeof p.value !== 'string')
+          throw new ChannelError('invalid_params')
+        if (prompt.kind !== 'select' && prompt.kind !== 'input' && p.value !== undefined)
+          throw new ChannelError('invalid_params')
+      }
       return this.resolvePrompt(
         prompt,
         'resolved',
         p.choice as 'allow' | 'deny',
-        actor.installation_id
+        actor.installation_id,
+        p.choice === 'allow' && typeof p.value === 'string' ? p.value : undefined
       )
     }
     if (method === 'input.cancel') {
@@ -635,7 +688,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       if (!input) throw new ChannelError('stale_revision')
       this.transition(
         input,
-        this.session(session).provider === 'claude' ? 'delivery_unknown' : 'interrupted'
+        this.session(session).provider !== 'fake' ? 'delivery_unknown' : 'interrupted'
       )
       this.append(session, 'run.interrupted', installationActor, {
         run_id: p.run_id,
@@ -668,9 +721,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     prompt: Prompt,
     state: Prompt['state'],
     choice: 'allow' | 'deny',
-    installation: string | null
+    installation: string | null,
+    value?: string
   ): Prompt {
-    const result = PromptSchema.parse({ ...prompt, state, choice, installation_id: installation })
+    const result = PromptSchema.parse({
+      ...prompt,
+      state,
+      choice,
+      installation_id: installation,
+      ...(value !== undefined ? { value } : {}),
+    })
     this.db
       .prepare('UPDATE prompts SET body=? WHERE prompt_id=?')
       .run(JSON.stringify(result), prompt.prompt_id)
@@ -703,7 +763,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           )
           .get(String(s.session_id)) as Row
         InputStateSchema.parse(input.state)
-        if (this.session(String(input.session_id)).provider === 'claude') continue
+        if (this.session(String(input.session_id)).provider !== 'fake') continue
         const body = validateParams('session.send', JSON.parse(String(input.body))) as {
           text: string
           script: FakeStep[]

@@ -7,7 +7,7 @@ import {
   type AuthorityContext,
   type RecordFrame,
 } from '@abele/channel-protocol'
-import { MethodSchemas } from '@abele/node-protocol'
+import { MethodSchemas, PairingMethodSchemas } from '@abele/node-protocol'
 import { NodeCore } from '@abele/node-core'
 type Scheduled = {
   bytes: Uint8Array
@@ -71,8 +71,12 @@ interface Subscription {
   sent: Array<{ seq: number; bytes: number }>
 }
 /** Journal reads are the source of truth. Socket notifications never carry canonical events. */
-export async function serveChannel(transport: RecordTransport, core: NodeCore): Promise<void> {
-  let actor: AuthorityContext | undefined,
+export async function serveChannel(
+  transport: RecordTransport,
+  core: NodeCore,
+  authenticatedActor?: AuthorityContext
+): Promise<void> {
+  let actor: AuthorityContext | undefined = authenticatedActor,
     ready = false,
     closed = false,
     last = Date.now(),
@@ -148,7 +152,10 @@ export async function serveChannel(transport: RecordTransport, core: NodeCore): 
           node_id: core.node_id,
           installation_id: actor.installation_id,
           instance_id: randomUUID(),
-          methods: Object.keys(MethodSchemas),
+          methods: [
+            ...Object.keys(MethodSchemas),
+            ...(actor.profile === 'local-token-v1' ? Object.keys(PairingMethodSchemas) : []),
+          ],
           limits: LIMITS,
           capabilities: core.capabilities(),
         })

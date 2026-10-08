@@ -12,18 +12,36 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { NodeCore, ClaudeProviderAdapter } from '@abele/node-core'
+import { NodeCore, ClaudeProviderAdapter, PiProviderAdapter } from '@abele/node-core'
+import type { PiOptions } from '@abele/provider-pi'
 import type { ClaudeOptions } from '@abele/provider-claude'
 import { TokenCommandSchema } from '@abele/node-protocol'
 import { serveChannel } from '@abele/channel-server'
 import { RecordQueue } from '@abele/channel-client'
 import { ChannelError, LIMITS, type RecordTransport } from '@abele/channel-protocol'
 import type WebSocket from 'ws'
+import { z } from 'zod'
+import { TailscaleServeManager, FileServeOwnershipStore, tailscaleRunner } from './tailscale.js'
+import { Id, FingerprintSchema } from '@abele/channel-protocol'
+import {
+  PairedListenerSchema,
+  pairedAdmission,
+  servePairedChannel,
+  type PairedListenerConfig,
+} from './paired.js'
+export { PairedListenerSchema, pairedAdmission, type PairedListenerConfig } from './paired.js'
+export { TailscaleServeManager } from './tailscale.js'
 
-export function readRuntime(
-  dir: string
-):
-  | { pid: number; port?: number; node_id?: string; claude?: unknown; control_socket?: string }
+export function readRuntime(dir: string):
+  | {
+      pid: number
+      port?: number
+      node_id?: string
+      claude?: unknown
+      pi?: unknown
+      control_socket?: string
+      paired?: PairedListenerConfig
+    }
   | undefined {
   try {
     const value = JSON.parse(readFileSync(join(dir, 'daemon.lock'), 'utf8')) as {
@@ -31,7 +49,9 @@ export function readRuntime(
       port?: number
       node_id?: string
       claude?: unknown
+      pi?: unknown
       control_socket?: string
+      paired?: PairedListenerConfig
     }
     if (!Number.isSafeInteger(value.pid) || value.pid < 1) return
     process.kill(value.pid, 0)
@@ -112,7 +132,52 @@ class WsTransport implements RecordTransport {
     }
   }
 }
-function tokenCommand(core: NodeCore, raw: unknown) {
+export const PairingControlSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('pairing.issue'),
+      endpoint: z.string(),
+      label: z.string(),
+      installation_id: Id.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('pairing.confirm'),
+      installation_id: Id,
+      device_fingerprint: FingerprintSchema,
+    })
+    .strict(),
+  z.object({ action: z.literal('pairing.revoke'), installation_id: Id }).strict(),
+  z.object({ action: z.literal('pairing.list') }).strict(),
+  z.object({ action: z.literal('pairing.rotate') }).strict(),
+])
+const ServeControlSchema = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('tailscale.enable'), policy_verified: z.literal(true) }).strict(),
+  z.object({ action: z.literal('tailscale.disable') }).strict(),
+])
+export type OwnerCommand =
+  | { action: string; value?: string }
+  | z.infer<typeof PairingControlSchema>
+  | z.infer<typeof ServeControlSchema>
+async function tokenCommand(core: NodeCore, raw: unknown) {
+  const paired = PairingControlSchema.safeParse(raw)
+  if (paired.success) {
+    const c = paired.data
+    switch (c.action) {
+      case 'pairing.issue':
+        return core.pairing.issue(c.endpoint, c.label, 300000, c.installation_id)
+      case 'pairing.confirm':
+        return core.pairing.confirm(c.installation_id, c.device_fingerprint)
+      case 'pairing.list':
+        return core.pairing.list()
+      case 'pairing.revoke':
+        core.pairing.revoke(c.installation_id)
+        return { revoked: c.installation_id }
+      case 'pairing.rotate':
+        return { node_key: (await core.pairing.identity.rotate()).public_key }
+    }
+  }
   const command = TokenCommandSchema.parse(raw)
   switch (command.action) {
     case 'create':
@@ -127,10 +192,7 @@ function tokenCommand(core: NodeCore, raw: unknown) {
       throw new Error('unknown_token_command')
   }
 }
-export async function control(
-  dir: string,
-  command: { action: string; value?: string }
-): Promise<unknown> {
+export async function control(dir: string, command: OwnerCommand): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const runtime = readRuntime(dir)
     // Older running daemons did not publish an endpoint; keep their CLI compatible.
@@ -140,7 +202,9 @@ export async function control(
         : join(dir, 'control.sock')
     const socket = createConnection(endpoint)
     let data = ''
-    socket.setTimeout(3000, () => socket.destroy(new Error('control_timeout')))
+    socket.setTimeout(command.action.startsWith('tailscale.') ? 60000 : 3000, () =>
+      socket.destroy(new Error('control_timeout'))
+    )
     socket.on('connect', () => socket.end(JSON.stringify(command) + '\n'))
     socket.on('data', (chunk) => {
       data += chunk
@@ -158,13 +222,13 @@ export async function control(
     })
   })
 }
-export async function offlineToken(dir: string, command: { action: string; value?: string }) {
+export async function offlineToken(dir: string, command: OwnerCommand) {
   if (readRuntime(dir)) return control(dir, command)
   const release = takeLock(dir)
   try {
     const core = new NodeCore(dir)
     try {
-      return tokenCommand(core, command)
+      return await tokenCommand(core, command)
     } finally {
       core.close()
     }
@@ -176,11 +240,21 @@ export async function startDaemon(
   dir: string,
   port = 7777,
   worktreeRoot?: string,
-  claudeOptions: ClaudeOptions = {}
+  claudeOptions: ClaudeOptions = {},
+  pairedConfig?: PairedListenerConfig,
+  tailscalePath?: string,
+  piOptions: Omit<PiOptions, 'stateDir'> = {}
 ) {
+  const paired = pairedConfig ? PairedListenerSchema.parse(pairedConfig) : undefined
   const release = takeLock(dir)
   let core: NodeCore | undefined, ipc: Server | undefined
   const app = Fastify({ logger: false, bodyLimit: LIMITS.record_bytes })
+  const pairedApp = Fastify({ logger: false, bodyLimit: LIMITS.record_bytes })
+  let pairedPort: number | undefined
+  const serveManager = new TailscaleServeManager(
+    tailscaleRunner(tailscalePath),
+    new FileServeOwnershipStore(join(dir, 'serve-ownership.json'))
+  )
   const sockets = new Set<WebSocket>()
   const channels = new Set<Promise<void>>()
   let jobs: Promise<void> | undefined
@@ -193,9 +267,9 @@ export async function startDaemon(
     stopped = true
     if (timer) clearInterval(timer)
     for (const socket of sockets) socket.terminate()
-    await app.close()
+    await Promise.all([app.close(), pairedApp.close()])
     await Promise.allSettled([...channels])
-    await core?.claude.stop()
+    await core?.execution.stop()
     await execution
     await core?.resources.stop()
     if (ipc) await new Promise<void>((r) => ipc!.close(() => r()))
@@ -207,8 +281,9 @@ export async function startDaemon(
     core = new NodeCore(dir, {
       ...(worktreeRoot ? { worktreeRoot } : {}),
       claude: new ClaudeProviderAdapter(claudeOptions),
+      pi: new PiProviderAdapter({ ...piOptions, stateDir: dir }),
     })
-    await core.claude.reconcile()
+    await core.execution.reconcile()
     await app.register(websocket, {
       options: { maxPayload: LIMITS.record_bytes, perMessageDeflate: false },
     })
@@ -243,6 +318,34 @@ export async function startDaemon(
     await app.listen({ host: '127.0.0.1', port })
     const address = app.server.address()
     if (!address || typeof address === 'string') throw new Error('invalid_listener')
+    if (paired) {
+      await pairedApp.register(websocket, {
+        options: { maxPayload: LIMITS.record_bytes, perMessageDeflate: false },
+      })
+      pairedApp.addHook('onRequest', async (request, reply) => {
+        if (
+          request.socket.remoteAddress !== '127.0.0.1' ||
+          !pairedAdmission(paired, request.headers.host, request.headers.origin, request.url)
+        )
+          return reply.code(403).send()
+        if (sockets.size >= LIMITS.connections) return reply.code(503).send()
+      })
+      pairedApp.get('/channel', { websocket: true }, (socket) => {
+        if (sockets.size >= LIMITS.connections) {
+          socket.terminate()
+          return
+        }
+        sockets.add(socket)
+        socket.once('close', () => sockets.delete(socket))
+        const task = servePairedChannel(new WsTransport(socket), core!, paired.endpoint)
+        channels.add(task)
+        void task.finally(() => channels.delete(task)).catch(() => {})
+      })
+      await pairedApp.listen({ host: '127.0.0.1', port: paired.backend_port })
+      const a = pairedApp.server.address()
+      if (!a || typeof a === 'string') throw new Error('invalid_listener')
+      pairedPort = a.port
+    }
     // macOS/libuv can silently truncate long sun_path values. The state directory
     // is unbounded, so put the endpoint in a private, randomly named short directory
     // and publish it only after listen/chmod succeed. Long custom TMPDIRs use /tmp.
@@ -260,11 +363,30 @@ export async function startDaemon(
         if (data.length > LIMITS.auth_bytes) socket.destroy()
       })
       socket.on('end', () => {
-        try {
-          socket.end(JSON.stringify({ result: tokenCommand(core!, JSON.parse(data)) }))
-        } catch {
-          socket.end(JSON.stringify({ error: 'invalid_control_command' }))
-        }
+        void (async () => {
+          try {
+            const raw: unknown = JSON.parse(data)
+            const serve = ServeControlSchema.safeParse(raw)
+            if (serve.success) {
+              if (!paired || !pairedPort) throw new Error('paired_listener_required')
+              if (serve.data.action === 'tailscale.enable')
+                await serveManager.enable(paired.endpoint, pairedPort, address.port)
+              else await serveManager.disable(paired.endpoint, pairedPort)
+              socket.end(JSON.stringify({ result: { action: serve.data.action, completed: true } }))
+            } else {
+              const cmd = PairingControlSchema.safeParse(raw)
+              if (
+                cmd.success &&
+                cmd.data.action === 'pairing.issue' &&
+                (!paired || cmd.data.endpoint !== paired.endpoint)
+              )
+                throw new Error('paired_endpoint_mismatch')
+              socket.end(JSON.stringify({ result: await tokenCommand(core!, raw) }))
+            }
+          } catch {
+            socket.end(JSON.stringify({ error: 'invalid_control_command' }))
+          }
+        })()
       })
     })
     await new Promise<void>((resolve, reject) => {
@@ -278,8 +400,10 @@ export async function startDaemon(
         pid: process.pid,
         port: address.port,
         node_id: core.node_id,
-        claude: core.claude.capabilities(),
+        claude: core.execution.capabilities(),
+        pi: core.execution.capabilities('pi'),
         control_socket: socketPath,
+        ...(paired ? { paired: { ...paired, backend_port: pairedPort } } : {}),
       }),
       { mode: 0o600 }
     )
@@ -287,7 +411,7 @@ export async function startDaemon(
       try {
         core!.tick()
         if (!execution) {
-          execution = core!.claude.drain()
+          execution = core!.execution.drain()
           void execution
             .catch(() => {
               console.error('provider execution paused: inspect durable runs and restart')
@@ -313,7 +437,7 @@ export async function startDaemon(
         if (timer) clearInterval(timer)
       }
     }, 20)
-    return { port: address.port, node_id: core.node_id, stop }
+    return { port: address.port, paired_port: pairedPort, node_id: core.node_id, stop }
   } catch (error) {
     await stop()
     throw error

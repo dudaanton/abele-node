@@ -1,17 +1,17 @@
 # Security and threat model
 
-AbeleNode is an **early, single-user, local-loopback daemon**, not a multi-user
-service or OS sandbox. The security boundaries and limitations below retain the
-local model used by the implementation. Remote access must replace channel
-admission/connector with a reviewed pairing/encryption design, not simply expose
-the local-token listener.
+AbeleNode is an **early, single-user daemon with loopback-only listeners**, not a
+multi-user service or OS sandbox. Local-token control stays loopback-only. Remote
+control is available through separately enabled paired WSS with Tailscale Serve in
+front of a separate paired backend, never by exposing the local-token listener.
+The plugin pairing UI is not yet released. See [remote access](remote-access.md).
 
 ## Local admission and authority
 
-The native listener binds only `127.0.0.1`. Admission accepts the exact listener's
+The native local-token listener binds only `127.0.0.1`. Admission accepts the exact listener's
 `127.0.0.1:PORT` Host and loopback peer, with either no Origin (native clients) or
 `app://obsidian.md` (desktop Obsidian). Other browser origins, URL queries and
-nonbinary application records are refused. The client accepts only explicit
+nonbinary application records are refused. The local-token client accepts only explicit
 `ws://127.0.0.1:PORT/channel`, with no hostname aliases, credentials, fragments,
 redirects, LAN fallback or alternate security profile.
 
@@ -40,6 +40,40 @@ untrusted siblings. It is not a remote-access mechanism; do not use host
 networking, LAN publishing, tunnels or a public reverse proxy. Docker port
 publishing protects the host exposure, not admission against other containers.
 
+## Paired remote admission
+
+Both node listeners remain on loopback. The optional paired listener accepts only
+`paired-wss-v1`; it refuses `local-token-v1` even from loopback. Tailscale Serve
+provides tailnet-only WSS in front of that backend, never Funnel. Its manager reads
+existing configuration before changes, refuses foreign mappings and local-token
+exposure, and only removes its own confirmed, unchanged mapping. Uncertain CLI
+results leave pending intent, not deletion rights. Starting/stopping the node does
+not change Serve configuration.
+
+Tailnet membership alone grants no application authority. Invitations bind endpoint,
+node identity, node-key fingerprint, expiry and a single-use secret. A claim requires
+fresh device-key possession but grants no access until a local owner confirms the
+exact enrolling key. Private keys stay device-local. Every connection verifies the
+pinned node application key and a fresh, expiring, connection-bound device proof
+using WebCrypto ECDSA P-256. The signed transcript binds node, installation and
+protocol; client freshness uses its nonce and a local monotonic deadline, not
+synchronized wall clocks. Changed node keys require explicit owner-verified recovery.
+
+The configured Host and path must match exactly. Origins are an explicit allowlist;
+missing/null Origin needs its own client policy and device authentication. Forwarded
+addresses, hosts and Tailscale identity headers are not authorization. Revocation
+fences mutations, receipt replay, prompt answers, artifact reads and queued/live
+publication; already-sent bytes cannot be recalled. Explicit migration preserves
+principal-scoped receipts, session identities and cursors. These are node-wide owner
+grants, not mixed-trust or per-project permissions.
+
+TLS protects records while trusting the local node/Serve process, PKI and endpoint
+devices. Application-key proof is not TLS certificate pinning or protection from a
+malicious TLS-terminating proxy. No external relay or end-to-end channel is provided.
+Effective network policy, certificate forwarding and device key persistence require
+deployment verification. Full prerequisites, pairing, revocation and recovery are
+in [remote access](remote-access.md).
+
 ## Local storage and durability
 
 State directories are `0700`; database, WAL/SHM, lock, credential socket, installer
@@ -60,8 +94,8 @@ possible commit. Prompts distinguish committed resolution from provider delivery
 
 History, receipts, snapshots and content have **no automatic expiry**. Logs are not
 rotated. Disk-full, sustained-load, backup/restore and operational hardening remain
-important deployment concerns. Provider-native resume files are separate CLI-owned
-state and need separate preservation. Stopped backups must preserve SQLite/WAL,
+important deployment concerns. Provider-native resume files are separate provider-owned
+state and need preservation; pi native files live in the protected node state. Stopped backups must preserve SQLite/WAL,
 Git metadata and worktrees consistently. Journal/raw provider records, tool inputs,
 file contents and logs can contain secrets; avoid putting secrets into prompts and
 redact diagnostics before sharing.
@@ -122,8 +156,8 @@ Review anchors validate against retained hunks/session workspace. Valid saved
 context may be accepted conservatively with `stale: true`; it is never silently
 retargeted. Authority/storage failures still fail closed.
 
-Stage 4B adds [bounded UTF-8 writes and explicit restore](editing.md) using content
-preconditions, installation-scoped receipts and private pre-write recovery copies.
+[Bounded UTF-8 writes and explicit restore](editing.md) use content preconditions,
+installation-scoped receipts and private pre-write recovery copies.
 Existing files are written in place on a pinned descriptor; their inode/permissions
 are not replaced. There is no filesystem CAS or exclusion of external writers.
 Crashes can leave partial bytes; durable unfinished intents settle unknown and
@@ -192,6 +226,29 @@ versions require real permission/resume acceptance, never a bypass fallback.
 Automatic tests use fake executables, including version/help. Live provider probes
 are explicit, quota-consuming manual operations, not CI tests.
 
+## Pi SDK approvals and execution
+
+The [pi SDK provider](pi.md) uses the same authorization, queue, journal and
+single-use approval machinery as other sessions. Tools require exact human grants;
+missing, expired, interrupted or unconfirmed answers deny. Model/authentication
+configuration is resolved only inside the worker; keys, headers, request payloads
+and environment are not exported through the client protocol. Feature availability
+is capability-gated and is not proof of model login or endpoint availability.
+
+Trusted project admission precedes executable resources. Isolated mode prevents
+SYSTEM/APPEND_SYSTEM discovery and reads as well as other inherited resources; it
+does not bypass approvals. Trusted extensions are full same-user code, not sandboxed.
+Unsupported custom UI and swallowed command/shutdown errors fail the turn rather
+than turning handled preflight into success. SDK-native diagnostic files remain
+protected local state and should be reviewed before sharing.
+
+Built-in bash uses an owned group anchor, with evidence committed before shell
+execution. Anchors outlive fast-exiting shells so ordinary background jobs cannot
+escape descendant-poll gaps. Group absence and recovery-record removal are verified
+before release acknowledgement; worker/anchor IPC loss also triggers independent
+cleanup. Explicit group escapes and arbitrary trusted-extension subprocess behavior
+remain outside the same-user boundary. Native child IDs are not node session IDs.
+
 ## Resource bounds and remaining gates
 
 Binary UTF-8 JSON records are bounded: 256 KiB records, 16 KiB first auth record,
@@ -203,7 +260,10 @@ Large payloads use authorized bounded artifact/content reads; oversized outputs
 fail explicitly rather than silently truncating snapshots. Session execution and
 provisioning each have bounded concurrency.
 
-Remote encryption/pairing, pi execution, mobile integration, comprehensive
-provider child/thinking support, login/logout service lifecycle, sustained load,
-log rotation and full disk/backup recovery are not promised by these local tests.
-Desktop Origin tests do not establish supported mobile or remote operation.
+Paired remote admission has offline coverage; real Tailscale forwarding/certificates,
+effective access policy, device-key persistence and off-network mobile operation
+remain deployment checks. An external relay or end-to-end encrypted channel is not
+provided. Comprehensive provider child/thinking support, login/logout
+service lifecycle, sustained load, log rotation and full disk/backup recovery are
+not promised by these tests. Desktop Origin tests do not establish supported mobile
+operation. See [remote access](remote-access.md) for the paired profile's limits.

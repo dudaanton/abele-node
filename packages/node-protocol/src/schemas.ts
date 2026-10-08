@@ -39,7 +39,7 @@ export const InputStateSchema = z.enum([
 ])
 export const PromptSchema = z
   .object({
-    kind: z.literal('permission').default('permission'),
+    kind: z.enum(['permission', 'select', 'confirm', 'input', 'trust']).default('permission'),
     prompt_id: id,
     session_id: id,
     run_id: id,
@@ -51,8 +51,12 @@ export const PromptSchema = z
     installation_id: id.nullable(),
     delivered: z.boolean(),
     tool_use_id: id.optional(),
+    native_session_id: z.string().uuid().optional(),
     tool_name: z.string().min(1).max(256).optional(),
     input: z.record(z.unknown()).optional(),
+    title: z.string().max(4096).optional(),
+    options: z.array(z.string().max(4096)).max(256).optional(),
+    value: z.string().max(32768).nullable().optional(),
   })
   .strict()
 export type Prompt = z.infer<typeof PromptSchema>
@@ -60,8 +64,9 @@ export const SessionSchema = z
   .object({
     session_id: id,
     title: z.string().max(256),
-    provider: z.enum(['fake', 'claude']),
+    provider: z.enum(['fake', 'claude', 'pi']),
     native_session_id: z.string().uuid().optional(),
+    native_session_file: z.string().min(1).max(4096).optional(),
     created_at: z.string().datetime(),
     workspace_id: id.nullable().optional(),
   })
@@ -156,7 +161,7 @@ export const MethodSchemas = {
   'session.create': z
     .object({
       title: z.string().max(256).default('Fake session'),
-      provider: z.enum(['fake', 'claude']).default('fake'),
+      provider: z.enum(['fake', 'claude', 'pi']).default('fake'),
       workspace_id: id.optional(),
     })
     .strict(),
@@ -191,6 +196,7 @@ export const MethodSchemas = {
       revision: z.literal(1),
       action_digest: z.string().length(64),
       choice: z.enum(['allow', 'deny']),
+      value: z.string().max(32768).optional(),
     })
     .strict(),
   'stream.read': z

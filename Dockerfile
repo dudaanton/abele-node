@@ -3,7 +3,8 @@ FROM node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e
 WORKDIR /app
 COPY package.json package-lock.json .npmrc tsconfig.json tsconfig.base.json ./
 COPY packages/ packages/
-RUN npm ci --ignore-scripts && npm run build && npm prune --omit=dev --ignore-scripts
+COPY scripts/prepare-pi.mjs scripts/prepare-pi.mjs
+RUN npm ci --ignore-scripts && npm run build && npm prune --omit=dev --ignore-scripts && node scripts/prepare-pi.mjs
 
 FROM node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/dudaanton/abele-node" \
@@ -19,7 +20,8 @@ COPY --from=build /app/node_modules/ node_modules/
 COPY --from=build /app/packages/ packages/
 COPY scripts/container.mjs scripts/container.mjs
 COPY LICENSE ./
-# No provider CLI, credentials, Git history, tests, probes or dev dependencies.
+# SDK resources are retained; no external provider CLI, credentials, Git history,
+# tests, probes or dev dependencies.
 RUN find packages -type d -name src -prune -exec rm -rf '{}' + \
     && find packages -type d -name tests -prune -exec rm -rf '{}' + \
     && find packages -type f -name '*.tsbuildinfo' -delete

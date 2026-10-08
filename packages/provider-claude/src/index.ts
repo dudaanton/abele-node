@@ -15,7 +15,7 @@ import {
 } from './supervisor.js'
 export { ClaudeStreamDecoder, ClaudeEventMapper, ProcessSupervisor }
 export type { ProcessIdentity, ProcessProbe, ClaudeEvent }
-export { systemProcessProbe } from './supervisor.js'
+export { systemProcessProbe, descendants } from './supervisor.js'
 export interface ClaudeOptions {
   executable?: string
   profile?: 'inherited' | 'isolated'

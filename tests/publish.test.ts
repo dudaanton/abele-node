@@ -4,15 +4,23 @@ import { execFileSync } from 'node:child_process'
 
 it('ships public source metadata, installation guides and a pinned non-root image', () => {
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
-  expect(pkg.version).toBe('0.1.0')
+  expect(pkg.version).toBe('0.2.0')
   expect(pkg.license).toBe('GPL-3.0-only')
   expect(pkg.repository.url).toBe('https://github.com/dudaanton/abele-node.git')
-  for (const file of ['LICENSE', 'docs/install.md', 'docs/docker.md', 'docs/security.md'])
+  for (const file of [
+    'LICENSE',
+    'docs/install.md',
+    'docs/docker.md',
+    'docs/security.md',
+    'docs/remote-access.md',
+  ])
     expect(existsSync(file), file).toBe(true)
   const docker = readFileSync('Dockerfile', 'utf8')
   expect(docker).toMatch(/FROM node:22[^\s]*@sha256:[a-f0-9]{64}/)
   expect(docker).toMatch(/USER node/)
   expect(docker).toMatch(/HEALTHCHECK/)
+  expect(docker).toContain('COPY scripts/prepare-pi.mjs scripts/prepare-pi.mjs')
+  expect(docker).toMatch(/npm prune --omit=dev --ignore-scripts\s*&& node scripts\/prepare-pi\.mjs/)
   expect(docker).toMatch(/git/)
   expect(docker).not.toMatch(/npm (?:install|i).*(?:claude|coding-agent)/)
   expect(readFileSync('docker-compose.example.yml', 'utf8')).toContain('127.0.0.1:7777:7778')
@@ -24,6 +32,7 @@ it('keeps public source free of concrete developer home paths and private probe 
     'docs/install.md',
     'docs/docker.md',
     'docs/security.md',
+    'docs/remote-access.md',
     'docs/debug-probe.md',
     '.github/workflows/ci.yml',
   ])
@@ -50,7 +59,9 @@ it('keeps public source free of concrete developer home paths and private probe 
 
 it('documents the current editing and control-endpoint contracts without publishing research evidence', () => {
   const readme = readFileSync('README.md', 'utf8')
-  expect(readme).toContain('Stages 1–4B')
+  expect(readme).toContain('Durable sessions')
+  expect(readme).toContain('managed Git worktrees')
+  expect(readme).toContain('Bounded UTF-8 file editing/creation')
   expect(readme).toContain('docs/editing.md')
   expect(readme).toContain('docs/debug-probe.md')
   const install = readFileSync('docs/install.md', 'utf8')
@@ -61,6 +72,74 @@ it('documents the current editing and control-endpoint contracts without publish
   expect(evidence).not.toContain('docs/debug-probe-evidence.json')
   const installer = readFileSync('probes/debug-install.sh', 'utf8')
   expect(installer).toContain('DEP_CHECK="${DEP_CHECK:?')
+})
+
+it('documents paired availability and keeps remote configuration examples deployment-neutral', () => {
+  const readme = readFileSync('README.md', 'utf8')
+  expect(readme).toMatch(/Local-token control stays loopback-only/)
+  expect(readme).toMatch(
+    /Node-side paired WSS\s+through Tailscale Serve is available but separately enabled/
+  )
+  expect(readme).toMatch(/plugin pairing UI is\s+not yet released/)
+  expect(readme).toContain('docs/remote-access.md')
+  expect(readme).not.toMatch(/Remote control, pairing.*planned, not implemented/s)
+  const security = readFileSync('docs/security.md', 'utf8')
+  expect(security).toContain('## Local admission and authority')
+  expect(security).toContain('## Paired remote admission')
+  expect(security).toContain('refuses `local-token-v1` even from loopback')
+  expect(security).toContain('[remote access](remote-access.md)')
+  const remote = readFileSync('docs/remote-access.md', 'utf8')
+  expect(remote).toContain('YOUR_PAIRED_WSS_ENDPOINT')
+  expect(remote).not.toMatch(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net\b/i)
+  expect(remote).not.toMatch(/(?:\/(?:Users|home|Applications|Volumes)\/|~\/|\/path\/to\/)/)
+  expect(remote).not.toMatch(
+    /\b(?:stage\s+\d+|node-side slice|owner\/manager|review[- ]round|agent harness|manager note)\b/i
+  )
+  expect(remote).not.toContain('../tests/security-regression-sensitivity.md')
+})
+
+it('documents pi availability neutrally and retains capability and publication gates', () => {
+  const readme = readFileSync('README.md', 'utf8')
+  expect(readme).toContain('docs/pi.md')
+  expect(readme).toMatch(/pi SDK provider.*available/i)
+  expect(readme).toMatch(/capability.gated/i)
+  expect(readme).not.toContain('pi has no execution adapter yet')
+  for (const file of ['README.md', 'docs/security.md', 'docs/pi.md']) {
+    const text = readFileSync(file, 'utf8')
+    expect(text, file).not.toMatch(
+      /\b(?:agent harness|review[- ]round|stage\s+\d+|manager note)\b/i
+    )
+    expect(text, file).not.toMatch(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net\b/i)
+    expect(text, file).not.toMatch(/(?:\/(?:Users|home|Applications|Volumes)\/|~\/|\/path\/to\/)/)
+  }
+  const pi = readFileSync('docs/pi.md', 'utf8')
+  expect(pi).toContain('--pi-provider YOUR_PROVIDER --pi-model YOUR_MODEL')
+})
+
+it('uses subject-based names and neutral dependency and acceptance metadata', () => {
+  const deps = readFileSync('deps.yaml', 'utf8')
+  expect(deps.split('\n')[0]).toBe(
+    '# Each version was audited before install: >=3 days old, established adoption, no OSV vulnerabilities.'
+  )
+  expect(deps).toMatch(/why: >-\n\s+pi SDK provider\n/)
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+  expect(pkg.scripts['acceptance:pi']).toContain('scripts/acceptance-pi.mjs')
+  expect(pkg.scripts['acceptance:remote']).toContain('tests/paired-security.test.ts')
+  const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], {
+    encoding: 'utf8',
+  })
+    .trim()
+    .split('\n')
+    .filter((file) => existsSync(file))
+  for (const file of [
+    'scripts/acceptance-pi.mjs',
+    'tests/pi-acceptance.test.ts',
+    'tests/security-regression-sensitivity.md',
+  ])
+    expect(readFileSync(file, 'utf8'), file).not.toMatch(
+      /\b(?:stage\s*\d+|review[- ]round|renewed acceptance|rebase)\b/i
+    )
+  expect(readFileSync('tests/security-regression-sensitivity.md', 'utf8')).not.toContain('.scratch')
 })
 
 it('pins workflow actions and never runs live acceptance in CI', () => {

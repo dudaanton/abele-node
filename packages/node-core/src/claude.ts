@@ -2,13 +2,14 @@ import { randomUUID, createHash } from 'node:crypto'
 import { ChannelError } from '@abele/channel-protocol'
 import { PromptSchema, SessionSchema, type Prompt } from '@abele/node-protocol'
 import type {
-  ClaudeProviderAdapter,
   ProviderRun,
   ProcessIdentity,
   PermissionAction,
   ClaudeEvent,
 } from '@abele/provider-claude'
 import { canonical, type NodeCore } from './index.js'
+import type { ProviderAdapter } from './providers.js'
+import type { PiAction } from '@abele/provider-pi'
 
 type Input = Record<string, string | number | null>
 const actor = { kind: 'node' } as const
@@ -20,34 +21,43 @@ type ActiveRun = {
   completion?: Promise<void>
 }
 /** The durable queue is the only input owner. External process effects are never inside SQL transactions. */
-export class ClaudeSessions {
+export class ProviderSessions {
   private active = new Map<string, ActiveRun>()
   private stopping = false
   constructor(
     private core: NodeCore,
-    private adapter?: ClaudeProviderAdapter
+    private adapter?: ProviderAdapter,
+    private piAdapter?: ProviderAdapter
   ) {}
-  get available() {
-    return this.adapter?.available ?? false
+  private adapterFor(provider: string) {
+    return provider === 'pi' ? this.piAdapter : this.adapter
   }
-  capabilities() {
+  isAvailable(provider: string) {
+    return this.adapterFor(provider)?.available ?? false
+  }
+  get available() {
+    return this.isAvailable('claude')
+  }
+  capabilities(provider = 'claude') {
     return (
-      this.adapter?.capabilities() ?? {
-        provider: 'claude',
+      this.adapterFor(provider)?.capabilities() ?? {
+        provider,
         available: false,
-        diagnostic: 'CLI adapter not configured',
+        diagnostic: 'Provider adapter not configured',
       }
     )
   }
   async reconcile() {
     const rows = this.core.db.prepare("SELECT * FROM provider_runs WHERE state='active'").all() as {
       run_id: string
+      session_id: string
       processes: string
       ipc_path: string | null
     }[]
     for (const row of rows) {
-      if (!this.adapter) throw new Error('provider_reconciliation_required')
-      await this.adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
+      const adapter = this.adapterFor(this.core.session(row.session_id).provider)
+      if (!adapter) throw new Error('provider_reconciliation_required')
+      await adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
       this.core.transaction(() =>
         this.core.db
           .prepare("UPDATE provider_runs SET state='unknown' WHERE run_id=?")
@@ -81,8 +91,9 @@ export class ClaudeSessions {
         .prepare('SELECT processes,ipc_path FROM provider_runs WHERE run_id=?')
         .get(slot.run_id) as { processes: string; ipc_path: string | null } | undefined
       if (row) {
-        if (!this.adapter) throw new Error('provider_reconciliation_required')
-        await this.adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
+        const adapter = this.adapterFor(this.core.session(session).provider)
+        if (!adapter) throw new Error('provider_reconciliation_required')
+        await adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
       }
     }
     this.core.transaction(() => {
@@ -106,14 +117,16 @@ export class ClaudeSessions {
       if (!active.starting && !['dispatching', 'delivered'].includes(input.state))
         await this.retryCleanup(session, active)
     }
-    if (this.stopping || !this.adapter?.available) return
+    if (this.stopping) return
     const rows = this.core.db
       .prepare("SELECT * FROM inputs WHERE state IN ('accepted','queued') ORDER BY ordinal")
       .all() as Input[]
     for (const input of rows) {
       if (this.stopping || this.active.size >= 4) break
       const session = this.core.session(String(input.session_id))
-      if (session.provider !== 'claude' || this.active.has(session.session_id)) continue
+      const adapter = this.adapterFor(session.provider)
+      if (session.provider === 'fake' || !adapter?.available || this.active.has(session.session_id))
+        continue
       if (!session.workspace_id) continue
       // Reserve worker ownership before any asynchronous validation; no two drain calls can select it.
       const run_id = randomUUID()
@@ -161,24 +174,41 @@ export class ClaudeSessions {
           this.core.append(session.session_id, 'run.started', actor, {
             run_id,
             input_id: input.input_id,
-            configuration: this.adapter!.configurationForTurn({
+            configuration: adapter.configurationForTurn({
               use_repository_claude_permissions: useRepositoryPermissions,
             }),
             native_session_id: session.native_session_id ?? null,
           })
         })
         const body = JSON.parse(String(input.body)) as { text: string }
-        slot.run = await this.adapter.startTurn(
+        slot.run = await adapter.startTurn(
           {
             session_id: session.session_id,
             run_id,
             cwd: workspace.path,
             text: body.text,
             native_session_id: session.native_session_id,
+            native_session_file: session.native_session_file,
             use_repository_claude_permissions: useRepositoryPermissions,
           },
           {
             processes: (evidence) => this.persistProcesses(run_id, evidence),
+            reaped: (leader) =>
+              this.core.transaction(() => {
+                const row = this.core.db
+                  .prepare('SELECT processes FROM provider_runs WHERE run_id=?')
+                  .get(run_id) as { processes: string }
+                const remaining = (JSON.parse(row.processes) as ProcessIdentity[]).filter(
+                  (p) => p.group !== leader.group
+                )
+                this.core.db
+                  .prepare('UPDATE provider_runs SET processes=? WHERE run_id=?')
+                  .run(JSON.stringify(remaining), run_id)
+                this.core.append(session.session_id, 'pi.process.group_reaped', actor, {
+                  run_id,
+                  group: leader.group,
+                })
+              }),
             ipc: (directory) =>
               this.core.transaction(() =>
                 this.core.db
@@ -187,6 +217,7 @@ export class ClaudeSessions {
               ),
             event: (event) => this.record(input, event),
             permission: (action, signal) => this.permission(input, action, signal),
+            question: (action, signal) => this.permission(input, action, signal),
           }
         )
         if (this.stopping) await slot.run.interrupt()
@@ -250,7 +281,7 @@ export class ClaudeSessions {
           cleaned = true
           if (persisted) {
             try {
-              await this.adapter.reconcile(
+              await adapter.reconcile(
                 JSON.parse(persisted.processes),
                 persisted.ipc_path ?? undefined
               )
@@ -319,15 +350,35 @@ export class ClaudeSessions {
         .prepare('SELECT * FROM inputs WHERE input_id=?')
         .get(String(input.input_id)) as Input
       const late = !['dispatching', 'delivered'].includes(String(current.state))
-      if (event.type === 'claude.init') {
-        const init = event.data.configuration as Record<string, unknown>
+      if (event.type === 'claude.init' || event.type === 'pi.session.bound') {
+        const init =
+          event.type === 'claude.init'
+            ? (event.data.configuration as Record<string, unknown>)
+            : {
+                session_id: event.data.native_session_id,
+                native_session_file: event.data.native_session_file,
+              }
         const session = this.core.session(session_id)
-        const updated = SessionSchema.parse({ ...session, native_session_id: init.session_id })
+        const updated = SessionSchema.parse({
+          ...session,
+          native_session_id: init.session_id,
+          ...(event.type === 'pi.session.bound'
+            ? { native_session_file: init.native_session_file }
+            : {}),
+        })
         if (
           !updated.native_session_id ||
-          (session.native_session_id && session.native_session_id !== updated.native_session_id)
+          (session.provider === 'claude' &&
+            session.native_session_id &&
+            session.native_session_id !== updated.native_session_id)
         )
           throw new Error('native_session_id_mismatch')
+        if (session.provider === 'pi')
+          this.core.db
+            .prepare(
+              "INSERT INTO provider_native_sessions(session_id,provider,native_session_id,session_file) VALUES(?,'pi',?,?) ON CONFLICT(session_id) DO UPDATE SET native_session_id=excluded.native_session_id,session_file=excluded.session_file"
+            )
+            .run(session_id, updated.native_session_id!, updated.native_session_file!)
         this.core.db
           .prepare('UPDATE sessions SET body=? WHERE session_id=?')
           .run(JSON.stringify(updated), session_id)
@@ -336,10 +387,17 @@ export class ClaudeSessions {
       }
       if (
         current.state === 'dispatching' &&
-        ['claude.block.lifecycle', 'claude.message.final'].includes(event.type)
+        ['claude.block.lifecycle', 'claude.message.final', 'pi.input.accepted'].includes(event.type)
       )
         this.core.transition(current, 'delivered')
-      let data: Record<string, unknown> = { run_id, ...event.data, ...(late ? { late: true } : {}) }
+      let data: Record<string, unknown> = {
+        ...event.data,
+        ...(event.data.run_id !== undefined && event.data.run_id !== run_id
+          ? { provider_run_id: event.data.run_id }
+          : {}),
+        run_id,
+        ...(late ? { late: true } : {}),
+      }
       const bytes = Buffer.from(JSON.stringify(event.data))
       if (event.type === 'claude.raw' || bytes.length > 8192) {
         const artifact_id = randomUUID()
@@ -357,7 +415,7 @@ export class ClaudeSessions {
       this.core.append(
         session_id,
         event.type,
-        { kind: 'provider', provider: 'claude', session_id },
+        { kind: 'provider', provider: this.core.session(session_id).provider, session_id },
         data
       )
     })
@@ -371,7 +429,11 @@ export class ClaudeSessions {
       if (p.state === 'pending') this.core.resolvePrompt(p, 'invalidated', 'deny', null)
     }
   }
-  private async permission(input: Input, action: PermissionAction, signal: AbortSignal) {
+  private async permission(
+    input: Input,
+    action: PermissionAction & Partial<PiAction>,
+    signal: AbortSignal
+  ) {
     const session_id = String(input.session_id),
       run_id = String(input.run_id)
     const action_digest = createHash('sha256')
@@ -385,7 +447,7 @@ export class ClaudeSessions {
         .prepare('SELECT state FROM inputs WHERE input_id=?')
         .get(String(input.input_id)) as { state: string }
       if (!['dispatching', 'delivered'].includes(current.state))
-        throw new Error('inactive_permission')
+        throw new ChannelError('stale_revision')
       this.core.authority.check(
         { installation_id: String(input.principal_id) },
         'execute',
@@ -404,12 +466,20 @@ export class ClaudeSessions {
           run_id,
           revision: 1,
           action_digest,
-          expires_at: Date.now() + Number(this.adapter!.configuration.permission_ttl_ms),
+          expires_at:
+            Date.now() +
+            Math.min(
+              Number(
+                this.adapterFor(this.core.session(session_id).provider)!.configuration
+                  .permission_ttl_ms
+              ),
+              action.ttl_ms ?? 3600000
+            ),
           state: 'pending',
           choice: null,
           installation_id: null,
           delivered: false,
-          ...action,
+          ...Object.fromEntries(Object.entries(action).filter(([key]) => key !== 'ttl_ms')),
         })
       const bytes = Buffer.byteLength(JSON.stringify(prompt))
       if (bytes > 128 * 1024) throw new ChannelError('record_too_large')
@@ -450,14 +520,27 @@ export class ClaudeSessions {
         : ('deny' as const)
     return {
       choice,
+      ...(choice === 'allow' && prompt.value !== undefined && prompt.value !== null
+        ? { value: prompt.value }
+        : {}),
       delivered: () =>
         this.core.transaction(() => {
           const current = this.core.db
             .prepare('SELECT state FROM inputs WHERE input_id=?')
             .get(String(input.input_id)) as { state: string }
-          if (!['dispatching', 'delivered'].includes(current.state))
-            throw new Error('inactive_permission')
+          if (!['dispatching', 'delivered'].includes(current.state)) return false
           const latest = this.core.prompt(prompt.prompt_id)
+          this.core.authority.check(
+            { installation_id: String(input.principal_id) },
+            'execute',
+            session_id
+          )
+          if (latest.installation_id)
+            this.core.authority.check(
+              { installation_id: latest.installation_id },
+              'approve',
+              session_id
+            )
           if (latest.delivered) return false
           const consumed =
             this.core.db
@@ -474,7 +557,10 @@ export class ClaudeSessions {
             prompt_id: prompt.prompt_id,
             run_id,
             choice,
-            evidence: 'bridge_ipc_ack',
+            evidence:
+              this.core.session(session_id).provider === 'pi'
+                ? 'sdk_worker_ipc_ack'
+                : 'bridge_ipc_ack',
           })
           return true
         }),

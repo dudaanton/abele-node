@@ -117,6 +117,7 @@ export class LocalChannelConnector implements ChannelConnector {
   ) {}
   async connect(target: NodeConnection): Promise<AuthenticatedChannel> {
     assertLocalEndpoint(target)
+    if (target.profile !== 'local-token-v1') throw new ChannelError('endpoint_refused')
     let transport: RecordTransport | undefined
     let abandoned = false
     let timer: ReturnType<typeof setTimeout> | undefined

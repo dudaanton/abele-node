@@ -33,6 +33,8 @@ import {
   type DiffMode,
 } from '@abele/node-protocol'
 export { LocalChannelConnector, reconnect }
+export { PairedWssConnector, type DeviceKeyStore, type PairedDevice } from './paired.js'
+export type { PairingInvite } from '@abele/node-protocol'
 export type { NodeConnection, ChannelConnector, RecordTransport } from '@abele/channel-protocol'
 export type {
   Prompt,
@@ -221,7 +223,11 @@ export class NodeClient {
     if (receipt.error) throw new ChannelError(receipt.error)
     return receipt.result
   }
-  async createSession(title: string, workspace_id?: string, provider: 'fake' | 'claude' = 'fake') {
+  async createSession(
+    title: string,
+    workspace_id?: string,
+    provider: 'fake' | 'claude' | 'pi' = 'fake'
+  ) {
     return SessionSchema.parse(
       await this.mutation('session.create', {
         title,
@@ -429,7 +435,7 @@ export class NodeClient {
     if (!Array.isArray(result)) throw new ChannelError('invalid_result')
     return result.map((r) => PromptSchema.parse(r))
   }
-  async answerPrompt(prompt: Prompt, choice: 'allow' | 'deny') {
+  async answerPrompt(prompt: Prompt, choice: 'allow' | 'deny', value?: string) {
     if (!this.connected) throw new ChannelError('disconnected')
     const { session_id, prompt_id, run_id, revision, action_digest } = prompt
     const id = await this.enqueue('prompt.answer', {
@@ -439,6 +445,7 @@ export class NodeClient {
       revision,
       action_digest,
       choice,
+      ...(value !== undefined ? { value } : {}),
     })
     await this.flush()
     const receipt = await this.operationResult(id)

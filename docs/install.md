@@ -304,7 +304,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.1.0  # example; select an existing release
+   git checkout v0.2.0  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

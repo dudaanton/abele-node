@@ -26,7 +26,7 @@ docker compose -f docker-compose.example.yml exec abele-node \
 ```
 
 The example builds locally and names the image
-`ghcr.io/dudaanton/abele-node:0.1.0`. Once a release exists, use
+`ghcr.io/dudaanton/abele-node:0.2.0`. Once a release exists, use
 `docker compose -f docker-compose.example.yml pull` and `up -d --no-build`
 to use the registry image instead. Prefer version tags (or a release image digest)
 over `latest` for upgrades. Tag pushes matching `vX.Y.Z` publish both Linux amd64
@@ -55,7 +55,8 @@ Do not publish `7778:7778`, use `localhost` aliases, rewrite headers, attach
 untrusted sibling containers, expose on a LAN, or use host networking. Other peers
 on the container network can reach the forwarder and appear loopback-local, though
 they still need a token. This is a container deployment workaround, **not the
-planned remote channel**. The example has a dedicated network, drops capabilities
+paired remote channel**. The example does not configure the separate paired listener
+or Tailscale Serve; see [remote access](remote-access.md). It has a dedicated network, drops capabilities
 and enables `no-new-privileges`; it does not prevent provider network access.
 
 ## State, workspaces and projects
@@ -133,7 +134,7 @@ provider installation. Build your own derived image; do not redistribute the
 provider binary without permission:
 
 ```dockerfile
-FROM ghcr.io/dudaanton/abele-node:0.1.0
+FROM ghcr.io/dudaanton/abele-node:0.2.0
 # ./provider/claude must be a compatible Linux binary, not a macOS executable.
 COPY --chown=node:node --chmod=0555 provider/claude /opt/provider/claude
 ENV ABELE_CLAUDE_PATH=/opt/provider/claude

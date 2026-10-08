@@ -1,6 +1,6 @@
 {
   "name": "abele-node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
@@ -15,11 +15,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -b",
+    "build": "node scripts/prepare-pi.mjs && tsc -b",
     "acceptance": "npm run build && node scripts/acceptance.mjs",
     "acceptance:stage2": "npm run build && node scripts/acceptance-stage2.mjs",
     "acceptance:stage3": "npm run build && node scripts/acceptance-stage3.mjs",
     "acceptance:stage4b": "npm run build && node scripts/acceptance-stage4b.mjs",
+    "acceptance:remote": "npm run build && vitest run tests/pairing.test.ts tests/paired-security.test.ts tests/paired-daemon.test.ts tests/tailscale.test.ts tests/serve-ownership.test.ts tests/paired-timeout.test.ts",
+    "acceptance:pi": "npm run build && node scripts/acceptance-pi.mjs",
     "types": "tsc -b && tsc -p tsconfig.tests.json --noEmit",
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
@@ -33,5 +35,8 @@
     "typescript": "5.9.3",
     "vite": "8.3.2",
     "vitest": "5.0.2"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.12"
   }
 }
