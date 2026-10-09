@@ -257,6 +257,7 @@ it('resolves owner/default refs without guessing or fetching and preserves froze
   ).rejects.toThrow('stale_cursor')
 })
 
+// Allow slow fixture I/O independently of the deterministic search execution budget.
 it('bounds trees and blobs, excludes submodules and metadata, and isolates continuations by owner and query', async () => {
   const s = await setup(),
     worktree_id = (await s.catalog()).entries[0].worktree_id
@@ -288,27 +289,43 @@ it('bounds trees and blobs, excludes submodules and metadata, and isolates conti
   expect(
     await s.request('repository.v1.blob', { ...params, path: 'too-large', larger: true })
   ).toMatchObject({ content_id: null, too_large: true })
-  const search = await s.request('repository.v1.search', {
-    ...params,
-    query: 'match',
-    path_glob: 'file-*',
-  })
-  expect(search.entries).toHaveLength(100)
-  expect(search.cursor).toBeTruthy()
-  expect(Buffer.byteLength(JSON.stringify(search))).toBeLessThanOrEqual(32768)
-  expect(
-    (
-      await s.request('repository.v1.search', {
-        ...params,
-        query: 'match',
-        path_glob: 'file-*',
-        cursor: search.cursor,
-      })
-    ).entries
-  ).toHaveLength(100)
-  await expect(
-    s.request('repository.v1.search', { ...params, query: 'different', cursor: search.cursor })
-  ).rejects.toThrow('stale_cursor')
+  // This checks pagination, not scan throughput. Freeze elapsed budget time so slow CI
+  // captures every fixture match; the separate deadline test below keeps the real clock.
+  const searchClock = vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+  try {
+    const query = { ...params, query: 'match', path_glob: 'file-*' }
+    const search = await s.request('repository.v1.search', query)
+    expect(search.entries).toHaveLength(100)
+    expect(search.cursor).toBeTruthy()
+    const nextSearch = await s.request('repository.v1.search', { ...query, cursor: search.cursor })
+    expect(nextSearch.entries).toHaveLength(100)
+    expect(nextSearch.cursor).toBeTruthy()
+    const lastSearch = await s.request('repository.v1.search', {
+      ...query,
+      cursor: nextSearch.cursor,
+    })
+    expect(lastSearch.entries).toHaveLength(70)
+    expect(lastSearch.cursor).toBeNull()
+    for (const result of [search, nextSearch, lastSearch]) {
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(32768)
+      expect(result.entries.length).toBeLessThanOrEqual(100)
+      expect(result.incomplete).toBe(false)
+      expect(result.omissions).toEqual([])
+    }
+    expect(
+      [search, nextSearch, lastSearch].flatMap((result) =>
+        result.entries.map((entry: any) => entry.path)
+      )
+    ).toEqual(Array.from({ length: 270 }, (_value, i) => `file-${String(i).padStart(3, '0')}`))
+    await expect(
+      s.request('repository.v1.search', { ...params, query: 'different', cursor: search.cursor })
+    ).rejects.toThrow('stale_cursor')
+    await expect(
+      s.core.request(other, 'repository.v1.search', { ...query, cursor: search.cursor })
+    ).rejects.toThrow('stale_cursor')
+  } finally {
+    searchClock.mockRestore()
+  }
   expect(
     (await s.request('repository.v1.search', { ...params, query: 'FILE-269', mode: 'filename' }))
       .entries[0].path
@@ -335,7 +352,7 @@ it('bounds trees and blobs, excludes submodules and metadata, and isolates conti
   await expect(
     s.request('repository.v1.tree', { worktree_id, revision: working.revision, path: 'module' })
   ).rejects.toThrow('unsafe_path')
-})
+}, 60000)
 
 it('blames retained working content and terminates hostile regex without blocking unrelated reads', async () => {
   const s = await setup(),
