@@ -28,8 +28,9 @@ function processState(pid: number): { identity: ProcessIdentity; zombie: boolean
       identity: { pid, group: Number(match[1]), fingerprint: match[3]! },
       zombie: match[2]!.startsWith('Z'),
     }
-  // ps exit 1/empty is ambiguous. Only ESRCH from the kernel confirms absence.
-  if (r.status === 1 && !r.stdout?.trim()) {
+  // Darwin can exit 0 with no row when a process disappears during ps.
+  // Empty output alone is ambiguous: only kernel ESRCH confirms absence.
+  if ((r.status === 0 || r.status === 1) && !r.stdout?.trim()) {
     try {
       process.kill(pid, 0)
     } catch (error) {
@@ -92,14 +93,36 @@ export class ProcessSupervisor {
   ): Promise<void> {
     const leaders = evidence.filter((p) => p.pid === p.group),
       collected = new Map(evidence.map((p) => [p.pid, p]))
+    // Retry unavailable probes, never changed identities or signal failures.
+    const retryProbe = async <T>(read: () => T): Promise<T> => {
+      const deadline = Date.now() + 3000
+      let backoff = 25
+      for (;;) {
+        try {
+          return read()
+        } catch (error) {
+          if (
+            !(error instanceof Error) ||
+            !['process_probe_unavailable', 'process_inventory_unavailable'].includes(
+              error.message
+            ) ||
+            Date.now() >= deadline
+          )
+            throw error
+          await delay(backoff)
+          backoff = Math.min(backoff * 2, 250)
+        }
+      }
+    }
     for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
       for (const leader of leaders)
-        for (const member of probe.groupMembers(leader)) collected.set(member.pid, member)
+        for (const member of await retryProbe(() => probe.groupMembers(leader)))
+          collected.set(member.pid, member)
       evidence = [...collected.values()]
       const signalledGroups = new Set<number>()
       for (const expected of [...evidence].reverse()) {
         if (expected.pid === process.pid) continue
-        const actual = probe.identity(expected.pid)
+        const actual = await retryProbe(() => probe.identity(expected.pid))
         if (!actual) continue
         if (actual.fingerprint !== expected.fingerprint || actual.group !== expected.group)
           throw new Error('process_identity_changed')
@@ -121,7 +144,9 @@ export class ProcessSupervisor {
           // must still fail cleanup; final verification below remains required.
           if (
             code === 'EPERM' &&
-            (leader ? probe.groupMembers(leader).length === 0 : !probe.identity(actual.pid))
+            (await retryProbe(() =>
+              leader ? probe.groupMembers(leader).length === 0 : !probe.identity(actual.pid)
+            ))
           )
             continue
           throw error
@@ -129,13 +154,23 @@ export class ProcessSupervisor {
       }
       await delay(grace)
     }
-    for (const leader of leaders)
-      for (const member of probe.groupMembers(leader)) collected.set(member.pid, member)
-    for (const expected of collected.values()) {
-      if (expected.pid === process.pid) continue
-      const actual = probe.identity(expected.pid)
-      if (actual && actual.fingerprint === expected.fingerprint)
-        throw new Error('process_cleanup_unconfirmed')
+    // SIGKILL delivery is asynchronous: positively confirm the entire fenced group.
+    const deadline = Date.now() + 5000
+    let backoff = 25
+    for (;;) {
+      const live = await retryProbe(() => {
+        for (const leader of leaders)
+          for (const member of probe.groupMembers(leader)) collected.set(member.pid, member)
+        return [...collected.values()].some((expected) => {
+          if (expected.pid === process.pid) return false
+          const actual = probe.identity(expected.pid)
+          return actual && actual.fingerprint === expected.fingerprint
+        })
+      })
+      if (!live) return
+      if (Date.now() >= deadline) throw new Error('process_cleanup_unconfirmed')
+      await delay(backoff)
+      backoff = Math.min(backoff * 2, 250)
     }
   }
 }

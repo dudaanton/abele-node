@@ -22,6 +22,41 @@ import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+test('Claude discovery records normalized paths and probes with service PATH', async () => {
+  const h = await home(),
+    bin = join(h, 'custom-bin'),
+    target = join(bin, 'claude-real.cjs')
+  await mkdir(bin, { recursive: true })
+  await writeFile(
+    target,
+    `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(join(h, 'claude-probe.json'))},JSON.stringify({args:process.argv.slice(2),path:process.env.PATH}));console.log('2.1.292');\n`,
+    { mode: 0o755 }
+  )
+  const alias = join(bin, 'claude')
+  await symlink(target, alias)
+  const result = await install(h, ['--no-service', '--claude-path', alias], {
+    ABELE_CLAUDE_PATH: '/missing/env-claude',
+  })
+  assert.equal(result.code, 0, result.stderr)
+  const config = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
+  assert.equal(config.claude, await realpath(target))
+  const probe = JSON.parse(await readFile(join(h, 'claude-probe.json'), 'utf8'))
+  assert.deepEqual(probe.args, ['--version'])
+  assert.equal(probe.path.split(':')[0], await realpath(bin))
+  assert.ok(
+    probe.path.split(':').includes(process.execPath.slice(0, process.execPath.lastIndexOf('/')))
+  )
+})
+test('missing Claude still installs and explains how to configure it later', async () => {
+  const h = await home()
+  const result = await install(h, ['--no-service'], {
+    ABELE_CLAUDE_PATH: join(h, 'missing-claude'),
+  })
+  assert.equal(result.code, 0, result.stderr)
+  assert.match(result.stdout, /pi still works.*sh install.sh --claude-path/)
+  const config = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
+  assert.equal(config.claude, join(await realpath(h), 'missing-claude'))
+})
 const platform = `${process.platform}-${process.arch === 'x64' ? 'x64' : 'arm64'}`
 let scratch, server, base, archive
 const routes = new Map()

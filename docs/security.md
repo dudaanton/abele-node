@@ -212,7 +212,9 @@ customizations; CLI PID evidence commits before stdin delivery. IPC loss trigger
 cleanup. Restart reconciles owned groups/observed descendants before another run.
 TERM is followed by daemon-owned whole-group SIGKILL escalation, even for a stopped
 worker. Cleanup must be positively confirmed; failed/timed-out probes mean unknown,
-not gone. Unconfirmed groups remain tracked and fence execution/detachment until
+not gone. Transient probe failures receive bounded retries, and after SIGKILL the
+supervisor polls for up to five seconds for positive absence before reporting
+unconfirmed cleanup. Unconfirmed groups remain tracked and fence execution/detachment until
 inspection/retried cleanup. Immutable process start/group evidence guards signals.
 Background subprocesses terminate at invocation settlement. This is **not an OS
 sandbox or a guarantee against malicious group escapes/reparenting**. Agent tools

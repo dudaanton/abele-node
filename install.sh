@@ -217,9 +217,37 @@ if [ -n "$old" ] && [ -n "$state" ]; then
 fi
 if [ -n "$old" ]; then state=$old_state; fi
 state=${state:-${old_state:-$HOME/.local/state/abele-node}}
-claude=${claude:-${old_claude:-${ABELE_CLAUDE_PATH:-$HOME/.local/bin/claude}}}
+discover_claude() {
+  [ -z "$claude" ] || return 0
+  claude=${ABELE_CLAUDE_PATH:-}
+  [ -z "$claude" ] || return 0
+  claude=$(command -v claude 2>/dev/null || true)
+  [ -z "$claude" ] || return 0
+  for candidate in "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then claude=$candidate; return 0; fi
+  done
+  # Record a stable path even when Claude has not been installed yet.
+  claude=$HOME/.local/bin/claude
+}
+# End Claude discovery
+if [ "$uninstall" = 1 ]; then claude=${old_claude:-$HOME/.local/bin/claude}
+else discover_claude; fi
+claude=$(physical_path "$claude") || fail 'Cannot resolve claude-path.'
 valid_path "$state" || fail 'Invalid state-dir: use an absolute normalized path other than / or HOME.'
 valid_path "$claude" || fail 'Invalid claude-path: use an absolute normalized executable path.'
+service_path=${claude%/*}:${node%/*}:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+if [ "$uninstall" = 0 ]; then
+  if [ ! -f "$claude" ] || [ ! -x "$claude" ]; then
+    printf 'Claude not found or not executable at %s. Install continues; pi still works. Run sh install.sh --claude-path /absolute/path/to/claude later.\n' "$claude"
+  elif ! PATH="$service_path" "$node" - "$claude" <<'NODE'
+const {spawnSync}=require('node:child_process');
+const r=spawnSync(process.argv[2],['--version'],{encoding:'utf8',timeout:5000,maxBuffer:65536});
+if(r.status!==0){console.error((r.error?.message || r.stderr || 'exit '+r.status).trim());process.exit(1)}
+NODE
+  then
+    printf 'Claude --version failed under service PATH %s. Install continues; pi still works. Fix the Claude executable/shebang, then run sh install.sh --claude-path "%s" and abele-node doctor.\n' "$service_path" "$claude"
+  fi
+fi
 verify_state_identity "$state" || fail 'Installed state identity changed; nothing was stopped or removed.'
 physical_root=$(physical_path "$root") || fail 'Cannot resolve physical installation directory.'
 physical_state=$(physical_path "$state") || fail 'Cannot resolve physical state directory.'
@@ -463,7 +491,7 @@ if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
 const q=(s,expand=false)=>'"'+s.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%').replaceAll('$',()=>expand?'$$':'$')+'"';
-fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--state-dir',state,'--claude-path',claude].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+process.env.HOME+'/.local/bin:/usr/local/bin:/usr/bin:/bin')}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
+fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--state-dir',state,'--claude-path',claude].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
 const fd=fs.openSync(candidate,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
 fs.renameSync(candidate,unit);
 }finally{fs.rmSync(temporary,{recursive:true,force:true})}

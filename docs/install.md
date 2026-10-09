@@ -19,7 +19,8 @@ on Linux remain unverified.
   Tools (`xcode-select --install`); on Debian/Ubuntu install `git` and `procps`.
   Process supervision requires `/bin/ps`. Repositories need an initial commit
   before managed worktrees can be provisioned.
-- Your own Claude Code CLI **2.1.285 or 2.1.291** installed and logged in under the
+- Your own Claude Code CLI **>=2.1.285 and <3.0.0**, with the required public and
+  permission prompt flags, installed and logged in under the
   same user, if you want real execution. Use the provider's official installation
   and login instructions; verify its version separately. A paid account/quota may
   be required. `doctor` checks compatibility, **not authentication or quota**.
@@ -40,7 +41,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.3.1
+  sh -s -- --version 0.3.2
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -59,17 +60,17 @@ atomically replaced `current` symlink. The command is a wrapper at
 An absolute Node executable is recorded in the wrapper and service. Keep that
 Node installation available; services do not source your shell startup files.
 
-| Installer option             | Meaning                                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `--version X.Y.Z`            | Pin a stable release (`vX.Y.Z` also accepted).                                                                                 |
-| `--prefix PATH`              | Installation prefix, default `$HOME/.local`; wrapper in `PATH/bin`, releases in `PATH/share/abele-node`.                       |
-| `--state-dir PATH`           | Private state, default `$HOME/.local/state/abele-node`. Must be separate from installed releases and the bin directory.        |
-| `--claude-path PATH`         | Absolute Claude executable; default `ABELE_CLAUDE_PATH` or `$HOME/.local/bin/claude`. Does not install or authenticate Claude. |
-| `--no-service`               | Do not register/start a service. Start manually with `abele-node start`. Use again for foreground-only upgrades.               |
-| `--uninstall`                | Stop the managed daemon, remove its service, wrapper and installed versions; retain state.                                     |
-| `--purge-state`              | With `--uninstall` only: also remove the state directory, including managed worktrees/history.                                 |
-| `--confirm-purge-state PATH` | Required for purge: repeat the exact absolute state directory to explicitly authorize deletion.                                |
-| `--help`                     | Print usage.                                                                                                                   |
+| Installer option             | Meaning                                                                                                                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--version X.Y.Z`            | Pin a stable release (`vX.Y.Z` also accepted).                                                                                                                |
+| `--prefix PATH`              | Installation prefix, default `$HOME/.local`; wrapper in `PATH/bin`, releases in `PATH/share/abele-node`.                                                      |
+| `--state-dir PATH`           | Private state, default `$HOME/.local/state/abele-node`. Must be separate from installed releases and the bin directory.                                       |
+| `--claude-path PATH`         | Claude executable; discovers `ABELE_CLAUDE_PATH`, shell PATH, then common locations. Records an absolute physical path; does not install/authenticate Claude. |
+| `--no-service`               | Do not register/start a service. Start manually with `abele-node start`. Use again for foreground-only upgrades.                                              |
+| `--uninstall`                | Stop the managed daemon, remove its service, wrapper and installed versions; retain state.                                                                    |
+| `--purge-state`              | With `--uninstall` only: also remove the state directory, including managed worktrees/history.                                                                |
+| `--confirm-purge-state PATH` | Required for purge: repeat the exact absolute state directory to explicitly authorize deletion.                                                               |
+| `--help`                     | Print usage.                                                                                                                                                  |
 
 Paths must be absolute and normalized (no `..`, trailing slash or control characters).
 Safety checks resolve physical paths, including symlinked parents and existing
@@ -448,6 +449,9 @@ how long a credentialed agent can run; do not enable it casually. Stop with
 
 ## State, logs and diagnostics
 
+Run `abele-node --version` (or `abele-node version`) to print the installed package
+version. For a source checkout, use `node packages/node-daemon/dist/cli.js --version`.
+
 Default state: `$HOME/.local/state/abele-node` on both operating systems.
 At startup the daemon resolves the state directory's existing ancestor to its
 physical path before creating missing descendants. Database, recovery, provider
@@ -524,7 +528,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.3.1  # example; select an existing release
+   git checkout v0.3.2  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
@@ -564,18 +568,32 @@ For manual/source installations:
 
 ## Troubleshooting
 
-| Symptom                                         | What to check                                                                                                                                                                                                                                                      |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `EADDRINUSE` / port 7777 in use                 | Another daemon/service may already own it. Run `status` with the correct state, inspect `lsof -nP -iTCP:7777 -sTCP:LISTEN` on macOS or `ss -ltnp` on Linux. Stop the owner or choose `--port 7779` and enroll that native endpoint. Never kill an unknown process. |
-| `already_running`                               | One daemon per state. Check service supervision before starting a foreground copy.                                                                                                                                                                                 |
-| `lock_needs_doctor`                             | An unreadable/corrupt lock is not proof of a dead process. Inspect the lock and process ownership; do not blindly delete it.                                                                                                                                       |
-| CLI missing / `unavailable/incompatible`        | Check the absolute `--claude-path`, executable permission, version (only 2.1.285/2.1.291), and required flags. Pin an installed compatible binary; restart/reinstall to change it. `PATH` alone is not enough.                                                     |
-| CLI login fails                                 | Authenticate your own CLI as the same OS user, with the service's HOME. Compatibility checks do not test account login/quota.                                                                                                                                      |
-| Service works in shell but not at login         | Node version-manager paths may have moved; shell rc files are not read. Inspect plist/unit absolute paths, HOME/PATH and stderr/journal.                                                                                                                           |
-| Plugin rejects endpoint / authentication        | Use exact `ws://127.0.0.1:PORT/channel`, not `localhost`, a LAN IP or a token-bearing URL. Check installation/token/node identity and desktop Origin. A revoked/new token needs a new client-store namespace.                                                      |
-| SQLite/API error                                | Use Node 22.23.2, writable private local state, and sufficient disk space. Do not put live SQLite/WAL state in a synced folder or network filesystem.                                                                                                              |
-| `git_required` / provisioning `needs_attention` | Commit the original repository first; re-register a formerly plain folder. For ambiguous Git effects inspect the durable job and worktree/branch state; there is no blind repair/retry.                                                                            |
-| `delivery_unknown` / cleanup unconfirmed        | Do not resend an uncertain input automatically. Inspect durable run evidence, CLI processes and workspace state; cleanup failure fences further execution.                                                                                                         |
+| Symptom                                         | What to check                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `EADDRINUSE` / port 7777 in use                 | Another daemon/service may already own it. Run `status` with the correct state, inspect `lsof -nP -iTCP:7777 -sTCP:LISTEN` on macOS or `ss -ltnp` on Linux. Stop the owner or choose `--port 7779` and enroll that native endpoint. Never kill an unknown process.                                                                         |
+| `already_running`                               | One daemon per state. Check service supervision before starting a foreground copy.                                                                                                                                                                                                                                                         |
+| `lock_needs_doctor`                             | An unreadable/corrupt lock is not proof of a dead process. Inspect the lock and process ownership; do not blindly delete it.                                                                                                                                                                                                               |
+| Claude unavailable                              | Run `abele-node doctor` or `abele-node status`: `claude.diagnostic` gives the exact cause and repair command. Versions >=2.1.285 and <3.0.0 require all public flags and acceptance of the permission prompt flags. Run `claude update` for old/missing flags, then reinstall with `sh install.sh --claude-path /absolute/path/to/claude`. |
+| CLI login fails                                 | Authenticate your own CLI as the same OS user, with the service's HOME. Compatibility checks do not test account login/quota.                                                                                                                                                                                                              |
+| Service works in shell but not at login         | Node version-manager paths may have moved; shell rc files are not read. Inspect plist/unit absolute paths, HOME/PATH and stderr/journal.                                                                                                                                                                                                   |
+| Plugin rejects endpoint / authentication        | Use exact `ws://127.0.0.1:PORT/channel`, not `localhost`, a LAN IP or a token-bearing URL. Check installation/token/node identity and desktop Origin. A revoked/new token needs a new client-store namespace.                                                                                                                              |
+| SQLite/API error                                | Use Node 22.23.2, writable private local state, and sufficient disk space. Do not put live SQLite/WAL state in a synced folder or network filesystem.                                                                                                                                                                                      |
+| `git_required` / provisioning `needs_attention` | Commit the original repository first; re-register a formerly plain folder. For ambiguous Git effects inspect the durable job and worktree/branch state; there is no blind repair/retry.                                                                                                                                                    |
+| `delivery_unknown` / cleanup unconfirmed        | Do not resend an uncertain input automatically. Inspect durable run evidence, CLI processes and workspace state; cleanup failure fences further execution.                                                                                                                                                                                 |
 
 Read the [security model](security.md) before trusting a repository or changing
 Claude setting sources.
+
+The one-command installer discovers Claude in this order: `--claude-path`,
+`ABELE_CLAUDE_PATH`, `command -v claude` in the installing shell, then
+`~/.local/bin/claude`, `~/.claude/local/claude`, `/opt/homebrew/bin/claude`,
+`/usr/local/bin/claude`. It records an absolute physical path in its config and
+includes Claude's directory and the installer's Node directory in service PATH.
+It checks `claude --version` under that PATH; shell startup files are not loaded.
+If Claude is missing or that check fails, installation continues and pi still works.
+Install/fix Claude and rerun the installer with `--claude-path` to update the service.
+
+Compatible versions without recorded real acceptance evidence report
+“untested version, flags detected” and unverified permission/resume capabilities.
+The recorded evidence for 2.1.285 and 2.1.291 is retained. Availability checks never
+start inference or verify account login, quota, or real permission behavior.

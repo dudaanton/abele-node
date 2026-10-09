@@ -3,6 +3,50 @@ import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { ProcessSupervisor, systemProcessProbe } from '@abele/provider-claude'
 
+it.each(['delayed exit', 'temporary probe failure', 'persistent live', 'persistent probe failure'])(
+  'confirms only positive absence after SIGKILL: %s',
+  async (mode) => {
+    vi.useFakeTimers()
+    const leader = { pid: 99999999, group: 99999999, fingerprint: 'owned' }
+    let killedAt: number | undefined
+    const kill = vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 'SIGKILL') killedAt = Date.now()
+      return true
+    })
+    const identity = () => {
+      if (killedAt === undefined) return leader
+      const elapsed = Date.now() - killedAt
+      if (
+        mode === 'persistent probe failure' ||
+        (mode === 'temporary probe failure' && elapsed < 700)
+      )
+        throw new Error('process_probe_unavailable')
+      return mode === 'persistent live' || elapsed < 700 ? leader : undefined
+    }
+    try {
+      const cleanup = ProcessSupervisor.cleanup([leader], 10, {
+        identity,
+        groupMembers: () => {
+          const member = identity()
+          return member ? [member] : []
+        },
+      })
+      const assertion =
+        mode === 'persistent live'
+          ? expect(cleanup).rejects.toThrow('process_cleanup_unconfirmed')
+          : mode === 'persistent probe failure'
+            ? expect(cleanup).rejects.toThrow('process_probe_unavailable')
+            : expect(cleanup).resolves.toBeUndefined()
+      await vi.runAllTimersAsync()
+      await assertion
+      expect(kill).toHaveBeenCalledWith(-leader.group, 'SIGKILL')
+    } finally {
+      kill.mockRestore()
+      vi.useRealTimers()
+    }
+  }
+)
+
 it.each([false, true])(
   'cleans a zombie group leader without abandoning its live members (member: %s)',
   async (withMember) => {

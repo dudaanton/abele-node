@@ -18,6 +18,7 @@ vi.mock('node:child_process', async (original) => {
 import { mkdtempSync, cpSync, chmodSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { waitForProcessGuarantee as until } from './process-wait.js'
 import {
   ClaudeProviderAdapter,
   ProcessSupervisor,
@@ -25,14 +26,6 @@ import {
   type ProcessIdentity,
   type ProcessProbe,
 } from '@abele/provider-claude'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until(f: () => boolean) {
-  for (let i = 0; i < 500; i++) {
-    if (f()) return
-    await delay(20)
-  }
-  throw Error('stop test deadline')
-}
 async function launch(probe?: ProcessProbe) {
   const cwd = mkdtempSync(join(tmpdir(), 'abele-stop-')),
     executable = join(cwd, 'cli.mjs')
@@ -73,14 +66,15 @@ it('SIGSTOP worker cannot prevent forced cleanup of its whole group or settlemen
       error = e
     }
     expect(error).toBeUndefined()
-    const outcome = await Promise.race([s.run.done, delay(500).then(() => undefined)])
+    const outcome = await s.run.done
     expect(outcome).toMatchObject({ reason: 'interrupted' })
+    // Successful settlement must already imply cleanup, not merely promise it later.
     expect(systemProcessProbe.identity(s.worker.pid)).toBeUndefined()
     expect(systemProcessProbe.identity(s.child)).toBeUndefined()
   } finally {
     await s.cleanup()
   }
-}, 20000)
+}, 60000)
 it('settles done after supervisor cleanup even when the worker close event is never emitted', async () => {
   suppressClose.active = true
   const s = await launch()
@@ -92,7 +86,7 @@ it('settles done after supervisor cleanup even when the worker close event is ne
     suppressClose.active = false
     await s.cleanup()
   }
-})
+}, 60000)
 it('repeated interrupt retries a failed cleanup instead of caching a rejected stopping promise', async () => {
   let unavailable = true,
     calls = 0
@@ -118,4 +112,4 @@ it('repeated interrupt retries a failed cleanup instead of caching a rejected st
     unavailable = false
     await s.cleanup()
   }
-}, 20000)
+}, 60000)

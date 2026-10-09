@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './warnings.js'
 import { homedir } from 'node:os'
 import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -154,6 +155,12 @@ function loadedArguments(text: string): string[] | undefined {
 }
 async function main() {
   switch (args[0]) {
+    case '--version':
+    case 'version':
+      console.log(
+        JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')).version
+      )
+      return
     case 'start': {
       const daemon = await startDaemon(
         state,
@@ -237,6 +244,7 @@ async function main() {
         running: !!running,
         ...running,
         state_dir: state,
+        claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
         tailscale: await tailscale.doctor(
           paired?.endpoint,
           paired?.backend_port,
@@ -411,7 +419,7 @@ async function main() {
         '--pi-max-tokens',
         String(piMaxTokens),
       ]
-      const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string></dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([dirname(claudePath), dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string></dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
       if (existsSync(destination)) accessSync(destination, constants.W_OK)
       const temporary = mkdtempSync(join(dirname(destination), '.abele-plist-write-'))
       try {
@@ -437,7 +445,7 @@ async function main() {
     }
     default:
       throw new Error(
-        'Usage: abele-node install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]'
+        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]'
       )
   }
 }

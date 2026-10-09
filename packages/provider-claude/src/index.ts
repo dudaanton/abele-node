@@ -122,20 +122,54 @@ export class ClaudeProviderAdapter {
       ],
       { encoding: 'utf8', timeout: 5000, maxBuffer: 256 * 1024 }
     )
-    this.available =
-      v.status === 0 &&
-      ['2.1.285', '2.1.291'].includes(this.version) &&
-      help.status === 0 &&
-      [
-        '--include-partial-messages',
-        '--forward-subagent-text',
-        '--resume',
-        '--setting-sources',
-        '--max-budget-usd',
-      ].every((f) => help.stdout.includes(f))
+    const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(this.version)
+    const parts = parsed
+      ? ([Number(parsed[1]), Number(parsed[2]), Number(parsed[3])] as const)
+      : undefined
+    const missingFlag = [
+      '--include-partial-messages',
+      '--forward-subagent-text',
+      '--resume',
+      '--setting-sources',
+      '--max-budget-usd',
+    ].find((f) => !new RegExp(`(?:^|[\\s,])${f}(?=[\\s,=]|$)`).test(help.stdout ?? ''))
+    const detail = (result: typeof v) =>
+      (
+        result.error?.message ||
+        result.stderr?.trim() ||
+        `exit ${result.status}, signal ${result.signal}`
+      )
+        .replace(/\s+/g, ' ')
+        .slice(0, 500)
+    const failure =
+      v.error && (v.error as NodeJS.ErrnoException).code === 'ENOENT'
+        ? `not found at path ${requestedExecutable}`
+        : v.status !== 0
+          ? `--version failed with ${detail(v)}`
+          : !parts || !parts.every(Number.isSafeInteger)
+            ? `unparsable version ${this.version}`
+            : parts[0] < 2 ||
+                (parts[0] === 2 && (parts[1] < 1 || (parts[1] === 1 && parts[2] < 285)))
+              ? `version ${this.version} below minimum 2.1.285`
+              : parts[0] >= 3
+                ? `version ${this.version} outside supported range >=2.1.285 <3.0.0`
+                : help.status !== 0
+                  ? `--help failed with ${detail(help)} (permission prompt flags must be accepted)`
+                  : missingFlag
+                    ? `missing flag ${missingFlag}`
+                    : undefined
+    this.available = failure === undefined
+    const repair =
+      parts && parts[0] >= 3
+        ? 'npm install -g @anthropic-ai/claude-code@2, then '
+        : v.error && (v.error as NodeJS.ErrnoException).code === 'ENOENT'
+          ? ''
+          : 'claude update, then '
     this.diagnostic = this.available
-      ? 'Version/public flags checked; real permission/resume evidence is version-specific (2.1.285, 2.1.291); installed customizations may affect behavior'
-      : `Claude ${this.version} unavailable/incompatible. Install a tested CLI (2.1.291) and run the real-provider acceptance script (scripts/acceptance-stage3.mjs); no permission bypass fallback.`
+      ? ['2.1.285', '2.1.291'].includes(this.version)
+        ? 'Version/public flags checked; real permission/resume evidence is version-specific (2.1.285, 2.1.291); installed customizations may affect behavior'
+        : `Claude ${this.version}: untested version, flags detected; real permission/resume acceptance not recorded`
+      : `Claude unavailable/incompatible: ${failure}. Run ${repair}sh install.sh --claude-path /absolute/path/to/claude; restart the node and run abele-node doctor. Real acceptance: scripts/acceptance-stage3.mjs.`
     this.configuration = {
       executable: this.executable,
       requested_executable: requestedExecutable,
@@ -190,31 +224,36 @@ export class ClaudeProviderAdapter {
           reason: this.diagnostic,
         },
         streaming: { status: 'supported', evidence: 'partial-final-replacement-v1' },
-        permissions: ['2.1.285', '2.1.291'].includes(this.version)
-          ? {
-              status: 'supported',
-              evidence: 'real-2.1.291-node-client-allow-deny-expiry; stage0-2.1.285',
-            }
-          : {
-              status: 'unverified',
-              reason: 'This CLI version has not passed the bounded real permission acceptance',
-            },
-        resume: ['2.1.285', '2.1.291'].includes(this.version)
-          ? {
-              status: 'supported',
-              evidence: 'real-2.1.291-queued-restart-interrupted-resume; stage0-2.1.285',
-            }
-          : {
-              status: 'unverified',
-              reason: 'This CLI version has not passed explicit native-ID resumed inference',
-            },
+        permissions:
+          this.available && ['2.1.285', '2.1.291'].includes(this.version)
+            ? {
+                status: 'supported',
+                evidence: 'real-2.1.291-node-client-allow-deny-expiry; stage0-2.1.285',
+              }
+            : {
+                status: 'unverified',
+                reason: this.diagnostic,
+              },
+        resume:
+          this.available && ['2.1.285', '2.1.291'].includes(this.version)
+            ? {
+                status: 'supported',
+                evidence: 'real-2.1.291-queued-restart-interrupted-resume; stage0-2.1.285',
+              }
+            : {
+                status: 'unverified',
+                reason: this.diagnostic,
+              },
         queued_followups: { status: 'supported', evidence: 'one-input-per-invocation' },
         foreground_child_text:
-          this.version === '2.1.285'
+          this.available && this.version === '2.1.285'
             ? { status: 'supported', evidence: 'stage0-forward-subagent-text' }
             : {
                 status: 'unverified',
-                reason: 'Flag accepted; real child inference not exercised on 2.1.291',
+                reason:
+                  this.available && this.version === '2.1.291'
+                    ? 'Flag accepted; real child inference not exercised on 2.1.291'
+                    : this.diagnostic,
               },
         readable_thinking: { status: 'unverified', reason: 'Empty blocks are withheld_or_empty' },
         exhaustive_children: {

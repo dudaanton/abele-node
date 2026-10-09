@@ -4,15 +4,7 @@ import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { ProcessSupervisor, systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until(fn: () => boolean) {
-  const end = Date.now() + 8000
-  while (Date.now() < end) {
-    if (fn()) return
-    await delay(20)
-  }
-  throw Error('anchor loss fixture deadline')
-}
+import { waitForProcessGuarantee as until } from './process-wait.js'
 it.each(['daemon', 'worker'])(
   'cleans a separate bash-anchor group after abrupt %s loss without supervisor recovery',
   async (target) => {
@@ -49,8 +41,9 @@ it.each(['daemon', 'worker'])(
         process.kill(worker.pid, 'SIGKILL')
         expect(systemProcessProbe.identity(supervisor.pid!)).toBeTruthy()
       }
-      await until(() => !systemProcessProbe.identity(anchor.pid))
-      expect(systemProcessProbe.identity(pid)).toBeUndefined()
+      await until(
+        () => !systemProcessProbe.identity(anchor.pid) && !systemProcessProbe.identity(pid)
+      )
     } finally {
       if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null) {
         const exited = new Promise((r) => supervisor!.once('exit', r))
@@ -60,5 +53,6 @@ it.each(['daemon', 'worker'])(
       await ProcessSupervisor.cleanup(proofs, 100)
       rmSync(dir, { recursive: true, force: true })
     }
-  }
+  },
+  60000
 )

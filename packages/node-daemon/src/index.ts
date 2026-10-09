@@ -1,3 +1,4 @@
+import './warnings.js'
 import Fastify from 'fastify'
 import websocket from '@fastify/websocket'
 import { createServer, createConnection, type Server } from 'node:net'
