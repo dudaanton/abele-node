@@ -4,7 +4,10 @@ import { execFileSync } from 'node:child_process'
 
 it('ships public source metadata, installation guides and a pinned non-root image', () => {
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
-  expect(pkg.version).toBe('0.2.0')
+  expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/)
+  // The published compose example and the Docker guide name the image of this exact version.
+  expect(readFileSync('docker-compose.example.yml', 'utf8')).toContain(`ghcr.io/dudaanton/abele-node:${pkg.version}`)
+  expect(readFileSync('docs/docker.md', 'utf8')).toContain(`ghcr.io/dudaanton/abele-node:${pkg.version}`)
   expect(pkg.license).toBe('GPL-3.0-only')
   expect(pkg.repository.url).toBe('https://github.com/dudaanton/abele-node.git')
   for (const file of [

@@ -40,7 +40,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.3.0
+  sh -s -- --version 0.3.1
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -524,7 +524,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.3.0  # example; select an existing release
+   git checkout v0.3.1  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
