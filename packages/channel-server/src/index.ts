@@ -226,7 +226,9 @@ export async function serveChannel(
       void send(
         response,
         frame.method === 'artifact.read' ? 2 : 0,
-        response.error ? undefined : () => core.checkPublication(actor!, frame.method, frame.params)
+        response.error
+          ? undefined
+          : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
       ).catch(() => close('send_failed'))
     }
   } catch {

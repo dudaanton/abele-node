@@ -8,6 +8,8 @@ import {
   DelegationTerminalSchema,
 } from './delegation.js'
 export * from './delegation.js'
+import { RepositoryMethodSchemas, RepositoryInvalidationSchema } from './repository.js'
+export * from './repository.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
 export * from './files.js'
 import { EventSchema } from '@abele/channel-protocol'
@@ -130,6 +132,7 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('revoke'), value: id }).strict(),
 ])
 const EventPayloads = {
+  'repository.invalidated': RepositoryInvalidationSchema,
   'delegation.created': DelegationSchema,
   'delegation.progress': DelegationMessageSchema,
   'delegation.question': DelegationMessageSchema,
@@ -174,6 +177,7 @@ export const MethodSchemas = {
       .default([{ kind: 'echo' }]),
   }),
   ...ResourceMethodSchemas,
+  ...RepositoryMethodSchemas,
   ...FileMethodSchemas,
   'session.detach': z.object(session).strict(),
   'node.describe': z.object({}).strict(),
@@ -250,6 +254,7 @@ export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
   ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,
+  'project.repository_settings',
   'review.submit',
   'workspace.write',
   'workspace.restore',

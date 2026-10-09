@@ -38,11 +38,14 @@ import {
   DiffSnapshotSchema,
   ReviewResultSchema,
   FileMutationResultSchema,
+  RepositorySettingsSchema,
   type FileWrite,
   type FileRestore,
   type ReviewBatch,
   type DiffMode,
 } from '@abele/node-protocol'
+import { RepositoryClient } from './repository.js'
+export * from './repository.js'
 export { LocalChannelConnector, reconnect }
 export { PairedWssConnector, type DeviceKeyStore, type PairedDevice } from './paired.js'
 export type { PairingInvite } from '@abele/node-protocol'
@@ -105,6 +108,7 @@ export class MemoryClientStore implements ClientStore {
   }
 }
 export class NodeClient {
+  readonly repository = new RepositoryClient((method, params) => this.request(method, params))
   private channel?: RequestChannel
   private flushing?: Promise<void>
   private listeners = new Set<(event: JournalEvent) => void>()
@@ -411,6 +415,14 @@ export class NodeClient {
     const receipt = await this.operationResult(operation_id)
     if (receipt?.error) throw new ChannelError(receipt.error)
     return receipt ? ReviewResultSchema.parse(receipt.result) : undefined
+  }
+  /** Owner-only project browsing opt-in; never expose this mutation as a model tool. */
+  async setRepositorySettings(
+    params: import('@abele/node-protocol').RepositoryParams<'project.repository_settings'>
+  ) {
+    return RepositorySettingsSchema.parse(
+      await this.mutation('project.repository_settings', params)
+    )
   }
   async getProject(project_id: string) {
     return ProjectSchema.parse(await this.request('project.get', { project_id }))

@@ -84,7 +84,9 @@ The same OS user (including its agents) can read/change it directly.
 
 SQLite uses plain SQL, versioned `PRAGMA user_version` migrations, WAL, foreign
 keys, `synchronous=FULL` and a 3-second busy timeout. Future schema versions are
-refused. Preconditions, state, sequences, journal events and principal-scoped
+refused. The optional repository-read tables use a separately checked
+`repository_schema_version` metadata value (currently 1); future extension versions
+are also refused. Preconditions, state, sequences, journal events and principal-scoped
 receipts commit together before response/publication. Reusing the same principal,
 operation ID and canonical method/body recovers the original receipt; a changed
 body returns `idempotency_mismatch`. A lost response means `outcome_unknown`, not
@@ -92,8 +94,11 @@ permission to repeat shell effects with a new operation. Internal/storage failur
 pause execution/approvals instead of dropping history or inventing rejection after
 possible commit. Prompts distinguish committed resolution from provider delivery.
 
-History, receipts, snapshots and content have **no automatic expiry**. Logs are not
-rotated. Disk-full, sustained-load, backup/restore and operational hardening remain
+Legacy history, receipts, workspace snapshots and content have **no automatic expiry**.
+Repository-v1 observations/cursors/comparison manifests have ten-minute bounded
+leases; its separate retained-content store has a global 64 MiB LRU ceiling.
+Expired identities fail explicitly and never retarget mutable files; see
+[repository API and bounds](repository-view.md). Logs are not rotated. Disk-full, sustained-load, backup/restore and operational hardening remain
 important deployment concerns. Provider-native resume files are separate provider-owned
 state and need preservation; pi native files live in the protected node state. Stopped backups must preserve SQLite/WAL,
 Git metadata and worktrees consistently. Journal/raw provider records, tool inputs,
@@ -108,7 +113,11 @@ managed worktree. Plain-folder registration is browsing-only; the node does not
 silently initialize/copy it. Trust changes are not currently supported.
 
 Git uses typed argv through `/usr/bin/git`, no shell, bounded output and subprocess
-deadlines. Operations disable hooks, fsmonitor, pagers, signature display/signing,
+deadlines. Repository-v1 adds aggregate read budgets, killable regex workers,
+opaque external-worktree targets and per-project owner opt-in. External targets
+never acquire workspace lifecycle/provider or mutation authority from discovery.
+Root/common-directory and target identities are rechecked at access and owner
+permission is rechecked before publishing, including retained reads. Operations disable hooks, fsmonitor, pagers, signature display/signing,
 external diff/textconv and configured checkout/clean filters **even for trusted
 projects**. Invocations ignore system/global Git config and pin supported signature
 programs to `/usr/bin/false`; commit/log/blob views also disable signature display.

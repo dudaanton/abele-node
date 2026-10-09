@@ -461,6 +461,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       providers: [this.provider.capabilities(), claude, this.claude.capabilities('pi')],
       capabilities: {
         ...this.provider.capabilities().capabilities,
+        repository_read_v1: {
+          status: 'supported',
+          evidence: 'repository.v1; opaque-worktrees; frozen-objects; bounded-worker-search',
+        },
+        repository_notifications_v1: {
+          status: 'supported',
+          evidence: 'leased-watchers-and-reconciliation-v1',
+        },
         workspace_files: { status: 'supported', evidence: 'bounded-no-follow-files-v1' },
         workspace_editing: { status: 'supported', evidence: 'preconditioned-in-place-writes-v2' },
         immutable_diffs: { status: 'supported', evidence: 'persisted-patch-snapshots-v1' },
@@ -515,7 +523,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (method.startsWith('delegation.'))
       return this.delegations.request(actor, method, params, operation)
-    if (/^(project|workspace|job|review)\./.test(method))
+    if (/^(project|workspace|job|review|repository)\./.test(method))
       return this.resources.request(actor, method, params, operation)
     if (!MUTATIONS.has(method as Method)) return this.query(actor, method, params)
     return this.commitOperation(actor, method, params, operation, () =>
@@ -523,16 +531,26 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     )
   }
   /** Recheck the exact resource of a successful response at the actual transport boundary. */
-  checkPublication(actor: AuthorityContext, method: string, raw: unknown) {
+  checkPublication(actor: AuthorityContext, method: string, raw: unknown, result?: unknown) {
     this.authority.check(actor, 'publish')
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
     this.authority.check(
       actor,
       'publish',
-      String(p.stream_id ?? p.session_id ?? p.workspace_id ?? p.project_id ?? p.job_id ?? '')
+      String(
+        p.stream_id ??
+          p.session_id ??
+          p.workspace_id ??
+          p.worktree_id ??
+          p.project_id ??
+          p.job_id ??
+          ''
+      )
     )
     this.delegations.checkPublication(actor, method, p)
+    if (method.startsWith('repository.v1.'))
+      this.resources.repository.checkPublication(actor, p, result)
   }
   operationReceipt(
     actor: AuthorityContext,

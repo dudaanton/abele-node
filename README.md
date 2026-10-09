@@ -29,6 +29,9 @@ see [pi configuration and limits](docs/pi.md). Windows is untested. See
   is separate; see [delegation API and limits](docs/delegation.md).
 - Workspace browsing, file/content reads, Git history, retained immutable diffs
   and anchored review comments submitted as session inputs.
+- Opt-in external-worktree discovery and versioned repository reads: frozen trees,
+  working observations, comparisons, blame, bounded node-side search and change
+  notifications. See [repository API and bounds](docs/repository-view.md).
 - Bounded UTF-8 file editing/creation with content-version checks, durable save
   receipts, protected recovery copies and explicit restore. See [editing](docs/editing.md).
 - Per-installation tokens, revocation, status/doctor commands and macOS LaunchAgent

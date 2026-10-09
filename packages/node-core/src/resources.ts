@@ -30,6 +30,7 @@ import {
 } from './files.js'
 import { GitRunner, decodeGit, parseWorktrees } from './git.js'
 import { FileMutationCoordinator } from './mutations.js'
+import { RepositoryService } from './repository.js'
 
 type Params = Record<string, unknown>
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
@@ -545,6 +546,7 @@ export class JobService {
 
 export class ResourceServices {
   readonly git: GitRunner
+  readonly repository: RepositoryService
   readonly files = new WorkspaceFileService(this)
   readonly mutations = new FileMutationCoordinator(this)
   readonly views = new GitViewService(this)
@@ -561,6 +563,7 @@ export class ResourceServices {
     git = new GitRunner()
   ) {
     this.git = git
+    this.repository = new RepositoryService(this)
     const stored = core.db.prepare("SELECT value FROM meta WHERE key='worktree_root'").get() as
       { value: string } | undefined
     this.worktreeRoot = resolve(
@@ -596,6 +599,7 @@ export class ResourceServices {
       .run(this.worktreeRoot)
   }
   async stop() {
+    await this.repository.stop()
     await this.jobs.stop()
   }
   /** Read-only preparation; reservation and its provisioning job commit with the caller's receipt. */
@@ -659,6 +663,9 @@ export class ResourceServices {
       'resource',
       String(p.project_id ?? p.workspace_id ?? p.job_id ?? '')
     )
+    if (method.startsWith('repository.v1.')) return this.repository.request(actor, method, p)
+    if (method === 'project.repository_settings')
+      return this.repository.settings(actor, p, operation)
     if (RESOURCE_MUTATIONS.includes(method as (typeof RESOURCE_MUTATIONS)[number])) {
       const previous = this.core.operationReceipt(actor, method, p, operation)
       if (previous) return previous.result
@@ -724,6 +731,7 @@ export class ResourceServices {
                 refreshed
               )
             }
+            this.repository.registered(refreshed)
             return refreshed
           }
           const project = ProjectSchema.parse({
@@ -764,6 +772,7 @@ export class ResourceServices {
               JSON.stringify(workspace)
             )
           this.core.append('catalog', 'workspace.changed', nodeActor, workspace)
+          this.repository.registered(project)
           return project
         })
       }
@@ -783,6 +792,7 @@ export class ResourceServices {
             })
           )
             throw new ChannelError('resource_busy')
+          this.repository.removed(String(p.project_id))
           // Unregister, never erase durable provenance/jobs or their retry receipts.
           this.core.db
             .prepare('UPDATE projects SET registered=0 WHERE project_id=?')
