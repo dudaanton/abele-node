@@ -1,4 +1,6 @@
-import { afterEach, it, expect } from 'vitest'
+import { afterEach, expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition, withProcessDeadline } from '../scripts/process-test-budget.mjs'
 import {
   mkdtempSync,
   cpSync,
@@ -20,14 +22,7 @@ import { identity, ProcessSupervisor } from '../packages/provider-claude/src/sup
 import { spawn } from 'node:child_process'
 const dirs: string[] = [],
   runs: ProviderRun[] = []
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until(test: () => boolean) {
-  for (let i = 0; i < 250; i++) {
-    if (test()) return
-    await delay(20)
-  }
-  throw new Error('test deadline')
-}
+const until = (test: () => boolean) => waitForProcessCondition(test, 'Claude process evidence')
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), 'abele-claude-process-'))
   dirs.push(cwd)
@@ -48,9 +43,9 @@ it('uses immutable process start evidence, not a mutable argv or process title',
     process.execPath,
     [
       '-e',
-      "setTimeout(()=>{process.title='abele-title-change';console.log('ready')},150);setInterval(()=>{},1000)",
+      "process.on('message',()=>{process.title='abele-title-change';console.log('ready')});setInterval(()=>{},1000)",
     ],
-    { detached: true, stdio: ['ignore', 'pipe', 'ignore'] }
+    { detached: true, stdio: ['ignore', 'pipe', 'ignore', 'ipc'] }
   )
   const closed = new Promise<void>((r) => child.once('close', () => r()))
   let output = ''
@@ -58,6 +53,7 @@ it('uses immutable process start evidence, not a mutable argv or process title',
   try {
     await new Promise<void>((r) => child.once('spawn', r))
     const before = identity(child.pid!)!
+    child.send('change title')
     await until(() => output.includes('ready'))
     expect(identity(child.pid!)?.fingerprint).toBe(before.fingerprint)
     await ProcessSupervisor.cleanup([before])
@@ -119,7 +115,7 @@ it('allows only the exact observed tool, denies mismatch and journals raw eviden
     expect(delivered).toBe(text === 'allow' ? 1 : 0)
     expect(events.some((e) => e.type === 'claude.raw')).toBe(true)
   }
-}, 20000)
+}, 12)
 it('repository allow rules cannot bypass node approval by default, but an explicit per-project opt-in enables them', async () => {
   for (const optIn of [false, true]) {
     const f = fixture()
@@ -275,7 +271,7 @@ it('two concurrent identical MCP tools/call requests cannot consume one approval
       processes: () => {},
       permission: async () => {
         approvals++
-        await delay(50)
+        await until(() => existsSync(join(f.cwd, 'duplicate-denied.txt')))
         return {
           choice: 'allow',
           delivered() {
@@ -347,7 +343,7 @@ it('interrupts a worker and its shell descendants without reporting success', as
   await run.interrupt()
   expect((await run.done).reason).toBe('interrupted')
   expect(identity(pid)).toBeUndefined()
-}, 10000)
+})
 it('retains explicit API failure independently of a nonzero CLI exit', async () => {
   const f = fixture(),
     adapter = new ClaudeProviderAdapter({ executable: f.executable })
@@ -409,7 +405,7 @@ it('preserves successful CLI exit after the final result is published while the 
     exit_code: 0,
     cleanup_confirmed: true,
   })
-}, 10000)
+})
 it('worker loss after a terminal record remains unknown and requires cleanup evidence', async () => {
   const f = fixture(),
     adapter = new ClaudeProviderAdapter({ executable: f.executable })
@@ -432,7 +428,7 @@ it('worker loss after a terminal record remains unknown and requires cleanup evi
   const result = await run.done
   await adapter.reconcile(evidence)
   expect(result.reason).toBe('worker_lost')
-}, 10000)
+})
 it('bridge process death aborts a pending approval and cannot create the file', async () => {
   const f = fixture(),
     adapter = new ClaudeProviderAdapter({ executable: f.executable })
@@ -444,8 +440,7 @@ it('bridge process death aborts a pending approval and cannot create the file', 
       processes: () => {},
       permission: async (_a, signal) => {
         const pid = Number(readFileSync(join(f.cwd, 'bridge.pid'), 'utf8'))
-        setTimeout(() => process.kill(pid, 'SIGKILL'), 50)
-        await new Promise<void>((resolve) =>
+        const aborted = new Promise<void>((resolve) =>
           signal.addEventListener(
             'abort',
             () => {
@@ -455,6 +450,8 @@ it('bridge process death aborts a pending approval and cannot create the file', 
             { once: true }
           )
         )
+        process.kill(pid, 'SIGKILL')
+        await withProcessDeadline(() => aborted, 'bridge loss abort')
         return {
           choice: 'allow',
           delivered() {
@@ -468,4 +465,4 @@ it('bridge process death aborts a pending approval and cannot create the file', 
   await run.done
   expect(lost).toBe(true)
   expect(existsSync(join(f.cwd, 'action.txt'))).toBe(false)
-}, 10000)
+})

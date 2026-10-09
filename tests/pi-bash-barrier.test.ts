@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { managedBashOperations } from '../packages/provider-pi/dist/processes.js'
 import { systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
+import { processScenarioDeadline, withProcessDeadline } from '../scripts/process-test-budget.mjs'
 it.each(['execute', 'abort'])(
   'holds a shell behind durable group registration before %s and confirms reaping before release',
   async (mode) => {
@@ -37,12 +38,16 @@ it.each(['execute', 'abort'])(
       (error) => ({ error: error.message })
     )
     try {
-      await Promise.race([
-        registered,
-        outcome.then((result) => {
-          throw new Error('anchor did not become ready: ' + JSON.stringify(result))
-        }),
-      ])
+      await withProcessDeadline(
+        () =>
+          Promise.race([
+            registered,
+            outcome.then((result) => {
+              throw new Error('anchor did not become ready: ' + JSON.stringify(result))
+            }),
+          ]),
+        'bash anchor registration'
+      )
       expect(existsSync(join(dir, 'marker'))).toBe(false)
       expect(systemProcessProbe.identity(proof.pid)).toBeTruthy()
       if (mode === 'abort') controller.abort()
@@ -62,5 +67,6 @@ it.each(['execute', 'abort'])(
       await outcome
       rmSync(dir, { recursive: true, force: true })
     }
-  }
+  },
+  processScenarioDeadline(4)
 )

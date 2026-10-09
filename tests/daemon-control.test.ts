@@ -1,4 +1,5 @@
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, expect, vi } from 'vitest'
+import { processIt as it } from './process-test.js'
 import { createServer } from 'node:net'
 import { once } from 'node:events'
 import {
@@ -58,7 +59,7 @@ it('long state paths have short protected control endpoints, isolated commands, 
   await second.stop()
   expect(existsSync(dirname(restartedEndpoint))).toBe(false)
   expect(existsSync(dirname(otherEndpoint))).toBe(false)
-})
+}, 6)
 
 it('daemon startup pins the physical state ancestor for locks, control and shutdown', async () => {
   const root = mkdtempSync(join(tmpdir(), 'abele-control-test-'))

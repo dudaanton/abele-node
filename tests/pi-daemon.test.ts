@@ -1,20 +1,13 @@
-import { it, expect } from 'vitest'
+import { expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { startDaemon, offlineToken } from '@abele/node-daemon'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until<T>(fn: () => T | Promise<T>): Promise<NonNullable<T>> {
-  const end = Date.now() + 18000
-  while (Date.now() < end) {
-    const v = await fn()
-    if (v) return v as NonNullable<T>
-    await delay(25)
-  }
-  throw Error('pi fixture deadline')
-}
+const until = <T>(fn: () => T | Promise<T>) => waitForProcessCondition(fn, 'Pi daemon phase')
 it('uses the existing client flow for allow/deny/expiry, extension answers, queue, replacement, crash and exact-file restart resume alongside fake Claude', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-pi-daemon-')),
     state = join(dir, 'state'),
@@ -212,4 +205,4 @@ it('uses the existing client flow for allow/deny/expiry, extension answers, queu
     await daemon?.stop()
     rmSync(dir, { recursive: true, force: true })
   }
-}, 60000)
+}, 12)

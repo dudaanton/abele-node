@@ -1,4 +1,5 @@
-import { it, expect } from 'vitest'
+import { expect, vi } from 'vitest'
+import { processIt as it } from './process-test.js'
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, cpSync, chmodSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { resolve, join } from 'node:path'
@@ -59,16 +60,27 @@ it('releases pre-spawn worker ownership even when a dispatch journal transaction
       return append(...args)
     }
     await expect(core.claude.drain()).rejects.toThrow(/storage_unavailable/)
-    const stopped = await Promise.race([
-      core.claude.stop().then(() => true),
-      new Promise<boolean>((r) => setTimeout(() => r(false), 500)),
-    ])
-    expect(stopped).toBe(true)
+    // Freeze only the shutdown phase, after real filesystem/CLI setup. A failed
+    // pre-spawn transaction leaves no worker to wait for: retain the original
+    // <500 ms bound in virtual time, independent of runner scheduling throughput.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let stopped = false
+    const shutdown = core.claude.stop().then(() => {
+      stopped = true
+    })
+    await vi.advanceTimersByTimeAsync(499)
+    expect(stopped, 'pre-spawn shutdown must not wait for a worker or cleanup timer').toBe(true)
+    await shutdown
+    expect(vi.getTimerCount()).toBe(0)
     expect(core.db.prepare('SELECT count(*) AS n FROM provider_runs').get()).toMatchObject({ n: 0 })
     expect(core.db.prepare('SELECT state FROM inputs').get()).toMatchObject({ state: 'queued' })
   } finally {
     // Test teardown must also release a deliberately broken pre-fix reservation after asserting.
     ;(core.claude as unknown as { active: Map<string, unknown> }).active.clear()
+    if (vi.isFakeTimers()) {
+      await vi.runOnlyPendingTimersAsync()
+      vi.useRealTimers()
+    }
     await core.resources.stop()
     core.close()
     rmSync(dir, { recursive: true, force: true })

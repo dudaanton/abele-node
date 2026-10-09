@@ -7,15 +7,11 @@ import { randomUUID } from 'node:crypto'
 import { NodeCore } from '@abele/node-core'
 import { PiProviderAdapter } from '@abele/provider-pi'
 import { ProcessSupervisor, systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until(fn: () => boolean) {
-  const end = Date.now() + 10000
-  while (Date.now() < end) {
-    if (fn()) return
-    await delay(20)
-  }
-  throw Error('durable admission fixture deadline')
-}
+import {
+  processScenarioDeadline,
+  waitForProcessCondition,
+} from '../scripts/process-test-budget.mjs'
+const until = (fn: () => boolean) => waitForProcessCondition(fn, 'durable admission evidence')
 it.each(['healthy', 'evidence-save', 'absence-check', 'record-removal', 'release-journal'])(
   'real adapter plus node-core SQLite gates shell admission/release under %s',
   async (mode) => {
@@ -189,5 +185,6 @@ it.each(['healthy', 'evidence-save', 'absence-check', 'record-removal', 'release
       core.close()
       rmSync(dir, { recursive: true, force: true })
     }
-  }
+  },
+  processScenarioDeadline(4)
 )

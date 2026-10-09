@@ -1,11 +1,12 @@
-import { it, expect } from 'vitest'
+import { expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PiProviderAdapter } from '@abele/provider-pi'
 import { systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 it('cancels the exact durable question signal before an extension proceeds to another question', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-pi-dialog-cancel-'))
   let cancelled: AbortSignal | undefined,
@@ -59,8 +60,10 @@ it('cleans the supervised worker and tool descendants after interrupt; worker-lo
       { session_id: randomUUID(), run_id: randomUUID(), cwd: dir, text: 'descendants' },
       sink
     )
-    const end = Date.now() + 5000
-    while (!existsSync(join(dir, 'pi-child.pid')) && Date.now() < end) await delay(20)
+    await waitForProcessCondition(
+      () => existsSync(join(dir, 'pi-child.pid')),
+      'Pi descendant ready'
+    )
     expect(existsSync(join(dir, 'pi-child.pid'))).toBe(true)
     const pid = Number(readFileSync(join(dir, 'pi-child.pid'), 'utf8'))
     expect(systemProcessProbe.identity(pid)).toBeTruthy()

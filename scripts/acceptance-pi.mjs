@@ -14,6 +14,13 @@ import { randomUUID } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { NodeClient, MemoryClientStore } from '../packages/node-client/dist/index.js'
 import { PiAcceptanceBudget } from './pi-acceptance-budget.mjs'
+import { waitForPiPrompt } from './pi-prompt-wait.mjs'
+import { systemProcessProbe } from '@abele/provider-claude'
+import {
+  processStepDeadlineMs,
+  waitForProcessCondition,
+  withProcessDeadline,
+} from './process-test-budget.mjs'
 const live = process.argv.includes('--live-final-acceptance')
 const repeat = process.argv.includes('--live-repeat')
 const fixtureError = process.argv.includes('--fixture-provider-error')
@@ -60,22 +67,17 @@ const command = (exe, args, cwd) => {
     cwd,
     env,
     encoding: 'utf8',
-    timeout: 15000,
+    timeout: processStepDeadlineMs,
+    killSignal: 'SIGKILL',
     maxBuffer: 1024 * 1024,
   })
-  if (p.status !== 0) throw Error('acceptance command failed: ' + args[0])
+  if (p.status !== 0)
+    throw Error(`acceptance command failed: ${args.join(' ')}: ${p.error?.message ?? p.stderr}`)
   return p.stdout.trim()
 }
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
-async function until(fn, ms = 100000) {
-  const end = Date.now() + ms
-  while (Date.now() < end) {
-    const value = await fn()
-    if (value) return value
-    await delay(30)
-  }
-  throw Error('bounded acceptance deadline')
-}
+const until = (fn, ms = live ? 100000 : processStepDeadlineMs) =>
+  waitForProcessCondition(fn, 'acceptance phase', ms)
 const budget = new PiAcceptanceBudget(),
   store = new MemoryClientStore()
 let child,
@@ -129,7 +131,7 @@ const start = async () => {
     if (child.exitCode !== null) throw Error('daemon failed before ready')
     const line = output.split('\n').find((s) => s.includes('"listening"'))
     return line ? JSON.parse(line) : null
-  }, 20000)
+  }, processStepDeadlineMs)
   if (nodeId) assert.equal(ready.node_id, nodeId)
   nodeId = ready.node_id
   client = new NodeClient(
@@ -160,16 +162,12 @@ const stop = async () => {
   const process = child,
     exited = new Promise((r) => process.once('exit', r))
   process.kill('SIGTERM')
-  let timer
   try {
-    await Promise.race([
-      exited,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(Error('daemon cleanup deadline')), 20000)
-      }),
-    ])
-  } finally {
-    clearTimeout(timer)
+    await withProcessDeadline(() => exited, 'daemon cleanup')
+  } catch (error) {
+    process.kill('SIGKILL')
+    await withProcessDeadline(() => exited, 'daemon forced exit')
+    throw error // Forced cleanup is never successful graceful shutdown.
   }
   assert.equal(process.exitCode, 0, 'daemon must confirm worker cleanup')
   child = undefined
@@ -198,17 +196,17 @@ async function failIfTerminal(id, message) {
   }
 }
 const pending = () =>
-  until(async () => {
-    const prompt = (await client.prompts(session.session_id, undefined, 'pending'))[0]
-    if (prompt) return prompt
-    await failIfTerminal(currentInput, 'provider_failed_before_prompt')
-    if (
-      (await client.history(session.session_id)).some(
-        (e) => e.data.input_id === currentInput && e.type === 'input.completed'
-      )
-    )
-      throw Error('provider_finished_without_required_prompt')
-  })
+  waitForPiPrompt(
+    {
+      prompt: async () => (await client.prompts(session.session_id, undefined, 'pending'))[0],
+      failIfTerminal: () => failIfTerminal(currentInput, 'provider_failed_before_prompt'),
+      completed: async () =>
+        (await client.history(session.session_id)).some(
+          (e) => e.data.input_id === currentInput && e.type === 'input.completed'
+        ),
+    },
+    live ? 100000 : processStepDeadlineMs
+  )
 const finished = (id, state = 'completed') =>
   until(async () => {
     const terminal = (await client.history(session.session_id)).find(
@@ -239,7 +237,7 @@ async function turn(text, work) {
       report.retries.push({ attempt: budget.turns, http_status: error.failure.http_status })
       // Only classified 5xx failures before a grant/effect are eligible. SDK
       // automatic retries are disabled; no uncertain shell work is replayed.
-      await delay(live ? 30000 : 0)
+      if (live) await delay(30000)
     }
   }
 }
@@ -260,12 +258,18 @@ try {
   await start()
   const project = await client.registerProject(repo, 'trusted'),
     reservation = await client.createWorkspace(project.project_id)
-  await until(async () => (await client.getJob(reservation.job_id)).state === 'succeeded', 20000)
+  await until(
+    async () => (await client.getJob(reservation.job_id)).state === 'succeeded',
+    processStepDeadlineMs
+  )
   workspace = await client.getWorkspace(reservation.workspace_id)
   session = await client.createSession('Pi acceptance', workspace.workspace_id, 'pi')
   await client.subscribe(session.session_id)
   const alongside = await client.createWorkspace(project.project_id)
-  await until(async () => (await client.getJob(alongside.job_id)).state === 'succeeded', 20000)
+  await until(
+    async () => (await client.getJob(alongside.job_id)).state === 'succeeded',
+    processStepDeadlineMs
+  )
   const claude = await client.createSession('Fixture provider', alongside.workspace_id, 'claude')
   await client.subscribe(claude.session_id)
   await client.send(claude.session_id, 'echo', await client.cursor(claude.session_id))
@@ -299,7 +303,7 @@ try {
   )
   await until(
     async () => (await client.history(claude.session_id)).some((e) => e.type === 'run.completed'),
-    20000
+    processStepDeadlineMs
   )
   report.checks.push('allow and disposable edit; fixture CLI concurrently', 'deny never executed')
   await turn(
@@ -318,15 +322,17 @@ try {
     }
   )
   report.checks.push('expiry never executed')
+  const interruptCommand = 'sleep 30 & echo $! > acceptance-child.pid; wait'
+  let interruptedChild
   await turn(
     live
-      ? 'Use bash exactly once to run this exact command: sleep 30. Do not use any other tool.'
+      ? `Use bash exactly once to run this exact command: ${interruptCommand}. Do not use any other tool.`
       : 'descendants',
     async (id) => {
       const wait = await pending()
       if (live) {
         assert.equal(wait.tool_name, 'bash')
-        assert.equal(wait.input.command.trim(), 'sleep 30')
+        assert.equal(wait.input.command.trim(), interruptCommand)
       }
       await client.answerPrompt(wait, 'allow')
       await until(async () =>
@@ -334,7 +340,10 @@ try {
           (e) => e.type === 'prompt.delivered' && e.data.prompt_id === wait.prompt_id
         )
       )
-      await delay(350)
+      const pidFile = join(workspace.path, live ? 'acceptance-child.pid' : 'pi-child.pid')
+      await until(() => existsSync(pidFile))
+      interruptedChild = systemProcessProbe.identity(Number(readFileSync(pidFile, 'utf8')))
+      assert.ok(interruptedChild, 'interrupt must exercise a live descendant, not just a grant')
       await client.interrupt(session.session_id, wait.run_id)
       await finished(id, 'delivery_unknown')
     }
@@ -348,6 +357,8 @@ try {
     workspace_id: workspace.workspace_id,
   }
   await stop()
+  await until(() => !systemProcessProbe.identity(interruptedChild.pid))
+  report.interrupted_child_reaped = true
   await start()
   assert.equal(
     (await client.getSession(session.session_id)).native_session_file,

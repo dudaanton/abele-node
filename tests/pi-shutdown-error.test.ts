@@ -1,4 +1,6 @@
-import { it, expect } from 'vitest'
+import { expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -6,7 +8,6 @@ import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { NodeCore } from '@abele/node-core'
 import { PiProviderAdapter } from '@abele/provider-pi'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 it('fails the durable turn after a successful prompt when SDK dispose swallows a session_shutdown error', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-pi-shutdown-')),
     repo = join(dir, 'repo'),
@@ -51,12 +52,10 @@ it('fails the durable turn after a successful prompt when SDK dispose swallows a
       observed_seq: 0,
     }) as { input_id: string }
     await core.execution.drain()
-    const end = Date.now() + 10000
-    while (Date.now() < end) {
+    await waitForProcessCondition(() => {
       const row = core.db.prepare('SELECT state FROM inputs WHERE input_id=?').get(input.input_id)!
-      if (['completed', 'failed', 'delivery_unknown'].includes(String(row.state))) break
-      await delay(20)
-    }
+      return ['completed', 'failed', 'delivery_unknown'].includes(String(row.state))
+    }, 'shutdown terminal evidence')
     expect(
       core.db.prepare('SELECT state FROM inputs WHERE input_id=?').get(input.input_id)
     ).toMatchObject({ state: 'failed' })

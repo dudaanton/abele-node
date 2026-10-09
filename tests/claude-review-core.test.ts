@@ -1,4 +1,6 @@
-import { it, expect } from 'vitest'
+import { expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,15 +12,7 @@ import {
   type ProcessIdentity,
   type ClaudeOptions,
 } from '@abele/provider-claude'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until(test: () => boolean, ms = 15000) {
-  const end = Date.now() + ms
-  while (Date.now() < end) {
-    if (test()) return
-    await delay(20)
-  }
-  throw Error('review test deadline')
-}
+const until = (test: () => boolean) => waitForProcessCondition(test, 'Claude durable evidence')
 async function setup(options: ClaudeOptions = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'abele-review-')),
     repo = join(dir, 'repo')
@@ -156,7 +150,7 @@ it('core retains an unconfirmed stopped worker so stop fails while the probe fai
     await ProcessSupervisor.cleanup(evidence)
     await s.cleanup()
   }
-}, 20000)
+}, 8)
 it('repository permission opt-in is explicit, durable, idempotent and journaled on the project', async () => {
   const s = await setup()
   try {

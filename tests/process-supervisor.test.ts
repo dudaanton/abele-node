@@ -2,6 +2,7 @@ import { it, expect, vi } from 'vitest'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { ProcessSupervisor, systemProcessProbe } from '@abele/provider-claude'
+import { processScenarioDeadline, processStepDeadlineMs } from '../scripts/process-test-budget.mjs'
 
 it.each(['delayed exit', 'temporary probe failure', 'persistent live', 'persistent probe failure'])(
   'confirms only positive absence after SIGKILL: %s',
@@ -73,7 +74,7 @@ it.each([false, true])(
       child.kill('SIGKILL')
       // Keep this parent's event loop blocked: libuv cannot waitpid/reap the
       // child before cleanup's first synchronous inventory/signalling pass.
-      const deadline = Date.now() + 5000
+      const deadline = Date.now() + processStepDeadlineMs
       let zombie = false
       while (Date.now() < deadline) {
         const result = spawnSync('/bin/ps', ['-p', String(child.pid), '-o', 'stat='], {
@@ -99,7 +100,8 @@ it.each([false, true])(
       }
       await exited
     }
-  }
+  },
+  processScenarioDeadline(4)
 )
 
 it.each([true, false])(

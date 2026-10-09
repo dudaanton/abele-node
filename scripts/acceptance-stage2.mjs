@@ -4,6 +4,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
+import {
+  processStepDeadlineMs,
+  waitForProcessCondition,
+  withProcessDeadline,
+} from './process-test-budget.mjs'
 
 mkdirSync('.scratch', { recursive: true })
 const evidence = mkdtempSync(resolve('.scratch/acceptance-stage2-'))
@@ -11,16 +16,14 @@ const state = join(evidence, 'state')
 const cli = resolve('packages/node-daemon/dist/cli.js')
 const processes = new Set(),
   clients = new Set()
-const delay = (ms) => new Promise((r) => setTimeout(r, ms))
-async function until(test) {
-  for (let i = 0; i < 750; i++) {
-    if (await test()) return
-    await delay(20)
-  }
-  throw new Error('acceptance deadline exceeded')
-}
+const until = (test) => waitForProcessCondition(test, 'stage 2 acceptance phase')
 function run(cwd, executable, args) {
-  const result = spawnSync(executable, args, { cwd, encoding: 'utf8' })
+  const result = spawnSync(executable, args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: processStepDeadlineMs,
+    killSignal: 'SIGKILL',
+  })
   assert.equal(result.status, 0, result.stderr)
   return result.stdout.trim()
 }
@@ -58,7 +61,13 @@ async function stop(child) {
   if (child.exitCode !== null || child.signalCode !== null) return
   const exited = new Promise((r) => child.once('exit', r))
   child.kill('SIGTERM')
-  await exited
+  try {
+    await withProcessDeadline(() => exited, 'stage 2 daemon exit')
+  } catch (error) {
+    child.kill('SIGKILL')
+    await withProcessDeadline(() => exited, 'stage 2 daemon forced exit')
+    throw error
+  }
   processes.delete(child)
 }
 function connect(daemon, token, store) {

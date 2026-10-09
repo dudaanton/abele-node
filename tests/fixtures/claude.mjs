@@ -104,6 +104,8 @@ if (text === 'worker-loss') {
         output += c
         if (!output.includes('\n')) return
         const answer = JSON.parse(JSON.parse(output.split('\n')[0]).result.content[0].text)
+        if (answer.behavior === 'deny')
+          writeFileSync('duplicate-denied.txt', 'denied while pending')
         bridge.stdin.end()
         resolve(answer.behavior)
       })

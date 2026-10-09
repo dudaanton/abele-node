@@ -1,4 +1,6 @@
-import { it, expect, afterAll } from 'vitest'
+import { expect, afterAll } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { processStepDeadlineMs } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -62,6 +64,8 @@ it('installer discovers explicit, environment, shell and common paths in order',
       ['-c', `${discovery}\ndiscover_claude\nprintf '%s' "$claude"`],
       {
         encoding: 'utf8',
+        timeout: processStepDeadlineMs,
+        killSignal: 'SIGKILL',
         env: {
           ...process.env,
           HOME: home,
@@ -107,7 +111,7 @@ it('status and doctor expose an actionable unavailable reason while stopped', ()
     const result = spawnSync(
       process.execPath,
       ['packages/node-daemon/dist/cli.js', command, '--state-dir', state, '--claude-path', missing],
-      { encoding: 'utf8' }
+      { encoding: 'utf8', timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
     )
     expect(result.status, result.stderr).toBe(0)
     const report = JSON.parse(result.stdout)

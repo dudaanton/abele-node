@@ -1,20 +1,13 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { startDaemon, offlineToken } from '@abele/node-daemon'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until<T>(fn: () => Promise<T>): Promise<NonNullable<T>> {
-  const end = Date.now() + 15000
-  while (Date.now() < end) {
-    const v = await fn()
-    if (v) return v as NonNullable<T>
-    await delay(25)
-  }
-  throw Error('delegation acceptance deadline')
-}
+const until = <T>(fn: () => Promise<T>) => waitForProcessCondition(fn, 'delegation convergence')
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
   for (const f of cleanup.splice(0).reverse()) await f()
@@ -120,7 +113,8 @@ for (const provider of ['claude', 'pi'] as const)
     expect(mailbox.some((e) => e.type.includes('tool.'))).toBe(false)
     await parent.disconnect()
     await parent.connect()
-    await delay(80)
+    // history is a replay barrier, not a timed guess that reconnect has settled.
+    expect(await parent.history(child.mailbox_stream_id)).toEqual(mailbox)
     expect(
       (await parent.history(child.mailbox_stream_id)).filter((e) => e.type === 'delegation.result')
     ).toHaveLength(1)
@@ -129,4 +123,4 @@ for (const provider of ['claude', 'pi'] as const)
         readFileSync(join(workspace.path, 'invocations.jsonl'), 'utf8').trim().split('\n')
       ).toHaveLength(1)
     else expect((await parent.getSession(child.session_id)).native_session_file).toBeTruthy()
-  })
+  }, 8)

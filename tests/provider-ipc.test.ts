@@ -1,4 +1,10 @@
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, expect, vi } from 'vitest'
+import { processIt as it } from './process-test.js'
+import {
+  processStepDeadlineMs,
+  waitForProcessCondition,
+  withProcessDeadline,
+} from '../scripts/process-test-budget.mjs'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import {
@@ -144,7 +150,13 @@ it('a fake-provider CLI run with long custom state never creates default-home IP
   writeFileSync(join(repo, 'sample.txt'), 'fixture')
   const env = { ...process.env, HOME: home }
   const command = (executable: string, args: string[], cwd = repo) => {
-    const result = spawnSync(executable, args, { cwd, env, encoding: 'utf8', timeout: 10000 })
+    const result = spawnSync(executable, args, {
+      cwd,
+      env,
+      encoding: 'utf8',
+      timeout: processStepDeadlineMs,
+      killSignal: 'SIGKILL',
+    })
     expect(result.status, result.stderr).toBe(0)
     return result.stdout
   }
@@ -162,14 +174,11 @@ it('a fake-provider CLI run with long custom state never creates default-home IP
   ) as { token: string }
   let daemon: ChildProcess | undefined, client: NodeClient | undefined
   const until = async <T>(check: () => T | Promise<T>): Promise<NonNullable<T>> => {
-    for (let i = 0; i < 750; i++) {
+    return waitForProcessCondition(() => {
       // Check every phase, including a failing allocation, not only successful completion.
       expect(readdirSync(home)).toEqual([])
-      const value = await check()
-      if (value) return value as NonNullable<T>
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    }
-    throw new Error('IPC fixture deadline')
+      return check()
+    }, 'IPC phase')
   }
   let ipc: string | undefined
   try {
@@ -242,8 +251,14 @@ it('a fake-provider CLI run with long custom state never creates default-home IP
     if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
       const closed = new Promise<void>((resolve) => daemon!.once('exit', () => resolve()))
       daemon.kill('SIGTERM')
-      await closed
+      try {
+        await withProcessDeadline(() => closed, 'IPC daemon exit')
+      } catch (error) {
+        daemon.kill('SIGKILL')
+        await withProcessDeadline(() => closed, 'IPC daemon forced exit')
+        throw error
+      }
     }
     if (ipc) expect(existsSync(ipc)).toBe(false)
   }
-}, 30000)
+}, 6)

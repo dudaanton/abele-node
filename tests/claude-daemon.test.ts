@@ -1,4 +1,10 @@
-import { it, expect } from 'vitest'
+import { expect } from 'vitest'
+import { processIt as it } from './process-test.js'
+import {
+  processStepDeadlineMs,
+  waitForProcessCondition,
+  withProcessDeadline,
+} from '../scripts/process-test-budget.mjs'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import {
   mkdtempSync,
@@ -16,16 +22,8 @@ import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { identity } from '../packages/provider-claude/src/supervisor.js'
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function until<T>(test: () => T | Promise<T>, ms = 15000): Promise<NonNullable<T>> {
-  const end = Date.now() + ms
-  while (Date.now() < end) {
-    const value = await test()
-    if (value) return value as NonNullable<T>
-    await delay(20)
-  }
-  throw new Error('fixture deadline')
-}
+const until = <T>(test: () => T | Promise<T>) =>
+  waitForProcessCondition(test, 'Claude daemon phase')
 it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt and abrupt daemon resume through node-client', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-claude-daemon-')),
     state = join(dir, 'state'),
@@ -35,7 +33,12 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
   const children = new Set<ChildProcess>(),
     clients = new Set<NodeClient>()
   const command = (cwd: string, exe: string, args: string[]) => {
-    const r = spawnSync(exe, args, { cwd, encoding: 'utf8', timeout: 10000 })
+    const r = spawnSync(exe, args, {
+      cwd,
+      encoding: 'utf8',
+      timeout: processStepDeadlineMs,
+      killSignal: 'SIGKILL',
+    })
     expect(r.status, r.stderr).toBe(0)
     return r.stdout.trim()
   }
@@ -77,7 +80,13 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     if (child.exitCode !== null || child.signalCode !== null) return
     const exit = new Promise((r) => child.once('exit', r))
     child.kill(signal)
-    await exit
+    try {
+      await withProcessDeadline(() => exit, 'Claude daemon exit')
+    } catch (error) {
+      child.kill('SIGKILL')
+      await withProcessDeadline(() => exit, 'Claude daemon forced exit')
+      throw error
+    }
     children.delete(child)
   }
   const connect = async (
@@ -276,4 +285,4 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     for (const child of children) await stop(child)
     rmSync(dir, { recursive: true, force: true })
   }
-}, 45000)
+}, 12)
