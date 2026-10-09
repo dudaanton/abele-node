@@ -3,6 +3,7 @@ import type * as PiSdk from '@earendil-works/pi-coding-agent'
 import { lstatSync, chmodSync, existsSync, realpathSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { materializeNativeState } from './native-state.js'
+import { normalizeResponsesInput } from './responses-input.js'
 import { randomUUID } from 'node:crypto'
 import type { HostProcessHooks } from './processes.js'
 import {
@@ -106,6 +107,15 @@ export async function createSdkHost(
           {
             name: 'abele-node-policy',
             factory: (pi) => {
+              pi.on('before_provider_request', (event, ctx) => {
+                if (
+                  ctx.model &&
+                  ['openai-responses', 'azure-openai-responses', 'openai-codex-responses'].includes(
+                    ctx.model.api
+                  )
+                )
+                  return normalizeResponsesInput(event.payload)
+              })
               // Last-loaded node policy replaces the SDK's detached-shell backend
               // with an anchored, durably registered process group. SDK rendering,
               // truncation, environment and configured prefix stay SDK-owned.

@@ -27,7 +27,7 @@ writeFileSync(join(repo, 'sample.txt'), 'one\nold\n')
 git('add', '.')
 git('commit', '-m', 'fixture')
 const credential = JSON.parse(
-  run(process.execPath, [cli, 'token', 'create', 'fixture', '--state-dir', state])
+  run(process.execPath, [cli, '--json', 'token', 'create', 'fixture', '--state-dir', state])
 )
 let daemon, client
 async function start() {
@@ -35,6 +35,7 @@ async function start() {
     process.execPath,
     [
       cli,
+      '--json',
       'start',
       '--state-dir',
       state,

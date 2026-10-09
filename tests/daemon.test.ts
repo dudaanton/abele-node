@@ -30,9 +30,13 @@ const cli = resolve('packages/node-daemon/dist/cli.js')
 const eventually = (test: () => Promise<boolean>) =>
   waitForProcessCondition(test, 'CLI daemon convergence')
 async function start(dir: string) {
-  const child = spawn(process.execPath, [cli, 'start', '--state-dir', dir, '--port', '0'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const child = spawn(
+    process.execPath,
+    [cli, '--json', 'start', '--state-dir', dir, '--port', '0'],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  )
   children.push(child)
   let text = ''
   let err = ''
@@ -87,7 +91,15 @@ it(
     const status = () =>
       spawnSync(
         process.execPath,
-        [cli, 'status', '--state-dir', state, '--tailscale-path', '/nonexistent/tailscale'],
+        [
+          cli,
+          '--json',
+          'status',
+          '--state-dir',
+          state,
+          '--tailscale-path',
+          '/nonexistent/tailscale',
+        ],
         commandOptions
       )
     const stopped = status()
@@ -100,7 +112,7 @@ it(
     expect(JSON.parse(running.stdout)).toMatchObject({ state_dir: expected, running: true })
     const doctor = spawnSync(
       process.execPath,
-      [cli, 'doctor', '--state-dir', state, '--tailscale-path', '/nonexistent/tailscale'],
+      [cli, '--json', 'doctor', '--state-dir', state, '--tailscale-path', '/nonexistent/tailscale'],
       commandOptions
     )
     expect(doctor.status, doctor.stderr).toBe(0)
@@ -121,7 +133,7 @@ it(
     const makeToken = (label: string) => {
       const p = spawnSync(
         process.execPath,
-        [cli, 'token', 'create', label, '--state-dir', dir],
+        [cli, '--json', 'token', 'create', label, '--state-dir', dir],
         commandOptions
       )
       expect(p.status, p.stderr).toBe(0)
@@ -194,7 +206,7 @@ it(
     expect(statSync(resolve(dir, 'node.sqlite')).mode & 0o777).toBe(0o600)
     const duplicate = spawnSync(
       process.execPath,
-      [cli, 'start', '--state-dir', dir, '--port', '0'],
+      [cli, '--json', 'start', '--state-dir', dir, '--port', '0'],
       commandOptions
     )
     expect(duplicate.status).not.toBe(0)
@@ -211,7 +223,7 @@ it(
     const t = JSON.parse(
       spawnSync(
         process.execPath,
-        [cli, 'token', 'create', 'retry', '--state-dir', dir],
+        [cli, '--json', 'token', 'create', 'retry', '--state-dir', dir],
         commandOptions
       ).stdout
     ) as { token: string }
@@ -310,7 +322,7 @@ it(
     const t = JSON.parse(
       spawnSync(
         process.execPath,
-        [cli, 'token', 'create', 'auth', '--state-dir', dir],
+        [cli, '--json', 'token', 'create', 'auth', '--state-dir', dir],
         commandOptions
       ).stdout
     ) as { token: string; installation_id: string }
@@ -344,7 +356,7 @@ it(
     // Revocation through protected local CLI IPC, never a second database owner.
     const revoked = spawnSync(
       process.execPath,
-      [cli, 'token', 'revoke', t.installation_id, '--state-dir', dir],
+      [cli, '--json', 'token', 'revoke', t.installation_id, '--state-dir', dir],
       commandOptions
     )
     expect(revoked.status, revoked.stderr).toBe(0)

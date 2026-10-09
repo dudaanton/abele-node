@@ -73,3 +73,20 @@ it('requires positive kernel absence, including when probing is denied', () => {
     kill.mockRestore()
   }
 })
+
+it.each(['start --json', '--json start'])('recognizes a JSON-mode daemon: %s', (command) => {
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true)
+  try {
+    const entry = '/release/packages/node-daemon/dist/cli.js',
+      state = '/state with spaces'
+    ps.mockReturnValue({
+      status: 0,
+      stdout: `node ${entry} ${command} --state-dir ${state} --port 7777`,
+    })
+    expect(daemonProcessPresent(1234, entry, state)).toBe(true)
+    ps.mockReturnValue({ status: 0, stdout: `node ${entry} ${command} --state-dir ${state}-other` })
+    expect(daemonProcessPresent(1234, entry, state)).toBe(false)
+  } finally {
+    kill.mockRestore()
+  }
+})

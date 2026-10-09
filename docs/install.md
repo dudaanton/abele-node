@@ -41,7 +41,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.3.4
+  sh -s -- --version 0.3.5
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -153,9 +153,67 @@ unavailability does not fail installer health checks.
 ### Installer upgrades and removal
 
 Back up the whole **stopped** state before upgrading; see [upgrade](#upgrade).
-Rerun the same one-liner (and the same `--prefix`, plus `--no-service` if used),
-or pin a newer version with `--version`. Downloads/import validation happen before
-stopping the old service. Ownership checks also complete before deployment mutation;
+Once your installed release includes the update command, use:
+
+```sh
+abele-node update --check             # current/latest; always exits 0 on a successful check
+abele-node update                     # latest stable GitHub release
+abele-node update --version 0.3.2     # example: explicitly select an existing tag
+abele-node update --check --json      # machine-readable report for scripts
+```
+
+Update output is short plain text by default: current/target versions, agent-turn
+admission pause/resume, completion or failure, and the next command to run. Active
+runs still require waiting for them to finish or an explicit `--force`; a forced
+update says that the installer must stop running agents, not that they are already
+stopped. Installer stdout/stderr are captured, not dumped into the human summary.
+`--json` emits one complete report on stdout (including failures), with versions,
+installation settings, active-run IDs, pause/resume state, warnings, exit status,
+next steps and the full captured installer diagnostics. Scripts parsing update
+output must pass `--json`; failure exit codes remain nonzero in either mode.
+
+`--check` never downloads/runs an installer or stops the daemon. An update available
+is reported clearly, not as an exit-code failure. Normal updates do nothing when
+the target is equal to or older than the installed version, including explicit
+version pins. This is an upgrade command, not a database downgrade mechanism.
+The updater uses the recorded prefix, state directory, Claude path and service mode,
+not shell discovery or new command-line state/provider overrides. Older installer
+configs without a recorded prefix are supported by deriving it from the installed
+runtime path. A source/manual installation instead says to use `git pull` and makes
+no changes.
+
+The updater downloads `install.sh` from the selected **release tag**, never `main`.
+If the release publishes `SHA256SUMS`, its single `install.sh` entry must match
+before any execution; a missing/duplicate entry, checksum mismatch or failed
+download is an error, never a reason to bypass verification. Future releases carry
+both the installer asset and its checksum. If a legacy release has no installer
+asset, the unpinned update refuses it. Explicit `--version X.Y.Z` allows that tag's
+raw installer over HTTPS, with a clear notice that it has no installer checksum.
+An installer asset published without `SHA256SUMS` also produces a warning.
+The installer remains responsible for archive verification, service ownership,
+transactional deployment and rollback; updater failures preserve its diagnostics
+and exit status.
+
+Active provider runs are reported by run/session ID and block installation. The
+updater holds a private `STATE_DIR/update.lock` admission fence through download
+and installer execution, so queued provider runs cannot start between inspection
+and deployment. Dispatch and fence publication serialize via a short-lived
+`STATE_DIR/.run-admission` lock. Neither lock changes queued input or database
+schema; normal completion/failure releases the updater's fence and dispatch
+resumes. SIGINT/Ctrl-C, SIGTERM and SIGHUP abort an in-progress download and release
+the fence before exiting. Concurrent updaters are refused. If the updater was
+killed without cleanup, provider dispatch and later updates can reclaim
+`update.lock` once its recorded PID is confirmed absent. Recovery serializes with
+fence publication and never removes a replacement lock. Live, malformed or
+unverifiable owners remain fenced. An orphaned `.run-admission` lock still requires
+manual inspection: confirm its owner has stopped before removing it. Never remove
+a live process's lock. Wait for active runs to finish; `abele-node update --force` explicitly permits interrupting
+active runs, but does not bypass any installer ownership or cleanup checks.
+Foreground-only daemons still need to be stopped manually before installation,
+even with `--force`.
+For releases predating the update command, rerun the same one-liner (and the same
+`--prefix`, plus `--no-service` if used), or pin a newer version with `--version`.
+Downloads/import validation happen before stopping the old service. Ownership checks also complete before deployment mutation;
 a refusal does not trigger recovery of an untouched service. Fresh service installs
 and foreground-to-service conversions refuse a running foreground/manual daemon:
 stop it explicitly first.
@@ -232,8 +290,12 @@ in their original repositories; inspect `git worktree list` and repair explicitl
 
 For local installer tests only, `ABELE_INSTALL_BASE_URL` replaces the GitHub download
 base (assets are under `/releases/download/vX.Y.Z/`), and `ABELE_INSTALL_API_URL`
-replaces the latest-release JSON endpoint. These overrides execute code from that
-source; do not point them at an untrusted server. SHA-256 detects corruption, not
+replaces the latest-release JSON endpoint. The updater uses these same overrides;
+pinned lookups replace the endpoint's trailing `/latest` with `/tags/vX.Y.Z`.
+`ABELE_UPDATE_RAW_URL` overrides the raw-file repository base for pinned legacy
+updater tests (files are under `/vX.Y.Z/install.sh`). Update downloads require
+HTTPS, with HTTP allowed only for loopback test servers. These overrides execute
+code from that source; do not point them at an untrusted server. SHA-256 detects corruption, not
 compromise of the release publisher or both files on a mirror.
 
 ## Install from source (manual alternative)
@@ -258,9 +320,9 @@ cd "$HOME/abele-node"
 node packages/node-daemon/dist/cli.js start
 ```
 
-It runs in the foreground on `127.0.0.1:7777`, prints a JSON `listening` record
-with the `node_id`, and stays alive. Ctrl-C/SIGTERM shuts it down and cleans up
-owned provider groups. There is no host/bind-address flag.
+It runs in the foreground on `127.0.0.1:7777`, prints its port and node ID
+in plain text, and stays alive. Add `--json` for a machine-readable `listening`
+record. Ctrl-C/SIGTERM shuts it down and cleans up owned provider groups. There is no host/bind-address flag.
 
 The default CLI candidate is `$HOME/.local/bin/claude`. To use another installation,
 stop first and supply the **absolute, version-pinned executable**:
@@ -305,29 +367,35 @@ abele-node status
 For a source checkout, substitute `node packages/node-daemon/dist/cli.js` for
 `abele-node` in these commands.
 
-`token create` generates a random 256-bit token and prints JSON containing
-`installation_id`, `token` and its label. **The token is shown once**; only its hash
-is stored by the daemon. This works before startup or through protected local IPC
-while running; it does not open a second database owner.
+`token create` generates a random 256-bit token and prints short connection
+instructions. **The token is shown once**; only its hash is stored by the daemon.
+This works before startup or through protected local IPC while running; it does
+not open a second database owner. Output is plain text by default. Add `--json`
+for scripts to get `installation_id` and `token`.
 
-In a plugin version that includes AbeleNode integration, add a local node. The
-connection needs:
+In the plugin, open **Abele Settings → Nodes** and fill in:
 
-- Endpoint: `ws://127.0.0.1:7777/channel` (or your actual native port).
-- Installation ID and token from `token create`.
-- Expected node identity (`node_id` from `status`) when the enrollment UI asks for it;
-  the client also pins it on its first successful connection.
+- **Label:** any name you like.
+- **URL:** `http://127.0.0.1:7777`, or the URL printed by `token create`.
+- **Installation token:** the token printed by `token create`.
 
-UI labels/layout may vary by plugin version; this repository does not install the
-plugin or guarantee that a released plugin has the enrollment UI yet. The
-[plugin repository](https://github.com/dudaanton/abele-obsidian-plugin) is the source
-of its UI instructions. The client API is `@abele/node-client`.
+Click **Add node**. Do not append `/channel` or use `ws://`; the plugin builds the
+channel URL itself. You do not need to paste an installation ID or node ID.
+`token create` uses the running daemon’s actual port. If you create a token before
+starting on a custom port, pass that same `--port PORT` to both commands.
+
+Use a plugin version with **Nodes** settings; this repository does not install the
+plugin. See the [plugin repository](https://github.com/dudaanton/abele-obsidian-plugin)
+for its UI instructions. The client API is `@abele/node-client`.
 
 Enrollment secrets and the installation's client store belong in **device-local**
 storage, not Obsidian-synced settings, notes, URL queries, cookies or shell arguments.
 Use a separate token for each installation. A replaced token needs a fresh client
 store namespace. Only desktop local connections work; a phone's loopback points at
-the phone, not this computer. Pairing/remote enrollment is not available.
+the phone, not this computer. For a phone or remote desktop, use **Pair remote node**
+in the plugin with an invitation after enabling the node’s paired listener and
+Tailscale Serve. See [remote access and pairing](remote-access.md); real phone
+pairing is not verified by this guide.
 
 ```sh
 node packages/node-daemon/dist/cli.js token list
@@ -507,8 +575,26 @@ node packages/node-daemon/dist/cli.js doctor
 node packages/node-daemon/dist/cli.js doctor --state-dir "$HOME/abele-node-state"
 ```
 
-`status` reports the locally recorded live PID/identity/port, running runtime
-identity (`runtime.cli_path` and `runtime.version`) and provider report;
+All CLI commands print concise human-readable text by default. `status` shows
+running state, version, port, node ID, Claude/pi availability with repair guidance,
+paired/remote state, and project/workspace counts. `doctor` shows an OK/problem
+checklist with a fix for each problem. Disk encryption is reported as unknown because
+the command does not inspect encryption of the state volume; check FileVault or
+your OS disk-encryption settings. The legacy JSON `encrypted_at_rest` flag describes
+application-level encryption, not disk encryption. Counts include registered projects and workspaces that have not been removed.
+They are read locally without starting the daemon;
+“unknown” means the database could not be read.
+
+For scripts, add `--json` to retain the original output schema (including the existing
+plain version string and error messages):
+
+```sh
+abele-node status --json
+abele-node doctor --json
+abele-node token create desktop --json
+```
+
+`status` reports the locally recorded live PID/identity/port and provider report;
 it is **not** an authenticated network probe. `doctor` adds Node/SQLite/state-mode
 and LaunchAgent diagnostics. With a running daemon, provider diagnostics describe
 that daemon, not a different CLI from your current shell. Neither command requests
@@ -522,13 +608,16 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
    resume files separately. Also preserve project Git metadata and managed worktrees
    together; worktree paths/registration provenance are absolute. Copying only the
    SQLite main file while WAL is live is not a safe backup.
-3. For the one-command installer, rerun it with the same prefix/settings and the
-   intended `--version` (plus `--no-service` for a foreground-only deployment).
+3. For the one-command installer, run `abele-node update` (or
+   `abele-node update --version X.Y.Z` to select a release). It reuses the recorded
+   installation settings. If the old release has no update command, rerun the
+   installer with the same prefix/settings and intended `--version` (plus
+   `--no-service` for a foreground-only deployment).
    For a source checkout, fetch and select the intended release, then rebuild:
 
    ```sh
    git fetch --tags origin
-   git checkout v0.3.4  # example; select an existing release
+   git checkout v0.3.5  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
@@ -568,18 +657,18 @@ For manual/source installations:
 
 ## Troubleshooting
 
-| Symptom                                         | What to check                                                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `EADDRINUSE` / port 7777 in use                 | Another daemon/service may already own it. Run `status` with the correct state, inspect `lsof -nP -iTCP:7777 -sTCP:LISTEN` on macOS or `ss -ltnp` on Linux. Stop the owner or choose `--port 7779` and enroll that native endpoint. Never kill an unknown process.                                                                         |
-| `already_running`                               | One daemon per state. Check service supervision before starting a foreground copy.                                                                                                                                                                                                                                                         |
-| `lock_needs_doctor`                             | An unreadable/corrupt lock is not proof of a dead process. Inspect the lock and process ownership; do not blindly delete it.                                                                                                                                                                                                               |
-| Claude unavailable                              | Run `abele-node doctor` or `abele-node status`: `claude.diagnostic` gives the exact cause and repair command. Versions >=2.1.285 and <3.0.0 require all public flags and acceptance of the permission prompt flags. Run `claude update` for old/missing flags, then reinstall with `sh install.sh --claude-path /absolute/path/to/claude`. |
-| CLI login fails                                 | Authenticate your own CLI as the same OS user, with the service's HOME. Compatibility checks do not test account login/quota.                                                                                                                                                                                                              |
-| Service works in shell but not at login         | Node version-manager paths may have moved; shell rc files are not read. Inspect plist/unit absolute paths, HOME/PATH and stderr/journal.                                                                                                                                                                                                   |
-| Plugin rejects endpoint / authentication        | Use exact `ws://127.0.0.1:PORT/channel`, not `localhost`, a LAN IP or a token-bearing URL. Check installation/token/node identity and desktop Origin. A revoked/new token needs a new client-store namespace.                                                                                                                              |
-| SQLite/API error                                | Use Node 22.23.2, writable private local state, and sufficient disk space. Do not put live SQLite/WAL state in a synced folder or network filesystem.                                                                                                                                                                                      |
-| `git_required` / provisioning `needs_attention` | Commit the original repository first; re-register a formerly plain folder. For ambiguous Git effects inspect the durable job and worktree/branch state; there is no blind repair/retry.                                                                                                                                                    |
-| `delivery_unknown` / cleanup unconfirmed        | Do not resend an uncertain input automatically. Inspect durable run evidence, CLI processes and workspace state; cleanup failure fences further execution.                                                                                                                                                                                 |
+| Symptom                                         | What to check                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EADDRINUSE` / port 7777 in use                 | Another daemon/service may already own it. Run `status` with the correct state, inspect `lsof -nP -iTCP:7777 -sTCP:LISTEN` on macOS or `ss -ltnp` on Linux. Stop the owner or choose `--port 7779` and enroll that native endpoint. Never kill an unknown process.                                                                                                |
+| `already_running`                               | One daemon per state. Check service supervision before starting a foreground copy.                                                                                                                                                                                                                                                                                |
+| `lock_needs_doctor`                             | An unreadable/corrupt lock is not proof of a dead process. Inspect the lock and process ownership; do not blindly delete it.                                                                                                                                                                                                                                      |
+| Claude unavailable                              | Run `abele-node doctor` or `abele-node status`: human output gives the cause and repair command (`claude.diagnostic` with `--json`). Versions >=2.1.285 and <3.0.0 require all public flags and acceptance of the permission prompt flags. Run `claude update` for old/missing flags, then reinstall with `sh install.sh --claude-path /absolute/path/to/claude`. |
+| CLI login fails                                 | Authenticate your own CLI as the same OS user, with the service's HOME. Compatibility checks do not test account login/quota.                                                                                                                                                                                                                                     |
+| Service works in shell but not at login         | Node version-manager paths may have moved; shell rc files are not read. Inspect plist/unit absolute paths, HOME/PATH and stderr/journal.                                                                                                                                                                                                                          |
+| Plugin rejects endpoint / authentication        | In the plugin’s URL field use `http://127.0.0.1:PORT` with the daemon’s actual port, without `/channel`; not `ws://`, `localhost`, a LAN IP or a token-bearing URL. Paste only the token into Installation token. For a phone or remote desktop use Pair remote node. Check the token and desktop Origin. A revoked/new token needs a new client-store namespace. |
+| SQLite/API error                                | Use Node 22.23.2, writable private local state, and sufficient disk space. Do not put live SQLite/WAL state in a synced folder or network filesystem.                                                                                                                                                                                                             |
+| `git_required` / provisioning `needs_attention` | Commit the original repository first; re-register a formerly plain folder. For ambiguous Git effects inspect the durable job and worktree/branch state; there is no blind repair/retry.                                                                                                                                                                           |
+| `delivery_unknown` / cleanup unconfirmed        | Do not resend an uncertain input automatically. Inspect durable run evidence, CLI processes and workspace state; cleanup failure fences further execution.                                                                                                                                                                                                        |
 
 Read the [security model](security.md) before trusting a repository or changing
 Claude setting sources.

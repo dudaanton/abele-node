@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import './warnings.js'
+import { DatabaseSync } from 'node:sqlite'
+import { humanOutput, humanError } from './output.js'
 import { homedir } from 'node:os'
 import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,143 +28,169 @@ import { spawnSync } from 'node:child_process'
 import { daemonProcessPresent, waitForLaunch } from './launch-wait.js'
 import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
+import { update } from './update.js'
 import { ClaudeProviderAdapter, PiProviderAdapter, canonicalStateDir } from '@abele/node-core'
 
-const args = process.argv.slice(2)
-function option(name: string, fallback: string) {
-  const i = args.indexOf(name)
-  if (i < 0) return fallback
-  if (!args[i + 1]) throw new Error('missing_' + name)
-  const value = args[i + 1]!
-  args.splice(i, 2)
-  return value
-}
-const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
-const port = Number(option('--port', '7777'))
-// A release installer can use its already deployed, immutable runtime directly.
-const configuredRuntime = option('--runtime-dir', '')
-const installerJournal = option('--installer-journal', '')
-function completedInstallerAction(action: string, target: string) {
-  if (!installerJournal) return
-  if (resolve(installerJournal) !== installerJournal) throw new Error('invalid_installer_journal')
-  const parent = statSync(dirname(installerJournal))
-  if (parent.uid !== process.getuid!() || (parent.mode & 0o077) !== 0)
-    throw new Error('unprotected_installer_journal')
-  writeFileSync(installerJournal, JSON.stringify({ action, target, state }) + '\n', {
-    flag: 'a',
-    mode: 0o600,
-  })
-  const fd = openSync(installerJournal, constants.O_RDONLY)
-  try {
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
-}
-const pairedConfigPath = option('--paired-config', '')
-const pairedConfig = pairedConfigPath
-  ? PairedListenerSchema.parse(JSON.parse(readFileSync(resolve(pairedConfigPath), 'utf8')))
-  : undefined
-const tailscalePath = option(
-  '--tailscale-path',
-  process.env.ABELE_TAILSCALE_PATH ?? '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
-)
-const pairInstallation = option('--pair-installation', '')
-const policyFlag = args.indexOf('--tailnet-policy-verified')
-const policyVerified = policyFlag >= 0
-if (policyVerified) args.splice(policyFlag, 1)
-const tailscale = new TailscaleServeManager(tailscaleRunner(tailscalePath))
-const configuredWorktreeRoot = option('--worktree-root', '')
-const worktreeRoot = configuredWorktreeRoot ? resolve(configuredWorktreeRoot) : undefined
-const claudePath = resolve(
-  option('--claude-path', process.env.ABELE_CLAUDE_PATH ?? join(homedir(), '.local/bin/claude'))
-)
-const claudeProfile = option('--claude-profile', 'inherited')
-const claudeBudget = Number(option('--claude-budget', '0.35'))
-const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
-const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
-const piProvider = option('--pi-provider', '')
-const piModel = option('--pi-model', '')
-const piAgentDir = resolve(option('--pi-agent-dir', join(homedir(), '.pi/agent')))
-const piProfile = option('--pi-profile', 'inherited')
-const piDeadline = Number(option('--pi-deadline-ms', '120000'))
-const piMaxTokens = Number(option('--pi-max-tokens', '4096'))
-if (!['inherited', 'isolated'].includes(piProfile)) throw new Error('invalid_pi_configuration')
-const piOptions = {
-  agentDir: piAgentDir,
-  provider: piProvider,
-  model: piModel,
-  profile: piProfile as 'inherited' | 'isolated',
-  maxTokens: piMaxTokens,
-  deadlineMs: piDeadline,
-  permissionTtlMs: permissionTtl,
-}
-if (
-  !['inherited', 'isolated'].includes(claudeProfile) ||
-  !Number.isFinite(claudeBudget) ||
-  claudeBudget <= 0 ||
-  claudeBudget > 10 ||
-  !Number.isSafeInteger(claudeDeadline) ||
-  claudeDeadline < 1000 ||
-  claudeDeadline > 1800000 ||
-  !Number.isSafeInteger(permissionTtl) ||
-  permissionTtl < 1 ||
-  permissionTtl > 3600000
-)
-  throw new Error('invalid_claude_configuration')
-const claudeOptions = {
-  executable: claudePath,
-  profile: claudeProfile as 'inherited' | 'isolated',
-  budgetUsd: claudeBudget,
-  deadlineMs: claudeDeadline,
-  permissionTtlMs: permissionTtl,
-}
-if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port')
-const output = (value: unknown) => console.log(JSON.stringify(value))
-const label = 'dev.abele.node'
-const launchDomain = `gui/${process.getuid!()}`
-const launch = (...params: string[]) =>
-  spawnSync('/bin/launchctl', params, { encoding: 'utf8', timeout: 1000 })
-const escape = (s: string) =>
-  s
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-function plistArguments(text: string): string[] {
-  const array = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1]
-  if (!array) return []
-  return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((match) =>
-    match[1]!
-      .replaceAll('&quot;', '"')
-      .replaceAll('&apos;', "'")
-      .replaceAll('&gt;', '>')
-      .replaceAll('&lt;', '<')
-      .replaceAll('&amp;', '&')
-  )
-}
-function launchMissing(result: ReturnType<typeof launch>): boolean {
-  return (
-    (result.status === 3 || result.status === 113) &&
-    /could not find (?:specified )?service|no such process/i.test(result.stderr ?? '')
-  )
-}
-function loadedArguments(text: string): string[] | undefined {
-  const body = text.match(/\n[ \t]*arguments = \{\r?\n([\s\S]*?)\r?\n[ \t]*\}/)?.[1]
-  if (!body) return
-  const lines = body.split(/\r?\n/),
-    indent = lines[0]!.match(/^[ \t]+/)?.[0]
-  if (!indent || lines.some((line) => !line.startsWith(indent))) return
-  return lines.map((line) => line.slice(indent.length))
-}
+const json = process.argv.includes('--json')
 async function main() {
+  const args = process.argv.slice(2).filter((arg) => arg !== '--json')
+  function option(name: string, fallback: string) {
+    const i = args.indexOf(name)
+    if (i < 0) return fallback
+    if (!args[i + 1]) throw new Error('missing_' + name)
+    const value = args[i + 1]!
+    args.splice(i, 2)
+    return value
+  }
+  const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
+  const port = Number(option('--port', '7777'))
+  // A release installer can use its already deployed, immutable runtime directly.
+  const configuredRuntime = option('--runtime-dir', '')
+  const installerJournal = option('--installer-journal', '')
+  function completedInstallerAction(action: string, target: string) {
+    if (!installerJournal) return
+    if (resolve(installerJournal) !== installerJournal) throw new Error('invalid_installer_journal')
+    const parent = statSync(dirname(installerJournal))
+    if (parent.uid !== process.getuid!() || (parent.mode & 0o077) !== 0)
+      throw new Error('unprotected_installer_journal')
+    writeFileSync(installerJournal, JSON.stringify({ action, target, state }) + '\n', {
+      flag: 'a',
+      mode: 0o600,
+    })
+    const fd = openSync(installerJournal, constants.O_RDONLY)
+    try {
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+  }
+  const pairedConfigPath = option('--paired-config', '')
+  const pairedConfig = pairedConfigPath
+    ? PairedListenerSchema.parse(JSON.parse(readFileSync(resolve(pairedConfigPath), 'utf8')))
+    : undefined
+  const tailscalePath = option(
+    '--tailscale-path',
+    process.env.ABELE_TAILSCALE_PATH ?? '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
+  )
+  const pairInstallation = option('--pair-installation', '')
+  const policyFlag = args.indexOf('--tailnet-policy-verified')
+  const policyVerified = policyFlag >= 0
+  if (policyVerified) args.splice(policyFlag, 1)
+  const tailscale = new TailscaleServeManager(tailscaleRunner(tailscalePath))
+  const configuredWorktreeRoot = option('--worktree-root', '')
+  const worktreeRoot = configuredWorktreeRoot ? resolve(configuredWorktreeRoot) : undefined
+  const claudePath = resolve(
+    option('--claude-path', process.env.ABELE_CLAUDE_PATH ?? join(homedir(), '.local/bin/claude'))
+  )
+  const claudeProfile = option('--claude-profile', 'inherited')
+  const claudeBudget = Number(option('--claude-budget', '0.35'))
+  const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
+  const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
+  const piProvider = option('--pi-provider', '')
+  const piModel = option('--pi-model', '')
+  const piAgentDir = resolve(option('--pi-agent-dir', join(homedir(), '.pi/agent')))
+  const piProfile = option('--pi-profile', 'inherited')
+  const piDeadline = Number(option('--pi-deadline-ms', '120000'))
+  const piMaxTokens = Number(option('--pi-max-tokens', '4096'))
+  if (!['inherited', 'isolated'].includes(piProfile)) throw new Error('invalid_pi_configuration')
+  const piOptions = {
+    agentDir: piAgentDir,
+    provider: piProvider,
+    model: piModel,
+    profile: piProfile as 'inherited' | 'isolated',
+    maxTokens: piMaxTokens,
+    deadlineMs: piDeadline,
+    permissionTtlMs: permissionTtl,
+  }
+  if (
+    !['inherited', 'isolated'].includes(claudeProfile) ||
+    !Number.isFinite(claudeBudget) ||
+    claudeBudget <= 0 ||
+    claudeBudget > 10 ||
+    !Number.isSafeInteger(claudeDeadline) ||
+    claudeDeadline < 1000 ||
+    claudeDeadline > 1800000 ||
+    !Number.isSafeInteger(permissionTtl) ||
+    permissionTtl < 1 ||
+    permissionTtl > 3600000
+  )
+    throw new Error('invalid_claude_configuration')
+  const claudeOptions = {
+    executable: claudePath,
+    profile: claudeProfile as 'inherited' | 'isolated',
+    budgetUsd: claudeBudget,
+    deadlineMs: claudeDeadline,
+    permissionTtlMs: permissionTtl,
+  }
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port')
+  const version = JSON.parse(
+    readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')
+  ).version as string
+  const output = (value: unknown) =>
+    console.log(
+      json
+        ? JSON.stringify(value)
+        : humanOutput(args, value, {
+            port:
+              args[0] === 'token' && args[1] === 'create'
+                ? (readRuntime(state)?.port ?? port)
+                : undefined,
+          })
+    )
+  const label = 'dev.abele.node'
+  const launchDomain = `gui/${process.getuid!()}`
+  const launch = (...params: string[]) =>
+    spawnSync('/bin/launchctl', params, { encoding: 'utf8', timeout: 1000 })
+  const escape = (s: string) =>
+    s
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+  function plistArguments(text: string): string[] {
+    const array = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1]
+    if (!array) return []
+    return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((match) =>
+      match[1]!
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&gt;', '>')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&amp;', '&')
+    )
+  }
+  function launchMissing(result: ReturnType<typeof launch>): boolean {
+    return (
+      (result.status === 3 || result.status === 113) &&
+      /could not find (?:specified )?service|no such process/i.test(result.stderr ?? '')
+    )
+  }
+  function loadedArguments(text: string): string[] | undefined {
+    const body = text.match(/\n[ \t]*arguments = \{\r?\n([\s\S]*?)\r?\n[ \t]*\}/)?.[1]
+    if (!body) return
+    const lines = body.split(/\r?\n/),
+      indent = lines[0]!.match(/^[ \t]+/)?.[0]
+    if (!indent || lines.some((line) => !line.startsWith(indent))) return
+    return lines.map((line) => line.slice(indent.length))
+  }
   switch (args[0]) {
     case '--version':
     case 'version':
-      console.log(
-        JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')).version
-      )
+      console.log(version)
       return
+    case 'update': {
+      const runtime = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+      const report = await update(
+        runtime,
+        args.slice(1),
+        json ? undefined : (progress) => console.log(humanOutput(['update'], progress))
+      )
+      const rendered = json ? JSON.stringify(report) : humanOutput(['update'], report)
+      if (json || report.exit_code === 0) console.log(rendered)
+      else console.error(rendered)
+      process.exitCode = report.exit_code
+      return
+    }
     case 'start': {
       const daemon = await startDaemon(
         state,
@@ -219,7 +247,9 @@ async function main() {
       let installedHere = stateIndex >= 0 && expected[stateIndex + 1] === state
       if (!installedHere && stateIndex >= 0) {
         try {
-          const recorded = statSync(canonicalStateDir(expected[stateIndex + 1]!), { bigint: true })
+          const recorded = statSync(canonicalStateDir(expected[stateIndex + 1]!), {
+            bigint: true,
+          })
           const requested = statSync(state, { bigint: true })
           installedHere =
             recorded.isDirectory() &&
@@ -283,7 +313,7 @@ async function main() {
     case 'status': {
       const running = readRuntime(state)
       const paired = running?.paired ?? pairedConfig
-      output({
+      const report = {
         running: !!running,
         ...running,
         state_dir: state,
@@ -293,7 +323,47 @@ async function main() {
           paired?.backend_port,
           running?.port ?? port
         ),
-      })
+      }
+      if (json) output(report)
+      else {
+        let counts: { projects: number | null; workspaces: number | null } = {
+          projects: 0,
+          workspaces: 0,
+        }
+        let nodeId = running?.node_id
+        const database = join(state, 'node.sqlite')
+        if (existsSync(database)) {
+          let db: DatabaseSync | undefined
+          try {
+            db = new DatabaseSync(database, { readOnly: true })
+            db.exec('BEGIN') // Read identity and counts from one consistent snapshot.
+            counts = {
+              projects: Number(
+                db.prepare('SELECT count(*) AS n FROM projects WHERE registered=1').get()!.n
+              ),
+              workspaces: Number(
+                db.prepare("SELECT count(*) AS n FROM workspaces WHERE state!='removed'").get()!.n
+              ),
+            }
+            nodeId ??= db.prepare("SELECT value FROM meta WHERE key='node_id'").get()?.value as
+              string | undefined
+          } catch {
+            counts = { projects: null, workspaces: null }
+          } finally {
+            db?.close()
+          }
+        }
+        output({
+          ...report,
+          version: running?.runtime?.version ?? version,
+          port: running?.port ?? port,
+          node_id: nodeId ?? (existsSync(database) ? 'unknown' : undefined),
+          paired: paired ?? null,
+          pi:
+            running?.pi ?? new PiProviderAdapter({ ...piOptions, stateDir: state }).capabilities(),
+          ...counts,
+        })
+      }
       return
     }
     case 'doctor': {
@@ -433,6 +503,7 @@ async function main() {
         process.execPath,
         join(runtime, 'packages/node-daemon/dist/cli.js'),
         'start',
+        '--json',
         '--state-dir',
         state,
         '--port',
@@ -511,11 +582,11 @@ async function main() {
     }
     default:
       throw new Error(
-        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]'
+        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]\n       abele-node update [--version X.Y.Z] [--check] [--force] [--json]'
       )
   }
 }
 void main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error))
+  console.error(json ? (error instanceof Error ? error.message : String(error)) : humanError(error))
   process.exitCode = 1
 })

@@ -40,6 +40,7 @@ test('Claude discovery records normalized paths and probes with service PATH', a
   assert.equal(result.code, 0, result.stderr)
   const config = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
   assert.equal(config.claude, await realpath(target))
+  assert.equal(config.prefix, join(h, '.local'))
   const probe = JSON.parse(await readFile(join(h, 'claude-probe.json'), 'utf8'))
   assert.deepEqual(probe.args, ['--version'])
   assert.equal(probe.path.split(':')[0], await realpath(bin))
@@ -148,7 +149,7 @@ if(args[0]==='status' && fs.existsSync(daemonPending)){
 const present=fs.existsSync(marker), reported=present && fs.readFileSync(marker,'utf8');
 const running=present && (!isMac || JSON.parse(reported).state===state);
 const runtime=reported ? JSON.parse(reported).runtime : {cli_path:fs.realpathSync(fileURLToPath(import.meta.url)),version:${JSON.stringify(version)}};
-console.log(JSON.stringify({running,service_unloaded,state_dir:state,pid:running?1337:null,runtime,node:process.version,state_mode:null,version:${JSON.stringify(version)}}));`
+console.log(JSON.stringify({running,service_unloaded,state_dir:state,pid:running?1337:null,port:running?Number(process.env.TEST_NODE_PORT || 7777):undefined,runtime,node:process.version,state_mode:null,version:${JSON.stringify(version)}}));`
   )
   const file = join(scratch, `${version}.tar.gz`)
   assert.equal((await run('tar', ['-czf', file, '-C', tree, '.'])).code, 0)
@@ -285,6 +286,23 @@ test('argument validation and help work without downloads', async () => {
   assert.equal(piped.code, 0, piped.stderr)
   assert.match(piped.stdout, /token create desktop/)
   assert.equal(await readlink(join(h, '.local/share/abele-node/current')), '0.2.0')
+})
+test('next steps match plugin fields and use the reported service port', async () => {
+  for (const port of [null, 50778]) {
+    const h = await home()
+    const result = await install(
+      h,
+      ['--version', '0.2.0', ...(port ? [] : ['--no-service'])],
+      port ? { ...(await mockedMacService(h)), TEST_NODE_PORT: String(port) } : {}
+    )
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /abele-node token create desktop/)
+    assert.match(result.stdout, /Label: any name you like/)
+    assert.ok(result.stdout.includes(`URL: http://127.0.0.1:${port ?? 7777}`))
+    assert.match(result.stdout, /Installation token: paste the token/)
+    assert.match(result.stdout, /Add node/)
+    assert.doesNotMatch(result.stdout, /ws:\/\/|installation ID|node_id|\/channel/)
+  }
 })
 test('physical paths reject symlinked ancestors that overlap runtime or HOME', async () => {
   for (const target of ['share/abele-node/not-created/state', 'bin/not-created/state']) {
@@ -482,7 +500,7 @@ test('latest resolution, pinned version and wrapper with spaces and quotes', asy
   ])
   assert.equal(result.code, 0, result.stderr)
   assert.equal(await readlink(join(prefix, 'share/abele-node/current')), '0.2.0')
-  const status = await run(join(prefix, 'bin/abele-node'), ['status'], { HOME: h })
+  const status = await run(join(prefix, 'bin/abele-node'), ['status', '--json'], { HOME: h })
   assert.equal(status.code, 0, status.stderr)
   assert.equal(JSON.parse(status.stdout).version, '0.2.0')
   assert.match(result.stdout, /token create desktop/)
@@ -653,7 +671,7 @@ test('failed doctor/status rolls back the symlink and wrapper, keeping state', a
   assert.match(result.stderr, /roll.*back/i)
   assert.equal(await readlink(join(h, '.local/share/abele-node/current')), '0.2.0')
   assert.equal(await readFile(join(state, 'keep'), 'utf8'), 'private-state')
-  const status = await run(join(h, '.local/bin/abele-node'), ['status'], { HOME: h })
+  const status = await run(join(h, '.local/bin/abele-node'), ['status', '--json'], { HOME: h })
   assert.equal(JSON.parse(status.stdout).version, '0.2.0')
 })
 test('invalid latest response cannot become a filesystem path', async () => {
@@ -780,10 +798,12 @@ test('macOS uninstall uses the installed canonical service state after alias ret
   await mkdir(a)
   await mkdir(b)
   await symlink(a, alias)
-  assert.equal(
-    (await install(h, ['--version', '0.2.0', '--state-dir', join(alias, 'node')], env)).code,
-    0
+  const installedResult = await install(
+    h,
+    ['--version', '0.2.0', '--state-dir', join(alias, 'node')],
+    env
   )
+  assert.equal(installedResult.code, 0, installedResult.stderr)
   const installed = JSON.parse(
     await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8')
   )
@@ -1703,7 +1723,7 @@ test(
       const result = await install(h, ['--version', realVersion, '--no-service'])
       assert.equal(result.code, 0, result.stderr)
       for (const command of ['status', 'doctor']) {
-        const check = await run(join(h, '.local/bin/abele-node'), [command], {
+        const check = await run(join(h, '.local/bin/abele-node'), [command, '--json'], {
           HOME: h,
           ABELE_CLAUDE_PATH: '/nonexistent/claude',
           ABELE_TAILSCALE_PATH: '/nonexistent/tailscale',
@@ -1713,6 +1733,24 @@ test(
         assert.equal(report.running, false)
         assert.equal(report.state_dir, join(await realpath(h), '.local/state/abele-node'))
       }
+      const updateCheck = await run(
+        join(h, '.local/bin/abele-node'),
+        ['update', '--check', '--json'],
+        {
+          HOME: h,
+          ABELE_INSTALL_API_URL: `${base}/latest`,
+          ABELE_INSTALL_BASE_URL: base,
+          ABELE_CLAUDE_PATH: '/nonexistent/claude',
+          ABELE_TAILSCALE_PATH: '/nonexistent/tailscale',
+        }
+      )
+      assert.equal(updateCheck.code, 0, updateCheck.stderr)
+      const updateReport = JSON.parse(updateCheck.stdout)
+      assert.equal(updateReport.current, realVersion)
+      assert.equal(updateReport.target, '0.2.0')
+      assert.equal(updateReport.target_kind, 'latest')
+      assert.equal(updateReport.status, 'checked')
+      await assert.rejects(access(join(h, '.local/state/abele-node/update.lock')))
     } finally {
       if (realVersion === '0.2.0') {
         const bytes = await readFile(archive)

@@ -63,9 +63,10 @@ switch(args[1]){
     fs.mkdirSync(flag('--dir'),{recursive:true});
     for(const name of state.assets)fs.copyFileSync(path.join(storage,name),path.join(flag('--dir'),name));
     if(mode==='corrupt-download')fs.writeFileSync(path.join(flag('--dir'),state.assets.find(name=>name.endsWith('.tar.gz'))),'corrupt');
+    if(mode==='corrupt-installer')fs.writeFileSync(path.join(flag('--dir'),'install.sh'),'corrupt');
     break;
   case 'edit':
-    state.isDraft=false; if(state.assets.length!==5)state.exposed_incomplete=true; save(); break;
+    state.isDraft=false; if(state.assets.length!==6)state.exposed_incomplete=true; save(); break;
   default: throw new Error('unexpected gh operation '+args);
 }
 `,
@@ -110,17 +111,28 @@ switch(args[1]){
       ...result,
       remote: JSON.parse(await readFile(join(home, 'remote.json'), 'utf8')),
       log: await readFile(join(home, 'gh.log'), 'utf8'),
+      manifest: await readFile(join(assets, 'SHA256SUMS'), 'utf8'),
+      installer: await readFile(join(home, 'remote-assets/install.sh'), 'utf8').catch(() => null),
     }
   } finally {
     await rm(home, { recursive: true, force: true })
   }
 }
-test('release remains draft until all five assets have been downloaded and verified', async () => {
+test('release remains draft until all six assets have been downloaded and verified', async () => {
   const result = await publish('success')
   assert.equal(result.code, 0, result.stderr)
   assert.equal(result.remote.exposed_incomplete, false)
   assert.equal(result.remote.isDraft, false)
-  assert.equal(result.remote.assets.length, 5)
+  assert.equal(result.remote.assets.length, 6)
+  assert.ok(result.remote.assets.includes('install.sh'))
+  assert.equal(result.installer, await readFile('install.sh', 'utf8'))
+  assert.match(result.manifest, /^[a-f0-9]{64}  install\.sh$/m)
+  const download = result.log
+    .split('\n')
+    .filter(Boolean)
+    .map(JSON.parse)
+    .find((args) => args[1] === 'download')
+  assert.ok(download.includes('install.sh'))
   const operations = result.log
     .trim()
     .split('\n')
@@ -137,6 +149,12 @@ test('upload failure leaves the incomplete release unpublished', async () => {
 })
 test('a corrupted downloaded asset prevents publication', async () => {
   const result = await publish('corrupt-download')
+  assert.notEqual(result.code, 0)
+  assert.equal(result.remote.isDraft, true)
+  assert.doesNotMatch(result.log, /"edit"/)
+})
+test('a corrupted downloaded installer prevents publication', async () => {
+  const result = await publish('corrupt-installer')
   assert.notEqual(result.code, 0)
   assert.equal(result.remote.isDraft, true)
   assert.doesNotMatch(result.log, /"edit"/)

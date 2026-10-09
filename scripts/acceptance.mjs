@@ -63,16 +63,20 @@ class FileStore {
 function token(label) {
   const result = spawnSync(
     process.execPath,
-    [cli, 'token', 'create', label, '--state-dir', state],
+    [cli, '--json', 'token', 'create', label, '--state-dir', state],
     { encoding: 'utf8' }
   )
   assert.equal(result.status, 0, result.stderr)
   return JSON.parse(result.stdout)
 }
 async function start() {
-  const child = spawn(process.execPath, [cli, 'start', '--state-dir', state, '--port', '0'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const child = spawn(
+    process.execPath,
+    [cli, '--json', 'start', '--state-dir', state, '--port', '0'],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  )
   processes.add(child)
   let output = '',
     errors = ''

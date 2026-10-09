@@ -87,7 +87,20 @@ it('documents paired availability and keeps remote configuration examples deploy
   expect(readme).toMatch(
     /Node-side paired WSS\s+through Tailscale Serve is available but separately enabled/
   )
-  expect(readme).toMatch(/plugin pairing UI is\s+not yet released/)
+  expect(readme).toMatch(/\*\*Pair remote node\*\* action with an invitation/)
+  expect(readme).toMatch(/Real phone pairing\s+remains unverified/)
+  for (const file of ['README.md', 'docs/install.md']) {
+    const text = readFileSync(file, 'utf8')
+    expect(text, file).toContain('Abele Settings → Nodes')
+    expect(text, file).toContain('**Label:** any name you like')
+    expect(text, file).toContain('**URL:** `http://127.0.0.1:7777`')
+    expect(text, file).toContain('**Installation token:** the token printed by `token create`')
+    expect(text, file).toContain('**Add node**')
+    expect(text, file).toContain('**Pair remote node**')
+    expect(text, file).not.toMatch(/plugin pairing UI is\s+not yet released/)
+    expect(text, file).not.toContain('Pairing/remote enrollment is not available')
+    expect(text, file).not.toContain('ws://127.0.0.1:7777/channel')
+  }
   expect(readme).toContain('docs/remote-access.md')
   expect(readme).not.toMatch(/Remote control, pairing.*planned, not implemented/s)
   const security = readFileSync('docs/security.md', 'utf8')

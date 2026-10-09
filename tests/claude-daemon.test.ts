@@ -48,6 +48,7 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
       process.execPath,
       [
         cli,
+        '--json',
         'start',
         '--state-dir',
         state,
@@ -133,15 +134,23 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     cpSync(resolve('tests/fixtures/claude.mjs'), executable)
     chmodSync(executable, 0o700)
     const auth = JSON.parse(
-      command(dir, process.execPath, [cli, 'token', 'create', 'fixture', '--state-dir', state])
+      command(dir, process.execPath, [
+        cli,
+        '--json',
+        'token',
+        'create',
+        'fixture',
+        '--state-dir',
+        state,
+      ])
     ) as { token: string }
     let daemon = await start()
     const store = new MemoryClientStore()
-    let a = await connect(daemon, auth.token, store),
-      b = await connect(daemon, auth.token, new MemoryClientStore())
+    let a = await connect(daemon, auth.token, store)
+    const b = await connect(daemon, auth.token, new MemoryClientStore())
     expect(await a.describe()).toHaveProperty('providers')
     const doctor = JSON.parse(
-      command(dir, process.execPath, [cli, 'doctor', '--state-dir', state])
+      command(dir, process.execPath, [cli, '--json', 'doctor', '--state-dir', state])
     ) as { claude: { configuration: { profile: string; executable: string } } }
     expect(doctor.claude.configuration.profile).toBe('isolated')
     expect(doctor.claude.configuration.executable).toBe(realpathSync(executable))

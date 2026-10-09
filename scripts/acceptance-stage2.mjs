@@ -31,9 +31,13 @@ function git(cwd, ...args) {
   return run(cwd, '/usr/bin/git', args)
 }
 async function start() {
-  const child = spawn(process.execPath, [cli, 'start', '--state-dir', state, '--port', '0'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const child = spawn(
+    process.execPath,
+    [cli, '--json', 'start', '--state-dir', state, '--port', '0'],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  )
   processes.add(child)
   let text = '',
     error = ''
@@ -111,6 +115,7 @@ try {
   const credential = JSON.parse(
     run(process.cwd(), process.execPath, [
       cli,
+      '--json',
       'token',
       'create',
       'stage2-acceptance',

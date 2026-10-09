@@ -104,6 +104,7 @@ const start = async () => {
     process.execPath,
     [
       cli,
+      '--json',
       'start',
       '--state-dir',
       state,
@@ -148,11 +149,13 @@ const start = async () => {
     if (e.type === 'pi.turn_start') providerTurns++
   })
   assert.equal(
-    JSON.parse(command(process.execPath, [cli, 'status', '--state-dir', state])).pi.configuration
-      .sdk_version,
+    JSON.parse(command(process.execPath, [cli, '--json', 'status', '--state-dir', state])).pi
+      .configuration.sdk_version,
     '0.87.0'
   )
-  report.doctor = JSON.parse(command(process.execPath, [cli, 'doctor', '--state-dir', state]))
+  report.doctor = JSON.parse(
+    command(process.execPath, [cli, '--json', 'doctor', '--state-dir', state])
+  )
   assert.equal(report.doctor.pi.configuration.profile, 'isolated')
 }
 const stop = async () => {
@@ -253,7 +256,15 @@ try {
   command('/usr/bin/git', ['add', '.'], repo)
   command('/usr/bin/git', ['commit', '-m', 'disposable fixture'], repo)
   token = JSON.parse(
-    command(process.execPath, [cli, 'token', 'create', 'acceptance', '--state-dir', state])
+    command(process.execPath, [
+      cli,
+      '--json',
+      'token',
+      'create',
+      'acceptance',
+      '--state-dir',
+      state,
+    ])
   ).token
   await start()
   const project = await client.registerProject(repo, 'trusted'),

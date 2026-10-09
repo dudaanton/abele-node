@@ -14,7 +14,7 @@ writeFileSync(join(repo, 'sample.txt'), 'before')
 const cli = resolve('packages/node-daemon/dist/cli.js')
 const token = spawnSync(
   process.execPath,
-  [cli, 'token', 'create', 'fixture', '--state-dir', state],
+  [cli, '--json', 'token', 'create', 'fixture', '--state-dir', state],
   { encoding: 'utf8' }
 )
 assert.equal(token.status, 0, token.stderr)
@@ -26,6 +26,7 @@ async function start() {
     process.execPath,
     [
       cli,
+      '--json',
       'start',
       '--state-dir',
       state,

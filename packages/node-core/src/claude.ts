@@ -10,6 +10,7 @@ import type {
 import { canonical, type NodeCore } from './index.js'
 import type { ProviderAdapter } from './providers.js'
 import type { PiAction } from '@abele/provider-pi'
+import { updateInProgress, tryRunAdmission } from './update-lock.js'
 
 type Input = Record<string, string | number | null>
 const actor = { kind: 'node' } as const
@@ -117,12 +118,12 @@ export class ProviderSessions {
       if (!active.starting && !['dispatching', 'delivered'].includes(input.state))
         await this.retryCleanup(session, active)
     }
-    if (this.stopping) return
+    if (this.stopping || updateInProgress(this.core.stateDir)) return
     const rows = this.core.db
       .prepare("SELECT * FROM inputs WHERE state IN ('accepted','queued') ORDER BY ordinal")
       .all() as Input[]
     for (const input of rows) {
-      if (this.stopping || this.active.size >= 4) break
+      if (this.stopping || updateInProgress(this.core.stateDir) || this.active.size >= 4) break
       const session = this.core.session(String(input.session_id))
       const adapter = this.adapterFor(session.provider)
       if (session.provider === 'fake' || !adapter?.available || this.active.has(session.session_id))
@@ -137,41 +138,50 @@ export class ProviderSessions {
         const workspace = this.core.resources.workspaces.get(session.workspace_id)
         const project = await this.core.resources.workspaces.bound(workspace)
         if (project.trust !== 'trusted') throw new ChannelError('project_untrusted')
-        if (this.stopping) {
+        const releaseAdmission = tryRunAdmission(this.core.stateDir)
+        if (!releaseAdmission) {
           this.active.delete(session.session_id)
           return
         }
-        // Recheck cancellation and principal after async filesystem checks, before durable dispatch.
-        const current = this.core.db
-          .prepare('SELECT * FROM inputs WHERE input_id=?')
-          .get(String(input.input_id)) as Input
-        if (!['accepted', 'queued'].includes(String(current.state))) {
-          this.active.delete(session.session_id)
-          continue
-        }
         let useRepositoryPermissions = false
-        this.core.transaction(() => {
-          const currentProject = this.core.resources.projects.get(project.project_id)
-          if (currentProject.trust !== 'trusted') throw new ChannelError('project_untrusted')
-          useRepositoryPermissions = currentProject.use_repository_claude_permissions
-          this.core.checkExecution(String(input.principal_id), session.session_id)
-          input.run_id = run_id
-          this.core.db
-            .prepare('UPDATE inputs SET run_id=? WHERE input_id=?')
-            .run(run_id, String(input.input_id))
-          this.core.transition(input, 'dispatching')
-          this.core.db
-            .prepare("INSERT INTO provider_runs(run_id,session_id,state) VALUES(?,?,'active')")
-            .run(run_id, session.session_id)
-          this.core.append(session.session_id, 'run.started', actor, {
-            run_id,
-            input_id: input.input_id,
-            configuration: adapter.configurationForTurn({
-              use_repository_claude_permissions: useRepositoryPermissions,
-            }),
-            native_session_id: session.native_session_id ?? null,
+        try {
+          if (this.stopping || updateInProgress(this.core.stateDir, true)) {
+            this.active.delete(session.session_id)
+            return
+          }
+          // Recheck cancellation and principal after async filesystem checks, before durable dispatch.
+          const current = this.core.db
+            .prepare('SELECT * FROM inputs WHERE input_id=?')
+            .get(String(input.input_id)) as Input
+          if (!['accepted', 'queued'].includes(String(current.state))) {
+            this.active.delete(session.session_id)
+            continue
+          }
+          this.core.transaction(() => {
+            const currentProject = this.core.resources.projects.get(project.project_id)
+            if (currentProject.trust !== 'trusted') throw new ChannelError('project_untrusted')
+            useRepositoryPermissions = currentProject.use_repository_claude_permissions
+            this.core.checkExecution(String(input.principal_id), session.session_id)
+            input.run_id = run_id
+            this.core.db
+              .prepare('UPDATE inputs SET run_id=? WHERE input_id=?')
+              .run(run_id, String(input.input_id))
+            this.core.transition(input, 'dispatching')
+            this.core.db
+              .prepare("INSERT INTO provider_runs(run_id,session_id,state) VALUES(?,?,'active')")
+              .run(run_id, session.session_id)
+            this.core.append(session.session_id, 'run.started', actor, {
+              run_id,
+              input_id: input.input_id,
+              configuration: adapter.configurationForTurn({
+                use_repository_claude_permissions: useRepositoryPermissions,
+              }),
+              native_session_id: session.native_session_id ?? null,
+            })
           })
-        })
+        } finally {
+          releaseAdmission()
+        }
         const body = JSON.parse(String(input.body)) as { text: string }
         slot.run = await adapter.startTurn(
           {

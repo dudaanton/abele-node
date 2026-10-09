@@ -117,7 +117,7 @@ it(
         (
           await promisify(execFile)(
             process.execPath,
-            [resolve('packages/node-daemon/dist/cli.js'), ...args, '--state-dir', dir],
+            [resolve('packages/node-daemon/dist/cli.js'), '--json', ...args, '--state-dir', dir],
             { timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
           )
         ).stdout

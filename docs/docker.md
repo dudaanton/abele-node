@@ -26,7 +26,7 @@ docker compose -f docker-compose.example.yml exec abele-node \
 ```
 
 The example builds locally and names the image
-`ghcr.io/dudaanton/abele-node:0.3.4`. Once a release exists, use
+`ghcr.io/dudaanton/abele-node:0.3.5`. Once a release exists, use
 `docker compose -f docker-compose.example.yml pull` and `up -d --no-build`
 to use the registry image instead. Prefer version tags (or a release image digest)
 over `latest` for upgrades. Tag pushes matching `vX.Y.Z` publish both Linux amd64
@@ -134,7 +134,7 @@ provider installation. Build your own derived image; do not redistribute the
 provider binary without permission:
 
 ```dockerfile
-FROM ghcr.io/dudaanton/abele-node:0.3.4
+FROM ghcr.io/dudaanton/abele-node:0.3.5
 # ./provider/claude must be a compatible Linux binary, not a macOS executable.
 COPY --chown=node:node --chmod=0555 provider/claude /opt/provider/claude
 ENV ABELE_CLAUDE_PATH=/opt/provider/claude

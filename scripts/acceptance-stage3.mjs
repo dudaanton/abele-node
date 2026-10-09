@@ -60,6 +60,7 @@ async function start() {
     process.execPath,
     [
       cli,
+      '--json',
       'start',
       '--state-dir',
       state,
@@ -158,7 +159,8 @@ async function permissions(client, sessions) {
                 ? 'allow'
                 : 'deny'
             await client.answerPrompt(p, choice)
-            choice === 'allow' ? allowed++ : denied++
+            if (choice === 'allow') allowed++
+            else denied++
           }
       }
     await delay(30)
@@ -229,6 +231,7 @@ try {
   const credential = JSON.parse(
     command(process.cwd(), process.execPath, [
       cli,
+      '--json',
       'token',
       'create',
       'stage3',

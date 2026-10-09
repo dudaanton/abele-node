@@ -1,0 +1,144 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`doctor checklist: healthy=false 1`] = `
+"OK Node: v22.23.2
+OK Local storage: available
+PROBLEM State directory: /state (755); fix: chmod 700 "/state"
+PROBLEM Daemon: not running; fix: run abele-node start or start the installed service
+OK Service: no LaunchAgent; use foreground start or your service manager
+PROBLEM Claude: unavailable — Executable missing; fix: sh install.sh --claude-path /path/to/claude and restart.
+PROBLEM pi: unavailable — pinned SDK missing; fix: Install and build pinned SDK 0.87.0 with audited brace-expansion 5.0.12
+PROBLEM Paired/remote: wss://node.example:8443/channel; Serve mapping unavailable; run abele-node doctor; fix: verify Tailscale prerequisites and enable Serve
+PROBLEM Tailscale: unavailable or unverified; fix: install Tailscale and pass --tailscale-path /absolute/path/to/tailscale
+PROBLEM Tailnet login: unavailable or unverified; fix: run tailscale up
+PROBLEM MagicDNS: unavailable or unverified; fix: enable MagicDNS in the Tailscale admin console
+PROBLEM HTTPS: unavailable or unverified; fix: enable HTTPS certificates in the Tailscale admin console
+PROBLEM Paired endpoint: unavailable or unverified; fix: set the paired endpoint hostname to this node’s Tailscale DNS name
+PROBLEM Serve mapping: unavailable or unverified; fix: verify tailnet policy, then run abele-node serve enable --tailnet-policy-verified
+PROBLEM Tailnet policy: unavailable or unverified; fix: verify the tailnet ACLs manually before enabling Serve
+PROBLEM Local token port: mapping safety unverified; fix: inspect tailscale serve status and remove any mapping to the local token port
+UNKNOWN Disk encryption: could not be determined; check FileVault or your operating system’s disk-encryption settings"
+`;
+
+exports[`doctor checklist: healthy=true 1`] = `
+"OK Node: v22.23.2
+OK Local storage: available
+OK State directory: /state (700)
+OK Daemon: running (0.3.2)
+OK Service: LaunchAgent installed
+OK Claude: available (2.1.291)
+OK pi: available (0.87.0)
+OK Paired/remote: wss://node.example:8443/channel; Serve mapping active
+OK Tailscale: ready
+OK Tailnet login: ready
+OK MagicDNS: ready
+OK HTTPS: ready
+OK Paired endpoint: ready
+OK Serve mapping: ready
+OK Tailnet policy: ready
+OK Local token port: not exposed via Serve
+UNKNOWN Disk encryption: could not be determined; check FileVault or your operating system’s disk-encryption settings"
+`;
+
+exports[`errors are one sentence with a code 1`] = `"Could not complete the command: already running. (already_running)"`;
+
+exports[`human command ["install"] 1`] = `
+"Installed LaunchAgent: /agents/node.plist
+Runtime: /runtime"
+`;
+
+exports[`human command ["pair","confirm"] 1`] = `"Paired installation install-one: confirmed; fingerprint fingerprint."`;
+
+exports[`human command ["pair","invite"] 1`] = `
+"Pairing invitation (expires 2027-01-15T08:00:00.000Z):
+endpoint: wss://node.example/channel
+node id: node-one
+node fingerprint: fingerprint
+invite id: invite-one
+secret: secret
+expires at: 1800000000000
+Paste these invitation fields into the Abele plugin’s remote node enrollment. Keep the secret private."
+`;
+
+exports[`human command ["pair","list"] 1`] = `"No paired devices."`;
+
+exports[`human command ["pair","revoke"] 1`] = `"Revoked paired installation install-one."`;
+
+exports[`human command ["pair","rotate"] 1`] = `
+"Rotated node key: kty: EC
+crv: P-256
+x: x
+y: y"
+`;
+
+exports[`human command ["serve","disable"] 1`] = `"Tailscale Serve disabled."`;
+
+exports[`human command ["serve","enable"] 1`] = `"Tailscale Serve enabled."`;
+
+exports[`human command ["start"] 1`] = `"AbeleNode running on port 7777; node ID node-one; paired port 8888."`;
+
+exports[`human command ["stop"] 1`] = `"Stopping AbeleNode (PID 42)."`;
+
+exports[`human command ["stop"] 2`] = `"AbeleNode is not running."`;
+
+exports[`human command ["token","create"] 1`] = `
+"Token created. Shown once; keep it only on this device, never in synced notes or settings.
+In Abele Settings → Nodes, add a local node:
+Label: any name you like
+URL: http://127.0.0.1:7777
+Installation token: secret-once
+Click Add node."
+`;
+
+exports[`human command ["token","list"] 1`] = `
+"install-one — desktop (active)
+install-two — old (revoked)"
+`;
+
+exports[`human command ["token","list"] 2`] = `"No tokens."`;
+
+exports[`human command ["token","revoke"] 1`] = `"Revoked installation install-one."`;
+
+exports[`human status: paired remote 1`] = `
+"AbeleNode: running
+Version: 0.3.2
+Port: 7777
+Node ID: node-one
+Claude: available (2.1.291)
+pi: available (0.87.0)
+Paired/remote: wss://node.example:8443/channel; Serve mapping active
+Projects: 2; workspaces: 3"
+`;
+
+exports[`human status: running local 1`] = `
+"AbeleNode: running
+Version: 0.3.2
+Port: 7777
+Node ID: node-one
+Claude: available (2.1.291)
+pi: available (0.87.0)
+Paired/remote: disabled (local only)
+Projects: 2; workspaces: 3"
+`;
+
+exports[`human status: stopped unavailable 1`] = `
+"AbeleNode: not running
+Version: 0.3.2
+Port: 7777
+Node ID: not created
+Claude: unavailable — Executable missing; fix: sh install.sh --claude-path /path/to/claude and restart.
+pi: unavailable — pinned SDK missing; fix: Install and build pinned SDK 0.87.0.
+Paired/remote: disabled (local only)
+Projects: 0; workspaces: 0"
+`;
+
+exports[`human status: unreadable counts 1`] = `
+"AbeleNode: running
+Version: 0.3.2
+Port: 7777
+Node ID: node-one
+Claude: available (2.1.291)
+pi: available (0.87.0)
+Paired/remote: disabled (local only)
+Projects: unknown; workspaces: unknown"
+`;

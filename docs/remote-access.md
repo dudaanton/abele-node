@@ -82,7 +82,7 @@ not prove certificate issuance/renewal, forwarding behavior or effective ACLs.
 ## Invitation and owner confirmation
 
 ```sh
-node packages/node-daemon/dist/cli.js pair invite phone
+node packages/node-daemon/dist/cli.js pair invite phone --json
 # JSON is the QR/invite payload. Treat its secret as sensitive; default expiry: 5 minutes.
 node packages/node-daemon/dist/cli.js pair list
 node packages/node-daemon/dist/cli.js pair confirm INSTALLATION_ID DEVICE_FINGERPRINT
@@ -161,7 +161,7 @@ To bind an existing local principal to a device key, issue an invitation with ex
 local authorization:
 
 ```sh
-node packages/node-daemon/dist/cli.js pair invite desktop --pair-installation EXISTING_ID
+node packages/node-daemon/dist/cli.js pair invite desktop --json --pair-installation EXISTING_ID
 ```
 
 After proof and confirmation, the installation ID is unchanged. Continue using the

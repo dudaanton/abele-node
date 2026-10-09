@@ -7,8 +7,9 @@ an authenticated WebSocket client API. Plugin UI availability depends on the plu
 version; this repository supplies the daemon, protocol and client libraries.
 
 **Early software.** Local-token control stays loopback-only. Node-side paired WSS
-through Tailscale Serve is available but separately enabled; plugin pairing UI is
-not yet released. Claude Code execution works with explicitly tested CLI versions;
+through Tailscale Serve is available but separately enabled; use the plugin’s
+**Pair remote node** action with an invitation. Claude Code execution works with
+explicitly tested CLI versions;
 the pi SDK provider is available and capability-gated;
 see [pi configuration and limits](docs/pi.md). Windows is untested. See
 [remote access, pairing and revocation](docs/remote-access.md).
@@ -34,7 +35,8 @@ see [pi configuration and limits](docs/pi.md). Windows is untested. See
   installation. Offline tests use a non-executing fake provider and fake CLI fixtures.
 - Separately enabled paired WSS through Tailscale Serve, owner-confirmed device keys,
   node-key pinning, revocation and explicit migration/recovery. The node-side client
-  API is available; the plugin pairing UI is not yet released.
+  API and the plugin’s **Pair remote node** action are available. Real phone pairing
+  remains unverified here.
 
 Git-mutation UI, live steering, AskUserQuestion, persistent always-allow,
 exhaustive child history and readable thinking are **not supported**. An experimental
@@ -84,9 +86,17 @@ abele-node status
 abele-node doctor
 ```
 
-The token command prints an `installation_id` and a new `token` **once**. Enroll the
-plugin with `ws://127.0.0.1:7777/channel`, that installation ID/token, and the reported
-`node_id` where requested. Use device-local secret storage, never synced settings.
+In the plugin, open **Abele Settings → Nodes** and fill in:
+
+- **Label:** any name you like.
+- **URL:** `http://127.0.0.1:7777` (use the port printed by `token create` if different).
+- **Installation token:** the token printed by `token create`.
+
+Click **Add node**. The token is shown **once**; keep it only on this device, never
+in synced notes or settings. You do not need to paste an installation ID or node ID.
+CLI output is plain text by default; add `--json` only for scripts.
+For a phone or remote desktop, use **Pair remote node**, not this loopback URL;
+see [remote access](docs/remote-access.md).
 See [installation](docs/install.md) for exact configuration, service examples,
 upgrades, backups and troubleshooting. A missing/incompatible CLI does not prevent
 startup or fake-provider use.

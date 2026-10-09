@@ -11,12 +11,15 @@ export function daemonProcessPresent(pid: number, entry: string, state: string):
   })
   if (result.status === 0 && result.stdout.trim()) {
     const command = result.stdout.trim()
-    const invocation = ` ${entry} start --state-dir ${state}`
-    const index = command.indexOf(invocation)
-    return (
-      index >= 0 &&
-      (command.length === index + invocation.length || command[index + invocation.length] === ' ')
-    )
+    // JSON output is a presentation flag, not a change in daemon ownership.
+    return ['start', 'start --json', '--json start'].some((start) => {
+      const invocation = ` ${entry} ${start} --state-dir ${state}`
+      const index = command.indexOf(invocation)
+      return (
+        index >= 0 &&
+        (command.length === index + invocation.length || command[index + invocation.length] === ' ')
+      )
+    })
   }
   if (processAbsent(pid)) return false
   throw new Error('daemon_process_ownership_unconfirmed')

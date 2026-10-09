@@ -373,7 +373,7 @@ const fd=fs.openSync(reserve,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally
 fs.appendFileSync(journal,JSON.stringify({phase:'capacity-verified'})+'\n');const log=fs.openSync(journal,fs.constants.O_RDONLY);try{fs.fsyncSync(log)}finally{fs.closeSync(log)};
 NODE
 }
-cli() { "$node" "$root/$1/packages/node-daemon/dist/cli.js" "$2" --state-dir "$state" --claude-path "$claude"; }
+cli() { "$node" "$root/$1/packages/node-daemon/dist/cli.js" "$2" --json --state-dir "$state" --claude-path "$claude"; }
 switch_to() {
   rm -f "$work/current" || return 1
   ln -s "$1" "$work/current" || return 1
@@ -497,7 +497,7 @@ start_service() {
     write_id=$journal_action_id
     journal_intent started-service "$service_file" "$runtime" || return 1
     started_id=$journal_action_id
-    "$node" "$root/$runtime/packages/node-daemon/dist/cli.js" install --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
+    "$node" "$root/$runtime/packages/node-daemon/dist/cli.js" install --json --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
     journal_done "$write_id" || return 1
     journal_done "$started_id" || return 1
   else
@@ -510,7 +510,7 @@ if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
 const q=(s,expand=false)=>'"'+s.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%').replaceAll('$',()=>expand?'$$':'$')+'"';
-fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--state-dir',state,'--claude-path',claude].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
+fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--claude-path',claude].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
 const fd=fs.openSync(candidate,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
 fs.renameSync(candidate,unit);
 }finally{fs.rmSync(temporary,{recursive:true,force:true})}
@@ -768,7 +768,7 @@ tar -xzf "$work/$asset" -C "$work/runtime"
 [ -f "$work/runtime/packages/node-daemon/dist/cli.js" ] || fail 'Archive has no built daemon.'
 "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version!==process.argv[2])process.exit(1)' "$work/runtime/package.json" "$version" || fail 'Archive version mismatch.'
 # Validate imports/diagnostics before disrupting the previous service.
-"$node" "$work/runtime/packages/node-daemon/dist/cli.js" status --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed; previous install retained (no rollback needed).'
+"$node" "$work/runtime/packages/node-daemon/dist/cli.js" status --json --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed; previous install retained (no rollback needed).'
 if [ "$service" = 0 ] || [ "$old_service" = 0 ]; then
   "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).running)process.exit(1)' "$work/preflight.json" || fail 'stop_before_install: stop the foreground/manual daemon before installation or conversion.'
 fi
@@ -803,7 +803,7 @@ if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathS
 const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
-fs.writeFileSync(config,JSON.stringify({version,state,state_identity,claude,service:Number(service),...ownership})+'\n',{mode:0o600});
+fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,service:Number(service),...ownership})+'\n',{mode:0o600});
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi
 if [ -f "$config" ]; then cp -p "$config" "$work/published-config.previous"; fi
@@ -818,11 +818,14 @@ journal_done "$config_id" || fail 'Cannot mark configuration publication done.'
 transaction=0
 journal_recording=0
 case ":${PATH:-}:" in *":$prefix/bin:"*) ;; *) printf 'Add %s/bin to PATH before running abele-node.\n' "$prefix" ;; esac
-printf '%s\n' 'AbeleNode installed. Next: abele-node token create desktop' \
-  'This prints an installation ID and token ONCE. Store them only in device-local secret storage.' \
-  'In an Abele plugin version with node enrollment, add ws://127.0.0.1:7777/channel,' \
-  'the installation ID/token, and node_id from abele-node status when requested.' \
-  'Never put enrollment secrets in synced settings or notes.'
-[ "$service" = 1 ] || printf '%s\n' 'No service installed. Start in a terminal with: abele-node start'
+local_port=$("$node" -e 'const s=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); console.log(Number.isInteger(s.port) && s.port>0 && s.port<=65535 ? s.port : 7777)' "$work/status.json")
+printf '%s\n' 'AbeleNode installed.'
+[ "$service" = 1 ] || printf '%s\n' 'First start it in a terminal: abele-node start'
+printf '%s\n' 'Next: abele-node token create desktop' \
+  'In Abele Settings → Nodes, add a local node:' \
+  'Label: any name you like' \
+  "URL: http://127.0.0.1:$local_port" \
+  'Installation token: paste the token printed by the command' \
+  'Click Add node. The token is shown once; keep it only on this device, never in synced notes or settings.'
 }
 abele_install "$@"

@@ -28,6 +28,7 @@ import {
 
 import { canonicalStateDir } from './state.js'
 export { canonicalStateDir } from './state.js'
+export { acquireUpdateLock } from './update-lock.js'
 import { ResourceServices } from './resources.js'
 import { DelegationService } from './delegation.js'
 export { DelegationService, DelegationMailbox, WorkerReporter } from './delegation.js'

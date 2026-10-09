@@ -30,6 +30,7 @@ for (const mode of [
         command = [
           process.execPath,
           resolve('packages/node-daemon/dist/cli.js'),
+          '--json',
           'start',
           '--state-dir',
           canonical,
@@ -122,7 +123,15 @@ cp.spawnSync=(binary,args)=>{
       const result = await new Promise((done, reject) => {
         const child = spawn(
           process.execPath,
-          ['--import', shim, 'packages/node-daemon/dist/cli.js', 'stop', '--state-dir', requested],
+          [
+            '--import',
+            shim,
+            'packages/node-daemon/dist/cli.js',
+            '--json',
+            'stop',
+            '--state-dir',
+            requested,
+          ],
           { env: { ...process.env, HOME: home } }
         )
         let stdout = '',
@@ -184,6 +193,7 @@ cp.spawnSync=(binary)=>{if(binary!=='/bin/launchctl')throw new Error('unexpected
           '--import',
           shim,
           'packages/node-daemon/dist/cli.js',
+          '--json',
           'install',
           '--runtime-dir',
           resolve('.'),
@@ -223,6 +233,7 @@ cp.spawnSync=(command,args)=>{if(command!=='/bin/launchctl')throw new Error('une
           '--import',
           shim,
           'packages/node-daemon/dist/cli.js',
+          '--json',
           'install',
           '--runtime-dir',
           resolve('.'),
@@ -302,6 +313,7 @@ syncBuiltinESMExports();`
               '--import',
               shim,
               'packages/node-daemon/dist/cli.js',
+              '--json',
               'install',
               ...(direct ? ['--runtime-dir', installedRoot] : []),
               '--claude-path',

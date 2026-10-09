@@ -110,7 +110,15 @@ it('status and doctor expose an actionable unavailable reason while stopped', ()
   for (const command of ['status', 'doctor']) {
     const result = spawnSync(
       process.execPath,
-      ['packages/node-daemon/dist/cli.js', command, '--state-dir', state, '--claude-path', missing],
+      [
+        'packages/node-daemon/dist/cli.js',
+        '--json',
+        command,
+        '--state-dir',
+        state,
+        '--claude-path',
+        missing,
+      ],
       { encoding: 'utf8', timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
     )
     expect(result.status, result.stderr).toBe(0)

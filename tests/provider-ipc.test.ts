@@ -170,7 +170,7 @@ it('a fake-provider CLI run with long custom state never creates default-home IP
     command('/usr/bin/git', args)
   const cli = resolve('packages/node-daemon/dist/cli.js')
   const token = JSON.parse(
-    command(process.execPath, [cli, 'token', 'create', 'fixture', '--state-dir', state])
+    command(process.execPath, [cli, '--json', 'token', 'create', 'fixture', '--state-dir', state])
   ) as { token: string }
   let daemon: ChildProcess | undefined, client: NodeClient | undefined
   const until = async <T>(check: () => T | Promise<T>): Promise<NonNullable<T>> => {
@@ -186,6 +186,7 @@ it('a fake-provider CLI run with long custom state never creates default-home IP
       process.execPath,
       [
         cli,
+        '--json',
         'start',
         '--state-dir',
         state,
