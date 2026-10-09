@@ -9,6 +9,17 @@ import {
 import { LocalChannelConnector, RequestChannel, reconnect } from '@abele/channel-client'
 import {
   SessionSchema,
+  DelegationSchema,
+  DelegationStatusSchema,
+  DelegationSendResultSchema,
+  DelegationGrantSchema,
+  DelegationGrantRequestSchema,
+  type DelegationGrant,
+  type Delegation,
+  type DelegationCreateRequest,
+  type DelegationGrantRequest,
+  type DelegationStatus,
+  type DelegationSendResult,
   PromptSchema,
   NodeEventSchema,
   validateParams,
@@ -49,6 +60,13 @@ export type {
   FileWrite,
   FileRestore,
   FileMutationResult,
+  Delegation,
+  DelegationStatus,
+  DelegationSendResult,
+  DelegationGrant,
+  DelegationCreateRequest,
+  DelegationGrantRequest,
+  WorkerReport,
 } from '@abele/node-protocol'
 export interface OutboxEntry {
   operation_id: string
@@ -238,6 +256,38 @@ export class NodeClient {
   }
   describe() {
     return this.request('node.describe', {})
+  }
+  /** Human/owner approval surface only. Never register this method as a model tool. */
+  async approveDelegationGrant(params: DelegationGrantRequest): Promise<DelegationGrant> {
+    return DelegationGrantSchema.parse(
+      await this.mutation('delegation.grant.create', DelegationGrantRequestSchema.parse(params))
+    )
+  }
+  async revokeDelegationGrant(grant_id: string): Promise<DelegationGrant> {
+    return DelegationGrantSchema.parse(await this.mutation('delegation.grant.revoke', { grant_id }))
+  }
+  /** A stable delegation_key survives even retries using a fresh operation ID. */
+  async createDelegation(params: DelegationCreateRequest): Promise<Delegation> {
+    return DelegationSchema.parse(await this.mutation('delegation.create', params))
+  }
+  async delegationStatus(delegation_id: string): Promise<DelegationStatus> {
+    return DelegationStatusSchema.parse(await this.request('delegation.status', { delegation_id }))
+  }
+  async sendDelegation(
+    delegation_id: string,
+    text: string,
+    observed_seq: number
+  ): Promise<DelegationSendResult> {
+    return DelegationSendResultSchema.parse(
+      await this.mutation('delegation.send', { delegation_id, text, observed_seq })
+    )
+  }
+  async cancelDelegation(delegation_id: string): Promise<Delegation> {
+    return DelegationSchema.parse(await this.mutation('delegation.cancel', { delegation_id }))
+  }
+  /** Uses the existing atomic event/cursor storage and reconnect replay, independent of child history. */
+  subscribeDelegation(delegation: Pick<Delegation, 'mailbox_stream_id'>) {
+    return this.subscribe(delegation.mailbox_stream_id)
   }
   async getSession(session_id: string) {
     return SessionSchema.parse(await this.request('session.get', { session_id }))

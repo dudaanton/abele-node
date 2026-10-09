@@ -51,6 +51,8 @@ export async function createHost(config, ask, signal, emit, hooks) {
       abort: async () => {},
       event,
       prompt: async (text, options) => {
+        // Route the fake task independently of the node reporting instruction.
+        text = text.split('\n\nWorker reporting:')[0]
         if (text === '/unsupported') {
           // SDK 0.87.0 registered commands swallow exceptions and report them
           // through the bound listener, then acknowledge handled preflight.
@@ -272,6 +274,34 @@ export async function createHost(config, ask, signal, emit, hooks) {
           writeFileSync(join(config.cwd, 'pi-resumed.txt'), header.id)
         }
         if (signal.aborted) throw Error('aborted')
+        if (text === 'delegation-report') {
+          const report = (report_id, kind, value) => {
+            active.event({ type: 'message_start', message: { role: 'assistant', content: [] } })
+            active.event({
+              type: 'message_end',
+              message: {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'text',
+                    text:
+                      '```abele-worker-report\n' +
+                      JSON.stringify({ report_id, kind, text: value }) +
+                      '\n```',
+                  },
+                ],
+                stopReason: 'stop',
+              },
+            })
+          }
+          report('progress', 'progress', 'Working')
+          report('progress', 'progress', 'Working')
+          report('question', 'question', 'Which direction?')
+          report('result', 'result', 'Structured final answer')
+          active.event({ type: 'agent_end' })
+          active.event({ type: 'agent_settled' })
+          return
+        }
         active.event({ type: 'message_start', message: { role: 'assistant', content: [] } })
         active.event({
           type: 'message_update',

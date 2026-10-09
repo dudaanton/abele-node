@@ -15,6 +15,9 @@ import {
   MUTATIONS,
   type Method,
   SessionSchema,
+  DelegationGrantSchema,
+  DelegationAuthoritySchema,
+  type DelegationGrant,
   PromptSchema,
   InputStateSchema,
   FakeStepSchema,
@@ -23,7 +26,11 @@ import {
   type FakeStep,
 } from '@abele/node-protocol'
 
+import { canonicalStateDir } from './state.js'
+export { canonicalStateDir } from './state.js'
 import { ResourceServices } from './resources.js'
+import { DelegationService } from './delegation.js'
+export { DelegationService, DelegationMailbox, WorkerReporter } from './delegation.js'
 import { PairingService } from './pairing.js'
 export { PairingService, IdentityStore } from './pairing.js'
 import { ProviderSessions } from './claude.js'
@@ -75,6 +82,54 @@ export class AuthorityService {
     if (!row) throw new ChannelError('unauthorized')
     return { installation_id: String(row.installation_id), profile: 'local-token-v1' }
   }
+  /** Resolve an installation's current controller authority, retaining the exact paired key. */
+  forInstallation(installation_id: string): AuthorityContext {
+    const paired = this.db
+      .prepare('SELECT public_key FROM paired_devices WHERE installation_id=?')
+      .get(installation_id) as Row | undefined
+    const actor: AuthorityContext = paired
+      ? { installation_id, profile: 'paired-wss-v1', device_key: String(paired.public_key) }
+      : { installation_id, profile: 'local-token-v1' }
+    this.check(actor, 'retain_authority')
+    return actor
+  }
+  snapshot(actor: AuthorityContext) {
+    const explicit = actor.profile ? actor : this.forInstallation(actor.installation_id)
+    this.check(explicit, 'retain_authority')
+    return DelegationAuthoritySchema.parse(explicit)
+  }
+  /** Inside the device-revocation transaction: a later claim of the same key cannot revive grants. */
+  invalidatePairedGrants(installation_id?: string) {
+    this.db
+      .prepare(
+        `UPDATE delegation_grants SET body=json_set(body,'$.revoked',json('true'))
+      WHERE (json_extract(body,'$.owner_authority.profile')='paired-wss-v1' AND (? IS NULL OR json_extract(body,'$.approved_by')=?))
+         OR (json_extract(body,'$.controller_authority.profile')='paired-wss-v1' AND (? IS NULL OR json_extract(body,'$.installation_id')=?))`
+      )
+      .run(
+        installation_id ?? null,
+        installation_id ?? null,
+        installation_id ?? null,
+        installation_id ?? null
+      )
+  }
+  checkGrant(grant: DelegationGrant) {
+    const retained = (id: string, saved?: AuthorityContext) => {
+      if (saved) {
+        if (saved.installation_id !== id) throw new ChannelError('unauthorized')
+        this.check(saved, 'delegation_authority')
+      } else {
+        // Legacy grants never recorded a paired key. Do not guess which device approved them,
+        // or revive an old approval after re-enrollment; require a new explicit approval.
+        if (this.db.prepare('SELECT 1 FROM paired_devices WHERE installation_id=?').get(id))
+          throw new ChannelError('unauthorized')
+        this.check({ installation_id: id, profile: 'local-token-v1' }, 'delegation_authority')
+      }
+    }
+    if (grant.revoked) throw new ChannelError('unauthorized')
+    retained(grant.approved_by, grant.owner_authority)
+    retained(grant.installation_id, grant.controller_authority)
+  }
   check(actor: AuthorityContext, _action: string, _resource?: string): void {
     if (
       !this.db
@@ -82,6 +137,24 @@ export class AuthorityService {
         .get(actor.installation_id)
     )
       throw new ChannelError('unauthorized')
+    if (_resource) {
+      const mailbox = this.db
+        .prepare('SELECT principal_id,grant_id FROM delegations WHERE mailbox_stream_id=?')
+        .get(_resource) as Row | undefined
+      if (mailbox) {
+        const grant = this.db
+          .prepare('SELECT body FROM delegation_grants WHERE grant_id=?')
+          .get(String(mailbox.grant_id)) as Row
+        const body = DelegationGrantSchema.parse(JSON.parse(String(grant.body)))
+        if (
+          mailbox.principal_id !== actor.installation_id ||
+          body.revoked ||
+          !body.actions.includes('read')
+        )
+          throw new ChannelError('unauthorized')
+        this.checkGrant(body)
+      }
+    }
     if (
       actor.profile === 'paired-wss-v1' &&
       (!actor.device_key ||
@@ -117,11 +190,13 @@ export class FakeProvider {
 }
 export class NodeCore implements JournalStore, OperationStore, SessionQueue, PromptService {
   readonly db: DatabaseSync
+  readonly stateDir: string
   readonly authority: AuthorityService
   readonly pairing: PairingService
   readonly node_id: string
   readonly provider = new FakeProvider()
   readonly resources: ResourceServices
+  readonly delegations: DelegationService
   readonly execution: ProviderSessions
   /** Compatibility alias; both providers share this dispatcher. */
   readonly claude: ProviderSessions
@@ -129,9 +204,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   private closed = false
   private storageFailed = false
   constructor(
-    readonly stateDir: string,
+    stateDir: string,
     options: { worktreeRoot?: string; claude?: ProviderAdapter; pi?: ProviderAdapter } = {}
   ) {
+    stateDir = this.stateDir = canonicalStateDir(stateDir)
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     chmodSync(stateDir, 0o700)
     this.db = new DatabaseSync(join(stateDir, 'node.sqlite'))
@@ -139,7 +215,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 10) {
+    if (version > 11) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -238,12 +314,19 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       CREATE TABLE provider_native_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), provider TEXT NOT NULL CHECK(provider='pi'), native_session_id TEXT NOT NULL, session_file TEXT UNIQUE NOT NULL);
       INSERT INTO provider_native_sessions SELECT session_id,'pi',json_extract(body,'$.native_session_id'),json_extract(body,'$.native_session_file') FROM sessions WHERE json_extract(body,'$.provider')='pi' AND json_extract(body,'$.native_session_file') IS NOT NULL;
       PRAGMA user_version=10; COMMIT;`)
+    if (version < 11)
+      this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE delegation_grants(grant_id TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE delegations(delegation_id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES installations(installation_id), delegation_key TEXT NOT NULL, request_hash TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES delegation_grants(grant_id), session_id TEXT UNIQUE NOT NULL REFERENCES sessions(session_id), mailbox_stream_id TEXT UNIQUE NOT NULL REFERENCES streams(stream_id), body TEXT NOT NULL, create_receipt TEXT NOT NULL, result_text TEXT, UNIQUE(principal_id,delegation_key));
+      CREATE TABLE delegation_reports(delegation_id TEXT NOT NULL REFERENCES delegations(delegation_id), run_id TEXT NOT NULL, report_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(delegation_id,run_id,report_id));
+      PRAGMA user_version=11; COMMIT;`)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
     if (!identity) this.db.prepare("INSERT INTO meta VALUES('node_id',?)").run(this.node_id)
     this.authority = new AuthorityService(this.db)
     this.pairing = new PairingService(this)
+    this.delegations = new DelegationService(this)
     try {
       this.resources = new ResourceServices(this, options.worktreeRoot)
       this.resources.mutations.recover()
@@ -252,6 +335,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       throw error
     }
     this.transaction(() => {
+      this.delegations.repairLeases()
       const active = this.db
         .prepare("SELECT * FROM inputs WHERE state IN ('dispatching','delivered')")
         .all() as Row[]
@@ -380,6 +464,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         workspace_editing: { status: 'supported', evidence: 'preconditioned-in-place-writes-v2' },
         immutable_diffs: { status: 'supported', evidence: 'persisted-patch-snapshots-v1' },
         review_batches: { status: 'supported', evidence: 'validated-idempotent-input-v1' },
+        delegation: { status: 'supported', evidence: 'durable-granted-mailbox-v1' },
+        worker_reporting: {
+          status: 'supported',
+          evidence: 'structured-final-message-adapter-v1; provider embedding report tool',
+        },
         execution:
           this.claude.available || this.claude.isAvailable('pi')
             ? {
@@ -423,12 +512,26 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           : 'invalid_params'
       )
     }
+    if (method.startsWith('delegation.'))
+      return this.delegations.request(actor, method, params, operation)
     if (/^(project|workspace|job|review)\./.test(method))
       return this.resources.request(actor, method, params, operation)
     if (!MUTATIONS.has(method as Method)) return this.query(actor, method, params)
     return this.commitOperation(actor, method, params, operation, () =>
       this.mutate(actor, method, params)
     )
+  }
+  /** Recheck the exact resource of a successful response at the actual transport boundary. */
+  checkPublication(actor: AuthorityContext, method: string, raw: unknown) {
+    this.authority.check(actor, 'publish')
+    if (Object.hasOwn(PairingMethodSchemas, method)) return
+    const p = validateParams(method, raw) as Record<string, unknown>
+    this.authority.check(
+      actor,
+      'publish',
+      String(p.stream_id ?? p.session_id ?? p.workspace_id ?? p.project_id ?? p.job_id ?? '')
+    )
+    this.delegations.checkPublication(actor, method, p)
   }
   operationReceipt(
     actor: AuthorityContext,
@@ -549,40 +652,46 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   acceptInput(actor: AuthorityContext, p: Record<string, unknown>): unknown {
     return this.mutate(actor, 'session.send', p)
   }
+  acceptSession(actor: AuthorityContext, p: Record<string, unknown>, provisioning = false) {
+    if (p.provider === 'claude' || p.provider === 'pi') {
+      if (!p.workspace_id) throw new ChannelError('workspace_required')
+      const workspace = this.resources.workspaces.get(String(p.workspace_id))
+      if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')
+        throw new ChannelError('project_untrusted')
+      if (!this.claude.isAvailable(String(p.provider)))
+        throw new ChannelError('provider_unavailable')
+    }
+    const session = SessionSchema.parse({
+      session_id: randomUUID(),
+      title: p.title,
+      provider: p.provider,
+      created_at: new Date().toISOString(),
+      ...(p.workspace_id ? { workspace_id: p.workspace_id } : {}),
+    })
+    this.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(session.session_id)
+    this.db
+      .prepare('INSERT INTO sessions VALUES(?,?)')
+      .run(session.session_id, JSON.stringify(session))
+    if (p.workspace_id)
+      this.resources.workspaces.lease(String(p.workspace_id), session.session_id, provisioning)
+    const installationActor = {
+      kind: 'installation',
+      installation_id: actor.installation_id,
+    } as const
+    this.append(session.session_id, 'session.created', installationActor, session)
+    this.append('catalog', 'session.created', installationActor, session)
+    return session
+  }
   private mutate(actor: AuthorityContext, method: string, p: Record<string, unknown>): unknown {
     const installationActor = {
       kind: 'installation',
       installation_id: actor.installation_id,
     } as const
-    if (method === 'session.create') {
-      if (p.provider === 'claude' || p.provider === 'pi') {
-        if (!p.workspace_id) throw new ChannelError('workspace_required')
-        const workspace = this.resources.workspaces.get(String(p.workspace_id))
-        if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')
-          throw new ChannelError('project_untrusted')
-        if (!this.claude.isAvailable(String(p.provider)))
-          throw new ChannelError('provider_unavailable')
-      }
-      const session = SessionSchema.parse({
-        session_id: randomUUID(),
-        title: p.title,
-        provider: p.provider,
-        created_at: new Date().toISOString(),
-        ...(p.workspace_id ? { workspace_id: p.workspace_id } : {}),
-      })
-      this.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(session.session_id)
-      this.db
-        .prepare('INSERT INTO sessions VALUES(?,?)')
-        .run(session.session_id, JSON.stringify(session))
-      if (p.workspace_id)
-        this.resources.workspaces.lease(String(p.workspace_id), session.session_id)
-      this.append(session.session_id, 'session.created', installationActor, session)
-      this.append('catalog', 'session.created', installationActor, session)
-      return session
-    }
+    if (method === 'session.create') return this.acceptSession(actor, p)
     const session = String(p.session_id)
     this.head(session)
     if (method === 'session.detach') {
+      if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
       if (
         this.db
           .prepare("SELECT 1 FROM provider_runs WHERE session_id=? AND state='active'")
@@ -611,6 +720,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (method === 'session.send') {
       const current = this.session(session)
+      if (current.workspace_id) this.resources.workspaces.assertLease(current.workspace_id, session)
       if (current.provider !== 'fake') {
         if (!current.workspace_id) throw new ChannelError('workspace_required')
         if (!this.claude.isAvailable(current.provider))
@@ -742,9 +852,28 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     )
     return result
   }
+  workspaceProvisioning(session_id: string) {
+    const session = this.session(session_id)
+    return (
+      !!session.workspace_id &&
+      this.resources.workspaces.get(session.workspace_id).state === 'provisioning'
+    )
+  }
+  checkExecution(installation_id: string, session_id: string) {
+    const actor = { installation_id }
+    this.authority.check(actor, 'execute', session_id)
+    const session = this.session(session_id)
+    if (session.workspace_id) {
+      this.resources.workspaces.assertLease(session.workspace_id, session_id)
+      if (this.resources.workspaces.get(session.workspace_id).state !== 'ready')
+        throw new ChannelError('resource_busy')
+    }
+    this.delegations.checkExecution(session_id)
+  }
   /** One durable worker per session; at most four sessions execute per tick. No socket participates. */
   tick(now = Date.now()) {
     this.transaction(() => {
+      this.delegations.settle()
       for (const row of this.db
         .prepare("SELECT body FROM prompts WHERE json_extract(body,'$.state')='pending'")
         .all() as Row[]) {
@@ -763,18 +892,18 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           )
           .get(String(s.session_id)) as Row
         InputStateSchema.parse(input.state)
-        if (this.session(String(input.session_id)).provider !== 'fake') continue
+        if (
+          this.session(String(input.session_id)).provider !== 'fake' ||
+          this.workspaceProvisioning(String(input.session_id))
+        )
+          continue
         const body = validateParams('session.send', JSON.parse(String(input.body))) as {
           text: string
           script: FakeStep[]
         }
         if (input.state === 'queued' || input.state === 'accepted') {
           try {
-            this.authority.check(
-              { installation_id: String(input.principal_id) },
-              'execute',
-              String(input.session_id)
-            )
+            this.checkExecution(String(input.principal_id), String(input.session_id))
           } catch {
             this.transition(input, 'cancelled')
             continue
@@ -878,6 +1007,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           })
         }
       }
+      this.delegations.settle()
     })
   }
 }

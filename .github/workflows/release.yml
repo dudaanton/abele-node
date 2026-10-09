@@ -1,0 +1,78 @@
+name: Publish native release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin-arm64
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+      - name: Validate tag and runner
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$(node -p 'require("./package.json").version')" == "$version" ]] || exit 1
+          [[ "$(node -p 'process.platform + "-" + process.arch')" == "${{ matrix.platform }}" ]] || exit 1
+      - run: npm ci --ignore-scripts
+      - run: npm run types && npm test
+      - run: node scripts/package-release.mjs
+      - name: Test installer against local release server
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ABELE_INSTALLER_TARBALL=".scratch/release/abele-node-$version-${{ matrix.platform }}.tar.gz" \
+            node --test scripts/installer.test.mjs scripts/install-runtime.test.mjs scripts/publish-release.test.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.platform }}
+          path: .scratch/release/*.tar.gz
+          if-no-files-found: error
+          include-hidden-files: true # Explicit glob selects only tarballs under .scratch.
+          retention-days: 3
+  release:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: native-*
+          path: release
+          merge-multiple: true
+      - name: Upload and verify draft assets before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: sh scripts/publish-release.sh release

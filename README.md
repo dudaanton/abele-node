@@ -23,6 +23,9 @@ see [pi configuration and limits](docs/pi.md). Windows is untested. See
   approvals, interruption, process-group cleanup and explicit native-session resume.
 - Supervised pi SDK turns using the same queue, journal, approvals and native-file
   resume flow; per-feature capability gates and local model configuration apply.
+- Node-side delegation with owner-approved controller grants, isolated child workspaces,
+  structured durable mailboxes and retry-safe creation. The plugin tool integration
+  is separate; see [delegation API and limits](docs/delegation.md).
 - Workspace browsing, file/content reads, Git history, retained immutable diffs
   and anchored review comments submitted as session inputs.
 - Bounded UTF-8 file editing/creation with content-version checks, durable save
@@ -59,20 +62,26 @@ Git state, not an OS sandbox for agent tools.
 
 ## Quick start: without Docker (recommended)
 
+Install Node.js **22.23.2** and Git **2.31+** first, then run as your ordinary user:
+
 ```sh
-git clone https://github.com/dudaanton/abele-node.git
-cd abele-node
-npm ci --ignore-scripts
-npm run build
-node packages/node-daemon/dist/cli.js start
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | sh
 ```
 
-In another terminal, from the same checkout:
+**Read [the script](install.sh) first** before piping downloaded code into a shell.
+It downloads a platform-specific GitHub release, verifies its SHA-256 checksum,
+installs under `$HOME/.local`, and starts a macOS LaunchAgent or Linux user service.
+It does not install Node, provider CLIs or credentials. Linux requires a running
+systemd user manager; use `sh -s -- --no-service` instead of `sh` above for a
+foreground-only installation, then run `abele-node start` yourself.
+See [installer options and the manual source path](docs/install.md).
+
+With `$HOME/.local/bin` on your PATH:
 
 ```sh
-node packages/node-daemon/dist/cli.js token create desktop
-node packages/node-daemon/dist/cli.js status
-node packages/node-daemon/dist/cli.js doctor
+abele-node token create desktop
+abele-node status
+abele-node doctor
 ```
 
 The token command prints an `installation_id` and a new `token` **once**. Enroll the
@@ -128,6 +137,7 @@ revocation, Git/file boundaries, configuration policy, cleanup and durability li
 npm ci --ignore-scripts
 npm run types
 npm test                       # builds first; fake SDK/CLI, at most two workers
+npm run test:installer         # production tarball + local HTTP server; temporary HOMEs
 npm run build
 npm run format:check
 node --test probes/approval-mcp.test.mjs probes/echo.test.mjs
@@ -145,6 +155,8 @@ model-free MCP/transport/lifecycle tests; generated research evidence stays loca
 explicit live acceptance consumes model quota and is not a CI operation.
 `npm run acceptance:remote` verifies paired-device flows offline without changing
 live Tailscale configuration. It does not establish real mobile interoperability.
+`npm run acceptance:delegation` verifies offline delegated completion/replay, mailbox
+isolation, human transcript access and creation retries using fake providers.
 The [debugger scratch installer](docs/debug-probe.md#manual-real-adapter-check) is
 manual-only, excluded from CI and from the published image.
 

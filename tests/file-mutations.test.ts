@@ -22,6 +22,7 @@ import {
   chownSync,
   renameSync,
   existsSync,
+  realpathSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -34,14 +35,20 @@ const posixMetadata = (path: string) => {
 }
 const roots: string[] = [],
   cores: NodeCore[] = []
-async function setup() {
+async function setup(stateThroughAlias = false) {
   mkdirSync('.scratch', { recursive: true })
   const dir = mkdtempSync(resolve('.scratch/mutations-')),
     repo = join(dir, 'folder')
   roots.push(dir)
   mkdirSync(repo)
   writeFileSync(join(repo, 'sample.txt'), 'before')
-  const core = new NodeCore(join(dir, 'state'))
+  let state = join(dir, 'state')
+  if (stateThroughAlias) {
+    mkdirSync(join(dir, 'physical-state-parent'))
+    symlinkSync(join(dir, 'physical-state-parent'), join(dir, 'state-parent-alias'))
+    state = join(dir, 'state-parent-alias', 'not-created', 'state')
+  }
+  const core = new NodeCore(state)
   cores.push(core)
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   const project = (await core.request(
@@ -83,7 +90,7 @@ function schema8(s: Awaited<ReturnType<typeof setup>>) {
   s.core.close()
   const db = new DatabaseSync(join(s.dir, 'state', 'node.sqlite'))
   db.exec(
-    'DROP TABLE IF EXISTS provider_native_sessions; CREATE TABLE IF NOT EXISTS legacy_file_recoveries(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), path TEXT NOT NULL, content_id TEXT NOT NULL, fingerprint TEXT NOT NULL, protected INTEGER NOT NULL DEFAULT 0, UNIQUE(workspace_id,path)); PRAGMA user_version=8;'
+    'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE IF EXISTS provider_native_sessions; CREATE TABLE IF NOT EXISTS legacy_file_recoveries(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), path TEXT NOT NULL, content_id TEXT NOT NULL, fingerprint TEXT NOT NULL, protected INTEGER NOT NULL DEFAULT 0, UNIQUE(workspace_id,path)); PRAGMA user_version=8;'
   )
   return db
 }
@@ -120,6 +127,58 @@ it('saves with a retained predecessor and one bounded invalidation; retry never 
   await expect(s.save('save', { ...s.params, text: 'different' })).rejects.toThrow(
     'idempotency_mismatch'
   )
+})
+it('repeated saves and recovery reads work when a missing state dir has a symlinked ancestor', async () => {
+  const s = await setup(true)
+  const first = (await s.save()) as Receipt
+  expect(first.state).toBe('saved')
+  const second = (await s.save('second-save', {
+    ...s.params,
+    expected_content_id: hash('after'),
+    text: 'second',
+  })) as Receipt
+  expect(second.state).toBe('saved')
+  expect(s.core.stateDir).toBe(realpathSync(join(s.dir, 'physical-state-parent/not-created/state')))
+  const copy = (await s.core.request(s.actor, 'workspace.recovery.read', {
+    workspace_id: s.params.workspace_id,
+    recovery_path: first.recovery_path,
+    offset: 0,
+    length: 1024,
+  })) as { base64: string }
+  expect(Buffer.from(copy.base64, 'base64').toString()).toBe('before')
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe('second')
+})
+it('state is pinned at startup even if its parent alias is retargeted later', async () => {
+  const s = await setup(true)
+  expect(await s.save()).toMatchObject({ state: 'saved' })
+  const replacement = join(s.dir, 'replacement')
+  mkdirSync(replacement)
+  rmSync(join(s.dir, 'state-parent-alias'))
+  symlinkSync(replacement, join(s.dir, 'state-parent-alias'))
+  expect(
+    await s.save('after-retarget', {
+      ...s.params,
+      expected_content_id: hash('after'),
+      text: 'still pinned',
+    })
+  ).toMatchObject({ state: 'saved' })
+  expect(readdirSync(replacement)).toEqual([])
+})
+it('canonical state paths do not permit recovery-directory symlink replacement', async () => {
+  const s = await setup()
+  expect(await s.save()).toMatchObject({ state: 'saved' })
+  const recoveryRoot = join(s.core.stateDir, 'file-recovery')
+  const moved = join(s.dir, 'moved-recovery')
+  renameSync(recoveryRoot, moved)
+  symlinkSync(moved, recoveryRoot)
+  await expect(
+    s.save('replaced-recovery', {
+      ...s.params,
+      expected_content_id: hash('after'),
+      text: 'must not write',
+    })
+  ).rejects.toThrow('unsafe_path')
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe('after')
 })
 it('external edits conflict without touching them at the final base check', async () => {
   const s = await setup()
@@ -517,7 +576,7 @@ it('migration 9 drops only an empty legacy table and preserves normal recovery r
   db.close()
   const c = new NodeCore(join(s.dir, 'state'))
   cores.push(c)
-  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(10)
+  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(11)
   expect(
     c.db.prepare("SELECT name FROM sqlite_master WHERE name='legacy_file_recoveries'").get()
   ).toBeUndefined()

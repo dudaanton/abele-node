@@ -652,7 +652,10 @@ export class ClaudeProviderAdapter {
                 sink.event(event)
               }
             }
-            worker.send({ kind: 'output_ack' })
+            // The worker can finish and close IPC while the final stdout record is
+            // being committed. A failed flow-control ack is not a failed run;
+            // the worker close event still decides whether it exited cleanly.
+            if (worker.connected) worker.send({ kind: 'output_ack' }, () => {})
           }
         } else if (m?.kind === 'exit') {
           sink.event({

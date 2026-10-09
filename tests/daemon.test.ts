@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import WebSocket from 'ws'
 import { FileClientStore } from './fileStore.js'
@@ -60,6 +60,42 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
+it('CLI diagnostics resolve a symlinked existing ancestor without creating stopped state', async () => {
+  const dir = mkdtempSync(resolve('.scratch/canonical-state-'))
+  dirs.push(dir)
+  const parent = resolve(dir, 'physical')
+  const alias = resolve(dir, 'alias')
+  mkdirSync(parent)
+  symlinkSync(parent, alias)
+  const state = resolve(alias, 'not-created', 'state')
+  const expected = resolve(realpathSync(parent), 'not-created', 'state')
+  const status = () =>
+    spawnSync(
+      process.execPath,
+      [cli, 'status', '--state-dir', state, '--tailscale-path', '/nonexistent/tailscale'],
+      { encoding: 'utf8' }
+    )
+  const stopped = status()
+  expect(stopped.status, stopped.stderr).toBe(0)
+  expect(JSON.parse(stopped.stdout)).toMatchObject({ state_dir: expected, running: false })
+  expect(() => statSync(expected)).toThrow()
+  const daemon = await start(state)
+  const running = status()
+  expect(running.status, running.stderr).toBe(0)
+  expect(JSON.parse(running.stdout)).toMatchObject({ state_dir: expected, running: true })
+  const doctor = spawnSync(
+    process.execPath,
+    [cli, 'doctor', '--state-dir', state, '--tailscale-path', '/nonexistent/tailscale'],
+    { encoding: 'utf8' }
+  )
+  expect(doctor.status, doctor.stderr).toBe(0)
+  expect(JSON.parse(doctor.stdout)).toMatchObject({
+    state_dir: expected,
+    running: true,
+    state_mode: '700',
+  })
+  await stop(daemon.child)
+})
 it('real CLI daemon: offline persisted send, prompt, concurrent clients, replay/live and restart converge', async () => {
   const dir = mkdtempSync(resolve('.scratch/e2e-'))
   dirs.push(dir)

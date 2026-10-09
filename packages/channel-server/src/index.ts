@@ -12,6 +12,7 @@ import { NodeCore } from '@abele/node-core'
 type Scheduled = {
   bytes: Uint8Array
   priority: number
+  authorize?: () => void
   resolve: () => void
   reject: (error: unknown) => void
 }
@@ -22,14 +23,14 @@ export class RecordScheduler {
   private draining = false
   private stopped = false
   constructor(private transport: RecordTransport) {}
-  send(frame: unknown, priority = 0): Promise<void> {
+  send(frame: unknown, priority = 0, authorize?: () => void): Promise<void> {
     const bytes = FrameCodec.encode(frame)
     if (this.stopped) return Promise.reject(new ChannelError('disconnected'))
     if (this.bytes + bytes.length > LIMITS.unacked_bytes)
       return Promise.reject(new ChannelError('slow_consumer'))
     this.bytes += bytes.length
     const result = new Promise<void>((resolve, reject) =>
-      this.queue.push({ bytes, priority, resolve, reject })
+      this.queue.push({ bytes, priority, authorize, resolve, reject })
     )
     void this.drain()
     return result
@@ -42,6 +43,9 @@ export class RecordScheduler {
         this.queue.sort((a, b) => a.priority - b.priority)
         const item = this.queue.shift()!
         try {
+          // Retain the resource scope with the queued record, not with a replay page.
+          // This synchronous check runs immediately before transport.send, with no await gap.
+          item.authorize?.()
           await this.transport.send(item.bytes)
           item.resolve()
         } catch (error) {
@@ -92,7 +96,8 @@ export async function serveChannel(
       await transport.send(bytes)
     },
   })
-  const send = (frame: unknown, priority = 0) => scheduler.send(frame, priority)
+  const send = (frame: unknown, priority = 0, authorize?: () => void) =>
+    scheduler.send(frame, priority, authorize)
   const close = async (reason: string) => {
     if (closed) return
     closed = true
@@ -119,7 +124,7 @@ export async function serveChannel(
           subscription.bytes += bytes.byteLength
           subscription.sent.push({ seq: event.seq, bytes: bytes.byteLength })
           subscription.cursor = event.seq
-          await scheduler.send(event, 1)
+          await scheduler.send(event, 1, () => core.authority.check(actor!, 'publish', stream))
           if (closed) return
         }
       }
@@ -218,9 +223,11 @@ export async function serveChannel(
         }
       }
       // Do not block admission behind artifact writes. The scheduler bounds queued bytes.
-      void send(response, frame.method === 'artifact.read' ? 2 : 0).catch(() =>
-        close('send_failed')
-      )
+      void send(
+        response,
+        frame.method === 'artifact.read' ? 2 : 0,
+        response.error ? undefined : () => core.checkPublication(actor!, frame.method, frame.params)
+      ).catch(() => close('send_failed'))
     }
   } catch {
     /* Reject unauthenticated/malformed records without application error details. */

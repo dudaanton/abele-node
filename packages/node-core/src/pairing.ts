@@ -54,6 +54,7 @@ export class IdentityStore {
     this.core.transaction(() => {
       this.core.db.prepare("DELETE FROM meta WHERE key='paired_identity'").run()
       this.core.db.prepare("UPDATE paired_devices SET state='revoked'").run()
+      this.core.authority.invalidatePairedGrants()
       this.core.db.prepare('DELETE FROM pairing_invites').run()
     })
     this.loading = undefined
@@ -217,6 +218,7 @@ export class PairingService {
       this.core.db
         .prepare("UPDATE paired_devices SET state='revoked' WHERE installation_id=?")
         .run(id)
+      this.core.authority.invalidatePairedGrants(id)
     })
   }
 }

@@ -9,10 +9,17 @@ import {
   writeFileSync,
   unlinkSync,
   rmSync,
+  realpathSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
-import { NodeCore, ClaudeProviderAdapter, PiProviderAdapter } from '@abele/node-core'
+import {
+  NodeCore,
+  ClaudeProviderAdapter,
+  PiProviderAdapter,
+  canonicalStateDir,
+} from '@abele/node-core'
 import type { PiOptions } from '@abele/provider-pi'
 import type { ClaudeOptions } from '@abele/provider-claude'
 import { TokenCommandSchema } from '@abele/node-protocol'
@@ -41,9 +48,11 @@ export function readRuntime(dir: string):
       pi?: unknown
       control_socket?: string
       paired?: PairedListenerConfig
+      runtime?: { cli_path: string; version: string }
     }
   | undefined {
   try {
+    dir = canonicalStateDir(dir)
     const value = JSON.parse(readFileSync(join(dir, 'daemon.lock'), 'utf8')) as {
       pid: number
       port?: number
@@ -52,6 +61,7 @@ export function readRuntime(dir: string):
       pi?: unknown
       control_socket?: string
       paired?: PairedListenerConfig
+      runtime?: { cli_path: string; version: string }
     }
     if (!Number.isSafeInteger(value.pid) || value.pid < 1) return
     process.kill(value.pid, 0)
@@ -61,6 +71,7 @@ export function readRuntime(dir: string):
   }
 }
 export function takeLock(dir: string): () => void {
+  dir = canonicalStateDir(dir)
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   chmodSync(dir, 0o700)
   const path = join(dir, 'daemon.lock')
@@ -193,6 +204,7 @@ async function tokenCommand(core: NodeCore, raw: unknown) {
   }
 }
 export async function control(dir: string, command: OwnerCommand): Promise<unknown> {
+  dir = canonicalStateDir(dir)
   return new Promise((resolve, reject) => {
     const runtime = readRuntime(dir)
     // Older running daemons did not publish an endpoint; keep their CLI compatible.
@@ -223,6 +235,7 @@ export async function control(dir: string, command: OwnerCommand): Promise<unkno
   })
 }
 export async function offlineToken(dir: string, command: OwnerCommand) {
+  dir = canonicalStateDir(dir)
   if (readRuntime(dir)) return control(dir, command)
   const release = takeLock(dir)
   try {
@@ -245,6 +258,7 @@ export async function startDaemon(
   tailscalePath?: string,
   piOptions: Omit<PiOptions, 'stateDir'> = {}
 ) {
+  dir = canonicalStateDir(dir)
   const paired = pairedConfig ? PairedListenerSchema.parse(pairedConfig) : undefined
   const release = takeLock(dir)
   let core: NodeCore | undefined, ipc: Server | undefined
@@ -394,10 +408,18 @@ export async function startDaemon(
       ipc!.listen(socketPath, () => resolve())
     })
     chmodSync(socketPath, 0o600)
+    const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+    const runtime = {
+      cli_path: realpathSync(join(runtimeRoot, 'packages/node-daemon/dist/cli.js')),
+      version: (
+        JSON.parse(readFileSync(join(runtimeRoot, 'package.json'), 'utf8')) as { version: string }
+      ).version,
+    }
     writeFileSync(
       join(dir, 'daemon.lock'),
       JSON.stringify({
         pid: process.pid,
+        runtime,
         port: address.port,
         node_id: core.node_id,
         claude: core.execution.capabilities(),

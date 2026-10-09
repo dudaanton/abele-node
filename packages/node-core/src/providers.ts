@@ -16,6 +16,8 @@ export interface ProviderAdapter {
   startTurn(
     turn: TurnContext & { native_session_file?: string },
     sink: ProviderEventSink & {
+      /** Optional run-bound node reporting tool; model inputs never supply authority. */
+      report?(report: unknown): { recorded: boolean }
       question?(action: PiAction, signal: AbortSignal): Promise<Answer>
       reaped?(leader: ProcessIdentity): void
     }

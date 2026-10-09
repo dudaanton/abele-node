@@ -21,6 +21,8 @@ appendFileSync(
   'invocations.jsonl',
   JSON.stringify({ text, resume, args: process.argv.slice(2) }) + '\n'
 )
+// Delegation adds a provider-neutral reporting instruction; route on the original task.
+text = text.split('\n\nWorker reporting:')[0]
 emit({
   type: 'system',
   subtype: 'init',
@@ -61,6 +63,28 @@ if (text === 'worker-loss') {
   writeFileSync('descendant.pid', String(nested.pid))
   emit({ type: 'assistant', message: { id: 'm', content: [{ type: 'text', text: 'started' }] } })
   setTimeout(() => {}, 60000)
+} else if (text === 'delegation-report') {
+  const report = (id, kind, value) =>
+    emit({
+      type: 'assistant',
+      message: {
+        id,
+        content: [
+          {
+            type: 'text',
+            text:
+              '```abele-worker-report\n' +
+              JSON.stringify({ report_id: id, kind, text: value }) +
+              '\n```',
+          },
+        ],
+      },
+    })
+  report('progress', 'progress', 'Working')
+  report('progress', 'progress', 'Working') // Final snapshots may be repeated.
+  report('question', 'question', 'Which direction?')
+  report('result', 'result', 'Structured final answer')
+  emit({ type: 'result', subtype: 'success', is_error: false, result: 'Structured final answer' })
 } else if (text === 'echo') {
   emit({ type: 'assistant', message: { id: 'm', content: [{ type: 'text', text: 'followup' }] } })
   emit({ type: 'result', subtype: 'success', is_error: false, result: 'followup' })

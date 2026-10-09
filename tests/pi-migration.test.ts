@@ -35,10 +35,12 @@ it('forward-migrates pi native mapping without losing identity, receipts or hist
       }),
       session.session_id
     )
-    db.exec('DROP TABLE IF EXISTS provider_native_sessions; PRAGMA user_version=9;')
+    db.exec(
+      'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE IF EXISTS provider_native_sessions; PRAGMA user_version=9;'
+    )
     db.close()
     core = new NodeCore(dir)
-    expect(core.db.prepare('PRAGMA user_version').get()!.user_version).toBe(10)
+    expect(core.db.prepare('PRAGMA user_version').get()!.user_version).toBe(11)
     expect(core.db.prepare('SELECT * FROM provider_native_sessions').get()).toMatchObject({
       session_id: session.session_id,
       native_session_id: native,
@@ -50,7 +52,7 @@ it('forward-migrates pi native mapping without losing identity, receipts or hist
     core.close()
     core = undefined
     const future = new DatabaseSync(join(dir, 'node.sqlite'))
-    future.exec('PRAGMA user_version=11')
+    future.exec('PRAGMA user_version=12')
     future.close()
     expect(() => new NodeCore(dir)).toThrow(/unsupported_database_version/)
   } finally {

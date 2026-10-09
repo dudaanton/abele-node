@@ -164,10 +164,19 @@ export class WorkspaceService {
       .prepare('SELECT 1 FROM workspace_leases WHERE workspace_id=?')
       .get(id)
   }
-  lease(id: string, session: string): WorkspaceLease {
+  assertLease(id: string, session: string) {
+    if (
+      !this.resources.core.db
+        .prepare('SELECT 1 FROM workspace_leases WHERE workspace_id=? AND session_id=?')
+        .get(id, session)
+    )
+      throw new ChannelError('resource_busy')
+  }
+  lease(id: string, session: string, provisioning = false): WorkspaceLease {
     const workspace = this.get(id)
     if (workspace.kind !== 'managed') throw new ChannelError('git_required')
-    if (workspace.state !== 'ready' || this.leased(id)) throw new ChannelError('resource_busy')
+    if (workspace.state !== (provisioning ? 'provisioning' : 'ready') || this.leased(id))
+      throw new ChannelError('resource_busy')
     this.resources.core.db.prepare('INSERT INTO workspace_leases VALUES(?,?)').run(id, session)
     return { workspace_id: id, session_id: session }
   }
@@ -589,6 +598,56 @@ export class ResourceServices {
   async stop() {
     await this.jobs.stop()
   }
+  /** Read-only preparation; reservation and its provisioning job commit with the caller's receipt. */
+  async prepareWorkspace(project_id: string, base_ref: string) {
+    const project = this.projects.get(project_id)
+    if (!project.repository_path) throw new ChannelError('git_required')
+    await this.projects.available(project)
+    try {
+      return {
+        project_id,
+        base: await this.git.text(project.root_path, { kind: 'resolve', ref: base_ref }),
+      }
+    } catch (e) {
+      if (e instanceof ChannelError && e.code === 'git_failed')
+        throw new ChannelError('invalid_ref')
+      throw e
+    }
+  }
+  /** Must be called inside the state transaction. No filesystem effects. */
+  reserveWorkspace(
+    actor: AuthorityContext,
+    operation: string,
+    prepared: { project_id: string; base: string }
+  ) {
+    const project = this.projects.get(prepared.project_id)
+    const workspace_id = randomUUID()
+    const workspace = WorkspaceSchema.parse({
+      workspace_id,
+      project_id: project.project_id,
+      kind: 'managed',
+      path: join(this.worktreeRoot, project.project_id, workspace_id),
+      branch: 'abele/' + workspace_id,
+      base_commit: prepared.base,
+      state: 'provisioning',
+      created_at: now(),
+      provenance: {
+        node_id: this.core.node_id,
+        installation_id: actor.installation_id,
+        operation_id: operation,
+      },
+    })
+    this.core.db
+      .prepare('INSERT INTO workspaces VALUES(?,?,?,?)')
+      .run(workspace_id, workspace.project_id, workspace.state, JSON.stringify(workspace))
+    this.core.append(
+      'catalog',
+      'workspace.changed',
+      { kind: 'installation', installation_id: actor.installation_id },
+      workspace
+    )
+    return { workspace_id, job_id: this.jobs.insert(workspace, 'workspace.create', actor).job_id }
+  }
   async request(
     actor: AuthorityContext,
     method: string,
@@ -737,52 +796,10 @@ export class ResourceServices {
           return { project_id: p.project_id, removed: true }
         })
       if (method === 'workspace.create') {
-        const project = this.projects.get(String(p.project_id))
-        if (!project.repository_path) throw new ChannelError('git_required')
-        await this.projects.available(project)
-        let base: string
-        try {
-          base = await this.git.text(project.root_path, {
-            kind: 'resolve',
-            ref: String(p.base_ref),
-          })
-        } catch (e) {
-          if (e instanceof ChannelError && e.code === 'git_failed')
-            throw new ChannelError('invalid_ref')
-          throw e
-        }
-        return this.core.commitOperation(actor, method, p, operation!, () => {
-          this.projects.get(project.project_id) // registration might have been removed during the read
-          const workspace_id = randomUUID()
-          const workspace = WorkspaceSchema.parse({
-            workspace_id,
-            project_id: project.project_id,
-            kind: 'managed',
-            path: join(this.worktreeRoot, project.project_id, workspace_id),
-            branch: 'abele/' + workspace_id,
-            base_commit: base,
-            state: 'provisioning',
-            created_at: now(),
-            provenance: {
-              node_id: this.core.node_id,
-              installation_id: actor.installation_id,
-              operation_id: operation!,
-            },
-          })
-          this.core.db
-            .prepare('INSERT INTO workspaces VALUES(?,?,?,?)')
-            .run(workspace_id, workspace.project_id, workspace.state, JSON.stringify(workspace))
-          this.core.append(
-            'catalog',
-            'workspace.changed',
-            { kind: 'installation', installation_id: actor.installation_id },
-            workspace
-          )
-          return {
-            workspace_id,
-            job_id: this.jobs.insert(workspace, 'workspace.create', actor).job_id,
-          }
-        })
+        const prepared = await this.prepareWorkspace(String(p.project_id), String(p.base_ref))
+        return this.core.commitOperation(actor, method, p, operation!, () =>
+          this.reserveWorkspace(actor, operation!, prepared)
+        )
       }
       if (method === 'workspace.remove') {
         const workspace = this.workspaces.get(String(p.workspace_id)),

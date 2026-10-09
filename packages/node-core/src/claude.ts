@@ -127,17 +127,13 @@ export class ProviderSessions {
       const adapter = this.adapterFor(session.provider)
       if (session.provider === 'fake' || !adapter?.available || this.active.has(session.session_id))
         continue
-      if (!session.workspace_id) continue
+      if (!session.workspace_id || this.core.workspaceProvisioning(session.session_id)) continue
       // Reserve worker ownership before any asynchronous validation; no two drain calls can select it.
       const run_id = randomUUID()
       const slot: ActiveRun = { run_id, starting: true }
       this.active.set(session.session_id, slot)
       try {
-        this.core.authority.check(
-          { installation_id: String(input.principal_id) },
-          'execute',
-          session.session_id
-        )
+        this.core.checkExecution(String(input.principal_id), session.session_id)
         const workspace = this.core.resources.workspaces.get(session.workspace_id)
         const project = await this.core.resources.workspaces.bound(workspace)
         if (project.trust !== 'trusted') throw new ChannelError('project_untrusted')
@@ -158,11 +154,7 @@ export class ProviderSessions {
           const currentProject = this.core.resources.projects.get(project.project_id)
           if (currentProject.trust !== 'trusted') throw new ChannelError('project_untrusted')
           useRepositoryPermissions = currentProject.use_repository_claude_permissions
-          this.core.authority.check(
-            { installation_id: String(input.principal_id) },
-            'execute',
-            session.session_id
-          )
+          this.core.checkExecution(String(input.principal_id), session.session_id)
           input.run_id = run_id
           this.core.db
             .prepare('UPDATE inputs SET run_id=? WHERE input_id=?')
@@ -186,7 +178,7 @@ export class ProviderSessions {
             session_id: session.session_id,
             run_id,
             cwd: workspace.path,
-            text: body.text,
+            text: this.core.delegations.turnText(session.session_id, body.text),
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
             use_repository_claude_permissions: useRepositoryPermissions,
@@ -216,6 +208,8 @@ export class ProviderSessions {
                   .run(directory, run_id)
               ),
             event: (event) => this.record(input, event),
+            report: (report) =>
+              this.core.delegations.reporter(session.session_id, run_id).report(report),
             permission: (action, signal) => this.permission(input, action, signal),
             question: (action, signal) => this.permission(input, action, signal),
           }
@@ -390,6 +384,7 @@ export class ProviderSessions {
         ['claude.block.lifecycle', 'claude.message.final', 'pi.input.accepted'].includes(event.type)
       )
         this.core.transition(current, 'delivered')
+      if (!late) this.core.delegations.observe(session_id, run_id, event)
       let data: Record<string, unknown> = {
         ...event.data,
         ...(event.data.run_id !== undefined && event.data.run_id !== run_id
@@ -448,11 +443,7 @@ export class ProviderSessions {
         .get(String(input.input_id)) as { state: string }
       if (!['dispatching', 'delivered'].includes(current.state))
         throw new ChannelError('stale_revision')
-      this.core.authority.check(
-        { installation_id: String(input.principal_id) },
-        'execute',
-        session_id
-      )
+      this.core.checkExecution(String(input.principal_id), session_id)
       const previous = this.core.db
         .prepare(
           "SELECT body FROM prompts WHERE session_id=? AND run_id=? AND json_extract(body,'$.action_digest')=?"
@@ -530,11 +521,7 @@ export class ProviderSessions {
             .get(String(input.input_id)) as { state: string }
           if (!['dispatching', 'delivered'].includes(current.state)) return false
           const latest = this.core.prompt(prompt.prompt_id)
-          this.core.authority.check(
-            { installation_id: String(input.principal_id) },
-            'execute',
-            session_id
-          )
+          this.core.checkExecution(String(input.principal_id), session_id)
           if (latest.installation_id)
             this.core.authority.check(
               { installation_id: latest.installation_id },

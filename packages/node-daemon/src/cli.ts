@@ -11,11 +11,20 @@ import {
   readdirSync,
   existsSync,
   statSync,
+  realpathSync,
+  accessSync,
+  constants,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  openSync,
+  fsyncSync,
+  closeSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
-import { ClaudeProviderAdapter, PiProviderAdapter } from '@abele/node-core'
+import { ClaudeProviderAdapter, PiProviderAdapter, canonicalStateDir } from '@abele/node-core'
 
 const args = process.argv.slice(2)
 function option(name: string, fallback: string) {
@@ -26,8 +35,28 @@ function option(name: string, fallback: string) {
   args.splice(i, 2)
   return value
 }
-const state = resolve(option('--state-dir', join(homedir(), '.local/state/abele-node')))
+const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
 const port = Number(option('--port', '7777'))
+// A release installer can use its already deployed, immutable runtime directly.
+const configuredRuntime = option('--runtime-dir', '')
+const installerJournal = option('--installer-journal', '')
+function completedInstallerAction(action: string, target: string) {
+  if (!installerJournal) return
+  if (resolve(installerJournal) !== installerJournal) throw new Error('invalid_installer_journal')
+  const parent = statSync(dirname(installerJournal))
+  if (parent.uid !== process.getuid!() || (parent.mode & 0o077) !== 0)
+    throw new Error('unprotected_installer_journal')
+  writeFileSync(installerJournal, JSON.stringify({ action, target, state }) + '\n', {
+    flag: 'a',
+    mode: 0o600,
+  })
+  const fd = openSync(installerJournal, constants.O_RDONLY)
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
 const pairedConfigPath = option('--paired-config', '')
 const pairedConfig = pairedConfigPath
   ? PairedListenerSchema.parse(JSON.parse(readFileSync(resolve(pairedConfigPath), 'utf8')))
@@ -97,6 +126,32 @@ const escape = (s: string) =>
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
+function plistArguments(text: string): string[] {
+  const array = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1]
+  if (!array) return []
+  return [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((match) =>
+    match[1]!
+      .replaceAll('&quot;', '"')
+      .replaceAll('&apos;', "'")
+      .replaceAll('&gt;', '>')
+      .replaceAll('&lt;', '<')
+      .replaceAll('&amp;', '&')
+  )
+}
+function launchMissing(result: ReturnType<typeof launch>): boolean {
+  return (
+    (result.status === 3 || result.status === 113) &&
+    /could not find (?:specified )?service|no such process/i.test(result.stderr ?? '')
+  )
+}
+function loadedArguments(text: string): string[] | undefined {
+  const body = text.match(/\n[ \t]*arguments = \{\r?\n([\s\S]*?)\r?\n[ \t]*\}/)?.[1]
+  if (!body) return
+  const lines = body.split(/\r?\n/),
+    indent = lines[0]!.match(/^[ \t]+/)?.[0]
+  if (!indent || lines.some((line) => !line.startsWith(indent))) return
+  return lines.map((line) => line.slice(indent.length))
+}
 async function main() {
   switch (args[0]) {
     case 'start': {
@@ -130,16 +185,49 @@ async function main() {
     case 'stop': {
       // Disable KeepAlive before terminating; otherwise launchd immediately restarts it.
       const plist = join(homedir(), 'Library/LaunchAgents', label + '.plist')
-      const installedHere =
-        existsSync(plist) &&
-        readFileSync(plist, 'utf8').includes(
-          '<string>--state-dir</string><string>' + escape(state) + '</string>'
-        )
-      if (process.platform === 'darwin' && installedHere)
-        launch('bootout', `${launchDomain}/${label}`)
+      const expected =
+        process.platform === 'darwin' && existsSync(plist)
+          ? plistArguments(readFileSync(plist, 'utf8'))
+          : []
+      const stateIndex = expected.indexOf('--state-dir')
+      let installedHere = stateIndex >= 0 && expected[stateIndex + 1] === state
+      if (!installedHere && stateIndex >= 0) {
+        try {
+          const recorded = statSync(canonicalStateDir(expected[stateIndex + 1]!), { bigint: true })
+          const requested = statSync(state, { bigint: true })
+          installedHere =
+            recorded.isDirectory() &&
+            requested.isDirectory() &&
+            recorded.dev === requested.dev &&
+            recorded.ino === requested.ino
+        } catch {
+          /* A missing or retargeted state is not proof of service ownership. */
+        }
+      }
+      let service_unloaded: boolean | null = process.platform === 'darwin' ? false : null
+      if (process.platform === 'darwin' && installedHere) {
+        const job = `${launchDomain}/${label}`
+        const before = launch('print', job)
+        if (before.status === 0) {
+          // A cached job may differ from the on-disk plist. Never boot out a
+          // foreign runtime merely because the file now looks like ours.
+          if (JSON.stringify(loadedArguments(before.stdout)) !== JSON.stringify(expected))
+            throw new Error('launch_agent_loaded_arguments_mismatch')
+          if (launch('bootout', job).status !== 0) throw new Error('launch_agent_stop_unconfirmed')
+          completedInstallerAction('stopped-service', plist)
+          if (!launchMissing(launch('print', job))) throw new Error('launch_agent_stop_unconfirmed')
+        } else if (!launchMissing(before)) throw new Error('launch_agent_stop_unconfirmed')
+        service_unloaded = true
+      }
       const running = readRuntime(state)
-      if (running) process.kill(running.pid, 'SIGTERM')
-      output({ stopping: running?.pid ?? null })
+      if (running) {
+        try {
+          process.kill(running.pid, 'SIGTERM')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+        }
+      }
+      output({ stopping: running?.pid ?? null, service_unloaded })
       return
     }
     case 'status': {
@@ -165,6 +253,7 @@ async function main() {
         state_dir: state,
         state_mode: existsSync(state) ? (statSync(state).mode & 0o777).toString(8) : null,
         running: !!running,
+        runtime: running?.runtime ?? null,
         launch_agent: existsSync(join(homedir(), 'Library/LaunchAgents', label + '.plist')),
         profile: 'local-token-v1 (loopback only)',
         paired: running?.paired ?? pairedConfig ?? null,
@@ -234,37 +323,51 @@ async function main() {
       if (process.platform !== 'darwin') throw new Error('LaunchAgent requires macOS')
       if (port === 0) throw new Error('install_requires_fixed_port')
       if (readRuntime(state)) throw new Error('stop_before_install')
+      const existingJob = launch('print', `${launchDomain}/${label}`)
+      if (existingJob.status === 0) throw new Error('stop_loaded_launch_agent_before_install')
+      if (!launchMissing(existingJob)) throw new Error('launch_agent_state_unconfirmed')
       mkdirSync(state, { recursive: true, mode: 0o700 })
       chmodSync(state, 0o700)
-      const runtime = join(state, 'runtime'),
-        root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
-      mkdirSync(runtime, { recursive: true })
-      // Stable deployment path: the source checkout may be removed after installation.
-      for (const name of readdirSync(join(root, 'packages'))) {
-        const source = join(root, 'packages', name),
-          destination = join(runtime, 'packages', name)
-        mkdirSync(destination, { recursive: true })
-        cpSync(join(source, 'package.json'), join(destination, 'package.json'))
-        cpSync(join(source, 'dist'), join(destination, 'dist'), { recursive: true })
-      }
-      const modules = join(runtime, 'node_modules')
-      mkdirSync(modules, { recursive: true })
-      const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')) as {
-        packages: Record<string, { dev?: boolean; link?: boolean }>
-      }
-      for (const [path, entry] of Object.entries(lock.packages)) {
-        if (!path.startsWith('node_modules/') || entry.dev || entry.link) continue
-        const destination = join(runtime, path)
-        mkdirSync(dirname(destination), { recursive: true })
-        cpSync(join(root, path), destination, { recursive: true, dereference: true })
-      }
-      for (const name of readdirSync(join(root, 'packages'))) {
-        const destination = join(modules, '@abele', name)
-        mkdirSync(destination, { recursive: true })
-        cpSync(join(runtime, 'packages', name, 'package.json'), join(destination, 'package.json'))
-        cpSync(join(runtime, 'packages', name, 'dist'), join(destination, 'dist'), {
-          recursive: true,
-        })
+      const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+      const runtime = configuredRuntime ? resolve(configuredRuntime) : join(state, 'runtime')
+      if (configuredRuntime && realpathSync(runtime) !== realpathSync(root))
+        throw new Error('runtime_dir_must_match_cli')
+      if (!configuredRuntime) {
+        mkdirSync(runtime, { recursive: true })
+        cpSync(join(root, 'package.json'), join(runtime, 'package.json'))
+        // Stable deployment path: the source checkout may be removed after installation.
+        for (const name of readdirSync(join(root, 'packages'))) {
+          const source = join(root, 'packages', name),
+            destination = join(runtime, 'packages', name)
+          mkdirSync(destination, { recursive: true })
+          cpSync(join(source, 'package.json'), join(destination, 'package.json'))
+          cpSync(join(source, 'dist'), join(destination, 'dist'), { recursive: true })
+        }
+        const modules = join(runtime, 'node_modules')
+        mkdirSync(modules, { recursive: true })
+        const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')) as {
+          packages: Record<string, { dev?: boolean; link?: boolean }>
+        }
+        for (const [path, entry] of Object.entries(lock.packages)) {
+          if (
+            !path.startsWith('node_modules/') ||
+            entry.dev ||
+            entry.link ||
+            !existsSync(join(root, path)) // Optional dependencies for other platforms are absent.
+          )
+            continue
+          const destination = join(runtime, path)
+          mkdirSync(dirname(destination), { recursive: true })
+          cpSync(join(root, path), destination, { recursive: true, dereference: true })
+        }
+        for (const name of readdirSync(join(root, 'packages'))) {
+          const destination = join(modules, '@abele', name)
+          mkdirSync(destination, { recursive: true })
+          cpSync(join(runtime, 'packages', name, 'package.json'), join(destination, 'package.json'))
+          cpSync(join(runtime, 'packages', name, 'dist'), join(destination, 'dist'), {
+            recursive: true,
+          })
+        }
       }
       const logs = join(state, 'logs')
       mkdirSync(logs, { recursive: true, mode: 0o700 })
@@ -297,10 +400,8 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
-        '--pi-provider',
-        piProvider,
-        '--pi-model',
-        piModel,
+        ...(piProvider ? ['--pi-provider', piProvider] : []),
+        ...(piModel ? ['--pi-model', piModel] : []),
         '--pi-agent-dir',
         piAgentDir,
         '--pi-profile',
@@ -311,10 +412,25 @@ async function main() {
         String(piMaxTokens),
       ]
       const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string></dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
-      writeFileSync(destination, plist, { mode: 0o600 })
-      chmodSync(destination, 0o600)
+      if (existsSync(destination)) accessSync(destination, constants.W_OK)
+      const temporary = mkdtempSync(join(dirname(destination), '.abele-plist-write-'))
+      try {
+        const candidate = join(temporary, 'agent.plist')
+        writeFileSync(candidate, plist, { mode: 0o600 })
+        const fd = openSync(candidate, constants.O_RDONLY)
+        try {
+          fsyncSync(fd)
+        } finally {
+          closeSync(fd)
+        }
+        renameSync(candidate, destination)
+        completedInstallerAction('write-service', destination)
+      } finally {
+        rmSync(temporary, { recursive: true, force: true })
+      }
       const result = launch('bootstrap', launchDomain, destination)
       if (result.status !== 0) throw new Error(result.stderr || 'launchctl bootstrap failed')
+      completedInstallerAction('started-service', destination)
       launch('kickstart', `${launchDomain}/${label}`)
       output({ installed: destination, runtime })
       return

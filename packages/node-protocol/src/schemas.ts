@@ -1,4 +1,13 @@
 import { z } from 'zod'
+import {
+  DelegationMethodSchemas,
+  DelegationCreateSchema,
+  DELEGATION_MUTATIONS,
+  DelegationSchema,
+  DelegationMessageSchema,
+  DelegationTerminalSchema,
+} from './delegation.js'
+export * from './delegation.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
 export * from './files.js'
 import { EventSchema } from '@abele/channel-protocol'
@@ -121,6 +130,11 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('revoke'), value: id }).strict(),
 ])
 const EventPayloads = {
+  'delegation.created': DelegationSchema,
+  'delegation.progress': DelegationMessageSchema,
+  'delegation.question': DelegationMessageSchema,
+  'delegation.result': DelegationMessageSchema,
+  'delegation.terminal': DelegationTerminalSchema,
   'project.registered': ProjectSchema,
   'project.claude_permissions.changed': ProjectSchema,
   'project.removed': z.object({ project_id: id }).strict(),
@@ -151,6 +165,14 @@ export const NodeEventSchema = EventSchema.superRefine((event, ctx) => {
 })
 const session = { session_id: id }
 export const MethodSchemas = {
+  ...DelegationMethodSchemas,
+  'delegation.create': DelegationCreateSchema.extend({
+    script: z
+      .array(FakeStepSchema)
+      .min(1)
+      .max(32)
+      .default([{ kind: 'echo' }]),
+  }),
   ...ResourceMethodSchemas,
   ...FileMethodSchemas,
   'session.detach': z.object(session).strict(),
@@ -223,8 +245,10 @@ export const MethodSchemas = {
     })
     .strict(),
 } as const
+export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
+  ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,
   'review.submit',
   'workspace.write',

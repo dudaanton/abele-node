@@ -23,11 +23,219 @@ on Linux remain unverified.
   same user, if you want real execution. Use the provider's official installation
   and login instructions; verify its version separately. A paid account/quota may
   be required. `doctor` checks compatibility, **not authentication or quota**.
-- pi can be installed/configured separately, but its daemon adapter is not yet
-  implemented. A pi login does not enable node execution. Neither CLI is needed
-  for startup, health checks or fake sessions.
+- The pinned pi SDK is bundled with the daemon. Real SDK execution needs your own
+  local model configuration/authentication; see [pi configuration and limits](pi.md).
+  No external provider CLI is needed for startup, health checks or fake sessions.
 
-## Install from source
+## One-command native installer
+
+Install the prerequisites above first. **Read [install.sh](../install.sh) before
+executing downloaded code.** Never run this command with sudo:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | sh
+```
+
+For a specific release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
+  sh -s -- --version 0.3.0
+```
+
+Only releases with installer assets can be installed this way. The installer
+resolves the latest stable GitHub release when no version is specified. It downloads
+`abele-node-X.Y.Z-PLATFORM.tar.gz` and `SHA256SUMS`, checks the exact asset checksum,
+and unpacks the built packages plus production dependencies. Supported platforms
+are `darwin-arm64`, `darwin-x64`, `linux-arm64` and `linux-x64`. The pi SDK includes
+native terminal-library prebuilds, so the artifacts are platform-specific. Node is
+**not** bundled or installed: the script requires Node 22.x, at least 22.23,
+with working `node:sqlite`, and recommends the tested 22.23.2. It also checks
+`/usr/bin/git` >=2.31, curl, tar and shasum/sha256sum.
+
+By default, versions live in `$HOME/.local/share/abele-node/X.Y.Z`, with an
+atomically replaced `current` symlink. The command is a wrapper at
+`$HOME/.local/bin/abele-node`; add that directory to PATH if the installer warns.
+An absolute Node executable is recorded in the wrapper and service. Keep that
+Node installation available; services do not source your shell startup files.
+
+| Installer option             | Meaning                                                                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--version X.Y.Z`            | Pin a stable release (`vX.Y.Z` also accepted).                                                                                 |
+| `--prefix PATH`              | Installation prefix, default `$HOME/.local`; wrapper in `PATH/bin`, releases in `PATH/share/abele-node`.                       |
+| `--state-dir PATH`           | Private state, default `$HOME/.local/state/abele-node`. Must be separate from installed releases and the bin directory.        |
+| `--claude-path PATH`         | Absolute Claude executable; default `ABELE_CLAUDE_PATH` or `$HOME/.local/bin/claude`. Does not install or authenticate Claude. |
+| `--no-service`               | Do not register/start a service. Start manually with `abele-node start`. Use again for foreground-only upgrades.               |
+| `--uninstall`                | Stop the managed daemon, remove its service, wrapper and installed versions; retain state.                                     |
+| `--purge-state`              | With `--uninstall` only: also remove the state directory, including managed worktrees/history.                                 |
+| `--confirm-purge-state PATH` | Required for purge: repeat the exact absolute state directory to explicitly authorize deletion.                                |
+| `--help`                     | Print usage.                                                                                                                   |
+
+Paths must be absolute and normalized (no `..`, trailing slash or control characters).
+Safety checks resolve physical paths, including symlinked parents and existing
+ancestors of directories not yet created. Existing directories are compared by
+device/inode identity, including case aliases on case-insensitive APFS. Missing
+components use read-only case-sensitivity evidence; when their distinction cannot
+be proved, overlapping case variants are rejected conservatively. State cannot
+physically overlap runtime/bin or resolve to HOME itself or an ancestor of HOME.
+A truncated piped
+script does nothing: execution starts only after the complete installer body has
+been parsed.
+
+The installer records non-secret state/provider settings; reruns with the same
+prefix retain them if omitted. The saved state path is canonical, and a service's
+state is read from its authenticated plist/unit rather than re-resolving a caller
+alias. Its directory identity is recorded for **both foreground and service**
+deployments. Even `--no-service` creates a private empty state directory before
+recording its identity. A moved/replaced state is refused before stop or purge;
+identity is checked again at destructive boundaries, including after stopping and
+immediately before deletion. It refuses changing an installed state directory.
+Legacy foreground configs without a recorded identity are not silently rebound:
+inspect and stop that deployment manually, preserve its state, then migrate to a
+fresh installer deployment.
+The wrapper supplies those recorded settings for **every command**; use the source
+CLI for independently configured instances. It never creates, prints or stores
+enrollment secrets; it only prints the command you should run next.
+
+macOS uses the CLI's LaunchAgent installer with the selected immutable release
+runtime (no second runtime copy under state). Linux writes
+`$HOME/.config/systemd/user/abele-node.service` and enables it with `systemctl --user`.
+Without a user manager, use `--no-service`. The script does not enable lingering.
+An existing manually installed service is not overwritten: stop/remove it first,
+keep its state, then use the installer with the same state/provider settings.
+The installer records the physical service-file path and a content fingerprint in
+its non-secret config. Every rerun, including uninstall and foreground-to-service
+conversion, refuses an unrecorded, missing or modified service file before it can
+stop or overwrite anything. Older installer service configurations without this
+ownership record are also refused. To move from such a deployment, explicitly stop
+the old service, preserve state, and remove the old service and installed
+runtime/config before doing a fresh install. Never discard the config of a running
+service; use the manual service path if you need to manage its configuration yourself.
+
+Systemd drop-in admission checks apply **only to service deployments**: installing,
+upgrading or removing a managed service. Foreground-only installs, upgrades and
+uninstalls do not scan drop-ins or contact systemd/busctl, so unrelated user-wide
+`service.d` defaults cannot block `--no-service` deployments.
+
+For service deployments, before the first stop or reload the installer checks `service.d/*.conf`, `abele-.service.d/*.conf` and
+`abele-node.service.d/*.conf` in all user unit search paths: XDG config/data paths,
+runtime/control/generator paths, system defaults, `SYSTEMD_UNIT_PATH`, and the
+manager's authoritative `UnitPath` list. Native Linux service deployment requires
+`busctl` (systemd tools) with JSON output so paths containing spaces can be checked
+without guessing. Missing/invalid introspection fails closed; use `--no-service`
+or the manual path if it is unavailable. Admission checks repeat after download and
+before stop/reload. Detectable loaded `DropInPaths` or a foreign `FragmentPath`
+are refused before the first stop; the installer does not try to enumerate every
+possible unit alias to prove that no override can appear later. It also verifies that the manager's live
+PID belongs to the recorded state/runtime. Use the manual service path if you need
+overrides. On macOS, cached launchd arguments must match the owned plist. An absent
+daemon PID alone never confirms stop: launchd must report the job unloaded, or
+systemd must report no main PID and an inactive/failed state after stopping.
+Unknown manager responses fail closed without removing the runtime or service file.
+Legacy services with non-canonical state arguments require an explicit manual stop
+and migration; the installer does not guess where their running state was pinned.
+
+For a foreground-only installation, for example:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
+  sh -s -- --no-service --prefix "$HOME/.local" --state-dir "$HOME/abele-node-state"
+abele-node start
+```
+
+After installation, run `abele-node token create desktop`, then follow
+[plugin enrollment](#enroll-the-abele-plugin). With a service, `abele-node status`
+and `abele-node doctor` should report a running daemon. With `--no-service`, they
+validate the runtime but report stopped until you start it yourself. Provider
+unavailability does not fail installer health checks.
+
+### Installer upgrades and removal
+
+Back up the whole **stopped** state before upgrading; see [upgrade](#upgrade).
+Rerun the same one-liner (and the same `--prefix`, plus `--no-service` if used),
+or pin a newer version with `--version`. Downloads/import validation happen before
+stopping the old service. Ownership checks also complete before deployment mutation;
+a refusal does not trigger recovery of an untouched service. Fresh service installs
+and foreground-to-service conversions refuse a running foreground/manual daemon:
+stop it explicitly first.
+
+The installer keeps a private **write-ahead** journal. Before each mutation it writes
+and fsyncs an intent containing its target, backup and prior state; afterward it
+writes and fsyncs a completion marker. This covers our service stop, immutable
+version deployment, pointer switch, unit write, enablement, service start and
+wrapper/config publication. Before the first mutation it checks journal writability
+and free space on the journal/backup volumes and allocates a private 1 MiB recovery
+reserve. If a completion write fails (including disk exhaustion), the durable intent
+still authorizes recovery. An incomplete final journal write is ignored safely.
+
+The installer itself journals the possibly partial macOS plist write/bootstrap
+around the CLI call. It neither passes nor depends on `--installer-journal`, so
+cached older runtimes can safely ignore that protocol. Rollback treats intents
+without completion as **possibly applied**, restores their snapshots idempotently
+in reverse, and checks actual manager state before stopping a possibly started job.
+No matching launchd job means no CLI stop: a manual daemon is never signaled just
+because an install intent existed. State is retained, and cached
+versions referenced by active/unverifiable user overrides are not removed.
+
+After switching `current` and starting the new service, `status`/`doctor` verify the
+running runtime's identity and release version, not just `running: true`.
+Recovery restores a journaled unit write from its exact backup (including mode).
+Only a journaled stop of our previously running service authorizes its restart;
+an already inactive service stays inactive on failure. That restored systemd unit
+is reloaded, enabled without starting it, and explicitly restarted—even if alias,
+generic or other user overrides change its effective configuration. `enable --now` is not used as a substitute for restart:
+a timer or socket may have reactivated the rejected version during restoration.
+Health checks then verify that the running runtime is the previous version. Overrides are
+reported, not deleted or used to veto recovery. An unconfirmed failed-service stop
+also does not prevent restoring the old unit and explicitly attempting a restart. If the old install had no service, rollback removes and
+disables the newly created one instead of leaving it to restart at login. Foreground daemons must be stopped
+manually before a `--no-service` upgrade. Previous versions are retained.
+
+Runtime rollback is **not a database downgrade**: a new version may already have
+migrated state. If an older runtime refuses the schema, stop and restore your
+pre-upgrade backup rather than editing migration markers. The installer reports
+failed service rollback; inspect logs and run `status`/`doctor` before proceeding.
+The restart may use user override settings, so it is not a promise that the effective
+runtime matches the old version. If health cannot verify that version, or the service
+manager/restart fails, the warning is explicit and the backup remains available.
+State-identity and backup-integrity checks are not relaxed during recovery.
+Service backups are private and adjacent to the service file, so an external
+runtime prefix does not cause cross-filesystem rename failures. Before stopping the
+old service, the installer writes, preserves the mode of, and fsyncs a complete
+restore candidate **on the service file's volume**. Recovery only validates and
+atomically renames that candidate; it does not allocate new service-file bytes when
+HOME fills after the upgrade begins. The original backup remains available for
+manual recovery. If restoration/restart cannot be verified,
+the original backup is retained outside download cleanup and its path is printed
+for manual recovery. Do not delete that backup before restoring or safely archiving it.
+
+To uninstall while retaining state:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
+  sh -s -- --uninstall
+```
+
+Explicitly discard state only after reviewing sessions, dirty worktrees and backups:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
+  sh -s -- --uninstall --purge-state \
+  --confirm-purge-state "$HOME/.local/state/abele-node"
+```
+
+For a custom prefix/state, pass the same prefix and confirm the recorded state path.
+Uninstall does not remove original projects, provider credentials or a separately
+configured managed root. Purging managed worktree files can leave registrations
+in their original repositories; inspect `git worktree list` and repair explicitly.
+
+For local installer tests only, `ABELE_INSTALL_BASE_URL` replaces the GitHub download
+base (assets are under `/releases/download/vX.Y.Z/`), and `ABELE_INSTALL_API_URL`
+replaces the latest-release JSON endpoint. These overrides execute code from that
+source; do not point them at an untrusted server. SHA-256 detects corruption, not
+compromise of the release publisher or both files on a mirror.
+
+## Install from source (manual alternative)
 
 ```sh
 git clone https://github.com/dudaanton/abele-node.git "$HOME/abele-node"
@@ -86,12 +294,15 @@ the plugin/client using their existing paths; the node creates managed branches
 
 ## Enroll the Abele plugin
 
-From another terminal, in the checkout:
+For an installer deployment:
 
 ```sh
-node packages/node-daemon/dist/cli.js token create desktop
-node packages/node-daemon/dist/cli.js status
+abele-node token create desktop
+abele-node status
 ```
+
+For a source checkout, substitute `node packages/node-daemon/dist/cli.js` for
+`abele-node` in these commands.
 
 `token create` generates a random 256-bit token and prints JSON containing
 `installation_id`, `token` and its label. **The token is shown once**; only its hash
@@ -238,6 +449,12 @@ how long a credentialed agent can run; do not enable it casually. Stop with
 ## State, logs and diagnostics
 
 Default state: `$HOME/.local/state/abele-node` on both operating systems.
+At startup the daemon resolves the state directory's existing ancestor to its
+physical path before creating missing descendants. Database, recovery, provider
+state and lock operations then use that pinned path; `status`/`doctor` report it.
+A stable parent alias such as macOS `/tmp` → `/private/tmp` is supported. Changing
+an alias while the daemon is running does not relocate its state; stop before
+moving state, and use the reported physical path to address the running instance.
 
 - `node.sqlite` plus WAL/SHM: identities, token hashes, sessions, queue, receipts,
   prompts, journals, jobs and retained content/diff/artifact bytes.
@@ -286,7 +503,8 @@ node packages/node-daemon/dist/cli.js doctor
 node packages/node-daemon/dist/cli.js doctor --state-dir "$HOME/abele-node-state"
 ```
 
-`status` reports the locally recorded live PID/identity/port and provider report;
+`status` reports the locally recorded live PID/identity/port, running runtime
+identity (`runtime.cli_path` and `runtime.version`) and provider report;
 it is **not** an authenticated network probe. `doctor` adds Node/SQLite/state-mode
 and LaunchAgent diagnostics. With a running daemon, provider diagnostics describe
 that daemon, not a different CLI from your current shell. Neither command requests
@@ -300,19 +518,23 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
    resume files separately. Also preserve project Git metadata and managed worktrees
    together; worktree paths/registration provenance are absolute. Copying only the
    SQLite main file while WAL is live is not a safe backup.
-3. In the checkout, fetch and select the intended release, then rebuild:
+3. For the one-command installer, rerun it with the same prefix/settings and the
+   intended `--version` (plus `--no-service` for a foreground-only deployment).
+   For a source checkout, fetch and select the intended release, then rebuild:
 
    ```sh
    git fetch --tags origin
-   git checkout v0.2.0  # example; select an existing release
+   git checkout v0.3.0  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
    npm run build
    ```
 
-4. macOS: run `install` again with the same state/root/port/provider options. Linux:
-   restart the user service; foreground: start again. Check `status` and `doctor`.
+4. The one-command installer restarts its service and checks `status`/`doctor`.
+   For source installs on macOS, run `install` again with the same
+   state/root/port/provider options; on Linux, restart the user service.
+   For foreground installs, start again. Check `status` and `doctor`.
 
 Database migrations are versioned and transactional; newer schemas are refused by
 older code. Migration 9 refuses legacy recovery rows/old mutation intents requiring
@@ -324,6 +546,9 @@ permission-bypass fallback exists.
 
 First stop all sessions and review any dirty managed worktrees. Preserve their
 changes/branches before removing anything.
+
+For one-command installations, use `install.sh --uninstall` as described above.
+For manual/source installations:
 
 - macOS: run `stop`, then remove
   `$HOME/Library/LaunchAgents/dev.abele.node.plist`.

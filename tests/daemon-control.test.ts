@@ -1,7 +1,17 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { createServer } from 'node:net'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  existsSync,
+  writeFileSync,
+  readFileSync,
+  symlinkSync,
+  realpathSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { control, readRuntime, startDaemon } from '../packages/node-daemon/src/index.js'
@@ -50,6 +60,30 @@ it('long state paths have short protected control endpoints, isolated commands, 
   expect(existsSync(dirname(otherEndpoint))).toBe(false)
 })
 
+it('daemon startup pins the physical state ancestor for locks, control and shutdown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'abele-control-test-'))
+  directories.push(root)
+  const parent = join(root, 'physical')
+  const alias = join(root, 'alias')
+  mkdirSync(parent)
+  symlinkSync(parent, alias)
+  const state = join(alias, 'not-created', 'state')
+  const physicalState = join(realpathSync(parent), 'not-created', 'state')
+  const daemon = await startDaemon(state, 0)
+  daemons.push(daemon)
+  expect(readRuntime(physicalState)?.pid).toBe(process.pid)
+  const replacement = join(root, 'replacement')
+  const replacementState = join(replacement, 'not-created', 'state')
+  mkdirSync(replacementState, { recursive: true })
+  const sentinel = JSON.stringify({ pid: process.pid, sentinel: 'must survive alias retarget' })
+  writeFileSync(join(replacementState, 'daemon.lock'), sentinel)
+  rmSync(alias)
+  symlinkSync(replacement, alias)
+  expect(await control(physicalState, { action: 'list' })).toEqual([])
+  await daemon.stop()
+  expect(existsSync(join(physicalState, 'daemon.lock'))).toBe(false)
+  expect(readFileSync(join(replacementState, 'daemon.lock'), 'utf8')).toBe(sentinel)
+})
 it('an overlong custom TMPDIR also gets a bounded private endpoint', async () => {
   const root = mkdtempSync(join(tmpdir(), 'abele-control-test-'))
   directories.push(root)

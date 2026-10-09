@@ -1,6 +1,6 @@
 {
   "name": "abele-node",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
@@ -22,9 +22,11 @@
     "acceptance:stage4b": "npm run build && node scripts/acceptance-stage4b.mjs",
     "acceptance:remote": "npm run build && vitest run tests/pairing.test.ts tests/paired-security.test.ts tests/paired-daemon.test.ts tests/tailscale.test.ts tests/serve-ownership.test.ts tests/paired-timeout.test.ts",
     "acceptance:pi": "npm run build && node scripts/acceptance-pi.mjs",
+    "acceptance:delegation": "npm run build && vitest run tests/delegation",
     "types": "tsc -b && tsc -p tsconfig.tests.json --noEmit",
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
+    "test:installer": "npm run build && node scripts/package-release.mjs && node scripts/test-installer.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

@@ -384,6 +384,32 @@ it('cleans an orphan in the Claude group even if the CLI exits before the first 
     if (identity(pid)) process.kill(pid, 'SIGKILL')
   }
 })
+it('preserves successful CLI exit after the final result is published while the supervisor is busy', async () => {
+  const f = fixture(),
+    adapter = new ClaudeProviderAdapter({ executable: f.executable }),
+    events: ClaudeEvent[] = []
+  const run = await adapter.startTurn(
+    { session_id: 's', run_id: 'r', cwd: f.cwd, text: 'delegation-report' },
+    {
+      event: (e) => {
+        events.push(e)
+        // Reproduce the worker closing IPC before the supervisor acknowledges
+        // the last output chunk, after the result has already been published.
+        if (e.type === 'claude.result')
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
+      },
+      processes: () => {},
+      permission: async () => ({ choice: 'deny', delivered() {} }),
+    }
+  )
+  runs.push(run)
+  expect(await run.done).toMatchObject({ result: { subtype: 'success' } })
+  expect((await run.done).reason).toBeUndefined()
+  expect(events.find((e) => e.type === 'claude.worker.exit')?.data).toMatchObject({
+    exit_code: 0,
+    cleanup_confirmed: true,
+  })
+}, 10000)
 it('worker loss after a terminal record remains unknown and requires cleanup evidence', async () => {
   const f = fixture(),
     adapter = new ClaudeProviderAdapter({ executable: f.executable })

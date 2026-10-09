@@ -33,5 +33,6 @@ jobs:
       - run: node --test probes/approval-mcp.test.mjs probes/echo.test.mjs
       # Fake DAP/process regressions only; no real adapters or scratch installation.
       - run: node --test probes/debug-*.test.mjs
-      - run: npm run build
+      - run: npm run test:installer
+      - run: sh -n install.sh && bash -n install.sh
       - run: npm run format:check
