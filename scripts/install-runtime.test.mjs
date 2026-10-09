@@ -10,6 +10,12 @@ import { join, resolve } from 'node:path'
 
 for (const mode of [
   'unload-ok',
+  'delayed-36',
+  'delayed-5',
+  'delayed-pid',
+  'stale-missing',
+  'stale-loaded',
+  'owned-missing',
   'already-unloaded',
   'still-loaded',
   'foreign-arguments',
@@ -60,21 +66,52 @@ for (const mode of [
           command.map((s) => '<string>' + escape(s) + '</string>').join('') +
           '</array></dict></plist>'
       )
-      if (mode !== 'already-unloaded') await writeFile(join(home, 'loaded'), 'loaded')
+      if (mode !== 'already-unloaded' && mode !== 'stale-missing' && mode !== 'owned-missing')
+        await writeFile(join(home, 'loaded'), 'loaded')
+      if (mode.startsWith('stale-'))
+        await writeFile(join(state, 'daemon.lock'), JSON.stringify({ pid: process.pid }))
+      if (mode === 'delayed-pid' || mode === 'owned-missing')
+        await writeFile(join(state, 'daemon.lock'), JSON.stringify({ pid: 99999999 }))
       const shim = join(home, 'launch-shim.mjs')
       await writeFile(
         shim,
         `import cp from 'node:child_process';import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
 Object.defineProperty(process,'platform',{value:'darwin'});
 const command=${JSON.stringify(command)}, mode=${JSON.stringify(mode)}, home=process.env.HOME;
+let stopping=false,polls=0;
+let pidPolls=0;
+let exited=false;
+if(mode==='owned-missing')process.kill=(pid,signal)=>{
+  if(pid!==99999999)throw new Error('unexpected pid');
+  if(exited)throw Object.assign(new Error('gone'),{code:'ESRCH'});
+  if(signal==='SIGTERM'){fs.appendFileSync(home+'/signals',signal+'\\n');exited=true;return true}
+  if(signal!==0)throw new Error('unexpected signal');
+  return true;
+};
+if(mode.startsWith('stale-'))process.kill=(pid,signal)=>{
+  if(pid!==${process.pid})throw new Error('unexpected pid');
+  if(signal!==0){fs.appendFileSync(home+'/signals',signal+'\\n');throw new Error('attempted to signal unrelated parent')}
+  return true;
+};
+if(mode==='delayed-pid')process.kill=(pid,signal)=>{
+  if(pid!==99999999 || signal!==0)throw new Error('unexpected signal');
+  if(++pidPolls<5)return true;
+  throw Object.assign(new Error('gone'),{code:'ESRCH'});
+};
 cp.spawnSync=(binary,args)=>{
+  if(binary==='/bin/ps' && mode==='owned-missing')return {status:0,stdout:command.join(' '),stderr:''};
+  if(binary==='/bin/ps' && mode==='delayed-pid')return pidPolls<5 ? {status:0,stdout:command.join(' '),stderr:''} : {status:1,stdout:'',stderr:''};
+  if(binary==='/bin/ps' && mode.startsWith('stale-'))return {status:0,stdout:'node --test scripts/install-runtime.test.mjs',stderr:''};
   if(binary!=='/bin/launchctl')throw new Error('unexpected subprocess '+binary);
   fs.appendFileSync(home+'/calls',JSON.stringify(args)+'\\n');
   if(args[0]==='bootout'){
+    stopping=true;
+    if(mode.startsWith('delayed-'))return {status:Number(mode.slice(8)),stdout:'',stderr:'Operation now in progress'};
     if(mode!=='still-loaded')fs.rmSync(home+'/loaded',{force:true});
     return {status:0,stdout:'',stderr:''};
   }
   if(args[0]==='print'){
+    if(stopping && mode.startsWith('delayed-') && ++polls===4)fs.rmSync(home+'/loaded',{force:true});
     if(!fs.existsSync(home+'/loaded'))return {status:113,stdout:'',stderr:'Could not find service dev.abele.node in domain'};
     const actual=[...command];if(mode==='foreign-arguments')actual[4]=home+'/foreign-state';
     return {status:0,stdout:'job = {\\n\\targuments = {\\n'+actual.map(s=>'\\t\\t'+s).join('\\n')+'\\n\\t}\\n}\\n',stderr:''};
@@ -99,9 +136,22 @@ cp.spawnSync=(binary,args)=>{
         child.on('error', reject)
         child.on('close', (code) => done({ code, stdout, stderr }))
       })
-      if (mode === 'unload-ok' || mode === 'already-unloaded' || mode === 'case-alias') {
+      if (
+        mode.startsWith('delayed-') ||
+        mode.startsWith('stale-') ||
+        mode === 'owned-missing' ||
+        mode === 'unload-ok' ||
+        mode === 'already-unloaded' ||
+        mode === 'case-alias'
+      ) {
         assert.equal(result.code, 0, result.stderr)
         assert.equal(JSON.parse(result.stdout).service_unloaded, true)
+        if (mode === 'owned-missing')
+          assert.equal(await readFile(join(home, 'signals'), 'utf8'), 'SIGTERM\n')
+        if (mode.startsWith('stale-')) {
+          assert.equal(JSON.parse(result.stdout).stopping, null)
+          await assert.rejects(readFile(join(home, 'signals')), { code: 'ENOENT' })
+        }
       } else {
         assert.notEqual(result.code, 0, result.stderr)
         await readFile(join(home, 'loaded'))
@@ -200,14 +250,16 @@ cp.spawnSync=(command,args)=>{if(command!=='/bin/launchctl')throw new Error('une
     await rm(home, { recursive: true, force: true })
   }
 })
-for (const mode of ['direct', 'source', 'symlink']) {
+for (const mode of ['direct', 'source', 'symlink', 'async']) {
   const direct = mode !== 'source'
   test(
-    mode === 'symlink'
-      ? 'CLI runtime-dir accepts a symlinked installation prefix'
-      : direct
-        ? 'CLI install points LaunchAgent directly at an immutable release runtime'
-        : 'source CLI install skips absent optional dependencies in the lockfile',
+    mode === 'async'
+      ? 'CLI install confirms delayed bootstrap and nonzero kickstart by observation'
+      : mode === 'symlink'
+        ? 'CLI runtime-dir accepts a symlinked installation prefix'
+        : direct
+          ? 'CLI install points LaunchAgent directly at an immutable release runtime'
+          : 'source CLI install skips absent optional dependencies in the lockfile',
     async () => {
       const home = await mkdtemp(join(tmpdir(), 'abele-launchagent-test-'))
       try {
@@ -216,8 +268,24 @@ for (const mode of ['direct', 'source', 'symlink']) {
           shim,
           `import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
+import fs from 'node:fs';
 Object.defineProperty(process, 'platform', {value:'darwin'});
-cp.spawnSync = (command,args) => { if(command==='/bin/launchctl') return args[0]==='print' ? {status:113,stdout:'',stderr:'Could not find service dev.abele.node in domain'} : {status:0,stdout:'',stderr:''}; throw new Error('unexpected subprocess: '+command) };
+let loaded=false,commandArgs=[],polls=0;
+const asynchronous=${JSON.stringify(mode === 'async')};
+cp.spawnSync = (command,args) => {
+ if(command!=='/bin/launchctl')throw new Error('unexpected subprocess: '+command);
+ if(args[0]==='bootstrap'){
+  loaded=true;
+  // Extract ProgramArguments separately from other plist strings.
+  const text=fs.readFileSync(args[2],'utf8').split('<array>')[1].split('</array>')[0];
+  commandArgs=[...text.matchAll(/<string>(.*?)<\\/string>/gs)].map(m=>m[1].replaceAll('&quot;','"').replaceAll('&gt;','>').replaceAll('&lt;','<').replaceAll('&amp;','&'));
+  if(asynchronous)return {status:36,stdout:'',stderr:'Operation now in progress'};
+ }
+ if(args[0]==='kickstart')fs.writeFileSync(commandArgs[commandArgs.indexOf('--state-dir')+1]+'/daemon.lock',JSON.stringify({pid:process.pid}));
+ if(args[0]==='kickstart' && asynchronous)return {status:5,stdout:'',stderr:'Input/output error'};
+ if(args[0]==='print' && loaded && asynchronous && ++polls<4)return {status:113,stdout:'',stderr:'Could not find service dev.abele.node in domain'};
+ return args[0]==='print' ? loaded ? {status:0,stdout:'job = {\\n\\targuments = {\\n'+commandArgs.map(s=>'\\t\\t'+s).join('\\n')+'\\n\\t}\\n}',stderr:''} : {status:113,stdout:'',stderr:'Could not find service dev.abele.node in domain'} : {status:0,stdout:'',stderr:''};
+};
 syncBuiltinESMExports();`
         )
         const root = resolve('.')

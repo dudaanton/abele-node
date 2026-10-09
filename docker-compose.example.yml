@@ -1,6 +1,6 @@
 services:
   abele-node:
-    image: ghcr.io/dudaanton/abele-node:0.3.2
+    image: ghcr.io/dudaanton/abele-node:0.3.3
     build:
       context: .
     restart: unless-stopped

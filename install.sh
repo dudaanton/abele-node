@@ -383,7 +383,14 @@ switch_to() {
 mac_manager_inspect() {
   "$node" - "$service_file" "gui/$(id -u)/dev.abele.node" "$1" <<'NODE'
 const fs=require('node:fs'),cp=require('node:child_process');const [file,job,absent]=process.argv.slice(2);
-const result=cp.spawnSync('/bin/launchctl',['print',job],{encoding:'utf8'});
+const deadline=performance.now()+20000;let result,delay=50;
+for(;;){
+result=cp.spawnSync('/bin/launchctl',['print',job],{encoding:'utf8',timeout:1000});
+const missing=(result.status===3 || result.status===113) && /could not find (?:specified )?service|no such process/i.test(result.stderr || '');
+if(absent==='2' || (absent==='1'?missing:result.status===0))break;
+const remaining=deadline-performance.now();if(remaining<=0)throw new Error((absent==='1'?'launch_agent_stop_unconfirmed: ':'launch_agent_load_unconfirmed: ')+(result.stderr || result.stdout));
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Math.min(delay,remaining));delay=Math.min(delay*2,500);
+}
 if((result.status===3 || result.status===113) && /could not find (?:specified )?service|no such process/i.test(result.stderr || '')){if(absent==='2')console.log('0');process.exit(0)}
 if(result.status!==0 || absent==='1')throw new Error('launch_agent_stop_unconfirmed');
 const array=fs.readFileSync(file,'utf8').match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];if(!array)throw new Error('unknown_launch_arguments');
@@ -419,7 +426,11 @@ NODE
     fi
   fi
 }
+report_stop_confirmation_failure() {
+  if [ -n "$stop_stderr" ]; then cat "$stop_stderr" >&2; fi
+}
 stop_service() {
+  stop_stderr=''
   preflight_stop || return 1
   if [ "$old_service" = 1 ] && [ "$os" = linux ]; then
     verify_state_identity "$state" || return 1
@@ -437,20 +448,28 @@ stop_service() {
     if [ "$os" = darwin ] && [ "$old_service" = 1 ] && [ "$journal_recording" = 1 ]; then
       stopped_id=''
       if [ "$old_mac_loaded" = 1 ]; then journal_intent stopped-service "$service_file" "$old" || return 1; stopped_id=$journal_action_id; fi
-      cli "$old" stop > "$work/stop.json" || return 1
+      # Immutable legacy CLIs can reject a bootout that is still completing.
+      # Confirm manager absence and daemon exit ourselves before proceeding.
+      stop_stderr="$work/stop.stderr"
+      cli "$old" stop > "$work/stop.json" 2> "$stop_stderr" || :
+      mac_manager_inspect 1 || { report_stop_confirmation_failure; return 1; }
       if [ -n "$stopped_id" ]; then journal_done "$stopped_id" || return 1; fi
-      mac_manager_inspect 1 || return 1
     else
-      cli "$old" stop > "$work/stop.json" || return 1
-      if [ "$os" = darwin ] && [ "$old_service" = 1 ]; then mac_manager_inspect 1 || return 1; fi
+      if [ "$os" = darwin ] && [ "$old_service" = 1 ]; then
+        stop_stderr="$work/stop.stderr"
+        cli "$old" stop > "$work/stop.json" 2> "$stop_stderr" || :
+        mac_manager_inspect 1 || { report_stop_confirmation_failure; return 1; }
+      else
+        cli "$old" stop > "$work/stop.json" || return 1
+      fi
     fi
   fi
   count=0
   while [ -n "$old" ]; do
-    verify_state_identity "$state" || return 1
-    cli "$old" status > "$work/stopped.json" || return 1
+    verify_state_identity "$state" || { report_stop_confirmation_failure; return 1; }
+    cli "$old" status > "$work/stopped.json" || { report_stop_confirmation_failure; return 1; }
     if "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).running)process.exit(1)' "$work/stopped.json"; then break; fi
-    count=$((count + 1)); [ "$count" -lt 45 ] || return 1; sleep 1
+    count=$((count + 1)); [ "$count" -lt 45 ] || { report_stop_confirmation_failure; return 1; }; sleep 1
   done
 }
 prepare_state() {
@@ -565,11 +584,13 @@ restart_stopped_service() {
   else
     restore_loaded=$(mac_manager_inspect 2) || return 1
     if [ "$restore_loaded" = 1 ]; then
-      /bin/launchctl kickstart -k "gui/$(id -u)/dev.abele.node" || return 1
+      /bin/launchctl kickstart -k "gui/$(id -u)/dev.abele.node" || :
     else
-      /bin/launchctl bootstrap "gui/$(id -u)" "$plist" || return 1
-      /bin/launchctl kickstart "gui/$(id -u)/dev.abele.node" || return 1
+      /bin/launchctl bootstrap "gui/$(id -u)" "$plist" || :
+      mac_manager_inspect 0 || return 1
+      /bin/launchctl kickstart "gui/$(id -u)/dev.abele.node" || :
     fi
+    mac_manager_inspect 0 || return 1
   fi
   if ! check_health "$old" 1; then
     printf '%s\n' 'Previous unit was restored and restart was attempted, but the previous runtime could not be verified. User overrides remain unchanged; inspect service status and logs.' >&2

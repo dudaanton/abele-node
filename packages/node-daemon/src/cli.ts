@@ -23,6 +23,7 @@ import {
   closeSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { daemonProcessPresent, waitForLaunch } from './launch-wait.js'
 import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
 import { ClaudeProviderAdapter, PiProviderAdapter, canonicalStateDir } from '@abele/node-core'
@@ -120,7 +121,8 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invali
 const output = (value: unknown) => console.log(JSON.stringify(value))
 const label = 'dev.abele.node'
 const launchDomain = `gui/${process.getuid!()}`
-const launch = (...params: string[]) => spawnSync('/bin/launchctl', params, { encoding: 'utf8' })
+const launch = (...params: string[]) =>
+  spawnSync('/bin/launchctl', params, { encoding: 'utf8', timeout: 1000 })
 const escape = (s: string) =>
   s
     .replaceAll('&', '&amp;')
@@ -190,6 +192,23 @@ async function main() {
       return
     }
     case 'stop': {
+      // Capture before bootout: launchd can remove the job before its daemon exits.
+      let recordedPid: number | undefined
+      let recordedEntry = fileURLToPath(import.meta.url)
+      try {
+        const record = JSON.parse(readFileSync(join(state, 'daemon.lock'), 'utf8'))
+        const pid = record.pid
+        if (Number.isSafeInteger(pid) && pid > 0) recordedPid = pid
+        if (
+          typeof record.runtime?.cli_path === 'string' &&
+          record.runtime.cli_path.endsWith('/packages/node-daemon/dist/cli.js')
+        )
+          recordedEntry = record.runtime.cli_path
+      } catch {
+        /* No recorded daemon. */
+      }
+      const recordedPresent = () =>
+        recordedPid !== undefined && daemonProcessPresent(recordedPid, recordedEntry, state)
       // Disable KeepAlive before terminating; otherwise launchd immediately restarts it.
       const plist = join(homedir(), 'Library/LaunchAgents', label + '.plist')
       const expected =
@@ -211,6 +230,8 @@ async function main() {
           /* A missing or retargeted state is not proof of service ownership. */
         }
       }
+      // launchd executes the plist's spelling, which may use a symlinked runtime.
+      if (installedHere && expected[1]) recordedEntry = expected[1]
       let service_unloaded: boolean | null = process.platform === 'darwin' ? false : null
       if (process.platform === 'darwin' && installedHere) {
         const job = `${launchDomain}/${label}`
@@ -220,14 +241,36 @@ async function main() {
           // foreign runtime merely because the file now looks like ours.
           if (JSON.stringify(loadedArguments(before.stdout)) !== JSON.stringify(expected))
             throw new Error('launch_agent_loaded_arguments_mismatch')
-          if (launch('bootout', job).status !== 0) throw new Error('launch_agent_stop_unconfirmed')
-          completedInstallerAction('stopped-service', plist)
-          if (!launchMissing(launch('print', job))) throw new Error('launch_agent_stop_unconfirmed')
+          const result = launch('bootout', job)
+          // Journal an accepted unload immediately so rollback can restart it
+          // even if process-exit confirmation subsequently times out.
+          if (result.status === 0) completedInstallerAction('stopped-service', plist)
+          let last = result
+          await waitForLaunch(
+            () => {
+              last = launch('print', job)
+              return launchMissing(last) && !recordedPresent()
+            },
+            () =>
+              `launch_agent_stop_unconfirmed: ${last.stderr || last.stdout || result.stderr}; recorded pid=${recordedPid ?? 'none'}`
+          )
+          if (result.status !== 0) completedInstallerAction('stopped-service', plist)
         } else if (!launchMissing(before)) throw new Error('launch_agent_stop_unconfirmed')
+        else if (recordedPid !== undefined && recordedPresent()) {
+          try {
+            process.kill(recordedPid, 'SIGTERM')
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          }
+        }
+        await waitForLaunch(
+          () => !recordedPresent(),
+          () => 'launch_agent_stop_unconfirmed: recorded daemon pid still present'
+        )
         service_unloaded = true
       }
-      const running = readRuntime(state)
-      if (running) {
+      const running = recordedPresent() ? readRuntime(state) : undefined
+      if (running && daemonProcessPresent(running.pid, recordedEntry, state)) {
         try {
           process.kill(running.pid, 'SIGTERM')
         } catch (error) {
@@ -437,9 +480,32 @@ async function main() {
         rmSync(temporary, { recursive: true, force: true })
       }
       const result = launch('bootstrap', launchDomain, destination)
-      if (result.status !== 0) throw new Error(result.stderr || 'launchctl bootstrap failed')
-      completedInstallerAction('started-service', destination)
-      launch('kickstart', `${launchDomain}/${label}`)
+      if (result.status === 0) completedInstallerAction('started-service', destination)
+      let last = result
+      const job = `${launchDomain}/${label}`
+      await waitForLaunch(
+        () => {
+          last = launch('print', job)
+          return (
+            last.status === 0 &&
+            JSON.stringify(loadedArguments(last.stdout)) === JSON.stringify(command)
+          )
+        },
+        () => `launch_agent_load_unconfirmed: ${last.stderr || last.stdout || result.stderr}`
+      )
+      if (result.status !== 0) completedInstallerAction('started-service', destination)
+      const started = launch('kickstart', job)
+      await waitForLaunch(
+        () => {
+          last = launch('print', job)
+          return (
+            last.status === 0 &&
+            JSON.stringify(loadedArguments(last.stdout)) === JSON.stringify(command) &&
+            !!readRuntime(state)
+          )
+        },
+        () => `launch_agent_start_unconfirmed: ${last.stderr || last.stdout || started.stderr}`
+      )
       output({ installed: destination, runtime })
       return
     }

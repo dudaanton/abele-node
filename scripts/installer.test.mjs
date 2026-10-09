@@ -119,6 +119,11 @@ if(args[0]==='stop'){
   if(!isMac)fs.rmSync(marker,{force:true});
   else{
     const current=fs.existsSync(job)?JSON.parse(fs.readFileSync(job,'utf8')):null;
+    const legacy=process.env.HOME+'/legacy-stop-unconfirmed';
+    if(current?.state===state && ${JSON.stringify(version)}==='0.3.1' && fs.existsSync(legacy)){
+      fs.writeFileSync(process.env.HOME+'/legacy-unload-polls',fs.readFileSync(legacy,'utf8'));
+      console.error('launch_agent_stop_unconfirmed');process.exit(1);
+    }
     if(current?.state===state && !fs.existsSync(process.env.HOME+'/block-unload')){
       fs.rmSync(job,{force:true});fs.rmSync(marker,{force:true});completed('stopped-service',plist);
     }
@@ -130,6 +135,15 @@ if(args[0]==='stop'){
 if(process.argv[2]==='doctor' && ${broken}){
   const late=process.env.HOME+'/override-after-doctor';if(fs.existsSync(late)){fs.writeFileSync(process.env.HOME+'/simulate-loaded-dropins',fs.readFileSync(late,'utf8'));fs.rmSync(late)}
   process.exit(1);
+}
+const daemonPending=process.env.HOME+'/legacy-daemon-polls';
+if(args[0]==='status' && fs.existsSync(daemonPending)){
+  const failure=process.env.HOME+'/legacy-status-fails';
+  if(fs.existsSync(failure)){fs.rmSync(failure);fs.rmSync(daemonPending);console.error('legacy status unavailable');process.exit(1)}
+  const count=Number(fs.readFileSync(daemonPending,'utf8'));
+  fs.appendFileSync(process.env.HOME+'/legacy-stop-events','status '+count+'\\n');
+  if(count===0){fs.rmSync(marker,{force:true});fs.rmSync(daemonPending)}
+  else fs.writeFileSync(daemonPending,String(count-1));
 }
 const present=fs.existsSync(marker), reported=present && fs.readFileSync(marker,'utf8');
 const running=present && (!isMac || JSON.parse(reported).state===state);
@@ -166,12 +180,25 @@ async function install(homeDir, args = [], extra = {}) {
   let installer = script
   if (extra.TEST_MAC_SERVICE === '1') {
     // Even an unexpected rollback must never reach the host's live launchctl.
-    const fake = join(homeDir, 'mocks/launchctl')
+    const fake = join(homeDir, 'mocks/launchctl.cjs')
     await writeFile(
       fake,
       `#!${process.execPath}
 const fs=require('node:fs'),home=process.env.HOME,args=process.argv.slice(2),file=home+'/.fake-launch-job';
 if(args[0]==='print'){
+  const unload=home+'/legacy-unload-polls';
+  if(fs.existsSync(unload)){
+    fs.appendFileSync(home+'/legacy-stop-events','print\\n');
+    const count=Number(fs.readFileSync(unload,'utf8'));
+    if(count===0){fs.rmSync(file,{force:true});fs.rmSync(unload);fs.writeFileSync(home+'/legacy-daemon-polls','2')}
+    else if(count>0)fs.writeFileSync(unload,String(count-1));
+  }
+  const pending=home+'/bootstrap-polls';
+  if(fs.existsSync(pending)){
+    const count=Number(fs.readFileSync(pending,'utf8'));
+    if(count>0){fs.writeFileSync(pending,String(count-1));console.error('Could not find service dev.abele.node in domain');process.exit(113)}
+    fs.rmSync(pending);
+  }
   if(!fs.existsSync(file)){console.error('Could not find service dev.abele.node in domain');process.exit(113)}
   const record=JSON.parse(fs.readFileSync(file,'utf8'));
   console.log('job = {\\n\\targuments = {\\n'+record.arguments.map(s=>'\\t\\t'+s).join('\\n')+'\\n\\t}\\n}');
@@ -184,7 +211,11 @@ if(args[0]==='print'){
   const state=command[command.indexOf('--state-dir')+1],cli=command[1],version=JSON.parse(fs.readFileSync(cli.replace('/packages/node-daemon/dist/cli.js','/package.json'),'utf8')).version;
   const record={state,arguments:command,runtime:{cli_path:fs.realpathSync(cli),version}};
   fs.writeFileSync(file,JSON.stringify(record));fs.writeFileSync(home+'/.test-service-running',JSON.stringify(record));
-}else if(args[0]==='kickstart'){if(!fs.existsSync(file))process.exit(113)}else process.exit(99);
+  if(fs.existsSync(home+'/async-rollback-bootstrap')){fs.writeFileSync(home+'/bootstrap-polls','3');console.error('Operation now in progress');process.exit(36)}
+}else if(args[0]==='kickstart'){
+  fs.appendFileSync(home+'/launch-kickstarts',args.join(' ')+'\\n');
+  if(!fs.existsSync(file))process.exit(113);
+}else process.exit(99);
 `,
       { mode: 0o755 }
     )
@@ -211,6 +242,9 @@ before(async () => {
   await release('0.2.1', true)
   await release('0.2.2', false, true)
   await release('0.2.3')
+  await release('0.3.1')
+  await release('0.3.2', true)
+  await release('0.3.3')
   routes.set('/latest', JSON.stringify({ tag_name: 'v0.2.0' }))
   server = createServer((req, res) => {
     const body = routes.get(req.url)
@@ -666,6 +700,77 @@ async function mockedMacService(h) {
   )
   return { PATH: `${bin}:${process.env.PATH}`, TEST_MAC_SERVICE: '1' }
 }
+for (const outcome of ['upgrade', 'never-unloads', 'status-fails', 'health-rollback']) {
+  test(`macOS confirms legacy CLI stop failure independently: ${outcome}`, async () => {
+    const h = await home(),
+      env = await mockedMacService(h),
+      root = join(h, '.local/share/abele-node'),
+      plist = join(h, 'Library/LaunchAgents/dev.abele.node.plist')
+    const first = await install(h, ['--version', '0.3.1'], env)
+    assert.equal(first.code, 0, first.stderr)
+    const original = await readFile(plist, 'utf8'),
+      config = await readFile(join(root, 'config.json'), 'utf8')
+    await writeFile(join(h, 'legacy-stop-unconfirmed'), outcome === 'never-unloads' ? '-1' : '3')
+    if (outcome === 'status-fails')
+      await writeFile(join(h, 'legacy-status-fails'), 'fail confirmation after unload')
+    const target = outcome === 'health-rollback' ? '0.3.2' : '0.3.3'
+    const result = await install(h, ['--version', target], env)
+    const events = await readFile(join(h, 'legacy-stop-events'), 'utf8')
+    assert.ok(events.split('\n').filter((line) => line === 'print').length >= 4, events)
+    if (outcome === 'upgrade') {
+      assert.equal(result.code, 0, result.stderr)
+      assert.doesNotMatch(result.stdout + result.stderr, /launch_agent_stop_unconfirmed/)
+      assert.match(events, /status 2\nstatus 1\nstatus 0/)
+      assert.equal(await readlink(join(root, 'current')), target)
+      assert.equal(
+        JSON.parse(await readFile(join(h, '.test-service-running'), 'utf8')).runtime.version,
+        target
+      )
+    } else {
+      assert.notEqual(result.code, 0)
+      if (outcome === 'health-rollback') {
+        assert.match(result.stderr, /New runtime failed status\/doctor health checks/)
+        assert.doesNotMatch(result.stdout + result.stderr, /launch_agent_stop_unconfirmed/)
+      } else {
+        if (outcome === 'never-unloads')
+          assert.match(result.stderr, /launch_agent_stop_unconfirmed: /)
+        else assert.match(result.stderr, /legacy status unavailable/)
+        assert.match(result.stderr, /^launch_agent_stop_unconfirmed$/m)
+      }
+      assert.equal(await readlink(join(root, 'current')), '0.3.1')
+      assert.equal(await readFile(plist, 'utf8'), original)
+      assert.equal(await readFile(join(root, 'config.json'), 'utf8'), config)
+      assert.equal(
+        JSON.parse(await readFile(join(h, '.test-service-running'), 'utf8')).runtime.version,
+        '0.3.1'
+      )
+      await access(join(h, '.fake-launch-job'))
+      assert.match(await readFile(join(h, 'launch-kickstarts'), 'utf8'), /kickstart/)
+      assert.doesNotMatch(result.stderr, /Automatic service rollback failed/)
+      if (outcome === 'never-unloads')
+        assert.match(await readFile(join(h, 'launch-kickstarts'), 'utf8'), /kickstart -k/)
+    }
+  })
+}
+test('failed macOS 0.3.2 upgrade restores a running 0.3.1 despite nonzero rollback bootstrap', async () => {
+  const h = await home(),
+    env = await mockedMacService(h),
+    root = join(h, '.local/share/abele-node')
+  const first = await install(h, ['--version', '0.3.1'], env)
+  assert.equal(first.code, 0, first.stderr)
+  await writeFile(join(h, 'async-rollback-bootstrap'), 'bootstrap accepted asynchronously')
+  const result = await install(h, ['--version', '0.3.2'], env)
+  assert.notEqual(result.code, 0)
+  assert.equal(await readlink(join(root, 'current')), '0.3.1')
+  assert.equal(
+    JSON.parse(await readFile(join(h, '.test-service-running'), 'utf8')).runtime.version,
+    '0.3.1'
+  )
+  assert.doesNotMatch(
+    result.stderr,
+    /Automatic service rollback failed|previous runtime could not be verified/
+  )
+})
 test('macOS uninstall uses the installed canonical service state after alias retargeting', async () => {
   const h = await home(),
     env = await mockedMacService(h),
