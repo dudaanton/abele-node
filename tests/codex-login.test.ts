@@ -192,6 +192,114 @@ it.each(['chatgpt', 'logged-out'])(
   }
 )
 
+it.each(['chatgpt', 'user-model', 'no-model-metadata', 'logged-out', 'model-missing'])(
+  'reports Codex own default without inference or a node model override: %s',
+  async (mode) => {
+    const dir = mkdtempSync(resolve('.scratch/codex-default-model-'))
+    const home = join(dir, 'home')
+    mkdirSync(home, { mode: 0o700 })
+    writeFileSync(join(home, 'fixture.json'), JSON.stringify({ mode, track_requests: true }))
+    try {
+      const report = await doctorCodex(
+        { executable: fixture, fixture: true, stateDir: dir, home },
+        undefined,
+        'darwin'
+      )
+      expect(report.available).toBe(!['logged-out', 'model-missing'].includes(mode))
+      expect(report.model).toBe(
+        mode === 'user-model'
+          ? 'fixture-user-default'
+          : ['no-model-metadata', 'logged-out'].includes(mode)
+            ? 'Codex default'
+            : mode === 'model-missing'
+              ? 'fixture-missing'
+              : 'fixture-small'
+      )
+      if (['no-model-metadata', 'logged-out'].includes(mode))
+        expect(report.checks?.model_available).toBeUndefined()
+      else
+        expect(report.checks?.model_available).toBe(!['logged-out', 'model-missing'].includes(mode))
+      expect(humanOutput(['doctor'], { codex: report })).toContain(`model: ${report.model}`)
+      const requests = readFileSync(join(home, 'request-log.jsonl'), 'utf8')
+      expect(requests).not.toContain('thread/start')
+      expect(JSON.parse(readFileSync(join(home, 'launch.json'), 'utf8')).config.model).toBe(
+        mode === 'user-model'
+          ? 'fixture-user-default'
+          : mode === 'model-missing'
+            ? 'fixture-missing'
+            : undefined
+      )
+      if (mode === 'model-missing')
+        expect(report.diagnostic).toBe('codex_selected_model_unavailable')
+      expect(existsSync(join(home, 'threads.json'))).toBe(false)
+      expect(existsSync(join(home, 'turn-log.jsonl'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
+it.each(['default-hidden', 'default-no-low', 'oversized-catalog'])(
+  'retains the catalog/low-effort gates for Codex own default: %s',
+  async (mode) => {
+    const dir = mkdtempSync(resolve('.scratch/codex-default-gates-')),
+      home = join(dir, 'home')
+    mkdirSync(home, { mode: 0o700 })
+    writeFileSync(join(home, 'fixture.json'), JSON.stringify({ mode }))
+    try {
+      const report = await doctorCodex(
+        { executable: fixture, fixture: true, stateDir: dir, home },
+        undefined,
+        'darwin'
+      )
+      expect(report).toMatchObject({
+        available: false,
+        diagnostic: 'codex_selected_model_unavailable',
+        model: mode === 'oversized-catalog' ? 'Codex default' : 'fixture-small',
+        checks: { model_available: false },
+      })
+      mkdirSync(join(dir, 'workspace'))
+      const events: any[] = []
+      const run = await startCodexTurn(
+        {
+          executable: discoverCodex({ executable: fixture, fixture: true }),
+          paths: { home, workspace: join(dir, 'workspace'), state: dir, sibling: dir },
+          deadlineMs: 3000,
+          turn: {
+            session_id: randomUUID(),
+            run_id: randomUUID(),
+            cwd: join(dir, 'workspace'),
+            text: 'must not dispatch',
+          },
+        },
+        {
+          event: (e) => events.push(e),
+          processes: () => {},
+          permission: async () => ({ choice: 'deny', delivered: () => true }),
+        }
+      )
+      expect((await run.done).reason).toBe('codex_selected_model_unavailable')
+      expect(events.some((e) => e.type === 'codex.session.bound')).toBe(false)
+      expect(existsSync(join(home, 'turn-log.jsonl'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
+it('shows one actionable Codex status line instead of a generic restart suggestion', () => {
+  const output = humanOutput(['status'], {
+    codex: {
+      available: false,
+      diagnostic: 'codex_authentication_required',
+      login_command: 'codex login',
+    },
+  })
+  expect(output.split('\n').filter((line) => line.startsWith('Codex:'))).toEqual([
+    'Codex: not logged in (model: Codex default) — run: codex login',
+  ])
+  expect(
+    humanOutput(['status'], { codex: { available: false, diagnostic: 'codex_disabled' } })
+  ).toContain('Codex: disabled (model: Codex default) — run: abele-node install --codex')
+})
 it.each(['apiKey', 'environment-key', 'logged-out', 'amazonBedrock'])(
   'accepts only supported first-party authentication on each fake worker launch: %s',
   async (auth) => {

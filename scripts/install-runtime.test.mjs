@@ -261,7 +261,7 @@ cp.spawnSync=(command,args)=>{if(command!=='/bin/launchctl')throw new Error('une
     await rm(home, { recursive: true, force: true })
   }
 })
-for (const mode of ['direct', 'source', 'symlink', 'async']) {
+for (const mode of ['direct', 'source', 'symlink', 'async', 'codex-disabled', 'codex-override']) {
   const direct = mode !== 'source'
   test(
     mode === 'async'
@@ -320,6 +320,10 @@ syncBuiltinESMExports();`
               '/nonexistent/claude',
               '--tailscale-path',
               '/nonexistent/tailscale',
+              '--codex-path',
+              resolve('tests/fixtures/codex.mjs'),
+              ...(mode === 'codex-disabled' ? ['--no-codex'] : []),
+              ...(mode === 'codex-override' ? ['--codex-model', 'fixture-small'] : []),
               '--port',
               String(port),
               '--installer-journal',
@@ -362,6 +366,14 @@ syncBuiltinESMExports();`
             .replaceAll('&lt;', '<')
             .replaceAll('&amp;', '&')
         )
+        assert.equal(command.includes('--no-codex'), mode === 'codex-disabled')
+        if (mode === 'codex-override')
+          assert.equal(command[command.indexOf('--codex-model') + 1], 'fixture-small')
+        else assert.equal(command.includes('--codex-model'), false)
+        assert.equal(
+          command[command.indexOf('--codex-path') + 1],
+          resolve('tests/fixtures/codex.mjs')
+        )
         // Execute precisely the generated command, without the launchctl shim.
         const daemon = spawn(command[0], command.slice(1), { env: { ...process.env, HOME: home } })
         const closed = once(daemon, 'close')
@@ -392,6 +404,14 @@ syncBuiltinESMExports();`
           assert.equal(ready.pid, daemon.pid)
           const lock = JSON.parse(
             await readFile(join(home, '.local/state/abele-node/daemon.lock'), 'utf8')
+          )
+          assert.equal(
+            lock.codex.configuration.model,
+            mode === 'codex-override' ? 'fixture-small' : null
+          )
+          assert.equal(
+            lock.codex.diagnostic,
+            mode === 'codex-disabled' ? 'codex_disabled' : 'codex_opaque_wrapper_unsupported'
           )
           assert.deepEqual(lock.runtime, {
             cli_path: await realpath(command[1]),

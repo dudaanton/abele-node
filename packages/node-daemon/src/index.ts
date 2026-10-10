@@ -168,6 +168,7 @@ export const PairingControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('pairing.list') }).strict(),
   z.object({ action: z.literal('pairing.rotate') }).strict(),
 ])
+const CodexPreflightSchema = z.object({ action: z.literal('codex.preflight') }).strict()
 const ServeControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('tailscale.enable'), policy_verified: z.literal(true) }).strict(),
   z.object({ action: z.literal('tailscale.disable') }).strict(),
@@ -219,8 +220,11 @@ export async function control(dir: string, command: OwnerCommand): Promise<unkno
         : join(dir, 'control.sock')
     const socket = createConnection(endpoint)
     let data = ''
-    socket.setTimeout(command.action.startsWith('tailscale.') ? 60000 : 3000, () =>
-      socket.destroy(new Error('control_timeout'))
+    socket.setTimeout(
+      command.action.startsWith('tailscale.') || command.action === 'codex.preflight'
+        ? 60000
+        : 3000,
+      () => socket.destroy(new Error('control_timeout'))
     )
     socket.on('connect', () => socket.end(JSON.stringify(command) + '\n'))
     socket.on('data', (chunk) => {
@@ -299,7 +303,7 @@ export async function startDaemon(
   }
   try {
     const codex = new CodexProviderAdapter({ ...codexOptions, stateDir: dir })
-    if (codexOptions.enabled || codexOptions.executable) await codex.prepare()
+    await codex.prepare()
     core = new NodeCore(dir, {
       ...(worktreeRoot ? { worktreeRoot } : {}),
       claude: new ClaudeProviderAdapter(claudeOptions),
@@ -389,8 +393,19 @@ export async function startDaemon(
         void (async () => {
           try {
             const raw: unknown = JSON.parse(data)
+            const preflight = CodexPreflightSchema.safeParse(raw)
             const serve = ServeControlSchema.safeParse(raw)
-            if (serve.success) {
+            if (preflight.success) {
+              socket.setTimeout(60000, () => socket.destroy())
+              await codex.prepare()
+              const report = codex.capabilities()
+              const lock = readRuntime(dir)
+              if (!lock || lock.pid !== process.pid) throw new Error('daemon_lock_changed')
+              writeFileSync(join(dir, 'daemon.lock'), JSON.stringify({ ...lock, codex: report }), {
+                mode: 0o600,
+              })
+              socket.end(JSON.stringify({ result: report }))
+            } else if (serve.success) {
               if (!paired || !pairedPort) throw new Error('paired_listener_required')
               if (serve.data.action === 'tailscale.enable')
                 await serveManager.enable(paired.endpoint, pairedPort, address.port)

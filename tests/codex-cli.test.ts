@@ -3,6 +3,38 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
+it.each([[], ['--codex-model', 'custom-small'], ['--no-codex']].map((options) => ({ options })))(
+  'uses automatic discovery/model selection or explicit opt-out in doctor: %j',
+  ({ options }) => {
+    const dir = mkdtempSync(resolve('.scratch/codex-cli-auto-'))
+    try {
+      const result = spawnSync(
+        process.execPath,
+        ['packages/node-daemon/dist/cli.js', 'doctor', '--json', '--state-dir', dir, ...options],
+        {
+          encoding: 'utf8',
+          timeout: 10000,
+          env: {
+            ...process.env,
+            HOME: dir,
+            CODEX_HOME: join(dir, 'login'),
+            ABELE_CODEX_PATH: resolve('tests/fixtures/codex.mjs'),
+            ABELE_CODEX_MODEL: '',
+            ABELE_CODEX_HOME: '',
+          },
+        }
+      )
+      expect(result.status, result.stderr).toBe(0)
+      const report = JSON.parse(result.stdout).codex
+      expect(report.diagnostic).toBe(
+        options.includes('--no-codex') ? 'codex_disabled' : 'codex_opaque_wrapper_unsupported'
+      )
+      if (options.includes('--no-codex')) expect(report.configuration.model).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
 it.each(['default', 'environment', 'flag'])(
   'reports the selected Codex home through the CLI: %s',
   (mode) => {

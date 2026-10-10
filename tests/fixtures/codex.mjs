@@ -56,6 +56,10 @@ try {
   initializeDelayMs = fixture.initialize_delay_ms ?? 0
   trackRequests = fixture.track_requests === true
 } catch {}
+const defaultModel = mode === 'user-model' ? 'fixture-user-default' : 'fixture-small'
+if (mode === 'user-model') config.model = defaultModel
+if (mode === 'model-missing') config.model = 'fixture-missing'
+if (['default-hidden', 'default-no-low'].includes(mode)) config.model = 'fixture-small'
 writeFileSync(
   join(home, 'launch.json'),
   JSON.stringify({
@@ -149,9 +153,26 @@ for await (const line of createInterface({ input: process.stdin })) {
         {
           id: 'fixture-small',
           model: 'fixture-small',
+          hidden: mode === 'default-hidden',
+          ...(mode === 'no-model-metadata' ? {} : { isDefault: true }),
+          supportedReasoningEfforts: [
+            { reasoningEffort: mode === 'default-no-low' ? 'high' : 'low' },
+          ],
+        },
+        {
+          id: 'fixture-user-default',
+          model: 'fixture-user-default',
           hidden: false,
           supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
         },
+        ...(mode === 'oversized-catalog'
+          ? Array.from({ length: 100 }, (_, i) => ({
+              id: `extra-${i}`,
+              model: `extra-${i}`,
+              hidden: false,
+              supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+            }))
+          : []),
       ],
       nextCursor: null,
     })
@@ -185,7 +206,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       notify('thread/status/changed', { threadId: thread.id, status: { type: 'idle' } })
     reply(msg.id, {
       thread,
-      model: mode === 'model-fallback' ? 'other' : p.model,
+      model: mode === 'model-fallback' ? 'other' : (p.model ?? defaultModel),
       modelProvider: 'openai',
       cwd: p.cwd,
       approvalPolicy: 'on-request',
@@ -206,7 +227,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       p.threadId !== thread.id ||
       p.permissions !== 'abele' ||
       p.effort !== 'low' ||
-      p.model !== 'fixture-small'
+      (p.model !== undefined && p.model !== 'fixture-small' && p.model !== 'fixture-user-default')
     )
       process.exit(70)
     if (mode === 'crash-after-binding') process.exit(17)

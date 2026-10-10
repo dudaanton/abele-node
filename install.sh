@@ -7,21 +7,25 @@ umask 077
 fail() { printf 'abele-node: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' 'Usage: sh install.sh [--version X.Y.Z] [--prefix PATH] [--state-dir PATH]' \
-    '  [--claude-path PATH] [--no-service] [--uninstall]' \
+    '  [--claude-path PATH] [--codex-path PATH] [--codex-model MODEL_ID] [--codex-home PATH]' \
+    '  [--codex | --no-codex] [--no-service] [--uninstall]' \
     '  [--purge-state --confirm-purge-state ABSOLUTE_STATE_PATH]' \
     'Default prefix: ~/.local; Node 22.23.2 must already be installed.'
 }
 version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service=0 uninstall=0 purge=0 confirmation=''
+codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABELE_CODEX_HOME:-} codex_enabled=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--prefix|--state-dir|--claude-path|--confirm-purge-state)
+    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then fail "$1 requires a value"; fi
       case "$2" in --*) fail "$1 requires a value" ;; esac
       case "$1" in
         --version) version=${2#v} ;; --prefix) prefix=$2 ;; --state-dir) state=$2 ;;
         --claude-path) claude=$2 ;; --confirm-purge-state) confirmation=$2 ;;
+        --codex-path) codex=$2 ;; --codex-model) codex_model=$2 ;; --codex-home) codex_home=$2 ;;
       esac
       shift 2 ;;
+    --codex) codex_enabled=true; shift ;; --no-codex) codex_enabled=false; shift ;;
     --no-service) no_service=1; shift ;; --uninstall) uninstall=1; shift ;;
     --purge-state) purge=1; shift ;; --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
@@ -157,6 +161,10 @@ if [ -f "$config" ]; then
   old=$(get_config version); valid_version "$old" || fail 'Invalid installed version in config.'
   old_state=$(get_config state); old_claude=$(get_config claude); old_service=$(get_config service)
   expected_state_identity=$(get_config state_identity)
+  codex=${codex:-$(get_config codex)}
+  codex_model=${codex_model:-$(get_config codex_model)}
+  codex_home=${codex_home:-$(get_config codex_home)}
+  codex_enabled=${codex_enabled:-$(get_config codex_enabled)}
   [ -L "$root/current" ] || fail 'Installed current pointer is missing; refusing to adopt an unknown deployment.'
   [ "$(readlink "$root/current")" = "$old" ] || fail 'Installed current pointer differs from the recorded version.'
   if [ "$old_service" = 0 ] && [ -z "$expected_state_identity" ]; then
@@ -230,6 +238,36 @@ discover_claude() {
   claude=$HOME/.local/bin/claude
 }
 # End Claude discovery
+# Record Codex found in the installing user's PATH, before the service narrows it.
+# Do not execute launchers here: the daemon resolves official npm native binaries
+# and applies version/schema/admin/login/model gates at startup.
+codex_enabled=${codex_enabled:-true}
+case "$codex_enabled" in true|false) ;; *) fail 'Invalid Codex enabled configuration.' ;; esac
+[ -z "$codex_model" ] || "$node" -e 'if(!/^[A-Za-z0-9_.:-]{1,128}$/.test(process.argv[1]))process.exit(1)' "$codex_model" || fail 'Invalid codex-model.'
+if [ "$uninstall" = 0 ] && [ "$codex_enabled" = true ] && [ -z "$codex" ]; then
+  codex=$(command -v codex 2>/dev/null || true)
+  if [ -z "$codex" ]; then
+    for candidate in "$HOME/.local/bin/codex" "$HOME/.codex/local/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then codex=$candidate; break; fi
+    done
+  fi
+fi
+if [ -n "$codex" ]; then
+  codex=$(physical_path "$codex") || fail 'Cannot resolve codex-path.'
+  valid_path "$codex" || fail 'Invalid codex-path: use an absolute normalized executable path.'
+fi
+if [ -n "$codex_home" ]; then
+  valid_path "$codex_home" || fail 'Invalid codex-home: use an absolute normalized path.'
+fi
+selected_cli() {
+  selected_runtime=$1; shift
+  [ -z "$codex_model" ] || set -- "$@" --codex-model "$codex_model"
+  [ -z "$codex" ] || set -- "$@" --codex-path "$codex"
+  [ -z "$codex_home" ] || set -- "$@" --codex-home "$codex_home"
+  [ "$codex_enabled" = true ] || set -- "$@" --no-codex
+  "$node" "$selected_runtime/packages/node-daemon/dist/cli.js" "$@"
+}
+# End provider discovery
 if [ "$uninstall" = 1 ]; then claude=${old_claude:-$HOME/.local/bin/claude}
 else discover_claude; fi
 claude=$(physical_path "$claude") || fail 'Cannot resolve claude-path.'
@@ -497,20 +535,21 @@ start_service() {
     write_id=$journal_action_id
     journal_intent started-service "$service_file" "$runtime" || return 1
     started_id=$journal_action_id
-    "$node" "$root/$runtime/packages/node-daemon/dist/cli.js" install --json --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
+    selected_cli "$root/$runtime" install --json --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
     journal_done "$write_id" || return 1
     journal_done "$started_id" || return 1
   else
     mkdir -p "$(dirname "$unit")" || return 1
     journal_intent write-service "$service_file" "$runtime" || return 1
     write_id=$journal_action_id
-    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" <<'NODE' || return 1
-const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude]=process.argv.slice(2);
+    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" <<'NODE' || return 1
+const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled]=process.argv.slice(2);
+const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
 if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
 const q=(s,expand=false)=>'"'+s.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%').replaceAll('$',()=>expand?'$$':'$')+'"';
-fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--claude-path',claude].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
+fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--claude-path',claude,...codexArgs].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[...(codex?[path.dirname(codex)]:[]),path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
 const fd=fs.openSync(candidate,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
 fs.renameSync(candidate,unit);
 }finally{fs.rmSync(temporary,{recursive:true,force:true})}
@@ -768,7 +807,7 @@ tar -xzf "$work/$asset" -C "$work/runtime"
 [ -f "$work/runtime/packages/node-daemon/dist/cli.js" ] || fail 'Archive has no built daemon.'
 "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version!==process.argv[2])process.exit(1)' "$work/runtime/package.json" "$version" || fail 'Archive version mismatch.'
 # Validate imports/diagnostics before disrupting the previous service.
-"$node" "$work/runtime/packages/node-daemon/dist/cli.js" status --json --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed; previous install retained (no rollback needed).'
+selected_cli "$work/runtime" status --json --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed; previous install retained (no rollback needed).'
 if [ "$service" = 0 ] || [ "$old_service" = 0 ]; then
   "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).running)process.exit(1)' "$work/preflight.json" || fail 'stop_before_install: stop the foreground/manual daemon before installation or conversion.'
 fi
@@ -796,14 +835,15 @@ if [ "$service" = 1 ]; then
   installed_state=$(service_state) || fail 'Cannot read newly installed service state.'
   [ "$installed_state" = "$state" ] || fail 'Service state differs from the canonical installation state.'
 fi
-"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" <<'NODE'
-const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity]=process.argv.slice(2);
+"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" <<'NODE'
+const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled]=process.argv.slice(2);
 const stateStat=fs.statSync(state,{bigint:true}),state_identity=stateStat.dev+':'+stateStat.ino;
 if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathSync(state)!==state)throw new Error('state_identity_changed_before_publication');
 const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
-fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+'\n',{mode:0o755});
+const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
+fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
-fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,service:Number(service),...ownership})+'\n',{mode:0o600});
+fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi
 if [ -f "$config" ]; then cp -p "$config" "$work/published-config.previous"; fi
@@ -828,8 +868,8 @@ printf '%s\n' 'Next: abele-node token create desktop' \
   'Installation token: paste the token printed by the command' \
   'Click Add node. The token is shown once; keep it only on this device, never in synced notes or settings.'
 printf '%s\n' \
-  'Optional Codex: Codex uses your existing login by default (daemon CODEX_HOME, otherwise ~/.codex).' \
-  'Check setup: abele-node doctor --codex-path /absolute/codex --codex-model MODEL_ID' \
+  'Codex is detected automatically. Codex uses your existing login by default (daemon CODEX_HOME, otherwise ~/.codex).' \
+  'Check setup: abele-node doctor. Override: --codex-model MODEL_ID; opt out: sh install.sh --no-codex.' \
   'For a separate node login, add --codex-home PATH or set ABELE_CODEX_HOME; subscription and API-key login are supported.' \
   'Persist Codex options in your service configuration. Setup and platform requirements: docs/codex.md.'
 }

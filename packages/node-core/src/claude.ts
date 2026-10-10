@@ -444,7 +444,10 @@ export class ProviderSessions {
             this.core.resources.workspaces.get(session.workspace_id).path !==
               binding.workspace_path ||
             !/^[a-f0-9]{64}$/.test(binding.policy_fingerprint) ||
-            binding.model !== this.adapterFor('codex')?.configuration.model
+            typeof binding.model !== 'string' ||
+            !/^[A-Za-z0-9_.:-]{1,128}$/.test(binding.model) ||
+            (this.adapterFor('codex')?.configuration.model &&
+              binding.model !== this.adapterFor('codex')?.configuration.model)
           )
             throw new Error('codex_native_binding_mismatch')
           const previous = this.core.db

@@ -13,6 +13,7 @@ import { RpcPeer } from './rpc.js'
 import { ensureCodexState, prepareCodexHome, resolveCodexHome, type CodexHome } from './home.js'
 import { isCodexAuthenticated, codexLoginCommand, codexApiKeyLoginCommand } from './auth.js'
 import { codexExecutionGates } from './gates.js'
+import { exposedCodexModel, codexModelAvailable, validCodexCatalog } from './models.js'
 import type { ProcessIdentity } from '@abele/provider-contract'
 export interface CodexDoctorReport {
   provider: string
@@ -20,6 +21,7 @@ export interface CodexDoctorReport {
   available: boolean
   diagnostic: string
   home?: string
+  model?: string
   home_mode?: CodexHome['mode']
   login_command?: string
   api_key_login_command?: string
@@ -81,25 +83,21 @@ export async function inspectCodex(
     checkEffective(effective.config, requirements, paths)
     const account = await peer.request('account/read', { refreshToken: false })
     const authenticated = isCodexAuthenticated(account)
-    let modelAvailable = false
-    if (authenticated && model) {
-      const catalog = await peer.request('model/list', { includeHidden: false, limit: 100 })
-      modelAvailable =
-        Array.isArray(catalog?.data) &&
-        catalog.data.length <= 100 &&
-        catalog.data.some(
-          (m: any) =>
-            m.model === model &&
-            m.hidden !== true &&
-            m.supportedReasoningEfforts?.some((e: any) => e.reasoningEffort === 'low')
-        )
-    }
+    const catalog = authenticated
+      ? await peer.request('model/list', { includeHidden: false, limit: 100 })
+      : undefined
+    const selected = exposedCodexModel(effective.config, catalog, model)
     return {
       handshake: true,
       effective_policy: true,
       managed_remote_control: true,
       authenticated,
-      ...(model ? { model_available: modelAvailable } : {}),
+      model: selected ?? 'Codex default',
+      ...(authenticated && !validCodexCatalog(catalog)
+        ? { model_available: false }
+        : selected
+          ? { model_available: authenticated && codexModelAvailable(catalog, selected) }
+          : {}),
     }
   } finally {
     await peer.close()
@@ -127,22 +125,21 @@ export async function doctorCodex(
     }
     mkdirSync(paths.workspace, { mode: 0o700 })
     generateAndVerifySchemas(executable, directory)
-    const checks = await inspectCodex(executable, paths, () => {}, options.model)
+    const { model, ...checks } = await inspectCodex(executable, paths, () => {}, options.model)
     const gates = codexExecutionGates(platform)
     const error =
       gates.find((g) => g.error)?.error ??
       (!checks.authenticated
         ? 'codex_authentication_required'
-        : !options.model
-          ? 'codex_selected_model_required'
-          : !checks.model_available
-            ? 'codex_selected_model_unavailable'
-            : undefined)
+        : checks.model_available === false
+          ? 'codex_selected_model_unavailable'
+          : undefined)
     return {
       provider: 'codex',
       provider_version: executable.version,
       available: error === undefined,
       home,
+      model,
       home_mode: selection.mode,
       ...(!checks.authenticated
         ? {
@@ -156,7 +153,7 @@ export async function doctorCodex(
       gates,
       diagnostic:
         error ??
-        'Pinned executable, schemas, managed policy, authentication and selected model checked without inference.',
+        'Pinned executable, schemas, managed policy, authentication and exposed model checked without inference.',
     }
   } catch (error) {
     // Return only controlled error identifiers; never CLI diagnostics or authentication payloads.
@@ -165,6 +162,7 @@ export async function doctorCodex(
       provider: 'codex',
       available: false,
       home,
+      model: options.model || 'Codex default',
       home_mode: selection.mode,
       diagnostic: /^[a-z_]+(?::[A-Za-z_.]+)?$/.test(message) ? message : 'codex_inspection_failed',
     }

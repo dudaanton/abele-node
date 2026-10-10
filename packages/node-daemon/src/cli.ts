@@ -94,11 +94,13 @@ async function main() {
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
   const codexFlag = args.indexOf('--codex')
   if (codexFlag >= 0) args.splice(codexFlag, 1)
+  const noCodexFlag = args.indexOf('--no-codex')
+  if (noCodexFlag >= 0) args.splice(noCodexFlag, 1)
   const codexPath = option('--codex-path', process.env.ABELE_CODEX_PATH ?? '')
-  const codexModel = option('--codex-model', '')
+  const codexModel = option('--codex-model', process.env.ABELE_CODEX_MODEL ?? '')
   const codexHome = option('--codex-home', process.env.ABELE_CODEX_HOME ?? '')
   const codexOptions = {
-    enabled: codexFlag >= 0 || !!codexPath,
+    enabled: noCodexFlag < 0,
     ...(codexPath ? { executable: codexPath } : {}),
     model: codexModel,
     ...(codexHome ? { home: resolve(codexHome) } : {}),
@@ -408,13 +410,17 @@ async function main() {
         encrypted_at_rest: false,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
         pi: running?.pi ?? new PiProviderAdapter({ ...piOptions, stateDir: state }).capabilities(),
+        // A running daemon must recheck its own selection/environment so a login
+        // followed by doctor also updates readiness, not just a standalone report.
         codex: codexOptions.enabled
-          ? await doctorCodex({
-              ...(codexPath ? { executable: codexPath } : {}),
-              stateDir: state,
-              model: codexModel || undefined,
-              ...(codexHome ? { home: resolve(codexHome) } : {}),
-            })
+          ? running?.control_socket
+            ? await control(state, { action: 'codex.preflight' })
+            : await doctorCodex({
+                ...(codexPath ? { executable: codexPath } : {}),
+                stateDir: state,
+                model: codexModel || undefined,
+                ...(codexHome ? { home: resolve(codexHome) } : {}),
+              })
           : new CodexProviderAdapter({ ...codexOptions, stateDir: state }).capabilities(),
       })
       return
@@ -552,7 +558,7 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
-        ...(codexOptions.enabled && !codexPath ? ['--codex'] : []),
+        ...(!codexOptions.enabled ? ['--no-codex'] : []),
         ...(codexPath ? ['--codex-path', codexPath] : []),
         ...(codexModel ? ['--codex-model', codexModel] : []),
         ...(codexHome ? ['--codex-home', resolve(codexHome)] : []),
@@ -567,7 +573,7 @@ async function main() {
         '--pi-max-tokens',
         String(piMaxTokens),
       ]
-      const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([dirname(claudePath), dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string>${process.env.CODEX_HOME ? `<key>CODEX_HOME</key><string>${escape(resolve(process.env.CODEX_HOME))}</string>` : ''}</dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([...(codexPath ? [dirname(codexPath)] : []), dirname(claudePath), dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string>${process.env.CODEX_HOME ? `<key>CODEX_HOME</key><string>${escape(resolve(process.env.CODEX_HOME))}</string>` : ''}</dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
       if (existsSync(destination)) accessSync(destination, constants.W_OK)
       const temporary = mkdtempSync(join(dirname(destination), '.abele-plist-write-'))
       try {

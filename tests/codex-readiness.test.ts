@@ -37,6 +37,37 @@ it.each([
   expect(adapter.available).toBe(false)
   expect(adapter.capabilities().diagnostic).toBe(diagnostic)
 })
+it('leaves model selection to Codex unless explicitly overridden', () => {
+  const automatic = new CodexProviderAdapter({ stateDir: '/fixture/state', enabled: false })
+  expect(automatic.configuration.model).toBeNull()
+  expect(automatic.capabilities()).toMatchObject({ model: 'Codex default' })
+  expect(new Adapter().configuration.model).toBe('fixture-small')
+})
+it('honours explicit opt-out even with an executable and never runs preflight', async () => {
+  const adapter = new Adapter()
+  const disabled = new (class extends CodexProviderAdapter {
+    protected async inspect(): Promise<never> {
+      throw new Error('must_not_inspect')
+    }
+  })({ stateDir: '/fixture/state', enabled: false, executable: '/fixture/codex' })
+  expect(await disabled.prepare()).toBe(false)
+  expect(disabled.capabilities().diagnostic).toBe('codex_disabled')
+  expect(adapter.available).toBe(false)
+})
+it('retains the doctor login command and checks in daemon status capabilities', async () => {
+  const adapter = new Adapter()
+  adapter.report = {
+    available: false,
+    diagnostic: 'codex_authentication_required',
+    checks: { authenticated: false },
+    login_command: 'codex login',
+  }
+  await adapter.prepare()
+  expect(adapter.capabilities()).toMatchObject({
+    checks: { authenticated: false },
+    login_command: 'codex login',
+  })
+})
 it('uses accepted sampled-inventory/marker parity, without treating live acceptance as a prerequisite', () => {
   const gates = codexExecutionGates('darwin')
   expect(gates.find((g) => g.name === 'detached_descendants')).toMatchObject({ status: 'verified' })

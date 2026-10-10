@@ -1,4 +1,9 @@
-# Repository reads and worktree discovery (v1)
+# Repository view (v1)
+
+For a user-facing overview of browsing, external access, editing approval and
+limits, see [Repository view in the README](../README.md#repository-view).
+This page specifies the node/client API; it does not promise a particular plugin
+UI version or register repository endpoints as agent tools.
 
 The node advertises `repository_read_v1`, `repository_notifications_v1` and
 `repository_editing_v1` in `node.describe` and the channel welcome. Requests use `repository.v1.*`; protocol
@@ -37,6 +42,12 @@ identity, never retargets the old ID. Reads revalidate registration, canonical
 root, worktree-list membership, common directory, and current opt-in. Opt-out
 stops external watchers and invalidates external observations, comparisons,
 cursors, and retained bytes. Old results cannot be resumed by opting in again.
+In-flight external reads capture a project access generation. Opt-out invalidates
+that generation before new bytes can be retained or results published, even if
+opt-in is enabled again while the original Git read is still pending. A fresh read
+is required; old bytes are not repopulated behind an expired identity. Catalogue
+continuations and watcher setup use the same access generation, so interrupted
+reads cannot retain a fresh cursor or allocate late watcher handles after reapproval.
 Legacy registrations are pinned at their first repository-v1 access. Bare entries
 are catalogue metadata only. Plain folders retain the existing workspace-file
 API but return `git_required` from repository-v1 discovery.
@@ -263,7 +274,15 @@ Observation/content identities and retained comparisons remain bounded, explicit
 versions; expiry never silently follows a mutable pathname.
 
 Reads use hardened typed Git, disabled executable customizations, literal
-pathspecs, no optional index writes and no lazy fetch. Absolute/traversal/`.git`
+pathspecs and no optional index writes. Hooks, fsmonitor, filters (including those
+configured through conditional includes), textconv, external diffs and signature
+verifiers are disabled; built-in commands cannot be replaced by repository aliases.
+Git transports are denied independently of repository `protocol.*.allow` settings.
+`GIT_NO_LAZY_FETCH` is also set: older supported Git versions that ignore that pin
+still cannot contact a promisor remote or execute its transport helper when a
+local object is missing. Reads fail rather than retrieve missing objects. Explicit
+`--ignore-submodules=all` on status/diff reads prevents repository or `.gitmodules`
+ignore settings from triggering nested submodule inspection. Absolute/traversal/`.git`
 paths and symlink traversal are refused, including historical trees. Internal
 shared metadata access is permitted only for validated Git binding, not file
 browsing. Portable pathname/inode checks detect observed replacements; they
@@ -282,6 +301,18 @@ retention expiry/eviction, watcher overflow/missing targets and reconnect.
 overflow, index/HEAD/ref/catalogue changes, subscription-setup revocation, obsolete
 notification fencing, immutable cache reuse/isolation/bounds, external owner approval,
 conflict, unknown outcomes, restart recovery and offline durable save replay.
+`tests/repository-security.test.ts` and `tests/repository-security-pending.test.ts`
+add adversarial fixtures for absolute/traversal/metadata paths across read/write
+methods, literal leading-dash filenames and ref/revision option injection,
+inward/outward/metadata symlinks at working and historical revisions, real nested
+repositories, linked metadata isolation, malicious conditional configuration,
+index-write suppression, legacy-Git promisor transports, binary/large inputs,
+oversized trees, search byte/file/match ceilings, cache/publication isolation,
+pending-read/catalogue/watch-setup opt-out/reapproval, mid-write authority/approval revocation and terminal
+unknown client receipts. Executable traps have sensitivity controls, and deadline
+coverage remains separate from deterministic byte/file-limit fixtures. All tests
+use invented disposable repositories, not personal projects or providers.
+
 Plugin rendering, navigation/pins, markdown safety, chat-scoped per-edit approvals, remote
 image/credential isolation and desktop/phone UI acceptance are later plugin-side
 verification, not evidence supplied by these node fixtures.

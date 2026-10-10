@@ -1,5 +1,5 @@
-import { expect, it } from 'vitest'
-import { mkdtempSync, copyFileSync, chmodSync, writeFileSync, rmSync } from 'node:fs'
+import { afterEach, expect, it, vi } from 'vitest'
+import { mkdtempSync, mkdirSync, copyFileSync, chmodSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '@abele/node-core'
 import { SessionSchema, DelegationGrantRequestSchema } from '@abele/node-protocol'
@@ -52,6 +52,43 @@ it('discovers only explicit absolute fixtures and detects replacement', () => {
     discovered.recheck()
     writeFileSync(executable, '#!/usr/bin/env node\nconsole.log("codex-cli 0.160.1")\n')
     expect(() => discovered.recheck()).toThrow('identity_changed')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+afterEach(() => vi.unstubAllEnvs())
+it('automatically discovers a pinned Codex in common user locations without shell PATH', () => {
+  const dir = mkdtempSync(resolve('.scratch/codex-auto-discovery-'))
+  vi.stubEnv('HOME', dir)
+  vi.stubEnv('ABELE_CODEX_PATH', '')
+  mkdirSync(join(dir, '.local/bin'), { recursive: true })
+  const executable = join(dir, '.local/bin/codex')
+  copyFileSync(resolve('tests/fixtures/codex.mjs'), executable)
+  chmodSync(executable, 0o700)
+  try {
+    expect(discoverCodex({ trustedPath: '', fixture: true }).executable).toBe(executable)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+it('searches absolute daemon PATH entries, skipping incompatible candidates without executing wrappers', () => {
+  const dir = mkdtempSync(resolve('.scratch/codex-auto-path-'))
+  vi.stubEnv('HOME', dir)
+  vi.stubEnv('ABELE_CODEX_PATH', '')
+  const bad = join(dir, 'bad'),
+    good = join(dir, 'good')
+  mkdirSync(bad)
+  mkdirSync(good)
+  writeFileSync(join(bad, 'codex'), '#!/bin/sh\nexit 99\n', { mode: 0o700 })
+  copyFileSync(resolve('tests/fixtures/codex.mjs'), join(good, 'codex'))
+  chmodSync(join(good, 'codex'), 0o700)
+  try {
+    expect(discoverCodex({ trustedPath: `.:${bad}:${good}`, fixture: true }).executable).toBe(
+      join(good, 'codex')
+    )
+    expect(() => discoverCodex({ executable: join(bad, 'codex'), trustedPath: good })).toThrow(
+      'wrapper_unsupported'
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

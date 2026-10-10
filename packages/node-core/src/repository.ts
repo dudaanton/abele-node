@@ -52,6 +52,8 @@ interface Target {
   workspace_id: string | null
   fingerprint: string
   active: number
+  /** Ephemeral per-project access epoch, captured by a request, never persisted as identity. */
+  readGeneration?: number
 }
 interface Observation {
   target: string
@@ -121,6 +123,20 @@ interface Subscription {
 export class RepositoryService {
   private objectCache = new RepositoryObjectCache()
   private cacheGeneration = 0
+  private readGenerations = new Map<string, number>()
+  private invalidateReads(project: string) {
+    this.readGenerations.set(project, (this.readGenerations.get(project) ?? 0) + 1)
+  }
+  private checkRead(target: Target) {
+    const config = this.config(target.project_id)
+    if (
+      target.kind === 'external' &&
+      (!config.external_read ||
+        (target.readGeneration !== undefined &&
+          target.readGeneration !== (this.readGenerations.get(target.project_id) ?? 0)))
+    )
+      throw new ChannelError('unauthorized')
+  }
   private clearObjectCache() {
     this.cacheGeneration++
     this.objectCache.clear()
@@ -166,6 +182,7 @@ export class RepositoryService {
       .run(p.project_id, fingerprint)
   }
   removed(id: string) {
+    this.invalidateReads(id)
     this.clearObjectCache()
     this.r.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(id)
     this.r.core.db.prepare('UPDATE repository_targets SET active=0 WHERE project_id=?').run(id)
@@ -182,6 +199,7 @@ export class RepositoryService {
       const project = this.r.projects.get(String(p.project_id))
       this.clearObjectCache()
       this.registered(project)
+      if (!p.external_read) this.invalidateReads(project.project_id)
       core.db
         .prepare(
           'UPDATE repository_projects SET external_read=?,default_branch=CASE WHEN ? THEN ? ELSE default_branch END WHERE project_id=?'
@@ -262,9 +280,8 @@ export class RepositoryService {
   }
   private async validate(target: Target) {
     if (!target.active) throw new ChannelError('stale_resource')
-    const project = this.r.projects.get(target.project_id),
-      config = this.config(target.project_id)
-    if (target.kind === 'external' && !config.external_read) throw new ChannelError('unauthorized')
+    const project = this.r.projects.get(target.project_id)
+    this.checkRead(target)
     await this.r.projects.available(project)
     try {
       if (
@@ -284,6 +301,7 @@ export class RepositoryService {
     } catch {
       throw new ChannelError('repository_unavailable')
     }
+    this.checkRead(target)
     return target
   }
   checkPublication(actor: AuthorityContext, p: Record<string, unknown>, result?: unknown) {
@@ -456,7 +474,7 @@ export class RepositoryService {
       .prepare('SELECT * FROM repository_targets WHERE worktree_id=?')
       .get(id) as unknown as Target | undefined
     if (!row) throw new ChannelError('not_found')
-    return row
+    return { ...row, readGeneration: this.readGenerations.get(row.project_id) ?? 0 }
   }
   private prune() {
     for (const map of [this.observations, this.cursors, this.comparisons]) {
@@ -540,7 +558,8 @@ export class RepositoryService {
   }
   private async catalog(actor: AuthorityContext, method: string, p: Record<string, unknown>) {
     const project = this.r.projects.get(String(p.project_id)),
-      config = this.config(project.project_id)
+      config = this.config(project.project_id),
+      readGeneration = this.readGenerations.get(project.project_id) ?? 0
     await this.r.projects.available(project)
     if (!project.git_common_dir) throw new ChannelError('git_required')
     const known = this.r.core.db.prepare(
@@ -639,7 +658,8 @@ export class RepositoryService {
     // retaining a continuation, even when this page contains only registered workspaces.
     if (
       entries.some((entry) => entry.kind === 'external') &&
-      !this.config(project.project_id).external_read
+      (!this.config(project.project_id).external_read ||
+        readGeneration !== (this.readGenerations.get(project.project_id) ?? 0))
     )
       throw new ChannelError('unauthorized')
     const resumed = this.continuation(actor, method, p)
@@ -805,6 +825,9 @@ export class RepositoryService {
     return o
   }
   private retain(target: Target, bytes: Buffer) {
+    // A read completing after opt-out must neither retain nor publish old bytes, even
+    // if the owner opted back in while Git/worker I/O was pending.
+    this.checkRead(target)
     if (bytes.length > 16 * 1024 * 1024) throw new ChannelError('output_limit')
     const id = hash(bytes),
       db = this.r.core.db
@@ -1368,6 +1391,10 @@ export class RepositoryService {
         let content: Buffer | null = null,
           content_id: string | null = null
         if (p.mode !== 'filename') {
+          if (file.size !== null && bytes + file.size > 32 * 1024 * 1024) {
+            omissions.add('scan limit; refine query to cover remaining files')
+            break
+          }
           if (revision.kind === 'working')
             content = this.readFile(target, file.path, 1024 * 1024).bytes
           else
@@ -1457,6 +1484,7 @@ export class RepositoryService {
     // Initial fingerprinting yields to token revocation, opt-out and shutdown.
     // Recheck before allocating timers/handles, not just when publishing the first hint.
     if (this.stopped) throw new ChannelError('resource_busy')
+    this.checkRead(target)
     this.checkPublication(actor, { worktree_id: target.worktree_id })
     for (const [key, current] of this.subscriptions)
       if (

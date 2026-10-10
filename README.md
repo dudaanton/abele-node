@@ -13,7 +13,9 @@ explicitly tested CLI versions;
 the pi SDK provider is available and capability-gated;
 see [pi configuration and limits](docs/pi.md). The experimental
 [Codex integration](docs/codex.md) is available on macOS after doctor verifies
-policy, node-local authentication and an explicitly selected model. Codex execution
+policy, the user's existing Codex login and model availability. Codex is discovered
+automatically and uses its own configured/built-in default model; override with `--codex-model`,
+or disable with `--no-codex`. Codex execution
 on Linux and Windows is unavailable. Windows deployment is untested. See
 [remote access, pairing and revocation](docs/remote-access.md).
 
@@ -49,6 +51,47 @@ exhaustive child history and readable thinking are **not supported**. An experim
 [debugger probe](docs/debug-probe.md) exercises synthetic JS/TS/Python targets; it is
 not a daemon debugger feature or plugin debugger UI. A worktree is isolation for
 Git state, not an OS sandbox for agent tools.
+
+## Repository view
+
+A compatible plugin can browse registered Git projects through the node: select a
+root or managed worktree, inspect branches/tags and frozen commits, read files and
+history, compare versions, view blame, and search on the node. **Working tree** also
+shows staged, unstaged and untracked changes. It is an observation, not an atomic
+snapshot; if files change during a read, refresh instead of assuming the old view
+still describes the disk. Retained file/patch identities refer to exact bytes until
+they expire. Plugin UI availability depends on the installed plugin version.
+
+External linked worktrees are hidden by default. Enable **external repository
+access for the project** to discover and browse them; this does not adopt them as
+managed workspaces or allow agent execution. They remain read-only until an owner
+**separately approves editing for that exact worktree identity**. Revoke editing to
+stop further saves; disabling project external access also clears editing approvals
+and invalidates pending reads and retained external content. Replacing a worktree
+never transfers its approval to the replacement.
+
+Saving changes only the current working file, with an exact-content precondition
+and a durable operation ID. Historical versions are read-only. Conflicts require
+review; an `outcome_unknown` save must not be retried with a new operation ID.
+Recovery copies support explicit restore, subject to retention. Repository view
+provides **no stage/unstage, commit, checkout, fetch, push, merge or generic shell
+operation**.
+
+Automatic file display stops at 1 MiB; an explicit larger load can read up to
+16 MiB. Search skips binary files and files over 1 MiB, and reports incomplete
+coverage when its file/byte/match/deadline limits are reached. Large trees and
+results are bounded and paged. Ignored files are excluded unless explicitly
+requested; symlinks, submodule contents and Git metadata are not browsable.
+
+All confirmed owner installations have node-wide authority: project opt-in is
+not a per-device or per-chat access restriction. Chat read/edit grants and approval
+of an agent's exact edit proposal belong to the plugin, separately from human
+browsing and worktree approval. Already delivered content cannot be recalled from
+client/chat history. Filesystem checks are not an OS sandbox or protection against
+an adversarial same-user parent-directory swap.
+
+See [repository permissions, APIs and precise limits](docs/repository-view.md) and
+[durable editing and recovery](docs/editing.md).
 
 ## Requirements
 

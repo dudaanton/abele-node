@@ -13,6 +13,7 @@ import type { CodexExecutable } from './discovery.js'
 import { createProcessScope } from './scope.js'
 import { systemDeadlineTimers, type DeadlineTimers } from './timers.js'
 import { isCodexAuthenticated } from './auth.js'
+import { codexModelAvailable, validCodexModel, validCodexCatalog } from './models.js'
 export interface WorkerOptions {
   /** Node-local process supervision seam, never a protocol field. */
   probe?: ProcessProbe
@@ -20,7 +21,7 @@ export interface WorkerOptions {
   timers?: DeadlineTimers
   executable: CodexExecutable
   paths: PolicyPaths
-  model: string
+  model?: string
   deadlineMs: number
   turn: TurnContext
 }
@@ -29,7 +30,8 @@ export async function startCodexTurn(
   options: WorkerOptions,
   sink: ProviderEventSink
 ): Promise<ProviderRun> {
-  const { paths, turn, model } = options
+  const { paths, turn } = options
+  const model = options.model || undefined
   const timers = options.timers ?? systemDeadlineTimers
   const fingerprint = policyFingerprint(paths)
   if (turn.cwd !== paths.workspace || !opaqueId(turn.run_id) || !opaqueId(turn.session_id))
@@ -39,7 +41,8 @@ export async function startCodexTurn(
     (!opaqueId(turn.native_session_id) ||
       turn.native_binding?.workspace_path !== paths.workspace ||
       turn.native_binding?.policy_fingerprint !== fingerprint ||
-      turn.native_binding?.model !== model)
+      !validCodexModel(turn.native_binding?.model) ||
+      (model !== undefined && turn.native_binding?.model !== model))
   )
     throw new Error('codex_native_binding_mismatch')
   const localAbort = new AbortController(),
@@ -186,19 +189,10 @@ export async function startCodexTurn(
       const account = await request('account/read', { refreshToken: false })
       if (!isCodexAuthenticated(account)) throw new Error('codex_authentication_required')
       const models = await request('model/list', { includeHidden: false, limit: 100 })
-      if (
-        !Array.isArray(models?.data) ||
-        models.data.length > 100 ||
-        !models.data.some(
-          (m: any) =>
-            m.model === model &&
-            m.hidden !== true &&
-            m.supportedReasoningEfforts?.some((e: any) => e.reasoningEffort === 'low')
-        )
-      )
+      if (!validCodexCatalog(models) || (model && !codexModelAvailable(models, model)))
         throw new Error('codex_selected_model_unavailable')
       const params = {
-        model,
+        ...(model ? { model } : {}),
         cwd: paths.workspace,
         runtimeWorkspaceRoots: [paths.workspace],
         approvalPolicy: 'on-request',
@@ -227,7 +221,9 @@ export async function startCodexTurn(
       if (
         !opaqueId(native?.thread?.id) ||
         (turn.native_session_id && native.thread.id !== turn.native_session_id) ||
-        native.model !== model ||
+        !validCodexModel(native.model) ||
+        (model !== undefined && native.model !== model) ||
+        (turn.native_session_id && native.model !== turn.native_binding?.model) ||
         native.modelProvider !== 'openai' ||
         native.cwd !== paths.workspace ||
         native.approvalPolicy !== 'on-request' ||
@@ -237,6 +233,10 @@ export async function startCodexTurn(
         JSON.stringify(native.runtimeWorkspaceRoots) !== JSON.stringify([paths.workspace])
       )
         throw new Error('codex_thread_policy_mismatch')
+      // Codex resolves its own default at thread creation. Check the actual model
+      // before binding or sending text, without turning it into a node override.
+      if (!codexModelAvailable(models, native.model))
+        throw new Error('codex_selected_model_unavailable')
       mapper.bind(native.thread.id)
       await inspect()
       if (localAbort.signal.aborted) throw new Error('interrupted')
@@ -249,7 +249,7 @@ export async function startCodexTurn(
           native_session_id: native.thread.id,
           workspace_path: paths.workspace,
           policy_fingerprint: fingerprint,
-          model,
+          model: native.model,
         },
       })
       const accepted = await request('turn/start', {

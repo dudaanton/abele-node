@@ -1,9 +1,11 @@
 # Codex provider
 
 Codex execution is available on macOS after the node's doctor checks succeed.
-Install the supported native executable and select an available model. By default,
-the node uses your existing Codex login, like Claude Code; there is no separate
-node login when Codex is already logged in for the daemon's OS user. Until these checks succeed, creating a
+The node automatically finds a supported Codex installation and uses Codex's own
+model selection: the user's `config.toml` model, or Codex's built-in default. It
+passes no model override unless you configure one. It reuses your existing Codex login
+(subscription or API key), like Claude Code; there is no separate node login when
+Codex is already logged in for the daemon's OS user. Until these checks succeed, creating a
 session with `provider: "codex"` returns `provider_unavailable`; the node does not
 fall back to another provider. Codex execution on Linux and Windows is unavailable.
 
@@ -12,17 +14,31 @@ fall back to another provider. Codex execution on Linux and Windows is unavailab
 Only Codex **0.160.1**, without a prerelease suffix, is accepted. The node checks
 version/help output, fingerprints the canonical executable, and verifies the
 app-server protocol schemas. It never installs or upgrades Codex automatically.
-Opaque launchers are rejected; configure an absolute path to the native executable.
+Official npm installations are resolved to their bundled/platform native executable
+without executing the JavaScript launcher. Other opaque launchers are rejected.
 
 - `--codex-path /absolute/codex` selects the executable explicitly.
 - `ABELE_CODEX_PATH` supplies the executable when `--codex-path` is omitted.
-- `--codex` opts into discovery through absolute entries in the daemon's trusted
-  `PATH`. Relative and worktree search entries are ignored.
+- Discovery is automatic: `~/.local/bin/codex`, `~/.codex/local/codex`,
+  `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, then absolute entries in the
+  daemon's trusted `PATH`. Relative entries are ignored; startup does not search
+  a session's workspace or read shell startup files. Incompatible auto-discovered
+  candidates are skipped; an explicit executable never silently falls back.
+- `--no-codex` disables discovery/preflight/execution, even with an executable set.
+  `--codex` remains accepted for compatibility and can re-enable installer setup.
+- `--codex-model MODEL_ID` or `ABELE_CODEX_MODEL` overrides Codex's own selection.
+  With no configured override, thread/start, thread/resume and turn/start omit
+  the model parameter. Doctor/status report the model exposed by `config/read`
+  or the default in `model/list`; otherwise they show `Codex default`.
+  The account's non-hidden catalog must offer any exposed/explicit model with low
+  reasoning effort. When doctor cannot determine the default, execution checks
+  the actual model returned at thread creation before sending user input.
+  Missing models cause refusal, never silent model substitution or inference.
 
-Without any of these options, ordinary daemon startup does not discover or start
-Codex. `--codex-model MODEL_ID` selects the model explicitly; there is no automatic
-model substitution. Only the first-party model provider is supported, and
-unexpected provider definitions are refused.
+The shell installer records its discovered executable, model, optional home and
+opt-out in its wrapper/service/config and preserves those selections on upgrade.
+Only the first-party model provider is supported, and unexpected provider
+definitions are refused.
 
 ## Administrator prerequisite
 
@@ -63,9 +79,17 @@ Codex credential-store selection, including an existing system credential-store
 login. It never rewrites your `config.toml` or copies your credentials into node
 state. Run the node as the same OS user you normally use for Codex.
 
-Replace these absolute paths and model ID with your configuration. `--state-dir`
-can be omitted to use `$HOME/.local/state/abele-node`; it does not select the Codex
-home:
+The simple subscription path is just:
+
+```sh
+abele-node doctor
+abele-node start
+```
+
+No executable/model flags or second login are needed if Codex is installed,
+already logged in and administrator policy is configured. To override the defaults,
+use these options. `--state-dir` can be omitted to use
+`$HOME/.local/state/abele-node`; it does not select the Codex home:
 
 ```sh
 STATE_DIR=/absolute/node-state
@@ -138,8 +162,13 @@ abele-node start --state-dir "$STATE_DIR" \
   --codex-home "$CODEX_DIR" --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
 ```
 
+With a running daemon, `abele-node doctor` rechecks that daemon's configured
+selection in its own environment and updates its availability. After logging in,
+run doctor again; no restart is needed. To diagnose alternate executable/model
+options, stop the daemon first or persist the new options through the installer.
+
 Doctor checks the stdio handshake, schemas, effective configuration, managed
-requirements, authentication type, and selected-model availability with low
+requirements, authentication type, and exposed/explicit model availability with low
 reasoning effort. It creates no thread or model turn. Startup uses these same
 checks, and they are reapplied before each production turn. Doctor does not return
 authentication payloads or unrestricted diagnostics. Human-readable output is
@@ -186,7 +215,9 @@ Codex authority; see [delegation](delegation.md).
 ## Resume and interruption
 
 The node records the thread ID, workspace identity, policy fingerprint and model
-before dispatching user input. Resume uses only the recorded thread ID; missing
+before dispatching user input. The binding records Codex's actual model, not the
+`Codex default` display label; a different model on resume is refused even when
+no override is configured. Resume uses only the recorded thread ID; missing
 context is an explicit error. There is no latest-thread lookup, caller-supplied
 rollout path, automatic uncertain-input retry or approval replay.
 

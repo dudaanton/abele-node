@@ -143,13 +143,27 @@ export class GitRunner {
         args = ['worktree', 'remove', '--', command.path]
         break
       case 'status':
-        args = ['status', '--porcelain=v1', '-z', '--untracked-files=all']
+        args = [
+          'status',
+          '--porcelain=v1',
+          '-z',
+          '--untracked-files=all',
+          '--ignore-submodules=all',
+        ]
         break
       case 'untracked':
         args = ['ls-files', '--others', '-z']
         break // includes ignored valuable files
       case 'diff':
-        args = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD', '--']
+        args = [
+          'diff',
+          '--no-ext-diff',
+          '--no-textconv',
+          '--no-color',
+          '--ignore-submodules=all',
+          'HEAD',
+          '--',
+        ]
         break
       case 'view.diff':
         args = [
@@ -158,6 +172,7 @@ export class GitRunner {
           '--no-textconv',
           '--no-color',
           '--no-renames',
+          '--ignore-submodules=all',
           '--src-prefix=a/',
           '--dst-prefix=b/',
           ...(command.mode === 'staged'
@@ -247,6 +262,7 @@ export class GitRunner {
           '--no-textconv',
           '--no-color',
           '--no-renames',
+          '--ignore-submodules=all',
           ...(command.kind === 'changes'
             ? ['--name-status', '-z']
             : ['--src-prefix=a/', '--dst-prefix=b/']),
@@ -360,6 +376,9 @@ export class GitRunner {
             GIT_CONFIG_GLOBAL: '/dev/null',
             // Recognized by current Git; older versions may ignore this best-effort pin.
             GIT_NO_LAZY_FETCH: '1',
+            // Fail closed on older Git too: repository protocol.*.allow cannot override this.
+            // No typed operation needs a transport, including local worktree mutations.
+            GIT_ALLOW_PROTOCOL: '',
             GIT_TERMINAL_PROMPT: '0',
             GIT_OPTIONAL_LOCKS: '0',
             GIT_CEILING_DIRECTORIES: dirname(cwd),

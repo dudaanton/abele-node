@@ -2,6 +2,8 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, constants, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
+import { homedir } from 'node:os'
+import { createRequire } from 'node:module'
 
 export interface CodexDiscoveryOptions {
   executable?: string
@@ -10,20 +12,70 @@ export interface CodexDiscoveryOptions {
   fixture?: boolean
 }
 const digest = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex')
-export function discoverCodex(options: CodexDiscoveryOptions = {}) {
-  let requested = options.executable ?? process.env.ABELE_CODEX_PATH
-  if (!requested) {
-    for (const root of (options.trustedPath ?? process.env.PATH ?? '').split(delimiter)) {
-      if (!isAbsolute(root)) continue
+// Resolve the official npm layout without running its JavaScript launcher.
+// All other wrappers remain unsupported; the native target still passes every pin.
+export function resolveCodexExecutable(requested: string): string {
+  const entry = realpathSync(requested)
+  if (readFileSync(entry).subarray(0, 2).toString() !== '#!') return entry
+  try {
+    const root = dirname(dirname(entry))
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+    if (
+      manifest.name !== '@openai/codex' ||
+      manifest.version !== '0.160.1' ||
+      entry !== join(root, 'bin/codex.js')
+    )
+      return entry
+    const triple = `${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-${process.platform === 'darwin' ? 'apple-darwin' : 'unknown-linux-musl'}`
+    const vendorRoots = [join(root, 'vendor')]
+    const name = `@openai/codex-${process.platform}-${process.arch}`
+    try {
+      const file = createRequire(join(root, 'package.json')).resolve(`${name}/package.json`)
+      const nativeManifest = JSON.parse(readFileSync(file, 'utf8'))
+      if (nativeManifest.name === name && nativeManifest.version === '0.160.1')
+        vendorRoots.unshift(join(dirname(file), 'vendor'))
+    } catch {}
+    for (const vendor of vendorRoots) {
       try {
-        accessSync(join(root, 'codex'), constants.X_OK)
-        requested = join(root, 'codex')
-        break
+        const native = realpathSync(join(vendor, triple, 'codex/codex'))
+        accessSync(native, constants.X_OK)
+        if (readFileSync(native).subarray(0, 2).toString() !== '#!') return native
       } catch {}
     }
+  } catch {}
+  return entry
+}
+export function discoverCodex(options: CodexDiscoveryOptions = {}): CodexExecutable {
+  const requested = options.executable || process.env.ABELE_CODEX_PATH
+  if (requested) return inspectExecutable(requested, options)
+  const candidates = [
+    join(homedir(), '.local/bin/codex'),
+    join(homedir(), '.codex/local/codex'),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    ...(options.trustedPath ?? process.env.PATH ?? '')
+      .split(delimiter)
+      .filter((root) => isAbsolute(root))
+      .map((root) => join(root, 'codex')),
+  ]
+  let failure: unknown
+  for (const candidate of new Set(candidates)) {
+    try {
+      accessSync(candidate, constants.X_OK)
+    } catch {
+      continue
+    }
+    try {
+      return inspectExecutable(candidate, options)
+    } catch (error) {
+      failure ??= error
+    }
   }
-  if (!requested || !isAbsolute(requested)) throw new Error('codex_absolute_executable_required')
-  const executable = realpathSync(requested)
+  throw failure ?? new Error('codex_executable_unavailable')
+}
+function inspectExecutable(requested: string, options: CodexDiscoveryOptions) {
+  if (!isAbsolute(requested)) throw new Error('codex_absolute_executable_required')
+  const executable = options.fixture ? realpathSync(requested) : resolveCodexExecutable(requested)
   accessSync(executable, constants.X_OK)
   const bytes = readFileSync(executable)
   // Opaque launchers cannot be fingerprinted transitively. Production accepts
@@ -40,7 +92,8 @@ export function discoverCodex(options: CodexDiscoveryOptions = {}) {
     interpreterHash = interpreter && digest(interpreter)
   const recheck = () => {
     if (
-      realpathSync(requested!) !== executable ||
+      (options.fixture ? realpathSync(requested) : resolveCodexExecutable(requested)) !==
+        executable ||
       digest(executable) !== sha256 ||
       (interpreter && digest(interpreter) !== interpreterHash)
     )
@@ -63,7 +116,7 @@ export function discoverCodex(options: CodexDiscoveryOptions = {}) {
   recheck()
   return { executable, interpreter, sha256, version: '0.160.1', recheck }
 }
-export type CodexExecutable = ReturnType<typeof discoverCodex>
+export type CodexExecutable = ReturnType<typeof inspectExecutable>
 interface FileEvidence {
   uid: number
   mode: number
@@ -88,7 +141,13 @@ export function checkManagedAncestry(entries: FileEvidence[]) {
     throw new Error('unsafe_managed_requirements')
 }
 export function requireManagedFile(path = '/etc/codex/requirements.toml') {
-  checkManagedRequirements(lstatSync(path), lstatSync(dirname(path)))
+  try {
+    checkManagedRequirements(lstatSync(path), lstatSync(dirname(path)))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      throw new Error('codex_managed_requirements_missing')
+    throw error
+  }
   const entries: FileEvidence[] = []
   for (let root of [dirname(path), realpathSync(dirname(path))]) {
     for (;;) {

@@ -34,7 +34,10 @@ async function fixture(mode: string, test: (f: any) => Promise<void>) {
   let beforeEvent: ((event: any) => void) | undefined, probe: ProcessProbe | undefined
   const adapter: ProviderAdapter = {
     available: true,
-    configuration: { model: 'fixture-small', permission_ttl_ms: 1000 },
+    configuration: {
+      model: mode === 'user-model' ? null : 'fixture-small',
+      permission_ttl_ms: 1000,
+    },
     capabilities: () => ({ provider: 'codex', available: true }),
     configurationForTurn: () => ({}),
     reconcile: (p) => new CodexProviderAdapter({ stateDir: state }).reconcile(p),
@@ -43,7 +46,7 @@ async function fixture(mode: string, test: (f: any) => Promise<void>) {
         {
           executable,
           paths: { home, state, workspace: turn.cwd, sibling: dirname(turn.cwd) },
-          model: 'fixture-small',
+          model: mode === 'user-model' ? undefined : 'fixture-small',
           deadlineMs: 3000,
           probe,
           turn,
@@ -127,6 +130,27 @@ async function fixture(mode: string, test: (f: any) => Promise<void>) {
     rmSync(dir, { recursive: true, force: true })
   }
 }
+it('durably records and resumes Codex own model without requiring a configured override', async () => {
+  await fixture('user-model', async (f) => {
+    f.send('first')
+    await f.core.execution.drain()
+    await f.wait(() => f.states()[0] === 'completed')
+    const binding = f.core.db
+      .prepare('SELECT * FROM codex_thread_bindings WHERE session_id=?')
+      .get(f.session.session_id)
+    expect(binding.model).toBe('fixture-user-default')
+    await f.restart()
+    f.send('resume')
+    await f.core.execution.drain()
+    await f.wait(() => f.states()[1] === 'completed')
+    const turns = readFileSync(join(f.home, 'turn-log.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    expect(turns.map((t) => t.threadId)).toEqual([binding.thread_id, binding.thread_id])
+    expect(turns.every((t) => !Object.hasOwn(t, 'model'))).toBe(true)
+  })
+})
 it('reports terminal cleanup failure as a session error and automatically releases the queued followup after retry', async () => {
   await fixture('success', async (f) => {
     let terminal = false,

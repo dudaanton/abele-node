@@ -10,10 +10,7 @@ it('reports the native sampled-descendant/marker checkpoint and retains prefligh
   expect(
     new CodexProviderAdapter({ stateDir: '/fixture/state' }).capabilities().capabilities.execution
       .reason
-  ).toBe(
-    codexExecutionGates().find((g) => g.error)?.error ??
-      'Not configured; select an executable and model, then run doctor preflight.'
-  )
+  ).toBe(codexExecutionGates().find((g) => g.error)?.error ?? 'codex_opaque_wrapper_unsupported')
 })
 it('does not certify Linux confinement from macOS evidence', () => {
   expect(

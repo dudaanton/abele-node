@@ -29,6 +29,8 @@ it('checks the full pinned schema closure and an isolated stdio inspection witho
       effective_policy: true,
       managed_remote_control: true,
       authenticated: true,
+      model: 'fixture-small',
+      model_available: true,
     })
     expect(evidence).toHaveLength(1)
     expect(() => process.kill(evidence[0].pid, 0)).toThrow()

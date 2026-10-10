@@ -32,6 +32,7 @@ export interface CodexOptions {
 }
 export class CodexProviderAdapter {
   private ready = false
+  private preflightReport?: CodexDoctorReport
   get available() {
     return this.ready
   }
@@ -39,6 +40,7 @@ export class CodexProviderAdapter {
   protected executable?: CodexExecutable
   private readonly homeSelection: CodexHome
   constructor(protected options: CodexOptions) {
+    this.options = { ...options, model: options.model || undefined }
     this.homeSelection = resolveCodexHome(options.home)
     const deadline = options.deadlineMs ?? 120000,
       ttl = options.permissionTtlMs ?? 60000
@@ -53,21 +55,20 @@ export class CodexProviderAdapter {
       (options.model && !/^[A-Za-z0-9_.:-]{1,128}$/.test(options.model))
     )
       throw new Error('invalid_codex_configuration')
-    let diagnostic = 'Not configured; select an executable and model, then run doctor preflight.'
-    if (options.enabled || options.executable) {
+    let diagnostic = 'codex_disabled'
+    if (options.enabled !== false) {
       try {
         this.executable = discoverCodex({ executable: options.executable })
-        diagnostic =
-          codexExecutionError() ??
-          'Pinned executable found; authentication and model checks required.'
-      } catch {
-        diagnostic = 'Pinned executable unavailable or incompatible'
+        diagnostic = codexExecutionError() ?? 'codex_preflight_required'
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        diagnostic = /^codex_[a-z_]+$/.test(code) ? code : 'codex_executable_unavailable'
       }
     }
     this.configuration = {
       home: this.homeSelection.home,
       home_mode: this.homeSelection.mode,
-      model: options.model ?? null,
+      model: this.options.model || null,
       version: this.executable?.version ?? null,
       deadline_ms: deadline,
       permission_ttl_ms: ttl,
@@ -77,8 +78,10 @@ export class CodexProviderAdapter {
     }
   }
   protected async inspect(): Promise<CodexDoctorReport> {
-    if (!this.executable)
-      return { provider: 'codex', available: false, diagnostic: 'codex_executable_unavailable' }
+    if (!this.executable) {
+      this.executable = discoverCodex({ executable: this.options.executable })
+      this.configuration.version = this.executable.version
+    }
     this.executable.recheck()
     return doctorCodex(
       {
@@ -91,13 +94,20 @@ export class CodexProviderAdapter {
   }
   async prepare() {
     this.ready = false
+    this.preflightReport = undefined
+    if (this.options.enabled === false) return false
     try {
       const report = await this.inspect()
+      this.preflightReport = report
       this.ready = report.available
       this.configuration.diagnostic = report.diagnostic
     } catch (error) {
       const code = error instanceof Error ? error.message : ''
-      this.configuration.diagnostic = /^codex_[a-z_]+$/.test(code) ? code : 'codex_preflight_failed'
+      this.configuration.diagnostic = /^codex_[a-z_]+$/.test(code)
+        ? code
+        : (error as NodeJS.ErrnoException).code === 'ENOENT'
+          ? 'codex_executable_unavailable'
+          : 'codex_preflight_failed'
     }
     return this.available
   }
@@ -112,6 +122,14 @@ export class CodexProviderAdapter {
       diagnostic: this.configuration.diagnostic,
       home: this.configuration.home,
       home_mode: this.configuration.home_mode,
+      model: this.preflightReport?.model ?? this.options.model ?? 'Codex default',
+      ...(this.preflightReport?.checks ? { checks: this.preflightReport.checks } : {}),
+      ...(this.preflightReport?.login_command
+        ? { login_command: this.preflightReport.login_command }
+        : {}),
+      ...(this.preflightReport?.api_key_login_command
+        ? { api_key_login_command: this.preflightReport.api_key_login_command }
+        : {}),
       configuration: this.configuration,
       gates: codexExecutionGates(),
       capabilities: {
@@ -151,7 +169,6 @@ export class CodexProviderAdapter {
     ensureCodexState(state)
     const home = prepareCodexHome(this.homeSelection)
     assertCodexLayout(home, workspace, false)
-    if (!this.options.model) throw new Error('codex_selected_model_required')
     const schemas = mkdtempSync(join(state, 'schema-check-'))
     try {
       generateAndVerifySchemas(this.executable, schemas)

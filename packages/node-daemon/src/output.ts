@@ -9,7 +9,54 @@ const line = (value: unknown) =>
 const shown = (value: unknown) => (value == null ? 'unknown' : line(value))
 function provider(name: string, value: unknown) {
   const p = record(value)
-  if (p.available === true) return `${name}: available (${shown(p.provider_version)})`
+  const model = line(p.model ?? record(p.configuration).model ?? 'Codex default')
+  if (p.available === true)
+    return `${name}: available (${shown(p.provider_version)})${name === 'Codex' ? `; model: ${model}` : ''}`
+  if (name === 'Codex') {
+    const diagnostic = line(p.diagnostic)
+    if (
+      diagnostic === 'codex_authentication_required' ||
+      diagnostic === 'codex_chatgpt_authentication_required'
+    )
+      return `Codex: not logged in (model: ${model}) — run: ${line(p.login_command ?? 'codex login')}`
+    if (diagnostic === 'codex_platform_confinement_uncertified')
+      return `Codex: macOS required (model: ${model}) — run on macOS: abele-node doctor`
+    const repairs: Record<string, [string, string]> = {
+      codex_disabled: ['disabled', 'abele-node install --codex'],
+      codex_executable_unavailable: ['not installed', 'npm install -g @openai/codex@0.160.1'],
+      codex_version_unsupported: ['requires Codex 0.160.1', 'npm install -g @openai/codex@0.160.1'],
+      codex_opaque_wrapper_unsupported: [
+        'native executable required',
+        'abele-node install --codex-path /absolute/path/to/native/codex',
+      ],
+      codex_absolute_executable_required: [
+        'absolute executable path required',
+        'abele-node install --codex-path /absolute/path/to/native/codex',
+      ],
+      codex_managed_requirements_missing: [
+        'administrator requirements missing (set allow_remote_control = false)',
+        'sudo install -d -o root -m 0755 /etc/codex && sudoedit /etc/codex/requirements.toml',
+      ],
+      managed_remote_control_ban_missing: [
+        'administrator remote-control ban missing (set allow_remote_control = false)',
+        'sudoedit /etc/codex/requirements.toml',
+      ],
+      unsafe_managed_requirements: [
+        'administrator requirements ownership/permissions unsafe',
+        'sudo chown root /etc/codex /etc/codex/requirements.toml && sudo chmod 0755 /etc/codex && sudo chmod 0644 /etc/codex/requirements.toml',
+      ],
+      codex_selected_model_unavailable: [
+        'selected model not available for this account',
+        'abele-node install --codex-model MODEL_ID',
+      ],
+      codex_preflight_required: ['preflight not checked', 'abele-node doctor'],
+    }
+    const [reason, command] = repairs[diagnostic] ?? [
+      `preflight failed (${diagnostic})`,
+      'abele-node doctor',
+    ]
+    return `Codex: ${reason} (model: ${model}) — run: ${command}`
+  }
   const diagnostic = line(
     p.diagnostic ?? 'Provider diagnostics missing. Run abele-node doctor after restarting the node.'
   )

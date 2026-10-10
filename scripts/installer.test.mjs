@@ -48,6 +48,50 @@ test('Claude discovery records normalized paths and probes with service PATH', a
     probe.path.split(':').includes(process.execPath.slice(0, process.execPath.lastIndexOf('/')))
   )
 })
+test('Codex discovery records common-location executable and no node model override, preserving explicit overrides on upgrade', async () => {
+  const h = await home(),
+    bin = join(h, '.local/bin')
+  await mkdir(bin, { recursive: true })
+  const codex = join(bin, 'codex')
+  await writeFile(codex, '#!/bin/sh\necho codex-cli 0.160.1\n', { mode: 0o755 })
+  const first = await install(h, ['--no-service'], { PATH: bin + ':' + process.env.PATH })
+  assert.equal(first.code, 0, first.stderr)
+  const configPath = join(h, '.local/share/abele-node/config.json')
+  let config = JSON.parse(await readFile(configPath, 'utf8'))
+  assert.equal(config.codex, await realpath(codex))
+  assert.equal(config.codex_model, '')
+  assert.equal(config.codex_enabled, true)
+  const wrapper = await readFile(join(h, '.local/bin/abele-node'), 'utf8')
+  assert.match(wrapper, /--codex-path/)
+  assert.doesNotMatch(wrapper, /--codex-model/)
+  const override = await install(h, [
+    '--no-service',
+    '--version',
+    '0.2.3',
+    '--codex-model',
+    'custom-small',
+    '--no-codex',
+  ])
+  assert.equal(override.code, 0, override.stderr)
+  const upgrade = await install(h, ['--no-service', '--version', '0.3.1'])
+  assert.equal(upgrade.code, 0, upgrade.stderr)
+  config = JSON.parse(await readFile(configPath, 'utf8'))
+  assert.equal(config.codex_model, 'custom-small')
+  assert.equal(config.codex_enabled, false)
+  assert.match(await readFile(join(h, '.local/bin/abele-node'), 'utf8'), /--no-codex/)
+})
+test('Codex PATH discovery reaches systemd service arguments and survives its restricted PATH', async () => {
+  const h = await home(),
+    bin = join(h, 'custom-codex')
+  await mkdir(bin, { recursive: true })
+  await writeFile(join(bin, 'codex'), '#!/bin/sh\necho codex-cli 0.160.1\n', { mode: 0o755 })
+  const env = await mockedLinuxService(h)
+  const result = await install(h, [], { ...env, PATH: bin + ':' + env.PATH })
+  assert.equal(result.code, 0, result.stderr)
+  const unit = await readFile(join(h, '.config/systemd/user/abele-node.service'), 'utf8')
+  assert.ok(unit.includes('"--codex-path" "' + (await realpath(join(bin, 'codex'))) + '"'))
+  assert.doesNotMatch(unit, /--codex-model/)
+})
 test('missing Claude still installs and explains how to configure it later', async () => {
   const h = await home()
   const result = await install(h, ['--no-service'], {
@@ -233,6 +277,9 @@ if(args[0]==='print'){
     ABELE_INSTALL_BASE_URL: base,
     ABELE_INSTALL_API_URL: `${base}/latest`,
     ABELE_CLAUDE_PATH: '/nonexistent/claude',
+    ABELE_CODEX_PATH: '',
+    ABELE_CODEX_MODEL: '',
+    ABELE_CODEX_HOME: '',
     ABELE_TAILSCALE_PATH: '/nonexistent/tailscale',
     ...extra,
   })
