@@ -21,8 +21,11 @@ import {
   type Project,
   type RepositoryMethod,
   type RepositoryParams,
+  type RepositoryWrite,
+  type RepositoryRestore,
 } from '@abele/node-protocol'
 import type { ResourceServices } from './resources.js'
+import { RepositoryObjectCache } from './object-cache.js'
 import { decodeGit, parseWorktrees, type GitCommand } from './git.js'
 
 const hash = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex')
@@ -111,10 +114,17 @@ interface Subscription {
   timer?: NodeJS.Timeout
   pending?: NodeJS.Timeout
   checking: boolean
+  dirty?: 'filesystem' | 'reconciliation' | 'overflow'
 }
 
-/** Read-only repository targets deliberately do not enter the managed-workspace/provider tables. */
+/** Repository targets deliberately do not enter the managed-workspace/provider tables. */
 export class RepositoryService {
+  private objectCache = new RepositoryObjectCache()
+  private cacheGeneration = 0
+  private clearObjectCache() {
+    this.cacheGeneration++
+    this.objectCache.clear()
+  }
   private observations = new Map<string, Observation>()
   private cursors = new Map<string, Continuation>()
   private comparisons = new Map<string, Comparison>()
@@ -127,13 +137,16 @@ export class RepositoryService {
     const version = r.core.db
       .prepare("SELECT value FROM meta WHERE key='repository_schema_version'")
       .get() as { value: string } | undefined
-    if (version && version.value !== '1') throw new Error('unsupported_repository_database_version')
+    if (version && !['1', '2'].includes(version.value))
+      throw new Error('unsupported_repository_database_version')
     r.core.db.exec(`BEGIN IMMEDIATE;
       CREATE INDEX IF NOT EXISTS repository_workspace_path ON workspaces(project_id,json_extract(body,'$.path')) WHERE state!='removed';
       CREATE TABLE IF NOT EXISTS repository_projects(project_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, external_read INTEGER NOT NULL DEFAULT 0, default_branch TEXT);
       CREATE TABLE IF NOT EXISTS repository_targets(worktree_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, workspace_id TEXT, fingerprint TEXT NOT NULL, active INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_contents(worktree_id TEXT NOT NULL, content_id TEXT NOT NULL, content BLOB NOT NULL, touched INTEGER NOT NULL, PRIMARY KEY(worktree_id,content_id));
-      INSERT OR IGNORE INTO meta VALUES('repository_schema_version','1');
+      CREATE TABLE IF NOT EXISTS repository_edit_permissions(worktree_id TEXT PRIMARY KEY REFERENCES repository_targets(worktree_id), enabled INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS repository_recovery_copies(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES repository_targets(worktree_id), path TEXT UNIQUE NOT NULL, file_path TEXT NOT NULL, content_id TEXT NOT NULL, size INTEGER NOT NULL);
+      INSERT INTO meta VALUES('repository_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2';
       COMMIT;
     `)
   }
@@ -153,14 +166,21 @@ export class RepositoryService {
       .run(p.project_id, fingerprint)
   }
   removed(id: string) {
+    this.clearObjectCache()
     this.r.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(id)
     this.r.core.db.prepare('UPDATE repository_targets SET active=0 WHERE project_id=?').run(id)
+    this.r.core.db
+      .prepare(
+        'DELETE FROM repository_edit_permissions WHERE worktree_id IN (SELECT worktree_id FROM repository_targets WHERE project_id=?)'
+      )
+      .run(id)
     for (const [key, s] of this.subscriptions) if (s.target.project_id === id) this.unwatch(key)
   }
   settings(actor: AuthorityContext, p: Record<string, unknown>, operation?: string) {
     const core = this.r.core
     return core.commitOperation(actor, 'project.repository_settings', p, operation, () => {
       const project = this.r.projects.get(String(p.project_id))
+      this.clearObjectCache()
       this.registered(project)
       core.db
         .prepare(
@@ -190,8 +210,10 @@ export class RepositoryService {
           if (targets.has(c.target) || c.target === project.project_id) this.cursors.delete(id)
         for (const [id, c] of this.comparisons)
           if (targets.has(c.target)) this.comparisons.delete(id)
-        for (const id of targets)
+        for (const id of targets) {
           core.db.prepare('DELETE FROM repository_contents WHERE worktree_id=?').run(id)
+          core.db.prepare('DELETE FROM repository_edit_permissions WHERE worktree_id=?').run(id)
+        }
       }
       if (!p.external_read)
         for (const [key, s] of this.subscriptions)
@@ -286,6 +308,148 @@ export class RepositoryService {
       )
         throw new ChannelError('unauthorized')
     }
+  }
+  /** Synchronous boundary for the existing pinned-descriptor editor, after async Git validation. */
+  fileRoot(id: string) {
+    const target = this.get(id)
+    this.checkEdit(target)
+    try {
+      if (
+        realpathSync(target.path) !== target.path ||
+        this.targetFingerprint(target.path) !== target.fingerprint
+      )
+        throw new Error()
+    } catch {
+      throw new ChannelError('stale_resource')
+    }
+    if (target.workspace_id) {
+      const w = this.r.workspaces.get(target.workspace_id)
+      if (w.state !== 'ready' || w.path !== target.path) throw new ChannelError('resource_busy')
+    }
+    return target.path
+  }
+  private checkEdit(target: Target) {
+    if (!target.active) throw new ChannelError('stale_resource')
+    const config = this.config(target.project_id)
+    if (target.kind === 'external') {
+      const approval = this.r.core.db
+        .prepare('SELECT enabled FROM repository_edit_permissions WHERE worktree_id=?')
+        .get(target.worktree_id) as { enabled: number } | undefined
+      if (!config.external_read || !approval?.enabled) throw new ChannelError('unauthorized')
+    }
+  }
+  private async editJob<T>(work: () => Promise<T>) {
+    if (this.stopped || this.active >= 4) throw new ChannelError('resource_busy')
+    this.active++
+    try {
+      return await this.r.git.bounded(15000, work)
+    } finally {
+      this.active--
+    }
+  }
+  async prepareEdit(actor: AuthorityContext, id: string, path: string) {
+    return this.editJob(async () => {
+      this.r.core.authority.check(actor, 'mutate', id)
+      const target = await this.validate(this.get(id))
+      this.fileRoot(id)
+      const state = await this.workingState(target)
+      if (
+        state.files.some(
+          (f) => f.kind === 'submodule' && (path === f.path || path.startsWith(f.path + '/'))
+        )
+      )
+        throw new ChannelError('unsafe_path')
+      this.r.core.authority.check(actor, 'mutate', id)
+      this.fileRoot(id)
+    })
+  }
+  editing(actor: AuthorityContext, p: Record<string, unknown>, operation?: string) {
+    return this.editJob(async () => {
+      const target = await this.validate(this.get(String(p.worktree_id)))
+      if (target.kind !== 'external') throw new ChannelError('invalid_params')
+      return this.r.core.commitOperation(actor, 'repository.v1.editing', p, operation, () => {
+        this.checkPublication(actor, p)
+        this.r.core.db
+          .prepare(
+            'INSERT INTO repository_edit_permissions VALUES(?,?) ON CONFLICT(worktree_id) DO UPDATE SET enabled=excluded.enabled'
+          )
+          .run(target.worktree_id, p.enabled ? 1 : 0)
+        this.r.core.append(
+          'catalog',
+          'repository.invalidated',
+          { kind: 'installation', installation_id: actor.installation_id },
+          {
+            project_id: target.project_id,
+            worktree_id: target.worktree_id,
+            reason: 'reconciliation',
+            generation: randomUUID(),
+          }
+        )
+        return { worktree_id: target.worktree_id, enabled: Boolean(p.enabled) }
+      })
+    })
+  }
+  async mutation(
+    actor: AuthorityContext,
+    method: string,
+    p: Record<string, unknown>,
+    operation?: string
+  ) {
+    if (this.stopped) throw new ChannelError('resource_busy')
+    if (method === 'repository.v1.editing') return this.editing(actor, p, operation)
+    let result: unknown
+    if (method === 'repository.v1.write')
+      result = await this.r.mutations.writeRepository(
+        actor,
+        p as unknown as RepositoryWrite,
+        operation
+      )
+    else if (method === 'repository.v1.restore')
+      result = await this.r.mutations.restoreRepository(
+        actor,
+        p as unknown as RepositoryRestore,
+        operation
+      )
+    else
+      result = await this.editJob(async () => {
+        await this.validate(this.get(String(p.worktree_id)))
+        this.fileRoot(String(p.worktree_id))
+        return this.r.mutations.readRecovery(
+          String(p.worktree_id),
+          String(p.recovery_path),
+          Number(p.offset),
+          Number(p.length),
+          true
+        )
+      })
+    this.checkPublication(actor, p)
+    this.fileRoot(String(p.worktree_id))
+    return result
+  }
+  canPublishInvalidation(data: unknown) {
+    try {
+      const target = this.get(String((data as { worktree_id: string }).worktree_id))
+      const config = this.config(target.project_id)
+      return Boolean(target.active && (target.kind !== 'external' || config.external_read))
+    } catch {
+      return false
+    }
+  }
+  mutationPublication(actor: AuthorityContext, method: string, p: Record<string, unknown>) {
+    if (
+      ['repository.v1.write', 'repository.v1.restore', 'repository.v1.recovery.read'].includes(
+        method
+      )
+    ) {
+      this.checkPublication(actor, p)
+      this.fileRoot(String(p.worktree_id))
+    }
+  }
+  retainEdited(id: string, bytes: Uint8Array) {
+    return this.retain(this.get(id), Buffer.from(bytes))
+  }
+  editedBytes(id: string, content: string) {
+    return this.content(this.get(id), content)
   }
   private get(id: string) {
     const row = this.r.core.db
@@ -707,21 +871,38 @@ export class RepositoryService {
         ]
       })
   }
+  private async immutable(
+    target: Target,
+    command: Extract<GitCommand, { kind: 'tree' | 'blob' | 'blob.size' }>,
+    deadline?: number
+  ) {
+    const project = this.r.projects.get(target.project_id)
+    const generation = this.cacheGeneration
+    const key = JSON.stringify([
+      generation,
+      project.git_common_dir,
+      this.config(target.project_id).fingerprint,
+      command,
+    ])
+    const cached = this.objectCache.get(key)
+    if (cached) return cached
+    const bytes = await this.r.git.run(target.path, command, undefined, deadline)
+    // Access is still checked by dispatch before publishing a hit or a newly loaded object.
+    if (generation === this.cacheGeneration) this.objectCache.set(key, bytes)
+    return bytes
+  }
   private async commitTree(target: Target, commit: string, path = '', recursive = false) {
     // Resolve directory one component at a time; links/gitlinks are never dereferenced.
     let object = commit,
       prefix = ''
     for (const part of path.split('/').filter(Boolean)) {
-      const entries = this.parseTree(await this.r.git.run(target.path, { kind: 'tree', object }))
+      const entries = this.parseTree(await this.immutable(target, { kind: 'tree', object }))
       const dir = entries.find((e) => e.name === part)
       if (!dir || dir.kind !== 'directory') throw new ChannelError('unsafe_path')
       object = dir.oid!
       prefix += part + '/'
     }
-    return this.parseTree(
-      await this.r.git.run(target.path, { kind: 'tree', object, recursive }),
-      prefix
-    )
+    return this.parseTree(await this.immutable(target, { kind: 'tree', object, recursive }), prefix)
   }
   private async blobBytes(
     actor: AuthorityContext,
@@ -745,10 +926,10 @@ export class RepositoryService {
     if (!entry) throw new ChannelError('not_found')
     if (entry.kind !== 'file') throw new ChannelError('unsafe_path')
     const size = Number(
-      await this.r.git.text(target.path, { kind: 'blob.size', object: entry.oid! })
+      decodeGit(await this.immutable(target, { kind: 'blob.size', object: entry.oid! }))
     )
     if (size > limit) return { size, bytes: null }
-    return { size, bytes: await this.r.git.run(target.path, { kind: 'blob', object: entry.oid! }) }
+    return { size, bytes: await this.immutable(target, { kind: 'blob', object: entry.oid! }) }
   }
   private async blob(actor: AuthorityContext, target: Target, p: Record<string, unknown>) {
     const result = await this.blobBytes(
@@ -1273,6 +1454,17 @@ export class RepositoryService {
         watchers: [],
         checking: false,
       }
+    // Initial fingerprinting yields to token revocation, opt-out and shutdown.
+    // Recheck before allocating timers/handles, not just when publishing the first hint.
+    if (this.stopped) throw new ChannelError('resource_busy')
+    this.checkPublication(actor, { worktree_id: target.worktree_id })
+    for (const [key, current] of this.subscriptions)
+      if (
+        current.owner.installation_id === actor.installation_id &&
+        current.target.worktree_id === target.worktree_id
+      )
+        this.unwatch(key)
+    if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
     this.subscriptions.set(id, s)
     const notify = (reason: 'filesystem' | 'reconciliation' | 'reconnect' | 'overflow') => {
       this.r.core.authority.check(actor, 'publish', target.worktree_id)
@@ -1292,7 +1484,18 @@ export class RepositoryService {
       )
     }
     const reconcile = async (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
-      if (s.checking || this.stopped || this.active >= 4) return
+      if (this.stopped || !this.subscriptions.has(id)) return
+      if (s.expires < Date.now()) {
+        this.unwatch(id)
+        return
+      }
+      if (s.checking || this.active >= 4) {
+        // Never lose overflow or a change hint while another read owns the job budget.
+        if (reason === 'overflow' || s.dirty !== 'overflow') s.dirty = reason
+        return
+      }
+      reason = s.dirty === 'overflow' ? 'overflow' : (s.dirty ?? reason)
+      s.dirty = undefined
       s.checking = true
       this.active++
       try {
@@ -1331,6 +1534,11 @@ export class RepositoryService {
       } finally {
         s.checking = false
         this.active--
+        if (s.dirty && this.subscriptions.has(id) && !this.stopped && !s.pending)
+          s.pending = setTimeout(() => {
+            s.pending = undefined
+            run(s.dirty ?? 'reconciliation')
+          }, 100)
       }
     }
     const run = (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
@@ -1390,6 +1598,17 @@ export class RepositoryService {
         const revision = p.revision as RepositoryRevision | undefined
         if (revision?.kind === 'working') await this.observation(actor, target, revision)
         switch (method) {
+          case 'repository.v1.editing.get': {
+            let enabled = true
+            try {
+              this.fileRoot(target.worktree_id)
+            } catch (error) {
+              if (error instanceof ChannelError && error.code === 'unauthorized') enabled = false
+              else throw error
+            }
+            result = { worktree_id: target.worktree_id, enabled }
+            break
+          }
           case 'repository.v1.resolve':
             result = {
               kind: 'commit',
@@ -1539,8 +1758,19 @@ export class RepositoryService {
       this.active--
     }
   }
+  revoked(installation: string) {
+    this.clearObjectCache()
+    for (const [id, s] of this.subscriptions)
+      if (s.owner.installation_id === installation) this.unwatch(id)
+    for (const [id, o] of this.observations)
+      if (o.owner === installation) this.observations.delete(id)
+    for (const [id, c] of this.cursors) if (c.owner === installation) this.cursors.delete(id)
+    for (const [id, c] of this.comparisons)
+      if (c.owner === installation) this.comparisons.delete(id)
+  }
   async stop() {
     this.stopped = true
+    this.clearObjectCache()
     for (const id of this.subscriptions.keys()) this.unwatch(id)
     await Promise.all([...this.workers].map((w) => w.terminate()))
     await Promise.allSettled([...this.reconciliations])

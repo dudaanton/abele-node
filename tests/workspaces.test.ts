@@ -417,7 +417,7 @@ it('upgrades a stage 1 database without losing identity, credentials or session 
   s.core.close()
   const db = new DatabaseSync(join(s.state, 'node.sqlite'))
   db.exec(
-    'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE provider_native_sessions; DROP TABLE file_recovery_copies; DROP TABLE IF EXISTS legacy_file_recoveries; DROP TABLE file_mutations; DROP TABLE diff_snapshots; DROP TABLE workspace_contents; DROP TABLE prompt_deliveries; DROP INDEX prompts_session; DROP INDEX prompts_run; DROP TABLE provider_runs; DROP TABLE workspace_leases; DROP TABLE jobs; DROP TABLE workspaces; DROP TABLE projects; PRAGMA user_version=1;'
+    'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE provider_native_sessions; DROP TABLE codex_thread_bindings; DROP TABLE file_recovery_copies; DROP TABLE IF EXISTS legacy_file_recoveries; DROP TABLE file_mutations; DROP TABLE diff_snapshots; DROP TABLE workspace_contents; DROP TABLE prompt_deliveries; DROP INDEX prompts_session; DROP INDEX prompts_run; DROP TABLE provider_runs; DROP TABLE workspace_leases; DROP TABLE jobs; DROP TABLE workspaces; DROP TABLE projects; PRAGMA user_version=1;'
   )
   db.close()
   const reopened = new NodeCore(s.state)

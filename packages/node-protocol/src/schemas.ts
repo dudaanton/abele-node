@@ -75,13 +75,25 @@ export const SessionSchema = z
   .object({
     session_id: id,
     title: z.string().max(256),
-    provider: z.enum(['fake', 'claude', 'pi']),
-    native_session_id: z.string().uuid().optional(),
+    provider: z.enum(['fake', 'claude', 'pi', 'codex']),
+    native_session_id: z
+      .string()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9_:-]+$/)
+      .optional(),
     native_session_file: z.string().min(1).max(4096).optional(),
     created_at: z.string().datetime(),
     workspace_id: id.nullable().optional(),
   })
   .strict()
+  .refine(
+    (s) =>
+      s.provider === 'codex' ||
+      s.native_session_id === undefined ||
+      z.string().uuid().safeParse(s.native_session_id).success,
+    { message: 'Native ID must be a UUID for this provider', path: ['native_session_id'] }
+  )
 export const CapabilitySchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('supported'), evidence: z.string() }),
   z.object({ status: z.literal('unsupported'), reason: z.string() }),
@@ -133,6 +145,7 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
 ])
 const EventPayloads = {
   'repository.invalidated': RepositoryInvalidationSchema,
+  'stream.redacted': z.object({ refresh_required: z.literal(true) }).strict(),
   'delegation.created': DelegationSchema,
   'delegation.progress': DelegationMessageSchema,
   'delegation.question': DelegationMessageSchema,
@@ -187,7 +200,7 @@ export const MethodSchemas = {
   'session.create': z
     .object({
       title: z.string().max(256).default('Fake session'),
-      provider: z.enum(['fake', 'claude', 'pi']).default('fake'),
+      provider: z.enum(['fake', 'claude', 'pi', 'codex']).default('fake'),
       workspace_id: id.optional(),
     })
     .strict(),
@@ -258,6 +271,9 @@ export const MUTATIONS = new Set<Method>([
   'review.submit',
   'workspace.write',
   'workspace.restore',
+  'repository.v1.editing',
+  'repository.v1.write',
+  'repository.v1.restore',
   'session.detach',
   'session.create',
   'session.send',

@@ -1,5 +1,12 @@
 import { z } from 'zod'
-import { CommitSchema, RelativePathSchema, ContentChunkSchema } from './files.js'
+import {
+  CommitSchema,
+  RelativePathSchema,
+  ContentChunkSchema,
+  FileWriteSchema,
+  FileRestoreSchema,
+  FileMutationResultSchema,
+} from './files.js'
 import { StatusEntrySchema } from './resources.js'
 const id = z.string().min(1).max(128)
 const path = RelativePathSchema.refine((p) => !p.split('/').some((s) => s.toLowerCase() === '.git'))
@@ -162,6 +169,19 @@ export const RepositoryWatchSchema = z
   })
   .strict()
 const target = { worktree_id: id }
+export const RepositoryWriteSchema = FileWriteSchema.omit({ workspace_id: true })
+  .extend(target)
+  .strict()
+export const RepositoryRestoreSchema = FileRestoreSchema.omit({ workspace_id: true })
+  .extend(target)
+  .strict()
+export const RepositoryMutationResultSchema = FileMutationResultSchema.omit({ workspace_id: true })
+  .extend(target)
+  .strict()
+export const RepositoryEditingSchema = z.object({ ...target, enabled: z.boolean() }).strict()
+export type RepositoryWrite = z.infer<typeof RepositoryWriteSchema>
+export type RepositoryRestore = z.infer<typeof RepositoryRestoreSchema>
+export type RepositoryMutationResult = z.infer<typeof RepositoryMutationResultSchema>
 const revision = { ...target, revision: RepositoryRevisionSchema }
 const paging = { cursor: id.optional(), limit: z.number().int().min(1).max(256).default(256) }
 export const RepositoryMethodSchemas = {
@@ -170,6 +190,18 @@ export const RepositoryMethodSchemas = {
       project_id: id,
       external_read: z.boolean(),
       default_branch: ref.nullable().optional(),
+    })
+    .strict(),
+  'repository.v1.editing': RepositoryEditingSchema,
+  'repository.v1.editing.get': z.object(target).strict(),
+  'repository.v1.write': RepositoryWriteSchema,
+  'repository.v1.restore': RepositoryRestoreSchema,
+  'repository.v1.recovery.read': z
+    .object({
+      ...target,
+      recovery_path: RelativePathSchema,
+      offset: z.number().int().nonnegative().default(0),
+      length: z.number().int().min(1).max(131072).default(131072),
     })
     .strict(),
   'repository.v1.worktrees': z.object({ project_id: id, ...paging }).strict(),

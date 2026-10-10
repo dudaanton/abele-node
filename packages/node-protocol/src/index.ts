@@ -5,7 +5,7 @@ export type NodeId = string
 export type SessionId = string
 export type StreamId = string
 export type ProviderSessionId = string
-export type ProviderName = 'claude' | 'pi' | 'fake'
+export type ProviderName = 'claude' | 'pi' | 'codex' | 'fake'
 
 export interface ProtocolVersion {
   major: number

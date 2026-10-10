@@ -509,9 +509,14 @@ export class DelegationService {
       .prepare('SELECT * FROM delegations WHERE session_id=?')
       .get(session_id) as Row | undefined
     if (!row || !active(DelegationSchema.parse(JSON.parse(row.body)))) return
-    const message = event.type === 'pi.message.final' ? event.data.message : event.data
+    const message =
+      event.type === 'codex.message.final'
+        ? { role: 'assistant', content: event.data.text }
+        : event.type === 'pi.message.final'
+          ? event.data.message
+          : event.data
     if (
-      !['claude.message.final', 'pi.message.final'].includes(event.type) ||
+      !['claude.message.final', 'pi.message.final', 'codex.message.final'].includes(event.type) ||
       event.data.parent_tool_use_id ||
       message?.role !== 'assistant'
     )

@@ -19,8 +19,10 @@ import {
   NodeCore,
   ClaudeProviderAdapter,
   PiProviderAdapter,
+  CodexProviderAdapter,
   canonicalStateDir,
 } from '@abele/node-core'
+import type { CodexOptions } from '@abele/provider-codex'
 import type { PiOptions } from '@abele/provider-pi'
 import type { ClaudeOptions } from '@abele/provider-claude'
 import { TokenCommandSchema } from '@abele/node-protocol'
@@ -50,6 +52,7 @@ export function readRuntime(dir: string):
       control_socket?: string
       paired?: PairedListenerConfig
       runtime?: { cli_path: string; version: string }
+      codex?: unknown
     }
   | undefined {
   try {
@@ -63,6 +66,7 @@ export function readRuntime(dir: string):
       control_socket?: string
       paired?: PairedListenerConfig
       runtime?: { cli_path: string; version: string }
+      codex?: unknown
     }
     if (!Number.isSafeInteger(value.pid) || value.pid < 1) return
     process.kill(value.pid, 0)
@@ -257,7 +261,8 @@ export async function startDaemon(
   claudeOptions: ClaudeOptions = {},
   pairedConfig?: PairedListenerConfig,
   tailscalePath?: string,
-  piOptions: Omit<PiOptions, 'stateDir'> = {}
+  piOptions: Omit<PiOptions, 'stateDir'> = {},
+  codexOptions: Omit<CodexOptions, 'stateDir'> = {}
 ) {
   dir = canonicalStateDir(dir)
   const paired = pairedConfig ? PairedListenerSchema.parse(pairedConfig) : undefined
@@ -293,10 +298,13 @@ export async function startDaemon(
     release()
   }
   try {
+    const codex = new CodexProviderAdapter({ ...codexOptions, stateDir: dir })
+    if (codexOptions.enabled || codexOptions.executable) await codex.prepare()
     core = new NodeCore(dir, {
       ...(worktreeRoot ? { worktreeRoot } : {}),
       claude: new ClaudeProviderAdapter(claudeOptions),
       pi: new PiProviderAdapter({ ...piOptions, stateDir: dir }),
+      codex,
     })
     await core.execution.reconcile()
     await app.register(websocket, {
@@ -425,6 +433,7 @@ export async function startDaemon(
         node_id: core.node_id,
         claude: core.execution.capabilities(),
         pi: core.execution.capabilities('pi'),
+        codex: core.execution.capabilities('codex'),
         control_socket: socketPath,
         ...(paired ? { paired: { ...paired, backend_port: pairedPort } } : {}),
       }),

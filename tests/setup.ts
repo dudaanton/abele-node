@@ -8,6 +8,9 @@ const executable = join(dir, 'claude.mjs')
 cpSync(new URL('./fixtures/claude.mjs', import.meta.url), executable)
 chmodSync(executable, 0o700)
 process.env.ABELE_CLAUDE_PATH = executable
+// Override ambient discovery even in daemon/doctor tests. Production rejects the
+// Node launcher; explicit Codex transport tests opt into this exact fixture.
+process.env.ABELE_CODEX_PATH = new URL('./fixtures/codex.mjs', import.meta.url).pathname
 const tailscale = join(dir, 'tailscale.mjs')
 cpSync(new URL('./fixtures/tailscale.mjs', import.meta.url), tailscale)
 chmodSync(tailscale, 0o700)

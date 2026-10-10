@@ -25,32 +25,18 @@ export interface ClaudeOptions {
   permissionTtlMs?: number
   processProbe?: ProcessProbe
 }
-export interface PermissionAction {
-  tool_use_id: string
-  tool_name: string
-  input: Record<string, unknown>
-}
-export interface TurnContext {
-  session_id: string
-  run_id: string
-  cwd: string
-  text: string
-  native_session_id?: string
-  use_repository_claude_permissions?: boolean
-}
-export interface ProviderEventSink {
-  event(event: ClaudeEvent): void
-  processes(evidence: ProcessIdentity[]): void
-  ipc?(directory: string): void
-  permission(
-    action: PermissionAction,
-    signal: AbortSignal
-  ): Promise<{ choice: 'allow' | 'deny'; delivered(): boolean | void }>
-}
-export interface ProviderRun {
-  done: Promise<{ result?: Record<string, any>; reason?: string }>
-  interrupt(): Promise<void>
-}
+import type {
+  PermissionAction,
+  TurnContext,
+  ProviderEventSink,
+  ProviderRun,
+} from '@abele/provider-contract'
+export type {
+  PermissionAction,
+  TurnContext,
+  ProviderEventSink,
+  ProviderRun,
+} from '@abele/provider-contract'
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const canonical = (v: any): string =>
   Array.isArray(v)

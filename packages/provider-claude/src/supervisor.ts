@@ -1,15 +1,7 @@
 import { spawnSync } from 'node:child_process'
 
-export interface ProcessIdentity {
-  pid: number
-  fingerprint: string
-  group: number
-}
-/** Undefined means positively absent or a non-executing zombie. Unavailable probes must throw. */
-export interface ProcessProbe {
-  identity(pid: number): ProcessIdentity | undefined
-  groupMembers(leader: ProcessIdentity): ProcessIdentity[]
-}
+import type { ProcessIdentity, ProcessProbe } from '@abele/provider-contract'
+export type { ProcessIdentity, ProcessProbe } from '@abele/provider-contract'
 function processState(pid: number): { identity: ProcessIdentity; zombie: boolean } | undefined {
   if (!Number.isSafeInteger(pid) || pid < 2) throw new Error('process_probe_unavailable')
   const r = spawnSync(

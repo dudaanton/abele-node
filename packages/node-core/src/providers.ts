@@ -3,8 +3,9 @@ import type {
   TurnContext,
   ProviderEventSink,
   ProviderRun,
-} from '@abele/provider-claude'
-import type { PiAction, Answer } from '@abele/provider-pi'
+  ProviderAction,
+  Answer,
+} from '@abele/provider-contract'
 /** Both real adapters use one queue, journal, fenced worker and prompt-delivery service. */
 export interface ProviderAdapter {
   readonly available: boolean
@@ -18,7 +19,7 @@ export interface ProviderAdapter {
     sink: ProviderEventSink & {
       /** Optional run-bound node reporting tool; model inputs never supply authority. */
       report?(report: unknown): { recorded: boolean }
-      question?(action: PiAction, signal: AbortSignal): Promise<Answer>
+      question?(action: ProviderAction, signal: AbortSignal): Promise<Answer>
       reaped?(leader: ProcessIdentity): void
     }
   ): Promise<ProviderRun>

@@ -39,9 +39,9 @@ export const DelegationGrantSchema = z
     parent_id: Id,
     project_ids: z.array(Id).max(128),
     providers: z
-      .array(z.enum(['fake', 'claude', 'pi']))
+      .array(z.enum(['fake', 'claude', 'pi', 'codex']))
       .min(1)
-      .max(3),
+      .max(4),
     actions: z.array(DelegationActionSchema).min(1).max(5),
     allow_fake: z.boolean(),
     created_at: z.string().datetime(),
@@ -96,9 +96,9 @@ export const DelegationGrantRequestSchema = z
     installation_id: Id.optional(),
     project_ids: z.array(Id).max(128),
     providers: z
-      .array(z.enum(['fake', 'claude', 'pi']))
+      .array(z.enum(['fake', 'claude', 'pi', 'codex']))
       .min(1)
-      .max(3)
+      .max(4)
       .default(['fake', 'claude', 'pi']),
     actions: z
       .array(DelegationActionSchema)
@@ -117,7 +117,7 @@ export const DelegationCreateSchema = z
     project_id: Id.optional(),
     base_ref: z.string().min(1).max(256).default('HEAD'),
     title: z.string().max(256),
-    provider: z.enum(['fake', 'claude', 'pi']),
+    provider: z.enum(['fake', 'claude', 'pi', 'codex']),
     text: z.string().min(1).max(32768),
   })
   .strict()

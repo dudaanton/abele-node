@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 it('ships public source metadata, installation guides and a pinned non-root image', () => {
@@ -134,6 +135,50 @@ it('documents pi availability neutrally and retains capability and publication g
   }
   const pi = readFileSync('docs/pi.md', 'utf8')
   expect(pi).toContain('--pi-provider YOUR_PROVIDER --pi-model YOUR_MODEL')
+})
+
+it('keeps internal Codex reports out of the public documentation', () => {
+  for (const file of [
+    'docs/codex-progress.md',
+    'docs/codex-native-checkpoint.md',
+    'docs/codex-stage0.md',
+  ])
+    expect(existsSync(file), file).toBe(false)
+})
+
+it('documents Codex setup and limits without machine-specific acceptance instructions', () => {
+  const codex = readFileSync('docs/codex.md', 'utf8')
+  expect(codex).toContain('--codex-path')
+  expect(codex).toContain('ABELE_CODEX_PATH')
+  expect(codex).toContain('--state-dir "$STATE_DIR"')
+  expect(codex).toContain('CODEX_HOME="$STATE_DIR/codex" HOME="$STATE_DIR/codex"')
+  expect(codex).toContain('login --device-auth')
+  expect(codex).toMatch(/telemetry.*analytics.*off by default/i)
+  expect(codex).toMatch(/remote.*off by default/i)
+  expect(codex).toContain('accept`')
+  expect(codex).toContain('decline`')
+  expect(codex).toContain('not exhaustive kernel containment')
+  expect(codex).not.toMatch(
+    /(?:\.scratch|probes\/|acceptance node|inference turns|checkpoint|worktree fence)/i
+  )
+  expect(codex).not.toMatch(/\/(?:Users|home|Volumes)\/|\b[a-z0-9.-]+\.ts\.net\b/i)
+})
+
+it('keeps relative links in the README and public guides resolvable', () => {
+  const files = [
+    'README.md',
+    ...readdirSync('docs')
+      .filter((f) => f.endsWith('.md'))
+      .map((f) => `docs/${f}`),
+  ]
+  for (const file of files) {
+    const text = readFileSync(file, 'utf8')
+    for (const match of text.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) {
+      const target = match[1]!.split('#')[0]!
+      if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target)) continue
+      expect(existsSync(resolve(dirname(file), target)), `${file}: ${target}`).toBe(true)
+    }
+  }
 })
 
 it('uses subject-based names and neutral dependency and acceptance metadata', () => {

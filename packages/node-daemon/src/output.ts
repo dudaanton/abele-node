@@ -42,6 +42,7 @@ export function humanOutput(
         `Node ID: ${r.node_id == null ? 'not created' : line(r.node_id)}`,
         provider('Claude', r.claude),
         provider('pi', r.pi),
+        ...(r.codex ? [provider('Codex', r.codex)] : []),
         remote(r),
         `Projects: ${shown(r.projects)}; workspaces: ${shown(r.workspaces)}`,
       ].join('\n')
@@ -77,7 +78,7 @@ export function humanOutput(
         ),
         // A foreground daemon does not require a LaunchAgent.
         `OK Service: ${r.launch_agent ? 'LaunchAgent installed' : 'no LaunchAgent; use foreground start or your service manager'}`,
-        ...(['Claude', 'pi'] as const).map((name) => {
+        ...['Claude', 'pi', ...(r.codex ? ['Codex'] : [])].map((name) => {
           const p = record(r[name.toLowerCase()])
           return `${p.available === true ? 'OK' : 'PROBLEM'} ${provider(name, p)}`
         }),

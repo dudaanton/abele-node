@@ -5,11 +5,11 @@ import type {
   ProviderRun,
   ProcessIdentity,
   PermissionAction,
-  ClaudeEvent,
-} from '@abele/provider-claude'
+  ProviderEvent as ClaudeEvent,
+  ProviderAction as PiAction,
+} from '@abele/provider-contract'
 import { canonical, type NodeCore } from './index.js'
 import type { ProviderAdapter } from './providers.js'
-import type { PiAction } from '@abele/provider-pi'
 import { updateInProgress, tryRunAdmission } from './update-lock.js'
 
 type Input = Record<string, string | number | null>
@@ -27,11 +27,10 @@ export class ProviderSessions {
   private stopping = false
   constructor(
     private core: NodeCore,
-    private adapter?: ProviderAdapter,
-    private piAdapter?: ProviderAdapter
+    private adapters: ReadonlyMap<string, ProviderAdapter> = new Map()
   ) {}
   private adapterFor(provider: string) {
-    return provider === 'pi' ? this.piAdapter : this.adapter
+    return this.adapters.get(provider)
   }
   isAvailable(provider: string) {
     return this.adapterFor(provider)?.available ?? false
@@ -113,9 +112,23 @@ export class ProviderSessions {
     for (const [session, active] of this.active) {
       if (active.starting) continue
       const input = this.core.db
-        .prepare('SELECT state FROM inputs WHERE run_id=?')
-        .get(active.run_id) as { state: string }
-      if (!active.starting && !['dispatching', 'delivered'].includes(input.state))
+        .prepare('SELECT * FROM inputs WHERE run_id=?')
+        .get(active.run_id) as Input
+      if (['dispatching', 'delivered'].includes(String(input.state))) {
+        try {
+          this.core.checkExecution(String(input.principal_id), session)
+        } catch {
+          this.core.transaction(() => {
+            this.core.transition(input, 'delivery_unknown')
+            this.invalidate(active.run_id)
+            this.core.append(session, 'run.interrupted', actor, {
+              run_id: active.run_id,
+              reason: 'execution_authority_revoked',
+            })
+          })
+        }
+      }
+      if (!['dispatching', 'delivered'].includes(String(input.state)))
         await this.retryCleanup(session, active)
     }
     if (this.stopping || updateInProgress(this.core.stateDir)) return
@@ -182,6 +195,14 @@ export class ProviderSessions {
         } finally {
           releaseAdmission()
         }
+        if (
+          session.provider === 'codex' &&
+          !session.native_session_id &&
+          this.core.db
+            .prepare('SELECT 1 FROM provider_runs WHERE session_id=? AND run_id<>?')
+            .get(session.session_id, run_id)
+        )
+          throw new Error('codex_native_binding_missing')
         const body = JSON.parse(String(input.body)) as { text: string }
         slot.run = await adapter.startTurn(
           {
@@ -191,6 +212,9 @@ export class ProviderSessions {
             text: this.core.delegations.turnText(session.session_id, body.text),
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
+            ...(session.provider === 'codex' && session.native_session_id
+              ? { native_binding: this.codexBinding(session.session_id) }
+              : {}),
             use_repository_claude_permissions: useRepositoryPermissions,
           },
           {
@@ -320,6 +344,16 @@ export class ProviderSessions {
       }
     }
   }
+  private codexBinding(session_id: string) {
+    const binding = this.core.db
+      .prepare(
+        'SELECT workspace_path,policy_fingerprint,model FROM codex_thread_bindings WHERE session_id=?'
+      )
+      .get(session_id) as
+      { workspace_path: string; policy_fingerprint: string; model: string } | undefined
+    if (!binding) throw new Error('codex_native_binding_missing')
+    return binding
+  }
   private persistProcesses(run_id: string, evidence: ProcessIdentity[]) {
     if (
       !evidence.every(
@@ -354,7 +388,26 @@ export class ProviderSessions {
         .prepare('SELECT * FROM inputs WHERE input_id=?')
         .get(String(input.input_id)) as Input
       const late = !['dispatching', 'delivered'].includes(String(current.state))
-      if (event.type === 'claude.init' || event.type === 'pi.session.bound') {
+      if (
+        event.type === 'codex.cleanup.failed' &&
+        this.core.session(session_id).provider === 'codex'
+      )
+        this.core.append(session_id, 'session.error', actor, {
+          run_id,
+          code: 'process_cleanup_unconfirmed',
+          attempt: event.data.attempt,
+          retrying: event.data.retrying === true,
+          ...(event.data.retry_in_ms !== undefined ? { retry_in_ms: event.data.retry_in_ms } : {}),
+        })
+      if (
+        event.type === 'claude.init' ||
+        event.type === 'pi.session.bound' ||
+        event.type === 'codex.session.bound'
+      ) {
+        if (event.type === 'codex.session.bound') {
+          if (late) throw new Error('codex_late_binding')
+          this.core.checkExecution(String(input.principal_id), session_id)
+        }
         const init =
           event.type === 'claude.init'
             ? (event.data.configuration as Record<string, unknown>)
@@ -372,7 +425,7 @@ export class ProviderSessions {
         })
         if (
           !updated.native_session_id ||
-          (session.provider === 'claude' &&
+          (['claude', 'codex'].includes(session.provider) &&
             session.native_session_id &&
             session.native_session_id !== updated.native_session_id)
         )
@@ -383,6 +436,40 @@ export class ProviderSessions {
               "INSERT INTO provider_native_sessions(session_id,provider,native_session_id,session_file) VALUES(?,'pi',?,?) ON CONFLICT(session_id) DO UPDATE SET native_session_id=excluded.native_session_id,session_file=excluded.session_file"
             )
             .run(session_id, updated.native_session_id!, updated.native_session_file!)
+        if (event.type === 'codex.session.bound') {
+          const binding = event.data
+          if (
+            session.provider !== 'codex' ||
+            !session.workspace_id ||
+            this.core.resources.workspaces.get(session.workspace_id).path !==
+              binding.workspace_path ||
+            !/^[a-f0-9]{64}$/.test(binding.policy_fingerprint) ||
+            binding.model !== this.adapterFor('codex')?.configuration.model
+          )
+            throw new Error('codex_native_binding_mismatch')
+          const previous = this.core.db
+            .prepare('SELECT * FROM codex_thread_bindings WHERE session_id=?')
+            .get(session_id)
+          if (
+            previous &&
+            (previous.thread_id !== updated.native_session_id ||
+              previous.workspace_path !== binding.workspace_path ||
+              previous.policy_fingerprint !== binding.policy_fingerprint ||
+              previous.model !== binding.model)
+          )
+            throw new Error('codex_native_binding_mismatch')
+          this.core.db
+            .prepare(
+              'INSERT INTO codex_thread_bindings(session_id,thread_id,workspace_path,policy_fingerprint,model) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING'
+            )
+            .run(
+              session_id,
+              updated.native_session_id!,
+              binding.workspace_path,
+              binding.policy_fingerprint,
+              binding.model
+            )
+        }
         this.core.db
           .prepare('UPDATE sessions SET body=? WHERE session_id=?')
           .run(JSON.stringify(updated), session_id)
@@ -391,7 +478,12 @@ export class ProviderSessions {
       }
       if (
         current.state === 'dispatching' &&
-        ['claude.block.lifecycle', 'claude.message.final', 'pi.input.accepted'].includes(event.type)
+        [
+          'claude.block.lifecycle',
+          'claude.message.final',
+          'pi.input.accepted',
+          'codex.input.accepted',
+        ].includes(event.type)
       )
         this.core.transition(current, 'delivered')
       if (!late) this.core.delegations.observe(session_id, run_id, event)
@@ -555,9 +647,11 @@ export class ProviderSessions {
             run_id,
             choice,
             evidence:
-              this.core.session(session_id).provider === 'pi'
-                ? 'sdk_worker_ipc_ack'
-                : 'bridge_ipc_ack',
+              this.core.session(session_id).provider === 'codex'
+                ? 'codex_rpc_dispatch_authorized'
+                : this.core.session(session_id).provider === 'pi'
+                  ? 'sdk_worker_ipc_ack'
+                  : 'bridge_ipc_ack',
           })
           return true
         }),

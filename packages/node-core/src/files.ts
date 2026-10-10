@@ -33,7 +33,8 @@ const same = (
 export class WorkspaceFileService {
   beforeOpen?: () => void
   constructor(private r: ResourceServices) {}
-  private root(id: string) {
+  private root(id: string, repository = false) {
+    if (repository) return this.r.repository.fileRoot(id)
     const w = this.r.workspaces.get(id)
     this.r.projects.get(w.project_id)
     if (w.state !== 'ready') throw new ChannelError('resource_busy')
@@ -65,8 +66,8 @@ export class WorkspaceFileService {
       throw new ChannelError('not_found')
     }
   }
-  writeTarget(id: string, path: string, create = false) {
-    const root = this.root(id)
+  writeTarget(id: string, path: string, create = false, repository = false) {
+    const root = this.root(id, repository)
     if (create) {
       if (!path || !RelativePathSchema.safeParse(path).success)
         throw new ChannelError('unsafe_path')
@@ -125,8 +126,8 @@ export class WorkspaceFileService {
       throw new ChannelError('unsafe_path')
     return { entries, next: entries.length < names.length ? (entries.at(-1)?.name ?? null) : null }
   }
-  read(id: string, path: string) {
-    const root = this.root(id),
+  read(id: string, path: string, repository = false) {
+    const root = this.root(id, repository),
       target = this.checked(root, path),
       before = lstatSync(target)
     if (!before.isFile()) throw new ChannelError('unsafe_path')
@@ -177,7 +178,7 @@ export class WorkspaceFileService {
         !same(end, lstatSync(target))
       )
         throw new ChannelError('stale_revision')
-      return this.retain(id, path, bytes)
+      return this.retain(id, path, bytes, repository)
     } catch (e) {
       if (e instanceof ChannelError) throw e
       throw new ChannelError('unsafe_path')
@@ -185,7 +186,7 @@ export class WorkspaceFileService {
       if (fd !== undefined) closeSync(fd)
     }
   }
-  retain(id: string, path: string, bytes: Uint8Array) {
+  retain(id: string, path: string, bytes: Uint8Array, repository = false) {
     let binary = bytes.includes(0)
     try {
       new TextDecoder('utf-8', { fatal: true }).decode(bytes)
@@ -193,11 +194,13 @@ export class WorkspaceFileService {
       binary = true
     }
     const content_id = hash(bytes)
-    this.r.core.transaction(() =>
-      this.r.core.db
-        .prepare('INSERT OR IGNORE INTO workspace_contents VALUES(?,?,?)')
-        .run(id, content_id, bytes)
-    )
+    if (repository) this.r.repository.retainEdited(id, bytes)
+    else
+      this.r.core.transaction(() =>
+        this.r.core.db
+          .prepare('INSERT OR IGNORE INTO workspace_contents VALUES(?,?,?)')
+          .run(id, content_id, bytes)
+      )
     return FileContentSchema.parse({
       workspace_id: id,
       path,
@@ -208,7 +211,8 @@ export class WorkspaceFileService {
       too_large: false,
     })
   }
-  bytes(id: string, content: string): Buffer {
+  bytes(id: string, content: string, repository = false): Buffer {
+    if (repository) return this.r.repository.editedBytes(id, content)
     const row = this.r.core.db
       .prepare('SELECT content FROM workspace_contents WHERE workspace_id=? AND content_id=?')
       .get(id, content) as { content: Uint8Array } | undefined

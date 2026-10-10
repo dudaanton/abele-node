@@ -37,6 +37,7 @@ export { PairingService, IdentityStore } from './pairing.js'
 import { ProviderSessions } from './claude.js'
 import type { ProviderAdapter } from './providers.js'
 export type { ProviderAdapter } from './providers.js'
+export { CodexProviderAdapter } from '@abele/provider-codex'
 export { PiProviderAdapter } from '@abele/provider-pi'
 export { ClaudeProviderAdapter } from '@abele/provider-claude'
 export {
@@ -206,7 +207,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   private storageFailed = false
   constructor(
     stateDir: string,
-    options: { worktreeRoot?: string; claude?: ProviderAdapter; pi?: ProviderAdapter } = {}
+    options: {
+      worktreeRoot?: string
+      claude?: ProviderAdapter
+      pi?: ProviderAdapter
+      codex?: ProviderAdapter
+    } = {}
   ) {
     stateDir = this.stateDir = canonicalStateDir(stateDir)
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
@@ -216,7 +222,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 11) {
+    if (version > 12) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -321,6 +327,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       CREATE TABLE delegations(delegation_id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES installations(installation_id), delegation_key TEXT NOT NULL, request_hash TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES delegation_grants(grant_id), session_id TEXT UNIQUE NOT NULL REFERENCES sessions(session_id), mailbox_stream_id TEXT UNIQUE NOT NULL REFERENCES streams(stream_id), body TEXT NOT NULL, create_receipt TEXT NOT NULL, result_text TEXT, UNIQUE(principal_id,delegation_key));
       CREATE TABLE delegation_reports(delegation_id TEXT NOT NULL REFERENCES delegations(delegation_id), run_id TEXT NOT NULL, report_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(delegation_id,run_id,report_id));
       PRAGMA user_version=11; COMMIT;`)
+    if (version < 12)
+      this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE codex_thread_bindings(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), thread_id TEXT NOT NULL UNIQUE, workspace_path TEXT NOT NULL, policy_fingerprint TEXT NOT NULL, model TEXT NOT NULL);
+      PRAGMA user_version=12; COMMIT;`)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -354,7 +364,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.resolvePrompt(prompt, 'invalidated', 'deny', null)
       }
     })
-    this.execution = new ProviderSessions(this, options.claude, options.pi)
+    this.execution = new ProviderSessions(
+      this,
+      new Map(
+        Object.entries({ claude: options.claude, pi: options.pi, codex: options.codex }).filter(
+          (entry): entry is [string, ProviderAdapter] => entry[1] !== undefined
+        )
+      )
+    )
     this.claude = this.execution
     this.protectFiles()
   }
@@ -384,6 +401,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   revokeToken(id: string) {
     this.db.prepare('UPDATE installations SET revoked=1 WHERE installation_id=?').run(id)
+    this.resources.repository.revoked(id)
   }
   /** Synchronous state/receipt/event commit only; Git effects must stay outside. */
   transaction<T>(work: () => T, inject = false): T {
@@ -465,6 +483,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported',
           evidence: 'repository.v1; opaque-worktrees; frozen-objects; bounded-worker-search',
         },
+        repository_editing_v1: {
+          status: 'supported',
+          evidence: 'durable-file-mutations; identity-bound-external-owner-approval',
+        },
         repository_notifications_v1: {
           status: 'supported',
           evidence: 'leased-watchers-and-reconciliation-v1',
@@ -530,6 +552,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.mutate(actor, method, params)
     )
   }
+  /** Invalidations are hints, not evidence that obsolete external authority can be replayed. */
+  canPublishEvent(actor: AuthorityContext, event: JournalEvent) {
+    this.authority.check(actor, 'publish', event.stream_id)
+    return (
+      event.type !== 'repository.invalidated' ||
+      this.resources.repository.canPublishInvalidation(event.data)
+    )
+  }
   /** Recheck the exact resource of a successful response at the actual transport boundary. */
   checkPublication(actor: AuthorityContext, method: string, raw: unknown, result?: unknown) {
     this.authority.check(actor, 'publish')
@@ -549,8 +579,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       )
     )
     this.delegations.checkPublication(actor, method, p)
-    if (method.startsWith('repository.v1.'))
+    if (method.startsWith('repository.v1.')) {
       this.resources.repository.checkPublication(actor, p, result)
+      this.resources.repository.mutationPublication(actor, method, p)
+    }
   }
   operationReceipt(
     actor: AuthorityContext,
@@ -672,7 +704,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     return this.mutate(actor, 'session.send', p)
   }
   acceptSession(actor: AuthorityContext, p: Record<string, unknown>, provisioning = false) {
-    if (p.provider === 'claude' || p.provider === 'pi') {
+    if (p.provider !== 'fake') {
       if (!p.workspace_id) throw new ChannelError('workspace_required')
       const workspace = this.resources.workspaces.get(String(p.workspace_id))
       if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')

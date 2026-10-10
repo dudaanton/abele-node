@@ -42,6 +42,33 @@ when retrying; changed parameters must use a new identity.
 - `workspace.changed` catalog events are bounded refresh hints, not file content
   or confirmation of what an external editor currently sees.
 
+## Repository targets, including external worktrees
+
+When `repository_editing_v1` is advertised, the versioned repository adapter exposes
+the **same durable coordinator**, not a second editor. Use
+`client.repository.write`/`restore` with `worktree_id` instead of `workspace_id`, and
+`client.repository.mutationResult` for receipts carrying `worktree_id`. Recovery
+reads use `client.repository.readRecovery`. Registered roots and ready managed
+targets remain writable; external targets require project external-read opt-in
+**and** one explicit owner `client.repository.editing({ worktree_id, enabled: true })`
+approval for the identity. `editingStatus` reads the effective permission. This does
+not adopt/lease a target or admit a provider. Opt-out clears external edit approvals;
+replacement identities never inherit them.
+
+Only current working files can be saved; no revision/ref is accepted by the write
+methods. Historical content remains immutable. Content preconditions, exclusive
+creation, text bounds, recovery quotas, conflict and `outcome_unknown` behavior,
+offline outbox/operation IDs and restart reconciliation are unchanged. Permission
+is checked again after queueing and immediately before effects/publication.
+External recovery is scoped to its target and original path, and stored privately
+under `STATE_DIR/file-recovery/<worktree_id>/`.
+
+All saves are owner APIs. Do not expose them directly to model tools. A plugin
+agent edit requires a separate edit grant and per-edit owner approval of exact
+identity/path, expected content and proposed text; changing the proposal invalidates
+that approval. Read opt-in or a human-opened tab is not agent edit permission.
+See [repository APIs](repository-view.md#durable-editing-adapter) for protocol shapes.
+
 ## In-place writes and uncertainty
 
 Existing files are opened with a pinned writable descriptor, without truncation.
@@ -68,8 +95,8 @@ Recovery bytes live under **`STATE_DIR/file-recovery/<workspace_id>/`**, not bes
 source files, so backups of ignored source cannot accidentally enter `git add .`.
 Directories are `0700`, files `0600`. Each workspace retains at most **32 copies /
 16 MiB**; oldest copies are evicted before allocating another. Receipts do not
-expire, but their recovery references can expire (`recovery_expired`). Immutable
-browse snapshots have a separate, currently unbounded retention policy.
+expire, but their recovery references can expire (`recovery_expired`). Legacy immutable browse snapshots have a separate, currently unbounded retention
+policy; repository-v1 retained contents use their separate 64 MiB bounded store.
 
 ```ts
 if (result?.recovery_path) {

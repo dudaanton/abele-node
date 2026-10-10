@@ -6,9 +6,14 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { NodeCore, type ProviderAdapter } from '@abele/node-core'
 import type { Answer } from '@abele/provider-pi'
-it.each(['revoked', 'interrupted'])(
-  'fails closed after %s at the durable provider-delivery boundary without treating stale control as disk failure',
-  async (condition) => {
+it.each([
+  ['pi', 'revoked'],
+  ['pi', 'interrupted'],
+  ['codex', 'revoked'],
+  ['codex', 'interrupted'],
+] as const)(
+  '%s fails closed after %s at the durable provider-delivery boundary',
+  async (provider, condition) => {
     const dir = mkdtempSync(join(tmpdir(), 'abele-pi-approval-')),
       repo = join(dir, 'repo')
     mkdirSync(repo)
@@ -28,11 +33,11 @@ it.each(['revoked', 'interrupted'])(
       available: true,
       configuration: { permission_ttl_ms: 10000 },
       configurationForTurn: () => ({}),
-      capabilities: () => ({ provider: 'pi', available: true }),
+      capabilities: () => ({ provider, available: true }),
       reconcile: async () => {},
       startTurn: async (_turn, sink) => {
         sink.event({
-          type: 'pi.native.child',
+          type: `${provider}.native.child`,
           data: { run_id: 'provider-native-run', child_id: 'native-child' },
         })
         answer = sink.permission(
@@ -49,7 +54,10 @@ it.each(['revoked', 'interrupted'])(
         }
       },
     }
-    const core = new NodeCore(join(dir, 'state'), { pi: adapter }),
+    const core = new NodeCore(
+        join(dir, 'state'),
+        provider === 'pi' ? { pi: adapter } : { codex: adapter }
+      ),
       token = core.createToken('requester'),
       actor = core.authority.authenticate(token.token)
     const request = (method: string, params: unknown) =>
@@ -64,13 +72,15 @@ it.each(['revoked', 'interrupted'])(
       await core.resources.jobs.drain()
       const session = request('session.create', {
         title: 'pi',
-        provider: 'pi',
+        provider,
         workspace_id: job.workspace_id,
       }) as { session_id: string }
       request('session.send', { session_id: session.session_id, text: 'hello', observed_seq: 0 })
       await core.execution.drain()
       const prompt = core.prompts(session.session_id)[0]!
-      const native = core.read(session.session_id, 0).find((e) => e.type === 'pi.native.child')!
+      const native = core
+        .read(session.session_id, 0)
+        .find((e) => e.type === `${provider}.native.child`)!
       expect(native.data).toMatchObject({
         run_id: prompt.run_id,
         provider_run_id: 'provider-native-run',

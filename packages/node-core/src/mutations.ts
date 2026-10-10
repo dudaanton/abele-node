@@ -25,14 +25,23 @@ import {
   type FileWrite,
   type FileRestore,
   type FileMutationResult,
+  RepositoryWriteSchema,
+  RepositoryRestoreSchema,
+  RepositoryMutationResultSchema,
+  type RepositoryWrite,
+  type RepositoryRestore,
 } from '@abele/node-protocol'
 import { canonical } from './index.js'
 import type { ResourceServices } from './resources.js'
 
 export const FILE_RECOVERY_LIMITS = { count: 32, bytes: 16 * 1024 * 1024 } as const
 const hash = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex')
-type Params = FileWrite | FileRestore
-type Method = 'workspace.write' | 'workspace.restore'
+type Params = FileWrite | FileRestore | RepositoryWrite | RepositoryRestore
+type Method =
+  'workspace.write' | 'workspace.restore' | 'repository.v1.write' | 'repository.v1.restore'
+const resourceId = (p: Params) => ('worktree_id' in p ? p.worktree_id : p.workspace_id)
+const copyTable = (repository: boolean) =>
+  repository ? 'repository_recovery_copies' : 'file_recovery_copies'
 type Intent = {
   kind: 'in_place'
   method: Method
@@ -65,6 +74,22 @@ export class FileMutationCoordinator {
   restore(actor: AuthorityContext, params: FileRestore, operation?: string) {
     return this.schedule(() => this.apply(actor, 'workspace.restore', params, operation))
   }
+  writeRepository(actor: AuthorityContext, params: RepositoryWrite, operation?: string) {
+    return this.schedule(async () => {
+      await this.r.git.bounded(15000, () =>
+        this.r.repository.prepareEdit(actor, params.worktree_id, params.path)
+      )
+      return this.apply(actor, 'repository.v1.write', params, operation)
+    })
+  }
+  restoreRepository(actor: AuthorityContext, params: RepositoryRestore, operation?: string) {
+    return this.schedule(async () => {
+      await this.r.git.bounded(15000, () =>
+        this.r.repository.prepareEdit(actor, params.worktree_id, params.path)
+      )
+      return this.apply(actor, 'repository.v1.restore', params, operation)
+    })
+  }
   private schedule(work: () => unknown) {
     const task = this.serial.then(work)
     this.serial = task.catch(() => {})
@@ -78,9 +103,9 @@ export class FileMutationCoordinator {
       closeSync(fd)
     }
   }
-  private copyRow(workspace: string, ref: string): Copy {
+  private copyRow(workspace: string, ref: string, repository = false): Copy {
     const row = this.r.core.db
-      .prepare('SELECT * FROM file_recovery_copies WHERE workspace_id=? AND path=?')
+      .prepare(`SELECT * FROM ${copyTable(repository)} WHERE workspace_id=? AND path=?`)
       .get(workspace, ref) as Copy | undefined
     if (!row) throw new ChannelError('recovery_expired')
     return row
@@ -105,8 +130,8 @@ export class FileMutationCoordinator {
       closeSync(fd)
     }
   }
-  readRecovery(workspace: string, ref: string, offset: number, length: number) {
-    const bytes = this.copyBytes(this.copyRow(workspace, ref))
+  readRecovery(workspace: string, ref: string, offset: number, length: number, repository = false) {
+    const bytes = this.copyBytes(this.copyRow(workspace, ref, repository))
     return {
       offset,
       total: bytes.length,
@@ -127,12 +152,13 @@ export class FileMutationCoordinator {
     // Persist the new directory entry in its parent before any workspace truncation.
     if (created) this.syncDirectory(path)
   }
-  private retainCopy(workspace: string, file: string, bytes: Uint8Array) {
+  private retainCopy(workspace: string, file: string, bytes: Uint8Array, repository = false) {
+    const table = copyTable(repository)
     if (bytes.length > FILE_RECOVERY_LIMITS.bytes) throw new ChannelError('file_too_large')
     // Workspace IDs are node-owned, but keep the state-directory component explicit and bounded.
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(workspace)) throw new ChannelError('unsafe_path')
     const rows = this.r.core.db
-      .prepare('SELECT * FROM file_recovery_copies WHERE workspace_id=? ORDER BY ordinal')
+      .prepare(`SELECT * FROM ${table} WHERE workspace_id=? ORDER BY ordinal`)
       .all(workspace) as Copy[]
     let total = rows.reduce((n, row) => n + row.size, 0)
     while (
@@ -146,7 +172,7 @@ export class FileMutationCoordinator {
         if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
       }
       this.r.core.transaction(() =>
-        this.r.core.db.prepare('DELETE FROM file_recovery_copies WHERE ordinal=?').run(row.ordinal)
+        this.r.core.db.prepare(`DELETE FROM ${table} WHERE ordinal=?`).run(row.ordinal)
       )
       total -= row.size
     }
@@ -175,13 +201,13 @@ export class FileMutationCoordinator {
       this.r.core.transaction(() =>
         this.r.core.db
           .prepare(
-            'INSERT INTO file_recovery_copies(workspace_id,path,file_path,content_id,size) VALUES(?,?,?,?,?)'
+            `INSERT INTO ${table}(workspace_id,path,file_path,content_id,size) VALUES(?,?,?,?,?)`
           )
           .run(workspace, path, file, hash(bytes), bytes.length)
       )
     } catch (e) {
       // No workspace effect has happened. An unindexed copy can be removed safely here.
-      if (!this.r.core.db.prepare('SELECT 1 FROM file_recovery_copies WHERE path=?').get(path))
+      if (!this.r.core.db.prepare(`SELECT 1 FROM ${table} WHERE path=?`).get(path))
         unlinkSync(target)
       throw e
     }
@@ -194,9 +220,12 @@ export class FileMutationCoordinator {
     predecessor = intent.predecessor,
     recovery = intent.recovery_path
   ) {
-    const result = FileMutationResultSchema.parse({
+    const repository = 'worktree_id' in intent.params
+    const result = (repository ? RepositoryMutationResultSchema : FileMutationResultSchema).parse({
       operation_id: row.operation_id,
-      workspace_id: intent.params.workspace_id,
+      ...(repository
+        ? { worktree_id: resourceId(intent.params) }
+        : { workspace_id: resourceId(intent.params) }),
       path: intent.params.path,
       state,
       expected_content_id: intent.params.expected_content_id,
@@ -211,17 +240,33 @@ export class FileMutationCoordinator {
       this.r.core.db
         .prepare('DELETE FROM file_mutations WHERE principal_id=? AND operation_id=?')
         .run(row.principal_id, row.operation_id)
-      this.r.core.append(
-        'catalog',
-        'workspace.changed',
-        { kind: 'node' },
-        {
-          workspace_id: intent.params.workspace_id,
-          reason: 'file_mutation',
-          operation_id: row.operation_id,
-          paths: [intent.params.path],
-        }
-      )
+      if (repository) {
+        const target = this.r.core.db
+          .prepare('SELECT project_id FROM repository_targets WHERE worktree_id=?')
+          .get(resourceId(intent.params)) as { project_id: string }
+        this.r.core.append(
+          'catalog',
+          'repository.invalidated',
+          { kind: 'installation', installation_id: row.principal_id },
+          {
+            project_id: target.project_id,
+            worktree_id: resourceId(intent.params),
+            reason: 'filesystem',
+            generation: randomUUID(),
+          }
+        )
+      } else
+        this.r.core.append(
+          'catalog',
+          'workspace.changed',
+          { kind: 'node' },
+          {
+            workspace_id: resourceId(intent.params),
+            reason: 'file_mutation',
+            operation_id: row.operation_id,
+            paths: [intent.params.path],
+          }
+        )
     }, true)
     return result
   }
@@ -237,7 +282,11 @@ export class FileMutationCoordinator {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ChannelError('unsafe_path')
     const referenced = new Set(
       (
-        this.r.core.db.prepare('SELECT path FROM file_recovery_copies').all() as { path: string }[]
+        this.r.core.db
+          .prepare(
+            'SELECT path FROM file_recovery_copies UNION ALL SELECT path FROM repository_recovery_copies'
+          )
+          .all() as { path: string }[]
       ).map((row) => row.path)
     )
     const visit = (directory: string, relative: string) => {
@@ -265,23 +314,30 @@ export class FileMutationCoordinator {
             JSON.stringify({ operation_id: row.operation_id })
         )
       const params =
-        raw.method === 'workspace.restore'
-          ? FileRestoreSchema.parse(raw.params)
-          : FileWriteSchema.parse(raw.params)
+        raw.method === 'repository.v1.restore'
+          ? RepositoryRestoreSchema.parse(raw.params)
+          : raw.method === 'repository.v1.write'
+            ? RepositoryWriteSchema.parse(raw.params)
+            : raw.method === 'workspace.restore'
+              ? FileRestoreSchema.parse(raw.params)
+              : FileWriteSchema.parse(raw.params)
       const intent: Intent = { ...raw, params }
       // Matching current bytes are not proof of completion. Never repeat an uncertain effect.
       this.finish(row, intent, 'outcome_unknown')
     }
   }
-  private current(workspace: string, path: string) {
+  private current(workspace: string, path: string, repository = false) {
     try {
-      return this.r.files.read(workspace, path)
+      return this.r.files.read(workspace, path, repository)
     } catch (e) {
       if (e instanceof ChannelError && e.code === 'not_found') return null
       throw e
     }
   }
   private apply(actor: AuthorityContext, method: Method, params: Params, operation?: string) {
+    const workspace = resourceId(params),
+      repository = 'worktree_id' in params
+    const current = () => this.current(workspace, params.path, repository)
     const core = this.r.core,
       previous = core.operationReceipt(actor, method, params, operation)
     if (previous) return previous.result
@@ -294,14 +350,19 @@ export class FileMutationCoordinator {
       return this.finish(pending, JSON.parse(pending.body) as Intent, 'outcome_unknown')
     }
     let bytes: Buffer
-    if (method === 'workspace.restore') {
-      const copy = this.copyRow(params.workspace_id, (params as FileRestore).recovery_path)
+    if (method === 'workspace.restore' || method === 'repository.v1.restore') {
+      const copy = this.copyRow(
+        workspace,
+        (params as FileRestore | RepositoryRestore).recovery_path,
+        repository
+      )
       if (copy.file_path !== params.path) throw new ChannelError('unsafe_path')
       bytes = this.copyBytes(copy)
     } else bytes = Buffer.from((params as FileWrite).text)
-    const initial = this.current(params.workspace_id, params.path)
+    const initial = current()
     if (initial?.too_large) throw new ChannelError('file_too_large')
-    if (method === 'workspace.write' && initial?.binary) throw new ChannelError('invalid_params')
+    if ((method === 'workspace.write' || method === 'repository.v1.write') && initial?.binary)
+      throw new ChannelError('invalid_params')
     const intent: Intent = {
       kind: 'in_place',
       method,
@@ -318,7 +379,7 @@ export class FileMutationCoordinator {
     }
     if ((initial?.content_id ?? null) !== params.expected_content_id)
       return this.finish(row, intent, 'conflict')
-    const target = this.r.files.writeTarget(params.workspace_id, params.path, !initial)
+    const target = this.r.files.writeTarget(workspace, params.path, !initial, repository)
     let fd: number | undefined
     if (initial) {
       // Probe write access WITHOUT truncation. O_TRUNC's effect is deferred to ftruncate on
@@ -333,7 +394,7 @@ export class FileMutationCoordinator {
       if (initial) {
         if (!sameInode(fstatSync(fd!), lstatSync(target))) throw new ChannelError('unsafe_path')
         this.fault?.('before_check')
-        const fresh = this.current(params.workspace_id, params.path)
+        const fresh = current()
         if (
           !fresh ||
           fresh.too_large ||
@@ -342,22 +403,27 @@ export class FileMutationCoordinator {
         )
           return this.finish(row, intent, 'conflict', fresh?.content_id ?? null)
         intent.recovery_path = this.retainCopy(
-          params.workspace_id,
+          workspace,
           params.path,
-          this.r.files.bytes(params.workspace_id, fresh.content_id!)
+          this.r.files.bytes(workspace, fresh.content_id!, repository),
+          repository
         )
       }
       row.body = JSON.stringify(intent)
       core.transaction(() => {
-        core.authority.check(actor, method, params.workspace_id)
+        core.authority.check(actor, method, workspace)
         core.db
           .prepare('INSERT INTO file_mutations VALUES(?,?,?,?)')
           .run(row.principal_id, row.operation_id, row.request_hash, row.body)
       })
       this.fault?.('after_intent')
+      core.authority.check(actor, method, workspace)
+      // Revalidate approval/identity even for exclusive creation, immediately before the effect.
+      if (repository) this.r.repository.fileRoot(workspace)
+      if (!initial) this.r.files.writeTarget(workspace, params.path, true, repository)
       if (initial) {
         // Final content/path check immediately before the first destructive write.
-        const final = this.current(params.workspace_id, params.path)
+        const final = current()
         if (
           !final ||
           final.content_id !== params.expected_content_id ||
@@ -377,12 +443,7 @@ export class FileMutationCoordinator {
           )
         } catch (e) {
           if ((e as NodeJS.ErrnoException).code === 'EEXIST')
-            return this.finish(
-              row,
-              intent,
-              'conflict',
-              this.current(params.workspace_id, params.path)?.content_id ?? null
-            )
+            return this.finish(row, intent, 'conflict', current()?.content_id ?? null)
           core.transaction(() =>
             core.db
               .prepare('DELETE FROM file_mutations WHERE principal_id=? AND operation_id=?')
@@ -403,7 +464,7 @@ export class FileMutationCoordinator {
         fsyncSync(fd!)
         if (!initial) this.syncDirectory(target)
         this.fault?.('after_write')
-        const actual = this.current(params.workspace_id, params.path)
+        const actual = current()
         if (
           actual?.content_id === intent.content_id &&
           sameInode(fstatSync(fd!), lstatSync(target))

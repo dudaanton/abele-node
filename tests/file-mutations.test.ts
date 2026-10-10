@@ -90,7 +90,7 @@ function schema8(s: Awaited<ReturnType<typeof setup>>) {
   s.core.close()
   const db = new DatabaseSync(join(s.dir, 'state', 'node.sqlite'))
   db.exec(
-    'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE IF EXISTS provider_native_sessions; CREATE TABLE IF NOT EXISTS legacy_file_recoveries(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), path TEXT NOT NULL, content_id TEXT NOT NULL, fingerprint TEXT NOT NULL, protected INTEGER NOT NULL DEFAULT 0, UNIQUE(workspace_id,path)); PRAGMA user_version=8;'
+    'DROP TABLE delegation_reports; DROP TABLE delegations; DROP TABLE delegation_grants; DROP TABLE IF EXISTS provider_native_sessions; DROP TABLE codex_thread_bindings; CREATE TABLE IF NOT EXISTS legacy_file_recoveries(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), path TEXT NOT NULL, content_id TEXT NOT NULL, fingerprint TEXT NOT NULL, protected INTEGER NOT NULL DEFAULT 0, UNIQUE(workspace_id,path)); PRAGMA user_version=8;'
   )
   return db
 }
@@ -576,7 +576,7 @@ it('migration 9 drops only an empty legacy table and preserves normal recovery r
   db.close()
   const c = new NodeCore(join(s.dir, 'state'))
   cores.push(c)
-  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(11)
+  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(12)
   expect(
     c.db.prepare("SELECT name FROM sqlite_master WHERE name='legacy_file_recoveries'").get()
   ).toBeUndefined()

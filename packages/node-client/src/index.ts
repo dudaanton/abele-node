@@ -108,7 +108,15 @@ export class MemoryClientStore implements ClientStore {
   }
 }
 export class NodeClient {
-  readonly repository = new RepositoryClient((method, params) => this.request(method, params))
+  readonly repository = new RepositoryClient((method, params) => this.request(method, params), {
+    mutation: (method, params) => this.mutation(method, params),
+    save: async (method, params, operation) => {
+      const operation_id = await this.enqueue(method, params, operation)
+      if (this.connected) await this.flush().catch(() => {})
+      return { operation_id }
+    },
+    result: (operation) => this.operationResult(operation),
+  })
   private channel?: RequestChannel
   private flushing?: Promise<void>
   private listeners = new Set<(event: JournalEvent) => void>()
@@ -555,7 +563,12 @@ export class NodeClient {
         await this.store.transaction((s) => {
           s.results[entry.operation_id] = {
             ...(error ? { error } : { result }),
-            ...(['workspace.write', 'workspace.restore'].includes(entry.method)
+            ...([
+              'workspace.write',
+              'workspace.restore',
+              'repository.v1.write',
+              'repository.v1.restore',
+            ].includes(entry.method)
               ? { request: { method: entry.method, params: entry.params } }
               : {}),
           }

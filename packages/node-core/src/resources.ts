@@ -663,6 +663,15 @@ export class ResourceServices {
       'resource',
       String(p.project_id ?? p.workspace_id ?? p.job_id ?? '')
     )
+    if (
+      [
+        'repository.v1.editing',
+        'repository.v1.write',
+        'repository.v1.restore',
+        'repository.v1.recovery.read',
+      ].includes(method)
+    )
+      return this.repository.mutation(actor, method, p, operation)
     if (method.startsWith('repository.v1.')) return this.repository.request(actor, method, p)
     if (method === 'project.repository_settings')
       return this.repository.settings(actor, p, operation)

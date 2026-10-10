@@ -29,7 +29,13 @@ import { daemonProcessPresent, waitForLaunch } from './launch-wait.js'
 import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
 import { update } from './update.js'
-import { ClaudeProviderAdapter, PiProviderAdapter, canonicalStateDir } from '@abele/node-core'
+import { doctorCodex } from '@abele/provider-codex'
+import {
+  ClaudeProviderAdapter,
+  PiProviderAdapter,
+  CodexProviderAdapter,
+  canonicalStateDir,
+} from '@abele/node-core'
 
 const json = process.argv.includes('--json')
 async function main() {
@@ -86,6 +92,16 @@ async function main() {
   const claudeBudget = Number(option('--claude-budget', '0.35'))
   const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
+  const codexFlag = args.indexOf('--codex')
+  if (codexFlag >= 0) args.splice(codexFlag, 1)
+  const codexPath = option('--codex-path', process.env.ABELE_CODEX_PATH ?? '')
+  const codexModel = option('--codex-model', '')
+  const codexOptions = {
+    enabled: codexFlag >= 0 || !!codexPath,
+    ...(codexPath ? { executable: codexPath } : {}),
+    model: codexModel,
+    permissionTtlMs: permissionTtl,
+  }
   const piProvider = option('--pi-provider', '')
   const piModel = option('--pi-model', '')
   const piAgentDir = resolve(option('--pi-agent-dir', join(homedir(), '.pi/agent')))
@@ -199,7 +215,8 @@ async function main() {
         claudeOptions,
         pairedConfig,
         tailscalePath,
-        piOptions
+        piOptions,
+        codexOptions
       )
       output({
         type: 'listening',
@@ -361,6 +378,9 @@ async function main() {
           paired: paired ?? null,
           pi:
             running?.pi ?? new PiProviderAdapter({ ...piOptions, stateDir: state }).capabilities(),
+          codex:
+            running?.codex ??
+            new CodexProviderAdapter({ ...codexOptions, stateDir: state }).capabilities(),
           ...counts,
         })
       }
@@ -386,6 +406,13 @@ async function main() {
         encrypted_at_rest: false,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
         pi: running?.pi ?? new PiProviderAdapter({ ...piOptions, stateDir: state }).capabilities(),
+        codex: codexOptions.enabled
+          ? await doctorCodex({
+              ...(codexPath ? { executable: codexPath } : {}),
+              stateDir: state,
+              model: codexModel || undefined,
+            })
+          : new CodexProviderAdapter({ stateDir: state }).capabilities(),
       })
       return
     }
@@ -522,6 +549,9 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
+        ...(codexOptions.enabled && !codexPath ? ['--codex'] : []),
+        ...(codexPath ? ['--codex-path', codexPath] : []),
+        ...(codexModel ? ['--codex-model', codexModel] : []),
         ...(piProvider ? ['--pi-provider', piProvider] : []),
         ...(piModel ? ['--pi-model', piModel] : []),
         '--pi-agent-dir',

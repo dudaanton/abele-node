@@ -6,6 +6,7 @@ import {
   type RecordTransport,
   type AuthorityContext,
   type RecordFrame,
+  type JournalEvent,
 } from '@abele/channel-protocol'
 import { MethodSchemas, PairingMethodSchemas } from '@abele/node-protocol'
 import { NodeCore } from '@abele/node-core'
@@ -117,14 +118,31 @@ export async function serveChannel(
       for (const [stream, subscription] of subscriptions) {
         core.authority.check(actor!, 'publish', stream)
         for (const event of core.read(stream, subscription.cursor)) {
-          const bytes = FrameCodec.encode(event)
+          // A skipped sequence makes contiguous clients replay the same gap forever.
+          // Preserve only stream/sequence identity; none of the fenced event's type,
+          // actor, timestamp or payload may cross the publication boundary.
+          const published: JournalEvent = core.canPublishEvent(actor!, event)
+            ? event
+            : {
+                kind: 'event',
+                node_id: core.node_id,
+                stream_id: stream,
+                seq: event.seq,
+                type: 'stream.redacted',
+                actor: { kind: 'node' },
+                at: new Date().toISOString(),
+                data: { refresh_required: true },
+              }
+          const bytes = FrameCodec.encode(published)
           const unacked = [...subscriptions.values()].reduce((sum, s) => sum + s.bytes, 0)
           if (unacked + bytes.byteLength > LIMITS.unacked_bytes)
             throw new ChannelError('slow_consumer')
           subscription.bytes += bytes.byteLength
           subscription.sent.push({ seq: event.seq, bytes: bytes.byteLength })
           subscription.cursor = event.seq
-          await scheduler.send(event, 1, () => core.authority.check(actor!, 'publish', stream))
+          await scheduler.send(published, 1, () => {
+            if (!core.canPublishEvent(actor!, published)) throw new ChannelError('unauthorized')
+          })
           if (closed) return
         }
       }

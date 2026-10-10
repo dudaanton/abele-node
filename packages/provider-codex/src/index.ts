@@ -1,0 +1,5 @@
+export { discoverCodex, checkManagedRequirements, requireManagedFile } from './discovery.js'
+export type { CodexExecutable, CodexDiscoveryOptions } from './discovery.js'
+export { CodexProviderAdapter } from './adapter.js'
+export type { CodexOptions } from './adapter.js'
+export { doctorCodex } from './doctor.js'

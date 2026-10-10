@@ -1,17 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import type { PermissionAction } from '@abele/provider-claude'
-export interface PiAction extends PermissionAction {
-  native_session_id?: string
-  kind?: 'permission' | 'select' | 'confirm' | 'input' | 'trust'
-  title?: string
-  options?: string[]
-  ttl_ms?: number
-}
-export interface Answer {
-  choice: 'allow' | 'deny'
-  value?: string
-  delivered(): boolean | void
-}
+import type { ProviderAction as PiAction, Answer } from '@abele/provider-contract'
+export type { ProviderAction as PiAction, Answer } from '@abele/provider-contract'
 export type Ask = (action: PiAction, signal: AbortSignal) => Promise<Answer>
 export interface PiTurnResult {
   subtype: 'success' | 'error'

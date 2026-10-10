@@ -182,6 +182,7 @@ it('stopped status is human by default, read-only, and JSON retains its exact ke
   const doctor = JSON.parse(command(state, 'doctor', '--json').stdout)
   expect(Object.keys(doctor).sort()).toEqual([
     'claude',
+    'codex',
     'encrypted_at_rest',
     'launch_agent',
     'node',
@@ -298,6 +299,7 @@ it.each([false, true])(
     const report = JSON.parse(result.stdout)
     expect(Object.keys(report).sort()).toEqual([
       'claude',
+      'codex',
       'control_socket',
       'node_id',
       'pi',
@@ -310,6 +312,7 @@ it.each([false, true])(
     ])
     expect(report).toMatchObject({
       running: true,
+      codex: { provider: 'codex', available: false },
       runtime: { version: JSON.parse(readFileSync('package.json', 'utf8')).version },
     })
     expect(command(state, 'status').stdout).toContain(`Port: ${report.port}`)

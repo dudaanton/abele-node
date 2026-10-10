@@ -1,0 +1,20 @@
+{
+  "name": "@abele/provider-codex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "schemas"
+  ],
+  "dependencies": {
+    "@abele/provider-contract": "0.0.0",
+    "@abele/provider-claude": "0.0.0"
+  }
+}

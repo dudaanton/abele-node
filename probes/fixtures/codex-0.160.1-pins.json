@@ -1,0 +1,15 @@
+{
+  "version": "codex-cli 0.160.1",
+  "source": "https://github.com/openai/codex/tree/rust-v0.160.1/codex-rs/app-server-protocol/schema/typescript",
+  "stable_schema_sha256": {
+    "ServerRequest.ts": "30880f1a8da876eec30600ba27560d05ad0db5c645e14564c9c79a2429274f06",
+    "ServerNotification.ts": "459d76defb8b368e906b2afbdd14f5ea8cae33eabdd28de097fd703c6f38c4ad",
+    "v2/CommandExecutionRequestApprovalParams.ts": "b3425c5bc97dd9a1d74d33ef1cb42d56049da7e4704435021d50fa4eb404abbe"
+  },
+  "observed_binary_sha256": "09fa44fdc37a5fc70dc1ace31235f90468a2e193d0e85f7552eab068ea2582be",
+  "observed_experimental_schema_sha256": {
+    "ServerRequest.ts": "1c5837adbfbdd005f387478ba87840808d1353b47b82dcf63739a78bb1c8d3be",
+    "ServerNotification.ts": "459d76defb8b368e906b2afbdd14f5ea8cae33eabdd28de097fd703c6f38c4ad",
+    "v2/CommandExecutionRequestApprovalParams.ts": "531eaecb38d8c93ed389ada2482f6e2d7d6fa5351adf423706bf6e6eeddf60dc"
+  }
+}

@@ -12,6 +12,7 @@ import {
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { copyWorkspaceRuntime } from './workspace-runtime.mjs'
 
 const root = resolve('.')
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version
@@ -54,9 +55,7 @@ try {
     cpSync(join(root, file), join(staging, file))
   for (const name of readdirSync('packages')) {
     const destination = join(staging, 'packages', name)
-    mkdirSync(destination, { recursive: true })
-    cpSync(join(root, 'packages', name, 'package.json'), join(destination, 'package.json'))
-    cpSync(join(root, 'packages', name, 'dist'), join(destination, 'dist'), { recursive: true })
+    copyWorkspaceRuntime(join(root, 'packages', name), destination)
   }
   run('npm', ['ci', '--omit=dev', '--ignore-scripts'])
   // Apply the same audited SDK dependency repair as the normal build.

@@ -10,6 +10,7 @@
   "references": [
     { "path": "../provider-claude" },
     { "path": "../provider-pi" },
+    { "path": "../provider-codex" },
     { "path": "../channel-client" },
     {
       "path": "../node-core"

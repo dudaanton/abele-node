@@ -9,6 +9,9 @@
       "default": "./dist/index.js"
     }
   },
+  "dependencies": {
+    "@abele/provider-contract": "0.0.0"
+  },
   "files": [
     "dist"
   ]

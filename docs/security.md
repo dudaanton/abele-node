@@ -85,7 +85,8 @@ The same OS user (including its agents) can read/change it directly.
 SQLite uses plain SQL, versioned `PRAGMA user_version` migrations, WAL, foreign
 keys, `synchronous=FULL` and a 3-second busy timeout. Future schema versions are
 refused. The optional repository-read tables use a separately checked
-`repository_schema_version` metadata value (currently 1); future extension versions
+`repository_schema_version` metadata value (currently 2; version 1 upgrades with
+identity-scoped edit permissions and separate recovery rows); future extension versions
 are also refused. Preconditions, state, sequences, journal events and principal-scoped
 receipts commit together before response/publication. Reusing the same principal,
 operation ID and canonical method/body recovers the original receipt; a changed
@@ -97,6 +98,10 @@ possible commit. Prompts distinguish committed resolution from provider delivery
 Legacy history, receipts, workspace snapshots and content have **no automatic expiry**.
 Repository-v1 observations/cursors/comparison manifests have ten-minute bounded
 leases; its separate retained-content store has a global 64 MiB LRU ceiling.
+Immutable Git tree/blob display reads also use a separate 16 MiB / 512-entry
+memory LRU, keyed by validated repository/object and authority generation. Every
+hit is authorized; mutable working/index/ref data is never cached there. Revocation
+stops watcher leases immediately and invalidates pending/cache publication.
 Expired identities fail explicitly and never retarget mutable files; see
 [repository API and bounds](repository-view.md). Logs are not rotated. Disk-full, sustained-load, backup/restore and operational hardening remain
 important deployment concerns. Provider-native resume files are separate provider-owned
@@ -114,8 +119,10 @@ silently initialize/copy it. Trust changes are not currently supported.
 
 Git uses typed argv through `/usr/bin/git`, no shell, bounded output and subprocess
 deadlines. Repository-v1 adds aggregate read budgets, killable regex workers,
-opaque external-worktree targets and per-project owner opt-in. External targets
-never acquire workspace lifecycle/provider or mutation authority from discovery.
+opaque external-worktree targets and per-project owner opt-in. External targets never acquire workspace lifecycle/provider or mutation authority
+from discovery. Durable file editing additionally requires explicit owner approval
+for that opaque worktree identity; project opt-out clears approvals. Replacements
+do not inherit them, and no Git-write operations are exposed.
 Root/common-directory and target identities are rechecked at access and owner
 permission is rechecked before publishing, including retained reads. Operations disable hooks, fsmonitor, pagers, signature display/signing,
 external diff/textconv and configured checkout/clean filters **even for trusted
@@ -173,6 +180,11 @@ Crashes can leave partial bytes; durable unfinished intents settle unknown and
 are never automatically replayed. Recovery copies live outside source checkouts,
 with a per-workspace limit of 32 copies / 16 MiB and oldest-first eviction. Receipts
 can outlive a copy. Workspace authorization applies to recovery reads/restores.
+The repository-v1 adapter uses this same coordinator for current files, including
+explicitly approved external identities, with separate target-scoped recovery rows.
+Historical views remain immutable; schemas reject revision/ref save arguments.
+Owner APIs are not agent tools: the consuming plugin must separately enforce chat
+edit grants and exact per-edit approval of path, expected content and proposed text.
 State backups must preserve these copies too. Legacy recovery/mutation evidence
 requiring inspection is refused at migration rather than silently imported/deleted.
 

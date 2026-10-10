@@ -11,7 +11,10 @@ through Tailscale Serve is available but separately enabled; use the plugin’s
 **Pair remote node** action with an invitation. Claude Code execution works with
 explicitly tested CLI versions;
 the pi SDK provider is available and capability-gated;
-see [pi configuration and limits](docs/pi.md). Windows is untested. See
+see [pi configuration and limits](docs/pi.md). The experimental
+[Codex integration](docs/codex.md) is available on macOS after doctor verifies
+policy, node-local authentication and an explicitly selected model. Codex execution
+on Linux and Windows is unavailable. Windows deployment is untested. See
 [remote access, pairing and revocation](docs/remote-access.md).
 
 ## What works today
@@ -174,7 +177,7 @@ The [debugger scratch installer](docs/debug-probe.md#manual-real-adapter-check) 
 manual-only, excluded from CI and from the published image.
 
 The workspace packages separate protocol, channel server/client, node core/client,
-daemon and Claude/pi adapters. `@abele/node-client` requires a device-local transactional
+daemon, provider-neutral contracts and Claude/pi/Codex adapters. `@abele/node-client` requires a device-local transactional
 `ClientStore`; `MemoryClientStore` is only for tests. Paired access also requires a
 transactional, device-local `DeviceKeyStore`; private keys must not be synced. The
 libraries are source/local workspace artifacts (currently version `0.0.0`), not
