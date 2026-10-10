@@ -47,10 +47,24 @@ for (let i = 0; i < args.length; i++)
       target[keys.at(-1)] = table
     } else target[keys.at(-1)] = JSON.parse(value)
   }
-let mode = 'normal'
+let mode = 'normal',
+  initializeDelayMs = 0,
+  trackRequests = false
 try {
-  mode = JSON.parse(readFileSync(join(home, 'fixture.json'), 'utf8')).mode
+  const fixture = JSON.parse(readFileSync(join(home, 'fixture.json'), 'utf8'))
+  mode = fixture.mode
+  initializeDelayMs = fixture.initialize_delay_ms ?? 0
+  trackRequests = fixture.track_requests === true
 } catch {}
+writeFileSync(
+  join(home, 'launch.json'),
+  JSON.stringify({
+    home: process.env.HOME,
+    hasApiKey: !!process.env.OPENAI_API_KEY,
+    config,
+  }),
+  { mode: 0o600 }
+)
 const send = (record) => process.stdout.write(JSON.stringify(record) + '\n')
 const reply = (id, result) => send({ id, result })
 const notify = (method, params) => send({ method, params })
@@ -85,14 +99,17 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     continue
   }
-  if (msg.method === 'initialize')
+  if (trackRequests) appendFileSync(join(home, 'request-log.jsonl'), JSON.stringify(msg) + '\n')
+  if (msg.method === 'initialize') {
+    // Exercise cold process I/O independently of the parent's logical RPC clock.
+    await new Promise((r) => setTimeout(r, initializeDelayMs))
     reply(msg.id, {
       userAgent: 'codex/0.160.1',
       codexHome: home,
       platformFamily: 'unix',
       platformOs: 'fixture',
     })
-  else if (msg.method === 'initialized') {
+  } else if (msg.method === 'initialized') {
     if (mode === 'duplicate-response') reply(1, { token: 'never retain' })
     if (mode === 'invalid-utf8') process.stdout.write(Buffer.from([0xff, 10]))
     if (mode === 'truncated') {
@@ -110,7 +127,22 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (msg.method === 'configRequirements/read')
     reply(msg.id, { requirements: { allowRemoteControl: false } })
   else if (msg.method === 'account/read')
-    reply(msg.id, { account: { type: 'chatgpt' }, requiresOpenaiAuth: true })
+    reply(msg.id, {
+      account:
+        mode === 'logged-out'
+          ? null
+          : {
+              type:
+                mode === 'environment-key'
+                  ? process.env.OPENAI_API_KEY
+                    ? 'apiKey'
+                    : 'logged-out'
+                  : ['apiKey', 'amazonBedrock'].includes(mode)
+                    ? mode
+                    : 'chatgpt',
+            },
+      requiresOpenaiAuth: true,
+    })
   else if (msg.method === 'model/list')
     reply(msg.id, {
       data: [

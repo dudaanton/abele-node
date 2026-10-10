@@ -1,6 +1,39 @@
 import { mkdirSync, chmodSync, realpathSync, lstatSync } from 'node:fs'
-import { isAbsolute, join, relative, sep } from 'node:path'
-export function assertCodexLayout(state: string, workspace: string) {
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { homedir } from 'node:os'
+
+export interface CodexHome {
+  home: string
+  mode: 'inherited' | 'isolated'
+}
+export function resolveCodexHome(
+  explicit?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  userHome = homedir()
+): CodexHome {
+  const isolated = explicit || env.ABELE_CODEX_HOME
+  return {
+    home: resolve(isolated || env.CODEX_HOME || join(userHome, '.codex')),
+    mode: isolated ? 'isolated' : 'inherited',
+  }
+}
+export function ensureCodexState(stateDir: string) {
+  if (!isAbsolute(stateDir)) throw new Error('codex_unsafe_home')
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+  if (realpathSync(stateDir) !== stateDir || lstatSync(stateDir).uid !== process.getuid?.())
+    throw new Error('codex_unsafe_home')
+}
+export function prepareCodexHome(selection: CodexHome): string {
+  if (selection.mode === 'isolated') return ensureCodexHome(selection.home)
+  // Codex owns the user's configuration and credential storage. Do not read or
+  // rewrite those files, force file-based auth, or tighten their existing modes.
+  mkdirSync(selection.home, { recursive: true, mode: 0o700 })
+  const home = realpathSync(selection.home)
+  const stat = lstatSync(home)
+  if (!stat.isDirectory() || stat.uid !== process.getuid?.()) throw new Error('codex_unsafe_home')
+  return home
+}
+export function assertCodexLayout(state: string, workspace: string, allowWorktrees = true) {
   const contains = (root: string, path: string) => {
     const from = relative(root, path)
     return from === '' || (from !== '..' && !from.startsWith('..' + sep) && !isAbsolute(from))
@@ -10,16 +43,14 @@ export function assertCodexLayout(state: string, workspace: string) {
     !isAbsolute(workspace) ||
     contains(workspace, state) ||
     (contains(state, workspace) &&
-      (!contains(join(state, 'worktrees'), workspace) || workspace === join(state, 'worktrees')))
+      (!allowWorktrees ||
+        !contains(join(state, 'worktrees'), workspace) ||
+        workspace === join(state, 'worktrees')))
   )
     throw new Error('codex_state_workspace_overlap')
 }
-export function ensureCodexHome(stateDir: string) {
-  if (!isAbsolute(stateDir)) throw new Error('codex_unsafe_home')
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  if (realpathSync(stateDir) !== stateDir || lstatSync(stateDir).uid !== process.getuid?.())
-    throw new Error('codex_unsafe_home')
-  const home = join(stateDir, 'codex')
+export function ensureCodexHome(home: string) {
+  if (!isAbsolute(home)) throw new Error('codex_unsafe_home')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   const stat = lstatSync(home)
   if (

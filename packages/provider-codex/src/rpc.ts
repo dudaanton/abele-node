@@ -4,6 +4,8 @@ import { CodexProcessInventory, CODEX_PROCESS_MARKER, newProcessMarker } from '.
 import type { ProcessProbe, ProcessIdentity } from '@abele/provider-contract'
 import type { CodexExecutable } from './discovery.js'
 import { prepareWorkspaceTemp } from './temp.js'
+import { systemDeadlineTimers, type DeadlineTimers } from './timers.js'
+import { homedir } from 'node:os'
 
 const METHODS = new Set([
   'initialize',
@@ -93,6 +95,7 @@ export interface RpcOptions {
   executable: CodexExecutable
   cwd: string
   home: string
+  isolated?: boolean
   configArgs?: string[]
   processes(evidence: ProcessIdentity[]): void
   notification?(msg: RpcMessage): void
@@ -100,12 +103,15 @@ export interface RpcOptions {
   probe?: ProcessProbe
   marker?: string
   timeoutMs?: number
+  /** Node-local request deadline seam; does not replace process cleanup timers. */
+  timers?: DeadlineTimers
 }
 export class RpcPeer {
   readonly child: ChildProcessWithoutNullStreams
   readonly signal: AbortSignal
   readonly lost: Promise<string>
   private abort = new AbortController()
+  private timers: DeadlineTimers
   private probe: ProcessProbe
   private evidence: ProcessIdentity[] = []
   private inventory: CodexProcessInventory
@@ -124,6 +130,7 @@ export class RpcPeer {
   private cleanup?: Promise<void>
   private constructor(private options: RpcOptions) {
     this.probe = options.probe ?? systemProcessProbe
+    this.timers = options.timers ?? systemDeadlineTimers
     const marker = options.marker ?? newProcessMarker()
     this.inventory = new CodexProcessInventory(marker, options.processes, this.probe)
     this.signal = this.abort.signal
@@ -152,8 +159,11 @@ export class RpcPeer {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-          HOME: options.home,
+          HOME: options.isolated ? options.home : homedir(),
           CODEX_HOME: options.home,
+          ...(options.isolated && process.env.OPENAI_API_KEY
+            ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY }
+            : {}),
           [CODEX_PROCESS_MARKER]: marker,
         },
       }
@@ -218,7 +228,7 @@ export class RpcPeer {
     if (this.sampler) clearInterval(this.sampler)
     this.abort.abort()
     for (const slot of this.pending.values()) {
-      clearTimeout(slot.timer)
+      this.timers.clearTimeout(slot.timer)
       slot.reject(new Error(reason))
     }
     this.pending.clear()
@@ -280,7 +290,7 @@ export class RpcPeer {
       const slot = this.pending.get(msg.id)
       if (!slot) throw new Error('codex_unexpected_response')
       this.pending.delete(msg.id)
-      clearTimeout(slot.timer)
+      this.timers.clearTimeout(slot.timer)
       if (msg.error) slot.reject(new Error(`codex_rpc_error:${msg.error.code}`))
       else slot.resolve(msg.result)
     }
@@ -309,7 +319,7 @@ export class RpcPeer {
       return Promise.reject(new Error('codex_request_forbidden'))
     const id = ++this.next
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
+      const timer = this.timers.setTimeout(
         () => this.fail('codex_rpc_timeout'),
         this.options.timeoutMs ?? 10000
       )

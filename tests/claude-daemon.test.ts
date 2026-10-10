@@ -17,9 +17,11 @@ import {
   rmSync,
   statSync,
   realpathSync,
+  renameSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { identity } from '../packages/provider-claude/src/supervisor.js'
 const until = <T>(test: () => T | Promise<T>) =>
@@ -30,6 +32,17 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     repo = join(dir, 'repo'),
     executable = join(dir, 'claude-fixture.mjs'),
     cli = resolve('packages/node-daemon/dist/cli.js')
+  // Same frozen Date.now budget pattern as repository pagination, across a real
+  // daemon process. Child startup, WebSocket traffic and cleanup keep real time.
+  const clockFile = join(dir, 'clock'),
+    clockStart = Date.now()
+  const advanceClockTo = (now: number) => {
+    writeFileSync(clockFile + '.next', String(now))
+    renameSync(clockFile + '.next', clockFile)
+  }
+  advanceClockTo(clockStart)
+  const clockImport = pathToFileURL(resolve('tests/fixtures/frozen-clock.mjs'))
+  clockImport.searchParams.set('path', clockFile)
   const children = new Set<ChildProcess>(),
     clients = new Set<NodeClient>()
   const command = (cwd: string, exe: string, args: string[]) => {
@@ -47,6 +60,8 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     const child = spawn(
       process.execPath,
       [
+        '--import',
+        clockImport.href,
         cli,
         '--json',
         'start',
@@ -179,6 +194,11 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     const config = invocation.args[invocation.args.indexOf('--mcp-config') + 1]!
     expect(statSync(config).mode & 0o777).toBe(0o600)
     expect(statSync(join(config, '..')).mode & 0o777).toBe(0o700)
+    expect(p1.expires_at).toBe(clockStart + 700)
+    expect(p2.expires_at).toBe(clockStart + 700)
+    // Deliberately slower than the permission TTL: real scheduling must not
+    // advance the logical authorization budget in this lifecycle test.
+    await new Promise((r) => setTimeout(r, 1000))
     const allow = await a.answerPrompt(p1, 'allow')
     await a.answerPrompt(p2, 'deny')
     // The winner is immutable, but delivery is a separate committed transition.
@@ -230,10 +250,16 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     )
     const timeout = await send(a, sessions[1]!.session_id, 'allow')
     const expired = await prompt(a, sessions[1]!.session_id)
+    advanceClockTo(expired.expires_at - 1)
+    expect(
+      (await a.prompts(sessions[1]!.session_id)).find((p) => p.prompt_id === expired.prompt_id)
+    ).toMatchObject({ state: 'pending', delivered: false })
+    advanceClockTo(expired.expires_at)
     await completed(a, sessions[1]!.session_id, timeout)
     expect(
       (await a.prompts(sessions[1]!.session_id)).find((p) => p.prompt_id === expired.prompt_id)
     ).toMatchObject({ state: 'expired', choice: 'deny', delivered: true })
+    await expect(a.answerPrompt(expired, 'allow')).rejects.toThrow('prompt_expired')
     expect(existsSync(join(workspaces[1]!.path, 'action.txt'))).toBe(false)
     const lost = await send(a, sessions[1]!.session_id, 'allow'),
       loss = await prompt(a, sessions[1]!.session_id)

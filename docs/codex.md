@@ -1,8 +1,9 @@
 # Codex provider
 
 Codex execution is available on macOS after the node's doctor checks succeed.
-Install the supported native executable, authenticate in the node's own Codex
-home, and select an available model. Until these checks succeed, creating a
+Install the supported native executable and select an available model. By default,
+the node uses your existing Codex login, like Claude Code; there is no separate
+node login when Codex is already logged in for the daemon's OS user. Until these checks succeed, creating a
 session with `provider: "codex"` returns `provider_unavailable`; the node does not
 fall back to another provider. Codex execution on Linux and Windows is unavailable.
 
@@ -54,12 +55,17 @@ Root-owned platform aliases such as macOS's `/etc` are checked through both
 lexical and physical administrator-owned ancestry. Effective requirements must
 also report the ban as false. Missing, unset, true or unsafe policy is refused.
 
-## Log the node into Codex
+## Use your existing login (default)
 
-Use the same state directory as the node's `--state-dir` option. If that option is
-omitted, the default is `$HOME/.local/state/abele-node`. Run the following commands
-as the OS user that runs the node. Replace the example absolute paths and model
-ID with your configuration:
+The node uses CODEX_HOME from the daemon environment when set, otherwise
+`~/.codex` of the OS user running the daemon. It preserves the user's `HOME` and
+Codex credential-store selection, including an existing system credential-store
+login. It never rewrites your `config.toml` or copies your credentials into node
+state. Run the node as the same OS user you normally use for Codex.
+
+Replace these absolute paths and model ID with your configuration. `--state-dir`
+can be omitted to use `$HOME/.local/state/abele-node`; it does not select the Codex
+home:
 
 ```sh
 STATE_DIR=/absolute/node-state
@@ -68,50 +74,82 @@ MODEL_ID=YOUR_MODEL_ID
 
 abele-node doctor --state-dir "$STATE_DIR" \
   --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
-```
-
-Doctor prepares the private `$STATE_DIR/codex` home once executable and
-administrator-policy checks pass. Before login, an authentication-required
-result is expected. Do not proceed past other configuration errors.
-
-Log in using device authentication:
-
-```sh
-CODEX_HOME="$STATE_DIR/codex" HOME="$STATE_DIR/codex" \
-  "$CODEX_BIN" \
-  -c 'cli_auth_credentials_store="file"' \
-  -c 'forced_login_method="chatgpt"' \
-  -c 'analytics.enabled=false' \
-  -c 'feedback.enabled=false' \
-  login --device-auth
-```
-
-Follow Codex's displayed login instructions. Credentials are stored in
-`$STATE_DIR/codex/auth.json`; the node does not copy credentials from another CLI
-home. The executable path must be absolute and resolved before changing `HOME`.
-The Codex home, SQLite and log directories must remain private and canonical;
-credential/config symlinks, non-private files and wrong ownership are refused.
-
-After login, verify readiness and start or restart the node with the same options:
-
-```sh
-abele-node doctor --state-dir "$STATE_DIR" \
-  --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
 abele-node start --state-dir "$STATE_DIR" \
   --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
 ```
 
-If the node is already running, stop it before restarting. For an installed
-service, persist these options in its configuration; see [installation](install.md).
+If Codex is already logged in, no additional login is needed. Doctor prints the
+selected home and login status. If not logged in, it prints the login command for
+that home, for example `codex login --device-auth`. Follow Codex's displayed
+instructions, then run doctor again. Resolve other configuration errors before
+login; an unchecked login status is not the same as being logged out.
+
+A service uses its own environment, not your terminal's shell startup files. If
+using a custom `CODEX_HOME`, set it in the service environment too. The macOS CLI
+`install` command records the current `CODEX_HOME` in its LaunchAgent. Stop a
+running node before restarting with new options. For installed services, persist
+the executable/model options in their configuration; see [installation](install.md).
+
+## Optional isolated node home
+
+For a separate node-owned login, select `--codex-home /absolute/directory` or set
+`ABELE_CODEX_HOME` in the daemon environment. The flag takes precedence over
+`ABELE_CODEX_HOME`; both take precedence over the inherited `CODEX_HOME`. This
+option is useful for separately configured machines and container deployments;
+see [Docker deployment](docker.md) for the current platform limit.
+
+```sh
+CODEX_DIR="$STATE_DIR/codex"
+abele-node doctor --state-dir "$STATE_DIR" \
+  --codex-home "$CODEX_DIR" --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
+```
+
+Doctor prepares the isolated home after executable and administrator checks pass.
+The home, SQLite and log directories must remain private and canonical;
+credential/config symlinks, non-private files and wrong ownership are refused.
+Use either your ChatGPT subscription or an API key supported by Codex. Subscription
+login:
+
+```sh
+CODEX_HOME="$CODEX_DIR" "$CODEX_BIN" \
+  -c 'cli_auth_credentials_store="file"' login --device-auth
+```
+
+For API-key authentication, supply `OPENAI_API_KEY` to the daemon environment, or
+use Codex's own API-key login. With the key already set in your shell:
+
+```sh
+printf '%s' "$OPENAI_API_KEY" | CODEX_HOME="$CODEX_DIR" "$CODEX_BIN" \
+  -c 'cli_auth_credentials_store="file"' login --with-api-key
+```
+
+Do not put a key value in command arguments, tracked files or service definitions.
+The isolated option uses file-based credential storage per launch. The daemon
+passes `OPENAI_API_KEY` only to isolated Codex app-servers; tool shells still use
+the restricted environment policy. Existing API-key logins in an inherited home
+are also accepted. No launch forces a subscription-only authentication method.
+
+Use the same home selection for doctor and start:
+
+```sh
+abele-node doctor --state-dir "$STATE_DIR" \
+  --codex-home "$CODEX_DIR" --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
+abele-node start --state-dir "$STATE_DIR" \
+  --codex-home "$CODEX_DIR" --codex-path "$CODEX_BIN" --codex-model "$MODEL_ID"
+```
+
 Doctor checks the stdio handshake, schemas, effective configuration, managed
-requirements, local authentication type, and selected-model availability with
-low reasoning effort. It creates no thread or model turn. Startup uses these same
+requirements, authentication type, and selected-model availability with low
+reasoning effort. It creates no thread or model turn. Startup uses these same
 checks, and they are reapplied before each production turn. Doctor does not return
 authentication payloads or unrestricted diagnostics. Human-readable output is
 the default; add `--json` for scripts.
 
 ## Default configuration and permissions
 
+The node applies its defaults on every app-server launch through `-c` overrides,
+not by changing user configuration files. History persistence is disabled per
+launch; native thread/resume files remain available for recorded session resume.
 Telemetry and analytics are off by default. Feedback, prompt/response logging,
 update checks, apps, plugins, hooks, memories and native multi-agent features are
 off by default. Remote features, including remote control, are off by default.

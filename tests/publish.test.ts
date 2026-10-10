@@ -151,7 +151,13 @@ it('documents Codex setup and limits without machine-specific acceptance instruc
   expect(codex).toContain('--codex-path')
   expect(codex).toContain('ABELE_CODEX_PATH')
   expect(codex).toContain('--state-dir "$STATE_DIR"')
-  expect(codex).toContain('CODEX_HOME="$STATE_DIR/codex" HOME="$STATE_DIR/codex"')
+  expect(codex).toContain('existing Codex login')
+  expect(codex).toContain('CODEX_HOME from the daemon environment')
+  expect(codex).toContain('--codex-home "$CODEX_DIR"')
+  expect(codex).toContain('ABELE_CODEX_HOME')
+  expect(codex).toContain('login --with-api-key')
+  expect(codex).toContain('never rewrites your `config.toml`')
+  expect(codex).not.toContain('forced_login_method')
   expect(codex).toContain('login --device-auth')
   expect(codex).toMatch(/telemetry.*analytics.*off by default/i)
   expect(codex).toMatch(/remote.*off by default/i)
@@ -162,6 +168,16 @@ it('documents Codex setup and limits without machine-specific acceptance instruc
     /(?:\.scratch|probes\/|acceptance node|inference turns|checkpoint|worktree fence)/i
   )
   expect(codex).not.toMatch(/\/(?:Users|home|Volumes)\/|\b[a-z0-9.-]+\.ts\.net\b/i)
+})
+
+it('explains Codex inherited login and the optional isolated home in installer and Docker guidance', () => {
+  const installer = readFileSync('install.sh', 'utf8')
+  expect(installer).toContain('Codex uses your existing login by default')
+  expect(installer).toContain('--codex-home PATH')
+  const docker = readFileSync('docs/docker.md', 'utf8')
+  expect(docker).toContain('ABELE_CODEX_HOME')
+  expect(docker).toContain('OPENAI_API_KEY')
+  expect(docker).toContain('Codex execution on Linux is currently unavailable')
 })
 
 it('keeps relative links in the README and public guides resolvable', () => {

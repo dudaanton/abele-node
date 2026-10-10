@@ -11,12 +11,19 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join, isAbsolute, resolve } from 'node:path'
 import { generateAndVerifySchemas, doctorCodex, type CodexDoctorReport } from './doctor.js'
 import { startCodexTurn } from './worker.js'
-import { ensureCodexHome, assertCodexLayout } from './home.js'
+import {
+  ensureCodexState,
+  prepareCodexHome,
+  resolveCodexHome,
+  assertCodexLayout,
+  type CodexHome,
+} from './home.js'
 import { codexExecutionGates, codexExecutionError } from './gates.js'
 import { CodexProcessInventory } from './processes.js'
 import { readProcessScope } from './scope.js'
 export interface CodexOptions {
   stateDir: string
+  home?: string
   executable?: string
   enabled?: boolean
   model?: string
@@ -30,7 +37,9 @@ export class CodexProviderAdapter {
   }
   readonly configuration: Record<string, any>
   protected executable?: CodexExecutable
+  private readonly homeSelection: CodexHome
   constructor(protected options: CodexOptions) {
+    this.homeSelection = resolveCodexHome(options.home)
     const deadline = options.deadlineMs ?? 120000,
       ttl = options.permissionTtlMs ?? 60000
     if (
@@ -56,6 +65,8 @@ export class CodexProviderAdapter {
       }
     }
     this.configuration = {
+      home: this.homeSelection.home,
+      home_mode: this.homeSelection.mode,
       model: options.model ?? null,
       version: this.executable?.version ?? null,
       deadline_ms: deadline,
@@ -69,11 +80,14 @@ export class CodexProviderAdapter {
     if (!this.executable)
       return { provider: 'codex', available: false, diagnostic: 'codex_executable_unavailable' }
     this.executable.recheck()
-    return doctorCodex({
-      stateDir: this.options.stateDir,
-      executable: this.executable.executable,
-      model: this.options.model,
-    })
+    return doctorCodex(
+      {
+        stateDir: this.options.stateDir,
+        executable: this.executable.executable,
+        model: this.options.model,
+      },
+      this.homeSelection
+    )
   }
   async prepare() {
     this.ready = false
@@ -96,6 +110,8 @@ export class CodexProviderAdapter {
       provider_version: this.executable?.version ?? 'unavailable',
       available: this.available,
       diagnostic: this.configuration.diagnostic,
+      home: this.configuration.home,
+      home_mode: this.configuration.home_mode,
       configuration: this.configuration,
       gates: codexExecutionGates(),
       capabilities: {
@@ -132,9 +148,11 @@ export class CodexProviderAdapter {
     if (state !== this.options.stateDir || workspace !== turn.cwd)
       throw new Error('codex_state_workspace_overlap')
     assertCodexLayout(state, workspace)
-    const home = ensureCodexHome(state)
+    ensureCodexState(state)
+    const home = prepareCodexHome(this.homeSelection)
+    assertCodexLayout(home, workspace, false)
     if (!this.options.model) throw new Error('codex_selected_model_required')
-    const schemas = mkdtempSync(join(home, 'schema-check-'))
+    const schemas = mkdtempSync(join(state, 'schema-check-'))
     try {
       generateAndVerifySchemas(this.executable, schemas)
     } finally {
@@ -156,6 +174,7 @@ export class CodexProviderAdapter {
     if (common.status !== 0) throw new Error('codex_git_binding_unavailable')
     const paths = {
       home,
+      isolated: this.homeSelection.mode === 'isolated',
       state,
       workspace,
       sibling: dirname(workspace),

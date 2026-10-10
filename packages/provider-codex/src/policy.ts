@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 export interface PolicyPaths {
   home: string
+  isolated?: boolean
   workspace: string
   sibling: string
   repository?: string
@@ -49,9 +50,7 @@ model_provider = "openai"
 web_search = "disabled"
 allow_login_shell = false
 check_for_update_on_startup = false
-cli_auth_credentials_store = "file"
-forced_login_method = "chatgpt"
-sqlite_home = ${q(join(p.home, 'sqlite'))}
+${p.isolated ? 'cli_auth_credentials_store = "file"\n' : ''}sqlite_home = ${q(join(p.home, 'sqlite'))}
 log_dir = ${q(join(p.home, 'logs'))}
 default_permissions = "abele"
 [analytics]
@@ -133,7 +132,6 @@ export function checkEffective(config: any, requirements: any, p: PolicyPaths) {
     web_search: 'disabled',
     allow_login_shell: false,
     check_for_update_on_startup: false,
-    forced_login_method: 'chatgpt',
     default_permissions: 'abele',
     sqlite_home: join(p.home, 'sqlite'),
     log_dir: join(p.home, 'logs'),

@@ -27,6 +27,13 @@ on Linux remain unverified.
 - The pinned pi SDK is bundled with the daemon. Real SDK execution needs your own
   local model configuration/authentication; see [pi configuration and limits](pi.md).
   No external provider CLI is needed for startup, health checks or fake sessions.
+- Optional Codex execution on macOS requires native Codex **0.160.1**, a selected
+  model and the administrator requirements file described in [Codex setup](codex.md).
+  It reuses your existing Codex home/login by default (`CODEX_HOME` in the daemon
+  environment, otherwise your user's `~/.codex`). `--codex-home PATH` or
+  `ABELE_CODEX_HOME` selects a separate node-owned home with subscription or
+  API-key authentication. Hardened defaults are launch overrides, not edits to
+  your Codex configuration. Linux/Windows Codex execution is unavailable.
 
 ## One-command native installer
 
@@ -41,7 +48,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.3.8
+  sh -s -- --version 0.3.9
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -148,7 +155,13 @@ After installation, run `abele-node token create desktop`, then follow
 [plugin enrollment](#enroll-the-abele-plugin). With a service, `abele-node status`
 and `abele-node doctor` should report a running daemon. With `--no-service`, they
 validate the runtime but report stopped until you start it yourself. Provider
-unavailability does not fail installer health checks.
+unavailability does not fail installer health checks. For optional Codex setup,
+run `abele-node doctor --codex-path /absolute/codex --codex-model MODEL_ID`.
+Doctor reports the selected Codex home and login status, with a login command if
+needed. Already logged-in Codex users do not need a second login. Use the same
+executable, model and optional `--codex-home PATH` for daemon startup, and persist
+these options in the service configuration; the shell installer does not enable
+Codex automatically.
 
 ### Installer upgrades and removal
 
@@ -617,7 +630,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.3.8  # example; select an existing release
+   git checkout v0.3.9  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

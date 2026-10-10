@@ -6,3 +6,8 @@ it('allows the node default nested worktree layout without exposing state or Cod
   for (const workspace of ['/state', '/state/codex/workspace', '/state/other', '/'])
     expect(() => assertCodexLayout('/state', workspace)).toThrow('overlap')
 })
+it('never allows a workspace inside a selected login home, even under worktrees', () => {
+  for (const workspace of ['/fixture/codex/worktrees/project', '/fixture/codex', '/fixture'])
+    expect(() => assertCodexLayout('/fixture/codex', workspace, false)).toThrow('overlap')
+  expect(() => assertCodexLayout('/fixture/codex', '/workspace', false)).not.toThrow()
+})

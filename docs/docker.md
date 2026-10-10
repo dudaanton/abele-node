@@ -26,7 +26,7 @@ docker compose -f docker-compose.example.yml exec abele-node \
 ```
 
 The example builds locally and names the image
-`ghcr.io/dudaanton/abele-node:0.3.8`. Once a release exists, use
+`ghcr.io/dudaanton/abele-node:0.3.9`. Once a release exists, use
 `docker compose -f docker-compose.example.yml pull` and `up -d --no-build`
 to use the registry image instead. Prefer version tags (or a release image digest)
 over `latest` for upgrades. Tag pushes matching `vX.Y.Z` publish both Linux amd64
@@ -134,7 +134,7 @@ provider installation. Build your own derived image; do not redistribute the
 provider binary without permission:
 
 ```dockerfile
-FROM ghcr.io/dudaanton/abele-node:0.3.8
+FROM ghcr.io/dudaanton/abele-node:0.3.9
 # ./provider/claude must be a compatible Linux binary, not a macOS executable.
 COPY --chown=node:node --chmod=0555 provider/claude /opt/provider/claude
 ENV ABELE_CLAUDE_PATH=/opt/provider/claude
@@ -195,6 +195,40 @@ Container environment options: `ABELE_CLAUDE_PATH`,
 `ABELE_PERMISSION_TTL_MS` (`60000`). The default model is Haiku. Default inherited
 configuration preserves user permission rules; repository permission sources need
 explicit trusted-project opt-in. Read [security](security.md) before changing it.
+
+## Codex home and authentication
+
+Codex execution on Linux is currently unavailable, so the supplied Docker image
+cannot run Codex sessions even with a compatible binary and login. Doctor reports
+this platform gate; an authenticated home does not remove it. The following
+settings describe the optional isolated-home configuration, not supported Linux
+execution. See [Codex setup](codex.md) for executable, model and administrator
+requirements on supported hosts.
+
+By default, Codex uses `CODEX_HOME` from the daemon environment, otherwise the
+running user's `~/.codex`, and reuses that home's existing login. In a container,
+this is the container user's home, not your host CLI home.
+
+For a separately configured node home, use `--codex-home /absolute/directory` or
+`ABELE_CODEX_HOME`. An example persistent selection is:
+
+```yaml
+volumes:
+  - codex-home:/home/node/abele-codex
+environment:
+  ABELE_CODEX_HOME: /home/node/abele-codex
+```
+
+Declare `codex-home` as a named volume and prepare it for UID/GID 1000 with mode
+`0700`. Install a compatible provider binary separately; none is bundled. The
+isolated home supports either Codex's ChatGPT/device login or API-key login. An
+`OPENAI_API_KEY` supplied to the daemon is passed to isolated Codex app-servers;
+Codex's `login --with-api-key` can instead store the login in that selected home.
+See the exact login commands in [Codex setup](codex.md#optional-isolated-node-home).
+Supply keys through your deployment's secret/environment mechanism, never image
+layers, Compose values or tracked files. Persist the selected Codex home across
+container replacement. The node applies launch-time defaults without rewriting
+its `config.toml`.
 
 ## Stop, upgrade and remove
 

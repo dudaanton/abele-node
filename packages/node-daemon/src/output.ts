@@ -18,6 +18,20 @@ function provider(name: string, value: unknown) {
     .split(/\. Run /, 2)
   return `${name}: unavailable — ${repair ? `${reason}; fix: ${repair.split('. Real acceptance:')[0]}` : name === 'pi' ? `pinned SDK missing; fix: ${diagnostic}` : `${diagnostic}; fix: restart the node and run abele-node doctor`}`
 }
+function codexLoginLines(p: Report): string[] {
+  const authenticated = record(p.checks).authenticated
+  return [
+    `Codex home: ${shown(p.home)} (${p.home_mode === 'isolated' ? 'isolated node home' : 'user home'})`,
+    `Codex login: ${authenticated === true ? 'logged in' : authenticated === false ? 'not logged in' : 'not checked; resolve the provider diagnostic and run doctor again'}`,
+    ...(authenticated === false && p.login_command ? [`Run: ${line(p.login_command)}`] : []),
+    ...(authenticated === false && p.api_key_login_command
+      ? [
+          'Or set OPENAI_API_KEY in the daemon environment, or log in with an API key:',
+          `Run: ${line(p.api_key_login_command)}`,
+        ]
+      : []),
+  ]
+}
 function remote(value: Report) {
   const paired = record(value.paired),
     t = record(value.tailscale)
@@ -82,6 +96,7 @@ export function humanOutput(
           const p = record(r[name.toLowerCase()])
           return `${p.available === true ? 'OK' : 'PROBLEM'} ${provider(name, p)}`
         }),
+        ...(r.codex ? codexLoginLines(record(r.codex)) : []),
         `${!paired.endpoint || t.node_mapping === true ? 'OK' : 'PROBLEM'} ${remote(r)}${paired.endpoint && t.node_mapping !== true ? '; fix: verify Tailscale prerequisites and enable Serve' : ''}`,
       ]
       if (paired.endpoint) {

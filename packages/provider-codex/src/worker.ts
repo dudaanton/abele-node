@@ -11,9 +11,13 @@ import { CodexApprovalBridge } from './approval.js'
 import { checkEffective, launchOverrides, policyFingerprint, type PolicyPaths } from './policy.js'
 import type { CodexExecutable } from './discovery.js'
 import { createProcessScope } from './scope.js'
+import { systemDeadlineTimers, type DeadlineTimers } from './timers.js'
+import { isCodexAuthenticated } from './auth.js'
 export interface WorkerOptions {
   /** Node-local process supervision seam, never a protocol field. */
   probe?: ProcessProbe
+  /** Node-local logical deadline seam, never a protocol field. */
+  timers?: DeadlineTimers
   executable: CodexExecutable
   paths: PolicyPaths
   model: string
@@ -26,6 +30,7 @@ export async function startCodexTurn(
   sink: ProviderEventSink
 ): Promise<ProviderRun> {
   const { paths, turn, model } = options
+  const timers = options.timers ?? systemDeadlineTimers
   const fingerprint = policyFingerprint(paths)
   if (turn.cwd !== paths.workspace || !opaqueId(turn.run_id) || !opaqueId(turn.session_id))
     throw new Error('codex_invalid_turn')
@@ -56,6 +61,7 @@ export async function startCodexTurn(
     executable: options.executable,
     cwd: paths.workspace,
     home: paths.home,
+    isolated: paths.isolated,
     configArgs: launchOverrides(paths),
     processes: (p) => sink.processes(p),
     probe: options.probe,
@@ -79,7 +85,7 @@ export async function startCodexTurn(
   const finalize = () => {
     if (cleanup) return cleanup
     if (retryTimer) {
-      clearTimeout(retryTimer)
+      timers.clearTimeout(retryTimer)
       retryTimer = undefined
     }
     cleanupAttempts++
@@ -92,7 +98,7 @@ export async function startCodexTurn(
         data: { run_id: turn.run_id, generation, cleanup_confirmed: true },
       })
       settled = true
-      clearTimeout(timer)
+      timers.clearTimeout(timer)
       finish({
         ...(mapper.result ? { result: mapper.result } : {}),
         ...(reason ? { reason } : !mapper.result ? { reason: 'codex_no_terminal_result' } : {}),
@@ -102,7 +108,7 @@ export async function startCodexTurn(
       cleanup = undefined
       const retryDelay = cleanupRetryDelays[cleanupAttempts - 1]
       if (retryDelay !== undefined)
-        retryTimer = setTimeout(() => {
+        retryTimer = timers.setTimeout(() => {
           retryTimer = undefined
           void finalize()
         }, retryDelay)
@@ -152,7 +158,7 @@ export async function startCodexTurn(
           Promise.resolve({ choice: 'deny', delivered: () => false })),
     cancel: interrupt,
   })
-  const timer = setTimeout(() => {
+  const timer = timers.setTimeout(() => {
     reason = 'deadline'
     void interrupt().catch(() => {})
   }, options.deadlineMs)
@@ -178,8 +184,7 @@ export async function startCodexTurn(
       }
       await inspect()
       const account = await request('account/read', { refreshToken: false })
-      if (account?.account?.type !== 'chatgpt')
-        throw new Error('codex_chatgpt_authentication_required')
+      if (!isCodexAuthenticated(account)) throw new Error('codex_authentication_required')
       const models = await request('model/list', { includeHidden: false, limit: 100 })
       if (
         !Array.isArray(models?.data) ||

@@ -827,5 +827,10 @@ printf '%s\n' 'Next: abele-node token create desktop' \
   "URL: http://127.0.0.1:$local_port" \
   'Installation token: paste the token printed by the command' \
   'Click Add node. The token is shown once; keep it only on this device, never in synced notes or settings.'
+printf '%s\n' \
+  'Optional Codex: Codex uses your existing login by default (daemon CODEX_HOME, otherwise ~/.codex).' \
+  'Check setup: abele-node doctor --codex-path /absolute/codex --codex-model MODEL_ID' \
+  'For a separate node login, add --codex-home PATH or set ABELE_CODEX_HOME; subscription and API-key login are supported.' \
+  'Persist Codex options in your service configuration. Setup and platform requirements: docs/codex.md.'
 }
 abele_install "$@"

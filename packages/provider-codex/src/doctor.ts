@@ -10,7 +10,8 @@ import {
 import { pinnedSchemas, verifySchemaDirectory } from './schema.js'
 import { checkEffective, launchOverrides, type PolicyPaths } from './policy.js'
 import { RpcPeer } from './rpc.js'
-import { ensureCodexHome } from './home.js'
+import { ensureCodexState, prepareCodexHome, resolveCodexHome, type CodexHome } from './home.js'
+import { isCodexAuthenticated, codexLoginCommand, codexApiKeyLoginCommand } from './auth.js'
 import { codexExecutionGates, codexExecutionError } from './gates.js'
 import type { ProcessIdentity } from '@abele/provider-contract'
 export interface CodexDoctorReport {
@@ -18,6 +19,10 @@ export interface CodexDoctorReport {
   provider_version?: string
   available: boolean
   diagnostic: string
+  home?: string
+  home_mode?: CodexHome['mode']
+  login_command?: string
+  api_key_login_command?: string
   checks?: Record<string, boolean>
   gates?: ReturnType<typeof codexExecutionGates>
 }
@@ -57,6 +62,7 @@ export async function inspectCodex(
     executable,
     cwd: paths.workspace,
     home: paths.home,
+    isolated: paths.isolated,
     configArgs: launchOverrides(paths),
     processes,
   })
@@ -74,7 +80,7 @@ export async function inspectCodex(
     })
     checkEffective(effective.config, requirements, paths)
     const account = await peer.request('account/read', { refreshToken: false })
-    const authenticated = account?.account?.type === 'chatgpt'
+    const authenticated = isCodexAuthenticated(account)
     let modelAvailable = false
     if (authenticated && model) {
       const catalog = await peer.request('model/list', { includeHidden: false, limit: 100 })
@@ -100,16 +106,20 @@ export async function inspectCodex(
   }
 }
 export async function doctorCodex(
-  options: CodexDiscoveryOptions & { stateDir: string; model?: string }
+  options: CodexDiscoveryOptions & { stateDir: string; model?: string; home?: string },
+  selection = resolveCodexHome(options.home)
 ): Promise<CodexDoctorReport> {
   let directory: string | undefined
+  let home = selection.home
   try {
     const executable = discoverCodex(options)
     requireManagedFile()
-    const home = ensureCodexHome(options.stateDir)
+    ensureCodexState(options.stateDir)
+    home = prepareCodexHome(selection)
     directory = mkdtempSync(join(realpathSync(options.stateDir), 'codex-doctor-'))
     const paths = {
       home,
+      isolated: selection.mode === 'isolated',
       workspace: join(directory, 'workspace'),
       sibling: directory,
       state: options.stateDir,
@@ -120,7 +130,7 @@ export async function doctorCodex(
     const error =
       codexExecutionError() ??
       (!checks.authenticated
-        ? 'codex_chatgpt_authentication_required'
+        ? 'codex_authentication_required'
         : !options.model
           ? 'codex_selected_model_required'
           : !checks.model_available
@@ -130,6 +140,16 @@ export async function doctorCodex(
       provider: 'codex',
       provider_version: executable.version,
       available: error === undefined,
+      home,
+      home_mode: selection.mode,
+      ...(!checks.authenticated
+        ? {
+            login_command: codexLoginCommand(executable.executable, home, paths.isolated),
+            ...(paths.isolated
+              ? { api_key_login_command: codexApiKeyLoginCommand(executable.executable, home) }
+              : {}),
+          }
+        : {}),
       checks,
       gates: codexExecutionGates(),
       diagnostic:
@@ -142,6 +162,8 @@ export async function doctorCodex(
     return {
       provider: 'codex',
       available: false,
+      home,
+      home_mode: selection.mode,
       diagnostic: /^[a-z_]+(?::[A-Za-z_.]+)?$/.test(message) ? message : 'codex_inspection_failed',
     }
   } finally {
