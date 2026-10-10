@@ -12,7 +12,7 @@ import { checkEffective, launchOverrides, type PolicyPaths } from './policy.js'
 import { RpcPeer } from './rpc.js'
 import { ensureCodexState, prepareCodexHome, resolveCodexHome, type CodexHome } from './home.js'
 import { isCodexAuthenticated, codexLoginCommand, codexApiKeyLoginCommand } from './auth.js'
-import { codexExecutionGates, codexExecutionError } from './gates.js'
+import { codexExecutionGates } from './gates.js'
 import type { ProcessIdentity } from '@abele/provider-contract'
 export interface CodexDoctorReport {
   provider: string
@@ -107,7 +107,8 @@ export async function inspectCodex(
 }
 export async function doctorCodex(
   options: CodexDiscoveryOptions & { stateDir: string; model?: string; home?: string },
-  selection = resolveCodexHome(options.home)
+  selection = resolveCodexHome(options.home),
+  platform: string = process.platform
 ): Promise<CodexDoctorReport> {
   let directory: string | undefined
   let home = selection.home
@@ -127,8 +128,9 @@ export async function doctorCodex(
     mkdirSync(paths.workspace, { mode: 0o700 })
     generateAndVerifySchemas(executable, directory)
     const checks = await inspectCodex(executable, paths, () => {}, options.model)
+    const gates = codexExecutionGates(platform)
     const error =
-      codexExecutionError() ??
+      gates.find((g) => g.error)?.error ??
       (!checks.authenticated
         ? 'codex_authentication_required'
         : !options.model
@@ -151,7 +153,7 @@ export async function doctorCodex(
           }
         : {}),
       checks,
-      gates: codexExecutionGates(),
+      gates,
       diagnostic:
         error ??
         'Pinned executable, schemas, managed policy, authentication and selected model checked without inference.',

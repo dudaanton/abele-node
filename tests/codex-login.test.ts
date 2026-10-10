@@ -98,12 +98,17 @@ it.each(['chatgpt', 'apiKey', 'environment-key', 'logged-out'])(
     vi.stubEnv('ABELE_CODEX_HOME', isolated ? home : '')
     vi.stubEnv('OPENAI_API_KEY', 'fake-test-key-not-a-credential')
     try {
-      const report = await doctorCodex({
-        executable: fixture,
-        fixture: true,
-        stateDir: dir,
-        model: 'fixture-small',
-      })
+      // Login/home behaviour is independent of the host's confinement certification.
+      const report = await doctorCodex(
+        {
+          executable: fixture,
+          fixture: true,
+          stateDir: dir,
+          model: 'fixture-small',
+        },
+        undefined,
+        'darwin'
+      )
       expect(report.home).toBe(home)
       expect(report.home_mode).toBe(isolated ? 'isolated' : 'inherited')
       expect(existsSync(join(home, 'threads.json'))).toBe(false)
@@ -131,6 +136,55 @@ it.each(['chatgpt', 'apiKey', 'environment-key', 'logged-out'])(
         expect(human).toContain('CODEX_HOME=')
         expect(human).toContain('login --device-auth')
         expect(human).toContain('login --with-api-key')
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
+
+it.each(['chatgpt', 'logged-out'])(
+  'keeps Linux confinement uncertified ahead of %s authentication',
+  async (auth) => {
+    const dir = mkdtempSync(resolve('.scratch/codex-login-linux-'))
+    const home = join(dir, 'home')
+    mkdirSync(home, { mode: 0o700 })
+    writeFileSync(join(home, 'fixture.json'), JSON.stringify({ mode: auth }), { mode: 0o600 })
+    try {
+      const report = await doctorCodex(
+        {
+          executable: fixture,
+          fixture: true,
+          stateDir: dir,
+          home,
+          model: 'fixture-small',
+        },
+        undefined,
+        'linux'
+      )
+      expect(report.available).toBe(false)
+      expect(report.diagnostic).toBe('codex_platform_confinement_uncertified')
+      expect(report.checks).toEqual({
+        handshake: true,
+        effective_policy: true,
+        managed_remote_control: true,
+        authenticated: auth !== 'logged-out',
+        model_available: auth !== 'logged-out',
+      })
+      expect(report.gates).toEqual([
+        {
+          name: 'platform_confinement',
+          status: 'unverified',
+          error: 'codex_platform_confinement_uncertified',
+        },
+      ])
+      expect(report.home).toBe(home)
+      expect(report.home_mode).toBe('isolated')
+      expect(existsSync(join(home, 'threads.json'))).toBe(false)
+      expect(existsSync(join(home, 'turn-log.jsonl'))).toBe(false)
+      if (auth === 'logged-out') {
+        expect(report.login_command).toContain('login --device-auth')
+        expect(report.api_key_login_command).toContain('login --with-api-key')
       }
     } finally {
       rmSync(dir, { recursive: true, force: true })
