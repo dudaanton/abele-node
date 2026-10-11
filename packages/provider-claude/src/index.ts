@@ -278,6 +278,12 @@ export class ClaudeProviderAdapter {
       sockets = new Set<Socket>(),
       calls = new Map<string, PermissionAction>(),
       permissionClaims = new Set<string>()
+    let debuggerClosed = false
+    const closeDebugger = () => {
+      if (debuggerClosed) return
+      debuggerClosed = true
+      sink.debugger?.close()
+    }
     const server = createServer((socket) => {
       if (sockets.size >= 8 || abort.signal.aborted) {
         socket.destroy()
@@ -290,7 +296,10 @@ export class ClaudeProviderAdapter {
       let consumed = false
       socket.on('error', () => {})
       socket.on('close', () => sockets.delete(socket))
-      socket.setTimeout(this.options.permissionTtlMs + 3000, () => socket.destroy())
+      socket.setTimeout(
+        Math.max(this.options.permissionTtlMs, sink.debugger ? 60000 : 0) + 3000,
+        () => socket.destroy()
+      )
       socket.on('data', (data) => {
         pending = Buffer.concat([pending, data])
         if (pending.length > 256 * 1024) {
@@ -339,6 +348,39 @@ export class ClaudeProviderAdapter {
             p.generation !== generation
           ) {
             socket.destroy()
+            return
+          }
+          if (p.kind === 'debugger') {
+            if (!sink.debugger || abort.signal.aborted || socket.destroyed) {
+              socket.destroy()
+              return
+            }
+            const loss = new AbortController()
+            const lost = () => loss.abort()
+            socket.once('close', lost)
+            abort.signal.addEventListener('abort', lost, { once: true })
+            try {
+              if (p.action === 'list')
+                socket.end(JSON.stringify({ tools: sink.debugger.tools }) + '\n')
+              else if (p.action === 'call' && typeof p.name === 'string') {
+                const result = await sink.debugger.call(p.name, p.args, loss.signal)
+                if (!loss.signal.aborted) {
+                  const published = sink.debugger.publish(p.args, result)
+                  const line = JSON.stringify(published) + '\n'
+                  socket.end(
+                    Buffer.byteLength(line) <= 256 * 1024
+                      ? line
+                      : JSON.stringify({
+                          code: 'debugger_response_too_large',
+                          snapshot: null,
+                          observation: 'unknown',
+                        }) + '\n'
+                  )
+                }
+              } else socket.destroy()
+            } finally {
+              abort.signal.removeEventListener('abort', lost)
+            }
             return
           }
           const args = p.args
@@ -438,6 +480,21 @@ export class ClaudeProviderAdapter {
         configPath,
         JSON.stringify({
           mcpServers: {
+            ...(sink.debugger?.tools.length
+              ? {
+                  abele_debugger: {
+                    command: process.execPath,
+                    args: [fileURLToPath(new URL('./debugger-bridge.js', import.meta.url))],
+                    env: {
+                      ABELE_APPROVAL_SOCKET: socketPath,
+                      ABELE_APPROVAL_TOKEN: token,
+                      ABELE_SESSION_ID: turn.session_id,
+                      ABELE_RUN_ID: turn.run_id,
+                      ABELE_GENERATION: generation,
+                    },
+                  },
+                }
+              : {}),
             abele_approval: {
               command: process.execPath,
               args: [fileURLToPath(new URL('./bridge.js', import.meta.url))],
@@ -533,6 +590,11 @@ export class ClaudeProviderAdapter {
       finalizing = (async () => {
         clearTimeout(timer)
         abort.abort()
+        try {
+          closeDebugger()
+        } catch {
+          reason ??= 'debugger_settlement_failed'
+        }
         for (const socket of sockets) socket.destroy()
         serverClosed ??= new Promise<void>((resolve) => server.close(() => resolve()))
         await serverClosed
@@ -578,6 +640,11 @@ export class ClaudeProviderAdapter {
       stopping = (async () => {
         reason ??= 'interrupted'
         abort.abort()
+        try {
+          closeDebugger()
+        } catch {
+          reason ??= 'debugger_settlement_failed'
+        }
         if (worker.connected) worker.send({ kind: 'stop' }, () => {})
         // A stopped/unresponsive worker cannot own escalation. The daemon always cleans
         // the durable group, even if no close event is ever received.

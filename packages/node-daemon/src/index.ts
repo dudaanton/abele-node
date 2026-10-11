@@ -14,7 +14,7 @@ import {
 } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { tmpdir } from 'node:os'
+import { tmpdir, hostname } from 'node:os'
 import {
   NodeCore,
   ClaudeProviderAdapter,
@@ -36,6 +36,7 @@ import { Id, FingerprintSchema } from '@abele/channel-protocol'
 import {
   PairedListenerSchema,
   pairedAdmission,
+  pairedHostAccepted,
   servePairedChannel,
   type PairedListenerConfig,
 } from './paired.js'
@@ -47,6 +48,7 @@ export function readRuntime(dir: string):
       pid: number
       port?: number
       node_id?: string
+      node_name?: string
       claude?: unknown
       pi?: unknown
       control_socket?: string
@@ -61,6 +63,7 @@ export function readRuntime(dir: string):
       pid: number
       port?: number
       node_id?: string
+      node_name?: string
       claude?: unknown
       pi?: unknown
       control_socket?: string
@@ -159,7 +162,7 @@ export const PairingControlSchema = z.discriminatedUnion('action', [
     .strict(),
   z
     .object({
-      action: z.literal('pairing.confirm'),
+      action: z.enum(['pairing.confirm', 'pairing.approve']),
       installation_id: Id,
       device_fingerprint: FingerprintSchema,
     })
@@ -168,6 +171,13 @@ export const PairingControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('pairing.list') }).strict(),
   z.object({ action: z.literal('pairing.rotate') }).strict(),
 ])
+const WorktreeRecoveryControlSchema = z
+  .object({
+    action: z.literal('worktree.recover'),
+    operation_id: z.string().min(1).max(128).optional(),
+    installation_id: z.string().min(1).max(128).optional(),
+  })
+  .strict()
 const CodexPreflightSchema = z.object({ action: z.literal('codex.preflight') }).strict()
 const ServeControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('tailscale.enable'), policy_verified: z.literal(true) }).strict(),
@@ -176,14 +186,23 @@ const ServeControlSchema = z.discriminatedUnion('action', [
 export type OwnerCommand =
   | { action: string; value?: string }
   | z.infer<typeof PairingControlSchema>
+  | z.infer<typeof WorktreeRecoveryControlSchema>
   | z.infer<typeof ServeControlSchema>
 async function tokenCommand(core: NodeCore, raw: unknown) {
+  const recovery = WorktreeRecoveryControlSchema.safeParse(raw)
+  if (recovery.success)
+    return core.resources.repository.recoverDeletions(
+      recovery.data.operation_id,
+      recovery.data.installation_id
+    )
   const paired = PairingControlSchema.safeParse(raw)
   if (paired.success) {
     const c = paired.data
     switch (c.action) {
       case 'pairing.issue':
         return core.pairing.issue(c.endpoint, c.label, 300000, c.installation_id)
+      case 'pairing.approve':
+        return core.pairing.approve(c.installation_id, c.device_fingerprint)
       case 'pairing.confirm':
         return core.pairing.confirm(c.installation_id, c.device_fingerprint)
       case 'pairing.list':
@@ -221,7 +240,9 @@ export async function control(dir: string, command: OwnerCommand): Promise<unkno
     const socket = createConnection(endpoint)
     let data = ''
     socket.setTimeout(
-      command.action.startsWith('tailscale.') || command.action === 'codex.preflight'
+      command.action.startsWith('tailscale.') ||
+        command.action === 'codex.preflight' ||
+        command.action === 'worktree.recover'
         ? 60000
         : 3000,
       () => socket.destroy(new Error('control_timeout'))
@@ -250,8 +271,10 @@ export async function offlineToken(dir: string, command: OwnerCommand) {
   try {
     const core = new NodeCore(dir)
     try {
+      await core.resources.ready
       return await tokenCommand(core, command)
     } finally {
+      await core.resources.stop()
       core.close()
     }
   } finally {
@@ -266,7 +289,8 @@ export async function startDaemon(
   pairedConfig?: PairedListenerConfig,
   tailscalePath?: string,
   piOptions: Omit<PiOptions, 'stateDir'> = {},
-  codexOptions: Omit<CodexOptions, 'stateDir'> = {}
+  codexOptions: Omit<CodexOptions, 'stateDir'> = {},
+  debuggerOptions: { enabled?: boolean } = {}
 ) {
   dir = canonicalStateDir(dir)
   const paired = pairedConfig ? PairedListenerSchema.parse(pairedConfig) : undefined
@@ -305,11 +329,13 @@ export async function startDaemon(
     const codex = new CodexProviderAdapter({ ...codexOptions, stateDir: dir })
     await codex.prepare()
     core = new NodeCore(dir, {
+      debuggerEnabled: debuggerOptions.enabled,
       ...(worktreeRoot ? { worktreeRoot } : {}),
       claude: new ClaudeProviderAdapter(claudeOptions),
       pi: new PiProviderAdapter({ ...piOptions, stateDir: dir }),
       codex,
     })
+    await core.resources.ready
     await core.execution.reconcile()
     await app.register(websocket, {
       options: { maxPayload: LIMITS.record_bytes, perMessageDeflate: false },
@@ -354,7 +380,15 @@ export async function startDaemon(
           request.socket.remoteAddress !== '127.0.0.1' ||
           !pairedAdmission(paired, request.headers.host, request.headers.origin, request.url)
         )
-          return reply.code(403).send()
+          return reply
+            .header(
+              'x-abele-pairing-error',
+              pairedHostAccepted(paired, request.headers.host)
+                ? 'policy_not_accepted'
+                : 'host_not_accepted'
+            )
+            .code(403)
+            .send()
         if (sockets.size >= LIMITS.connections) return reply.code(503).send()
       })
       pairedApp.get('/channel', { websocket: true }, (socket) => {
@@ -380,7 +414,7 @@ export async function startDaemon(
       Buffer.byteLength(join(tmpdir(), 'abele-c-XXXXXX/c.sock')) <= 100 ? tmpdir() : '/tmp'
     controlDirectory = mkdtempSync(join(base, 'abele-c-'))
     chmodSync(controlDirectory, 0o700)
-    const socketPath = join(controlDirectory, 'c.sock')
+    const socketPath = join(realpathSync(controlDirectory), 'c.sock')
     ipc = createServer({ allowHalfOpen: true }, (socket) => {
       let data = ''
       socket.setTimeout(3000, () => socket.destroy())
@@ -395,6 +429,8 @@ export async function startDaemon(
             const raw: unknown = JSON.parse(data)
             const preflight = CodexPreflightSchema.safeParse(raw)
             const serve = ServeControlSchema.safeParse(raw)
+            if (WorktreeRecoveryControlSchema.safeParse(raw).success)
+              socket.setTimeout(60000, () => socket.destroy())
             if (preflight.success) {
               socket.setTimeout(60000, () => socket.destroy())
               await codex.prepare()
@@ -446,6 +482,7 @@ export async function startDaemon(
         runtime,
         port: address.port,
         node_id: core.node_id,
+        node_name: hostname(),
         claude: core.execution.capabilities(),
         pi: core.execution.capabilities('pi'),
         codex: core.execution.capabilities('codex'),

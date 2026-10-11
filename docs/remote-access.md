@@ -28,6 +28,7 @@ values. For multiple supported clients, list each verified Origin explicitly.
 {
   "endpoint": "YOUR_PAIRED_WSS_ENDPOINT",
   "backend_port": 47124,
+  "accepted_routes": [],
   "origins": ["YOUR_VERIFIED_CLIENT_ORIGIN"],
   "allow_missing_origin": false,
   "allow_null_origin": false
@@ -82,8 +83,19 @@ not prove certificate issuance/renewal, forwarding behavior or effective ACLs.
 ## Invitation and owner confirmation
 
 ```sh
-node packages/node-daemon/dist/cli.js pair invite phone --json
-# JSON is the QR/invite payload. Treat its secret as sensitive; default expiry: 5 minutes.
+abele-node pair
+# One private code line; instructions on stderr. Default expiry: 5 minutes.
+abele-node pair --json
+# Scripts receive {code,node_name,invite}; --node-name sets the display label.
+abele-node approve-pair --list
+abele-node approve-pair
+# Interactive name/number selection and approval on a terminal.
+abele-node approve-pair "Test device"
+# Non-interactive: exactly one pending device must have this name.
+abele-node approve-pair "Test device" --installation-id INSTALLATION_ID
+# Optional independent check: --fingerprint FULL_DEVICE_FINGERPRINT.
+# Legacy invitation and exact-key confirmation remain supported:
+node packages/node-daemon/dist/cli.js pair invite device --json
 node packages/node-daemon/dist/cli.js pair list
 node packages/node-daemon/dist/cli.js pair confirm INSTALLATION_ID DEVICE_FINGERPRINT
 node packages/node-daemon/dist/cli.js pair revoke INSTALLATION_ID
@@ -93,11 +105,19 @@ The invitation binds endpoint, stable node ID, application-key fingerprint,
 expiry and a random single-use secret. The node stores only the secret hash. The
 device generates and persists a non-extractable ECDSA P-256 private key **before**
 claiming. Claiming requires a fresh proof of possession and atomically creates a
-**pending** installation; it does not grant access. The owner must independently
-compare the full device fingerprint displayed on the enrolling device, then
-confirm that exact fingerprint locally. Never blindly confirm an unexpected key
-from `pair list`. A stolen invitation can consume it and cause denial of service,
-but cannot authorize the thief without the owner's confirmation.
+**pending** installation; it does not grant access. The enrolling client supplies its
+bounded device name after proving possession; retries cannot rename the principal.
+Names are untrusted display labels, not authenticated identities. `approve-pair`
+shows waiting names, short device fingerprints (first eight hex digits, grouped),
+age and installation IDs. Name-only approval is the default; fingerprint comparison
+is optional. Duplicate pending names refuse approval until an exact installation ID
+is chosen. A non-terminal invocation without a selection never approves anything.
+The captured ID and full key are checked atomically against pending state.
+
+Keep the code private: it is base64url-encoded JSON, not encryption. Name-only approval
+can authorize a device with a spoofed label or a stolen invite if the owner picks it.
+For independent comparison, use the optional full `--fingerprint` check or the legacy
+`pair confirm` command. Invite expiry, single use and revocation still apply.
 
 Lost claim replies recover the same principal only with the same invitation and
 same device key plus a fresh proof, for 24 hours after consumption (even after the
@@ -110,7 +130,11 @@ The WebCrypto challenge-response uses SHA-256 and ECDSA P-256. A fixed transcrip
 binds role, authentication profile, node protocol 0.0, purpose, connection nonce,
 client nonce, node ID, endpoint, principal (or invitation ID during enrollment),
 device fingerprint and expiry. The node signs first; the client verifies its
-pinned application key before signing a distinct device-role transcript. Challenges
+pinned application key and its signature over the fresh client nonce before sending
+**any invitation secret or device name**. Enrollment's first `paired.begin` carries
+only the public device key, fresh nonce and non-secret invitation ID. The full
+invitation and device label are sent with the subsequent device proof; the node
+verifies the proof and exact invitation ID before consuming it. Challenges
 expire after 10 seconds on the **server's** clock and are consumed by one connection.
 The client verifies its fresh nonce within a local monotonic 10-second deadline,
 including asynchronous signature verification/signing; device and server wall clocks
@@ -118,21 +142,79 @@ need not match. The signed server expiry remains bound into both proofs. No perm
 token authenticates the paired profile. Protocol-version changes require an explicit
 profile/transcript review; no opportunistic downgrade is permitted.
 
-Host and path must match the configured endpoint exactly. Origins are an explicit
+New enrollment requires updated clients and daemons. A legacy secret-bearing begin
+is refused with `paired.error: pairing_upgrade_required`; a new client encountering
+an old daemon's pre-challenge close reports the same upgrade requirement and never
+falls back to disclosing the secret. Already-confirmed installations retain their
+existing begin/proof format and can reconnect across this update. A pre-challenge
+close cannot distinguish an old daemon from another prematurely closing endpoint.
+
+This proof is not end-to-end encryption. A TLS-terminating proxy that relays the
+real node's proof can still read/alter later traffic. Use only owner-trusted TLS
+termination and routes; an application-key pin does not make an arbitrary relay safe.
+
+## Edited addresses and accepted TLS routes
+
+After decoding a code, a client may edit the transport host and port. The invitation's
+canonical endpoint and node-key pin remain unchanged. The daemon accepts the canonical
+Host plus exact hosts/ports from the owner's `accepted_routes` array in the paired
+configuration. Each extra route is a complete canonical `wss://.../channel` URL, with
+no credentials, query or fragment; at most 16 are allowed. Restart the daemon after
+changing this setting. Inspect the effective configuration with:
+
+```sh
+abele-node pair routes
+abele-node pair routes --json
+# {endpoint,accepted_routes}; no invitation or credentials are returned.
+```
+
+For an extra route to work, the owner must provide a reachable, trusted TLS terminator
+or forwarder targeting the **paired** loopback backend and preserving the edited HTTP
+Host and permitted Origin. The daemon does not create these extra listeners, certificates
+or proxy mappings. Valid TLS must cover the **edited** hostname or IP. The canonical
+Tailscale DNS name with its certificate works; another hostname works with its own
+valid certificate and an accepted route. A bare LAN or Tailscale IP does **not** work
+with a certificate issued only for a DNS name: it needs a TLS route with a certificate
+valid for that IP (or use the certified hostname instead). No certificate checks are
+disabled and insecure `ws://` is never a remote fallback. Local-token access stays
+loopback-only and is never forwarded by this setting.
+
+Route errors carry typed `reason`/`address` details, validated by
+`PairingRouteFailureSchema` in `@abele/node-protocol`: `tls`, `host_not_accepted`,
+`unreachable`, or `different_node`. HTTP upgrade rejection exposes
+`x-abele-pairing-error` to diagnostic-capable openers; native TLS/network error codes
+are classified without exposing raw exception text. A custom `TransportOpener` should
+preserve the native error's `code`/`cause`; translate a `host_not_accepted` upgrade
+header to error code `PAIRED_HOST_NOT_ACCEPTED`, and another upgrade-policy refusal
+to `PAIRED_ROUTE_REFUSED`. These are display diagnostics, never authority or a reason
+to bypass the pin. Browser WebSocket APIs deliberately
+hide TLS and HTTP-upgrade diagnostics: an opaque browser failure is reported honestly
+as `tls_or_unreachable`, not guessed to be a certificate or Host error. A denied Origin
+or path is `policy_not_accepted`. Clients can show these typed errors on the Address row.
+
+The node still proves the original canonical endpoint and pinned key before receiving
+the invitation secret/name over any accepted route. Changing the address never changes
+the key or grants a different principal. Only owner-trusted TLS termination is in scope;
+the application proof does not encrypt traffic independently of TLS.
+
+Path remains exactly `/channel`. Origins are an explicit
 allowlist, with no wildcard. Missing and `null` Origin each require their own explicit
 client policy and still require device authentication. Mobile Origins must be measured
 on the actual supported WebView; **do not** assume the desktop policy works on iOS.
 Forwarded addresses, hosts and Tailscale identity headers are never authority.
 
-## Plugin-facing client API (browser compatible)
+## Pairing protocol and client API (browser compatible)
 
 ```ts
 import { PairedWssConnector, NodeClient, type DeviceKeyStore } from '@abele/node-client'
 
+import { decodePairCode, PairingRouteFailureSchema } from '@abele/node-protocol'
+
+const payload = decodePairCode(pastedCode) // Validate and display fields locally first.
 const connector = new PairedWssConnector(deviceLocalKeys satisfies DeviceKeyStore)
-const claim = await connector.claim(inviteFromQr)
+const claim = await connector.claim(payload.invite, { deviceName, endpoint: editedWssRoute })
 // Display claim.device_fingerprint for owner comparison; wait for node-side confirmation.
-const target = await connector.target(inviteFromQr.node_id)
+const target = await connector.target(payload.invite.node_id)
 const client = new NodeClient(target, installationLocalClientStore, connector)
 await client.connect()
 // All existing session, replay, outbox, prompt, review and file APIs are unchanged.
@@ -203,7 +285,11 @@ npm run format:check
 ```
 
 Tests use fake providers/CLI, real WebCrypto and SQLite, two independent fake devices,
-and loopback WebSockets emulating Serve's Host forwarding. They exercise claim response
+loopback WebSockets emulating Serve's Host forwarding, and a real TLS test terminator
+that dials the edited URL, validates its certificate and preserves its actual Host.
+They exercise secret/name non-disclosure to a wrong key or invalid node signature,
+legacy enrollment refusal, accepted-route admission and typed TLS/Host/network errors,
+claim response
 loss, replay/expiry, exact owner confirmation, key substitution, revoked replay/artifact/
 prompt boundaries with valid positive controls and revocation during processing,
 transactional concurrent claims across independent adapters after lost responses,
@@ -222,6 +308,6 @@ screen lock and reconnect. These checks are deployment responsibilities; backgro
 execution is not guaranteed.
 
 Out of scope: plugin pairing UI, Sync/relay adoption, Noise/E2E transport, Funnel/public
-exposure, non-Tailscale clients, push delivery, background socket survival, mixed-trust
+exposure, automatic extra-route TLS/proxy provisioning, push delivery, background socket survival, mixed-trust
 shell containment, or protection against a compromised node/Serve process, device or TLS
 termination. Journal state remains protected but **unencrypted at rest**.

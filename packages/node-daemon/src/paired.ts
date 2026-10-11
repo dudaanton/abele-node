@@ -3,7 +3,9 @@ import {
   FrameCodec,
   LIMITS,
   ChannelError,
+  DeviceNameSchema,
   assertPairedEndpoint,
+  assertPairedTransportEndpoint,
   fingerprint,
   randomNonce,
   signProof,
@@ -13,6 +15,26 @@ import {
   type RecordTransport,
 } from '@abele/channel-protocol'
 import type { NodeCore } from '@abele/node-core'
+import type { PairingListEntry } from '@abele/node-protocol'
+
+export function selectPendingPairing(
+  entries: PairingListEntry[],
+  name?: string,
+  installationId?: string
+): PairingListEntry {
+  if (name !== undefined) DeviceNameSchema.parse(name)
+  const matches = entries.filter(
+    (entry) =>
+      entry.state === 'pending' &&
+      (name === undefined || entry.device_name === name) &&
+      (installationId === undefined || entry.installation_id === installationId)
+  )
+  if (!name && !installationId) throw new Error('selection_required')
+  if (!matches.length) throw new Error('pending_device_not_found')
+  if (matches.length !== 1) throw new Error('ambiguous_device_name')
+  DeviceNameSchema.parse(matches[0]!.device_name)
+  return matches[0]!
+}
 import { serveChannel } from '@abele/channel-server'
 export const PairedListenerSchema = z
   .object({
@@ -35,6 +57,22 @@ export const PairedListenerSchema = z
           return false
         }
       }),
+    accepted_routes: z
+      .array(
+        z
+          .string()
+          .max(2048)
+          .refine((endpoint) => {
+            try {
+              assertPairedTransportEndpoint(endpoint)
+              return true
+            } catch {
+              return false
+            }
+          })
+      )
+      .max(16)
+      .optional(),
     backend_port: z.number().int().min(0).max(65535).default(47124),
     origins: z
       .array(
@@ -51,6 +89,14 @@ export const PairedListenerSchema = z
   })
   .strict()
 export type PairedListenerConfig = z.infer<typeof PairedListenerSchema>
+export function pairedHostAccepted(
+  config: PairedListenerConfig,
+  host: string | undefined
+): boolean {
+  return [config.endpoint, ...(config.accepted_routes ?? [])].some(
+    (route) => new URL(route).host === host
+  )
+}
 export function pairedAdmission(
   config: PairedListenerConfig,
   host: string | undefined,
@@ -60,7 +106,7 @@ export function pairedAdmission(
   const endpoint = new URL(config.endpoint)
   return (
     path === endpoint.pathname &&
-    host === endpoint.host &&
+    pairedHostAccepted(config, host) &&
     (origin === undefined
       ? config.allow_missing_origin
       : origin === 'null'
@@ -89,6 +135,12 @@ export async function servePairedChannel(
     }
     const begin = await next()
     if (begin.kind !== 'paired.begin') throw new ChannelError('profile_refused')
+    if (begin.invite || begin.device_name) {
+      await transport.send(
+        FrameCodec.encode({ kind: 'paired.error', code: 'pairing_upgrade_required' })
+      )
+      return
+    }
     const identity = await core.pairing.identity.load()
     const challenge: DeviceChallenge = {
       kind: 'paired.challenge',
@@ -97,8 +149,8 @@ export async function servePairedChannel(
       client_nonce: begin.client_nonce,
       node_id: core.node_id,
       endpoint,
-      installation_id: begin.installation_id ?? begin.invite!.invite_id,
-      purpose: begin.invite ? 'claim' : 'connect',
+      installation_id: begin.installation_id ?? begin.invite_id!,
+      purpose: begin.invite_id ? 'claim' : 'connect',
       device_fingerprint: await fingerprint(begin.public_key),
       expires_at: Date.now() + LIMITS.auth_ms,
       node_key: identity.public_key,
@@ -123,18 +175,26 @@ export async function servePairedChannel(
       (await fingerprint(identity.public_key))
     )
       throw new ChannelError('node_identity_changed')
-    if (begin.invite) {
+    if (begin.invite_id) {
       if (
-        begin.invite.endpoint !== endpoint ||
-        begin.invite.node_id !== core.node_id ||
-        begin.invite.node_fingerprint !== (await fingerprint(identity.public_key))
+        !proof.invite ||
+        proof.invite.invite_id !== begin.invite_id ||
+        proof.invite.endpoint !== endpoint ||
+        proof.invite.node_id !== core.node_id ||
+        proof.invite.node_fingerprint !== (await fingerprint(identity.public_key))
       )
         throw new ChannelError('invalid_invite')
-      const claim = await core.pairing.claim(begin.invite, begin.public_key, checkProof)
+      const claim = await core.pairing.claim(
+        proof.invite,
+        begin.public_key,
+        checkProof,
+        proof.device_name
+      )
       await transport.send(FrameCodec.encode({ kind: 'paired.claimed', claim }))
       return
     }
     checkProof()
+    if (proof.invite || proof.device_name) throw new ChannelError('invalid_proof')
     const actor = core.pairing.actor(begin.installation_id!, begin.public_key)
     await transport.send(
       FrameCodec.encode({ kind: 'authenticated', installation_id: actor.installation_id })

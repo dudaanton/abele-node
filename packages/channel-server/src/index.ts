@@ -87,6 +87,8 @@ export async function serveChannel(
     last = Date.now(),
     pumping = false
   const subscriptions = new Map<string, Subscription>()
+  const connection = new AbortController()
+  const timerRequests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
     receive: () => transport.receive(),
     close: (reason) => transport.close(reason),
@@ -102,6 +104,7 @@ export async function serveChannel(
   const close = async (reason: string) => {
     if (closed) return
     closed = true
+    connection.abort()
     scheduler.close()
     await transport.close(reason)
   }
@@ -177,6 +180,7 @@ export async function serveChannel(
           instance_id: randomUUID(),
           methods: [
             ...Object.keys(MethodSchemas),
+            ...core.debuggerControl.methods(),
             ...(actor.profile === 'local-token-v1' ? Object.keys(PairingMethodSchemas) : []),
           ],
           limits: LIMITS,
@@ -190,64 +194,87 @@ export async function serveChannel(
       }
       if (frame.kind === 'pong') continue
       if (frame.kind !== 'request') throw new ChannelError('unexpected_record')
-      let response: RecordFrame
-      try {
-        let result: unknown
-        if (['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)) {
-          const schema =
-            MethodSchemas[frame.method as 'stream.subscribe' | 'stream.ack' | 'stream.unsubscribe']
-          const parsed = schema.safeParse(frame.params)
-          if (!parsed.success) throw new ChannelError('invalid_params')
-          const p = parsed.data
-          core.authority.check(actor, 'subscribe', p.stream_id)
-          if ('after_seq' in p) {
-            if (!subscriptions.has(p.stream_id) && subscriptions.size >= 256)
-              throw new ChannelError('subscription_limit')
-            const after = Number(p.after_seq)
-            if (after > core.head(p.stream_id)) throw new ChannelError('resync_required')
-            subscriptions.set(p.stream_id, { cursor: after, ack: after, bytes: 0, sent: [] })
-            result = { head_seq: core.head(p.stream_id) }
-          } else if ('seq' in p) {
-            const seq = Number(p.seq)
-            const s = subscriptions.get(p.stream_id)
-            if (!s || seq > s.cursor || seq < s.ack) throw new ChannelError('invalid_ack')
-            s.ack = seq
-            while (s.sent[0] && s.sent[0].seq <= seq) s.bytes -= s.sent.shift()!.bytes
-            result = { seq }
-          } else {
-            subscriptions.delete(p.stream_id)
-            result = { unsubscribed: true }
+      const execute = async () => {
+        let response: RecordFrame
+        try {
+          let result: unknown
+          if (['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)) {
+            const schema =
+              MethodSchemas[
+                frame.method as 'stream.subscribe' | 'stream.ack' | 'stream.unsubscribe'
+              ]
+            const parsed = schema.safeParse(frame.params)
+            if (!parsed.success) throw new ChannelError('invalid_params')
+            const p = parsed.data
+            core.authority.check(actor!, 'subscribe', p.stream_id)
+            if ('after_seq' in p) {
+              if (!subscriptions.has(p.stream_id) && subscriptions.size >= 256)
+                throw new ChannelError('subscription_limit')
+              const after = Number(p.after_seq)
+              if (after > core.head(p.stream_id)) throw new ChannelError('resync_required')
+              subscriptions.set(p.stream_id, { cursor: after, ack: after, bytes: 0, sent: [] })
+              result = { head_seq: core.head(p.stream_id) }
+            } else if ('seq' in p) {
+              const seq = Number(p.seq)
+              const s = subscriptions.get(p.stream_id)
+              if (!s || seq > s.cursor || seq < s.ack) throw new ChannelError('invalid_ack')
+              s.ack = seq
+              while (s.sent[0] && s.sent[0].seq <= seq) s.bytes -= s.sent.shift()!.bytes
+              result = { seq }
+            } else {
+              subscriptions.delete(p.stream_id)
+              result = { unsubscribed: true }
+            }
+          } else
+            result = await core.request(
+              actor!,
+              frame.method,
+              frame.params,
+              frame.operation_id,
+              connection.signal
+            )
+          response = {
+            kind: 'response',
+            request_id: frame.request_id,
+            ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
+            result,
           }
-        } else result = await core.request(actor, frame.method, frame.params, frame.operation_id)
-        response = {
-          kind: 'response',
-          request_id: frame.request_id,
-          ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
-          result,
+        } catch (error) {
+          // Internal/storage failures can occur after commit. Do not manufacture a
+          // terminal rejection: disconnect so the durable outbox retries its receipt.
+          if (!(error instanceof ChannelError)) {
+            await close('internal_failure')
+            return
+          }
+          const code = error.code
+          response = {
+            kind: 'response',
+            request_id: frame.request_id,
+            ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
+            error: { code, message: code, details: {} },
+          }
         }
-      } catch (error) {
-        // Internal/storage failures can occur after commit. Do not manufacture a
-        // terminal rejection: disconnect so the durable outbox retries its receipt.
-        if (!(error instanceof ChannelError)) {
-          await close('internal_failure')
+        // Do not block admission behind artifact writes. The scheduler bounds queued bytes.
+        void send(
+          response,
+          frame.method === 'artifact.read' ? 2 : 0,
+          response.error
+            ? undefined
+            : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
+        ).catch(() => close('send_failed'))
+      }
+      if (frame.method === 'debugger.v1.wait' || frame.method === 'debugger.v1.sleep') {
+        // Timers never occupy the channel's next-input admission either. Keep
+        // reading cancel/control/heartbeat frames and observe EOF promptly.
+        if (timerRequests.size >= 128) {
+          await close('debugger_wait_limit')
           break
         }
-        const code = error.code
-        response = {
-          kind: 'response',
-          request_id: frame.request_id,
-          ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
-          error: { code, message: code, details: {} },
-        }
-      }
-      // Do not block admission behind artifact writes. The scheduler bounds queued bytes.
-      void send(
-        response,
-        frame.method === 'artifact.read' ? 2 : 0,
-        response.error
-          ? undefined
-          : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
-      ).catch(() => close('send_failed'))
+        const task = execute()
+          .catch(() => close('request_failed'))
+          .finally(() => timerRequests.delete(task))
+        timerRequests.add(task)
+      } else await execute()
     }
   } catch {
     /* Reject unauthenticated/malformed records without application error details. */
@@ -256,5 +283,6 @@ export async function serveChannel(
     clearInterval(heartbeat)
     clearInterval(pump)
     await close('channel_closed')
+    await Promise.allSettled(timerRequests)
   }
 }

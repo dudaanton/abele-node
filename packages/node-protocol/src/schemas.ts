@@ -8,6 +8,14 @@ import {
   DelegationTerminalSchema,
 } from './delegation.js'
 export * from './delegation.js'
+import {
+  NodePathMethodSchemas,
+  NODE_PATH_MUTATIONS,
+  WorkspaceWatchInvalidationSchema,
+  ExecutionTargetSchema,
+  SessionTargetChangedSchema,
+} from './node-path.js'
+export * from './node-path.js'
 import { RepositoryMethodSchemas, RepositoryInvalidationSchema } from './repository.js'
 export * from './repository.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
@@ -145,6 +153,7 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
 ])
 const EventPayloads = {
   'repository.invalidated': RepositoryInvalidationSchema,
+  'workspace.invalidated': WorkspaceWatchInvalidationSchema,
   'stream.redacted': z.object({ refresh_required: z.literal(true) }).strict(),
   'delegation.created': DelegationSchema,
   'delegation.progress': DelegationMessageSchema,
@@ -156,6 +165,7 @@ const EventPayloads = {
   'project.removed': z.object({ project_id: id }).strict(),
   'workspace.changed': z.union([WorkspaceSchema, WorkspaceInvalidationSchema]),
   'job.changed': JobSchema,
+  'session.worktree.changed': SessionTargetChangedSchema,
   'session.updated': SessionSchema,
   'session.created': SessionSchema,
   'prompt.opened': PromptSchema,
@@ -189,6 +199,7 @@ export const MethodSchemas = {
       .max(32)
       .default([{ kind: 'echo' }]),
   }),
+  ...NodePathMethodSchemas,
   ...ResourceMethodSchemas,
   ...RepositoryMethodSchemas,
   ...FileMethodSchemas,
@@ -202,8 +213,10 @@ export const MethodSchemas = {
       title: z.string().max(256).default('Fake session'),
       provider: z.enum(['fake', 'claude', 'pi', 'codex']).default('fake'),
       workspace_id: id.optional(),
+      target: ExecutionTargetSchema.optional(),
     })
-    .strict(),
+    .strict()
+    .refine((p) => !(p.workspace_id && p.target)),
   'session.get': z.object(session).strict(),
   'session.send': z
     .object({
@@ -267,6 +280,7 @@ export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
   ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,
+  ...NODE_PATH_MUTATIONS,
   'project.repository_settings',
   'review.submit',
   'workspace.write',

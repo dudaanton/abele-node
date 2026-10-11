@@ -3,6 +3,7 @@ import { ChannelError } from '@abele/channel-protocol'
 import { PromptSchema, SessionSchema, type Prompt } from '@abele/node-protocol'
 import type {
   ProviderRun,
+  DebuggerToolBridge,
   ProcessIdentity,
   PermissionAction,
   ProviderEvent as ClaudeEvent,
@@ -11,6 +12,8 @@ import type {
 import { canonical, type NodeCore } from './index.js'
 import type { ProviderAdapter } from './providers.js'
 import { updateInProgress, tryRunAdmission } from './update-lock.js'
+import { DebuggerRunBinding } from './debugger/run.js'
+import { RunTargetTools } from './run-target-tools.js'
 
 type Input = Record<string, string | number | null>
 const actor = { kind: 'node' } as const
@@ -20,6 +23,7 @@ type ActiveRun = {
   run?: ProviderRun
   starting: boolean
   completion?: Promise<void>
+  debugger?: DebuggerToolBridge
 }
 /** The durable queue is the only input owner. External process effects are never inside SQL transactions. */
 export class ProviderSessions {
@@ -57,12 +61,14 @@ export class ProviderSessions {
     for (const row of rows) {
       const adapter = this.adapterFor(this.core.session(row.session_id).provider)
       if (!adapter) throw new Error('provider_reconciliation_required')
+      this.core.debuggerControl.settleRun(row.run_id)
       await adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
-      this.core.transaction(() =>
+      this.core.transaction(() => {
         this.core.db
           .prepare("UPDATE provider_runs SET state='unknown' WHERE run_id=?")
           .run(row.run_id)
-      )
+        this.core.resources.targets.settle(row.session_id, row.run_id)
+      })
     }
   }
   async stop() {
@@ -105,6 +111,7 @@ export class ProviderSessions {
       this.core.db
         .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
         .run(slot.run_id)
+      this.core.resources.targets.settle(session, slot.run_id)
     })
     if (this.active.get(session) === slot) this.active.delete(session)
   }
@@ -141,15 +148,23 @@ export class ProviderSessions {
       const adapter = this.adapterFor(session.provider)
       if (session.provider === 'fake' || !adapter?.available || this.active.has(session.session_id))
         continue
-      if (!session.workspace_id || this.core.workspaceProvisioning(session.session_id)) continue
+      if (
+        (!session.workspace_id && !this.core.resources.targets.bound(session.session_id)) ||
+        this.core.workspaceProvisioning(session.session_id)
+      )
+        continue
       // Reserve worker ownership before any asynchronous validation; no two drain calls can select it.
       const run_id = randomUUID()
       const slot: ActiveRun = { run_id, starting: true }
       this.active.set(session.session_id, slot)
       try {
         this.core.checkExecution(String(input.principal_id), session.session_id)
-        const workspace = this.core.resources.workspaces.get(session.workspace_id)
-        const project = await this.core.resources.workspaces.bound(workspace)
+        const executionTarget = await this.core.resources.targets.runtime(session.session_id)
+        const project = executionTarget.project
+        if (!this.core.resources.targets.canLease(executionTarget, session.session_id)) {
+          this.active.delete(session.session_id)
+          continue
+        }
         if (project.trust !== 'trusted') throw new ChannelError('project_untrusted')
         const releaseAdmission = tryRunAdmission(this.core.stateDir)
         if (!releaseAdmission) {
@@ -175,6 +190,8 @@ export class ProviderSessions {
             if (currentProject.trust !== 'trusted') throw new ChannelError('project_untrusted')
             useRepositoryPermissions = currentProject.use_repository_claude_permissions
             this.core.checkExecution(String(input.principal_id), session.session_id)
+            if (!this.core.resources.targets.lease(executionTarget, session.session_id, run_id))
+              throw new ChannelError('resource_busy')
             input.run_id = run_id
             this.core.db
               .prepare('UPDATE inputs SET run_id=? WHERE input_id=?')
@@ -204,11 +221,49 @@ export class ProviderSessions {
         )
           throw new Error('codex_native_binding_missing')
         const body = JSON.parse(String(input.body)) as { text: string }
+        if (this.core.debugger.enabled && ['claude', 'pi'].includes(session.provider)) {
+          slot.debugger = new DebuggerRunBinding(this.core, {
+            authority: this.core.authority.forInstallation(String(input.principal_id)),
+            run_id,
+            conversation_id: session.session_id,
+            workspace_id: session.workspace_id ?? null,
+            active: () => {
+              const current = this.core.db
+                .prepare('SELECT state FROM inputs WHERE input_id=?')
+                .get(String(input.input_id))
+              return (
+                !this.stopping &&
+                !!current &&
+                ['dispatching', 'delivered'].includes(String(current.state))
+              )
+            },
+          })
+        }
+        if (this.core.resources.targets.bound(session.session_id)) {
+          slot.debugger = new RunTargetTools(
+            this.core,
+            this.core.authority.forInstallation(String(input.principal_id)),
+            session.session_id,
+            run_id,
+            () => {
+              const current = this.core.db
+                .prepare('SELECT state FROM inputs WHERE input_id=?')
+                .get(String(input.input_id)) as { state: string } | undefined
+              return (
+                !this.stopping &&
+                this.active.get(session.session_id) === slot &&
+                !!current &&
+                ['dispatching', 'delivered'].includes(current.state)
+              )
+            },
+            slot.debugger
+          )
+        }
         slot.run = await adapter.startTurn(
           {
             session_id: session.session_id,
             run_id,
-            cwd: workspace.path,
+            cwd: executionTarget.path,
             text: this.core.delegations.turnText(session.session_id, body.text),
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
@@ -218,6 +273,7 @@ export class ProviderSessions {
             use_repository_claude_permissions: useRepositoryPermissions,
           },
           {
+            ...(slot.debugger ? { debugger: slot.debugger } : {}),
             processes: (evidence) => this.persistProcesses(run_id, evidence),
             reaped: (leader) =>
               this.core.transaction(() => {
@@ -251,6 +307,8 @@ export class ProviderSessions {
         if (this.stopping) await slot.run.interrupt()
         slot.completion = slot.run.done
           .then((result) => {
+            slot.debugger?.close()
+            this.core.debuggerControl.settleRun(run_id)
             this.core.transaction(() => {
               const current = this.core.db
                 .prepare('SELECT * FROM inputs WHERE input_id=?')
@@ -290,6 +348,8 @@ export class ProviderSessions {
                 this.core.db
                   .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
                   .run(run_id)
+              if (result.reason !== 'process_cleanup_unconfirmed')
+                this.core.resources.targets.settle(session.session_id, run_id)
             })
             if (
               result.reason !== 'process_cleanup_unconfirmed' &&
@@ -301,6 +361,12 @@ export class ProviderSessions {
             this.stopping = true
           })
       } catch (error) {
+        try {
+          slot.debugger?.close()
+          this.core.debuggerControl.settleRun(run_id)
+        } catch {
+          this.stopping = true
+        }
         let cleaned = false
         try {
           const persisted = this.core.db
@@ -334,6 +400,7 @@ export class ProviderSessions {
               this.core.db
                 .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
                 .run(run_id)
+            if (cleaned) this.core.resources.targets.settle(session.session_id, run_id)
           })
         } finally {
           if (cleaned && this.active.get(session.session_id) === slot)
@@ -440,9 +507,7 @@ export class ProviderSessions {
           const binding = event.data
           if (
             session.provider !== 'codex' ||
-            !session.workspace_id ||
-            this.core.resources.workspaces.get(session.workspace_id).path !==
-              binding.workspace_path ||
+            this.core.resources.targets.pathForSession(session_id) !== binding.workspace_path ||
             !/^[a-f0-9]{64}$/.test(binding.policy_fingerprint) ||
             typeof binding.model !== 'string' ||
             !/^[A-Za-z0-9_.:-]{1,128}$/.test(binding.model) ||
@@ -521,6 +586,17 @@ export class ProviderSessions {
     })
   }
   private invalidate(run_id: string) {
+    // Called within input transactions. Cancel/settle outside that synchronous
+    // commit, before another queued turn can be admitted. Active-run predicates
+    // already reject publication once the input is no longer active.
+    queueMicrotask(() => {
+      try {
+        for (const slot of this.active.values()) if (slot.run_id === run_id) slot.debugger?.close()
+        this.core.debuggerControl.settleRun(run_id)
+      } catch {
+        this.stopping = true
+      }
+    })
     const rows = this.core.db.prepare('SELECT body FROM prompts WHERE run_id=?').all(run_id) as {
       body: string
     }[]

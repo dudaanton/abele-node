@@ -31,6 +31,12 @@ export const ClaimSchema = z
     state: z.enum(['pending', 'confirmed']),
   })
   .strict()
+/** Display labels are untrusted; refuse terminal controls and invisible direction changes. */
+export const DeviceNameSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((s) => !/[\p{Cc}\p{Cf}]/u.test(s))
 export const PairedBeginSchema = z
   .object({
     kind: z.literal('paired.begin'),
@@ -38,10 +44,13 @@ export const PairedBeginSchema = z
     client_nonce: Nonce,
     public_key: PublicKeySchema,
     installation_id: Id.optional(),
+    // Accepted only to return an explicit upgrade refusal to legacy enrollment.
     invite: InviteSchema.optional(),
+    device_name: DeviceNameSchema.optional(),
+    invite_id: Id.optional(),
   })
   .strict()
-  .refine((r) => !!r.installation_id !== !!r.invite)
+  .refine((r) => [r.installation_id, r.invite, r.invite_id].filter(Boolean).length === 1)
 export const ChallengeSchema = z
   .object({
     kind: z.literal('paired.challenge'),
@@ -63,9 +72,18 @@ export const PairedRecordSchemas = [
   PairedBeginSchema,
   ChallengeSchema,
   z
-    .object({ kind: z.literal('paired.proof'), signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/) })
+    .object({
+      kind: z.literal('paired.proof'),
+      signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
+      // Enrollment credentials are sent only AFTER verifying the pinned node challenge.
+      invite: InviteSchema.optional(),
+      device_name: DeviceNameSchema.optional(),
+    })
     .strict(),
   z.object({ kind: z.literal('paired.claimed'), claim: ClaimSchema }).strict(),
+  z
+    .object({ kind: z.literal('paired.error'), code: z.literal('pairing_upgrade_required') })
+    .strict(),
 ] as const
 export function proofTranscript(c: DeviceChallenge, role: 'node' | 'device'): string[] {
   return [
@@ -153,11 +171,11 @@ export async function verifyProof(
     return false
   }
 }
-export function assertPairedEndpoint(endpoint: string): void {
+/** Alternate routes still require TLS. The application pin authenticates the node. */
+export function assertPairedTransportEndpoint(endpoint: string): void {
   const u = new URL(endpoint)
   if (
     u.protocol !== 'wss:' ||
-    !u.hostname.endsWith('.ts.net') ||
     u.username ||
     u.password ||
     u.search ||
@@ -167,4 +185,8 @@ export function assertPairedEndpoint(endpoint: string): void {
     u.href !== u.origin + '/channel'
   )
     throw new Error('endpoint_refused')
+}
+export function assertPairedEndpoint(endpoint: string): void {
+  assertPairedTransportEndpoint(endpoint)
+  if (!new URL(endpoint).hostname.endsWith('.ts.net')) throw new Error('endpoint_refused')
 }

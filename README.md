@@ -49,8 +49,11 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
 Git-mutation UI, live steering, AskUserQuestion, persistent always-allow,
 exhaustive child history and readable thinking are **not supported**. An experimental
 [debugger probe](docs/debug-probe.md) exercises synthetic JS/TS/Python targets; it is
-not a daemon debugger feature or plugin debugger UI. A worktree is isolation for
-Git state, not an OS sandbox for agent tools.
+not a usable debugger release or plugin debugger UI. Separately,
+[gated debugger infrastructure](docs/debugger-v1.md) provides shared authorization,
+[agent tools and passive timers](docs/debugger-agent-tools.md); real profiles still
+require their audit/application gates. A worktree is isolation for Git state,
+not an OS sandbox for agent tools.
 
 ## Repository view
 

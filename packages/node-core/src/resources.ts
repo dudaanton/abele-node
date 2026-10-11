@@ -31,6 +31,9 @@ import {
 import { GitRunner, decodeGit, parseWorktrees } from './git.js'
 import { FileMutationCoordinator } from './mutations.js'
 import { RepositoryService } from './repository.js'
+import { NodePathService } from './node-path.js'
+import { WorkspaceSearchService } from './workspace-search.js'
+import { ExecutionTargetService } from './execution-targets.js'
 
 type Params = Record<string, unknown>
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
@@ -63,7 +66,8 @@ export class ProjectService {
   }
   async inspect(
     path: string,
-    trust: unknown
+    trust: unknown,
+    exactRoot = false
   ): Promise<Omit<Project, 'project_id' | 'created_at' | 'use_repository_claude_permissions'>> {
     if (!isAbsolute(path)) throw new ChannelError('invalid_params')
     let root: string
@@ -78,7 +82,10 @@ export class ProjectService {
     try {
       repository = realpathSync(await this.resources.git.text(root, { kind: 'root' }))
       common = realpathSync(await this.resources.git.text(root, { kind: 'common' }))
-      root = repository
+      if (exactRoot && repository !== root) {
+        repository = null
+        common = null
+      } else root = repository
     } catch (error) {
       if (
         !(error instanceof ChannelError) ||
@@ -256,6 +263,7 @@ export class WorkspaceService {
   }
   async clean(workspace: Workspace) {
     await this.bound(workspace)
+    if (this.resources.targets.leasedPath(workspace.path)) throw new ChannelError('resource_busy')
     if (
       (await this.resources.git.run(workspace.path, { kind: 'status' })).length ||
       (await this.resources.git.run(workspace.path, { kind: 'untracked' })).length
@@ -336,9 +344,13 @@ export class JobReconciler {
     } catch (e) {
       if (!(e instanceof ChannelError) || e.code !== 'git_failed') throw e
     }
-    if (branch && (job.phase === 'planned' || branch !== workspace.base_commit))
+    if (
+      branch &&
+      ((job.phase === 'planned' && !job.branch_preexisting) || branch !== workspace.base_commit)
+    )
       throw new ChannelError('unmanaged_workspace')
     if (!branch) {
+      if (job.branch_preexisting) throw new ChannelError('unmanaged_workspace')
       if (job.phase !== 'planned' && job.phase !== 'branch_intent')
         throw new ChannelError('unmanaged_workspace')
       r.jobs.phase(job, 'branch_intent') // durable intent precedes external effect
@@ -435,7 +447,12 @@ export class JobService {
       ).map((r) => JobSchema.parse(JSON.parse(r.body)))
     )
   }
-  insert(workspace: Workspace, kind: Job['kind'], actor: AuthorityContext): Job {
+  insert(
+    workspace: Workspace,
+    kind: Job['kind'],
+    actor: AuthorityContext,
+    branchPreexisting?: boolean
+  ): Job {
     const job = JobSchema.parse({
       job_id: randomUUID(),
       project_id: workspace.project_id,
@@ -447,6 +464,7 @@ export class JobService {
       created_at: now(),
       updated_at: now(),
       error: null,
+      ...(branchPreexisting === undefined ? {} : { branch_preexisting: branchPreexisting }),
     })
     this.resources.core.db
       .prepare('INSERT INTO jobs VALUES(?,?,?,?,?)')
@@ -545,6 +563,10 @@ export class JobService {
 }
 
 export class ResourceServices {
+  readonly ready: Promise<unknown>
+  readonly search = new WorkspaceSearchService(this)
+  readonly nodePath: NodePathService
+  readonly targets: ExecutionTargetService
   readonly git: GitRunner
   readonly repository: RepositoryService
   readonly files = new WorkspaceFileService(this)
@@ -564,6 +586,8 @@ export class ResourceServices {
   ) {
     this.git = git
     this.repository = new RepositoryService(this)
+    this.nodePath = new NodePathService(this)
+    this.targets = new ExecutionTargetService(this)
     const stored = core.db.prepare("SELECT value FROM meta WHERE key='worktree_root'").get() as
       { value: string } | undefined
     this.worktreeRoot = resolve(
@@ -597,20 +621,46 @@ export class ResourceServices {
         "INSERT INTO meta VALUES('worktree_root',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
       )
       .run(this.worktreeRoot)
+    this.ready = core.db.prepare('SELECT 1 FROM repository_deletions LIMIT 1').get()
+      ? Promise.resolve().then(() => this.repository.recoverDeletions())
+      : Promise.resolve([])
   }
   async stop() {
+    this.nodePath.stop()
+    await this.ready
+    await this.search.stop()
     await this.repository.stop()
     await this.jobs.stop()
   }
   /** Read-only preparation; reservation and its provisioning job commit with the caller's receipt. */
-  async prepareWorkspace(project_id: string, base_ref: string) {
+  async prepareWorkspace(project_id: string, base_ref: string, branch?: string) {
     const project = this.projects.get(project_id)
     if (!project.repository_path) throw new ChannelError('git_required')
     await this.projects.available(project)
     try {
+      let existing: string | undefined
+      if (branch) {
+        await this.git.run(project.root_path, { kind: 'branch.validate', branch })
+        if (
+          parseWorktrees(await this.git.run(project.root_path, { kind: 'worktrees' })).some(
+            (w) => w.branch === 'refs/heads/' + branch
+          )
+        )
+          throw new ChannelError('resource_busy')
+        try {
+          existing = await this.git.text(project.root_path, {
+            kind: 'resolve',
+            ref: 'refs/heads/' + branch,
+          })
+        } catch (e) {
+          if (!(e instanceof ChannelError) || e.code !== 'git_failed') throw e
+        }
+      }
       return {
         project_id,
-        base: await this.git.text(project.root_path, { kind: 'resolve', ref: base_ref }),
+        base:
+          existing ?? (await this.git.text(project.root_path, { kind: 'resolve', ref: base_ref })),
+        ...(branch ? { branch, branch_preexisting: existing !== undefined } : {}),
       }
     } catch (e) {
       if (e instanceof ChannelError && e.code === 'git_failed')
@@ -622,7 +672,7 @@ export class ResourceServices {
   reserveWorkspace(
     actor: AuthorityContext,
     operation: string,
-    prepared: { project_id: string; base: string }
+    prepared: { project_id: string; base: string; branch?: string; branch_preexisting?: boolean }
   ) {
     const project = this.projects.get(prepared.project_id)
     const workspace_id = randomUUID()
@@ -631,7 +681,7 @@ export class ResourceServices {
       project_id: project.project_id,
       kind: 'managed',
       path: join(this.worktreeRoot, project.project_id, workspace_id),
-      branch: 'abele/' + workspace_id,
+      branch: prepared.branch ?? 'abele/' + workspace_id,
       base_commit: prepared.base,
       state: 'provisioning',
       created_at: now(),
@@ -650,7 +700,11 @@ export class ResourceServices {
       { kind: 'installation', installation_id: actor.installation_id },
       workspace
     )
-    return { workspace_id, job_id: this.jobs.insert(workspace, 'workspace.create', actor).job_id }
+    return {
+      workspace_id,
+      job_id: this.jobs.insert(workspace, 'workspace.create', actor, prepared.branch_preexisting)
+        .job_id,
+    }
   }
   async request(
     actor: AuthorityContext,
@@ -663,6 +717,7 @@ export class ResourceServices {
       'resource',
       String(p.project_id ?? p.workspace_id ?? p.job_id ?? '')
     )
+    if (this.nodePath.handles(method)) return this.nodePath.request(actor, method, p, operation)
     if (
       [
         'repository.v1.editing',
@@ -681,6 +736,7 @@ export class ResourceServices {
       if (method === 'project.claude_permissions')
         return this.core.commitOperation(actor, method, p, operation!, () => {
           const project = this.projects.get(String(p.project_id))
+          if (this.targets.projectBusy(project.project_id)) throw new ChannelError('resource_busy')
           if (
             this.core.db
               .prepare(
@@ -707,7 +763,11 @@ export class ResourceServices {
           return updated
         })
       if (method === 'project.register') {
-        const inspected = await this.projects.inspect(String(p.path), p.trust)
+        const inspected = await this.projects.inspect(
+          String(p.path),
+          p.trust,
+          Boolean(p.exact_root)
+        )
         if (
           inspected.repository_path &&
           (this.worktreeRoot === inspected.repository_path ||
@@ -788,6 +848,8 @@ export class ResourceServices {
       if (method === 'project.remove')
         return this.core.commitOperation(actor, method, p, operation!, () => {
           this.projects.get(String(p.project_id))
+          if (this.targets.projectBusy(String(p.project_id)))
+            throw new ChannelError('resource_busy')
           const workspaces = this.core.db
             .prepare('SELECT body FROM workspaces WHERE project_id=?')
             .all(String(p.project_id)) as { body: string }[]
@@ -796,7 +858,8 @@ export class ResourceServices {
               const w = WorkspaceSchema.parse(JSON.parse(row.body))
               return (
                 (w.kind === 'managed' && w.state !== 'removed') ||
-                this.workspaces.leased(w.workspace_id)
+                this.workspaces.leased(w.workspace_id) ||
+                this.targets.leasedPath(w.path)
               )
             })
           )
@@ -815,7 +878,11 @@ export class ResourceServices {
           return { project_id: p.project_id, removed: true }
         })
       if (method === 'workspace.create') {
-        const prepared = await this.prepareWorkspace(String(p.project_id), String(p.base_ref))
+        const prepared = await this.prepareWorkspace(
+          String(p.project_id),
+          String(p.base_ref),
+          p.branch as string | undefined
+        )
         return this.core.commitOperation(actor, method, p, operation!, () =>
           this.reserveWorkspace(actor, operation!, prepared)
         )

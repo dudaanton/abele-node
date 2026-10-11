@@ -2,7 +2,15 @@
 import './warnings.js'
 import { DatabaseSync } from 'node:sqlite'
 import { humanOutput, humanError } from './output.js'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
+import { createInterface } from 'node:readline/promises'
+import {
+  encodePairCode,
+  PairingListEntrySchema,
+  shortPairingFingerprint,
+  InviteSchema,
+} from '@abele/node-protocol'
+import { selectPendingPairing } from './paired.js'
 import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -35,6 +43,7 @@ import {
   PiProviderAdapter,
   CodexProviderAdapter,
   canonicalStateDir,
+  installJsAdapter,
 } from '@abele/node-core'
 
 const json = process.argv.includes('--json')
@@ -79,6 +88,7 @@ async function main() {
     process.env.ABELE_TAILSCALE_PATH ?? '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
   )
   const pairInstallation = option('--pair-installation', '')
+  const nodeName = option('--node-name', hostname())
   const policyFlag = args.indexOf('--tailnet-policy-verified')
   const policyVerified = policyFlag >= 0
   if (policyVerified) args.splice(policyFlag, 1)
@@ -92,6 +102,10 @@ async function main() {
   const claudeBudget = Number(option('--claude-budget', '0.35'))
   const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
+  // This enables authorized infrastructure only, never the audit-blocked JS profile.
+  const debuggerFlag = args.indexOf('--debugger')
+  const debuggerEnabled = debuggerFlag >= 0
+  if (debuggerEnabled) args.splice(debuggerFlag, 1)
   const codexFlag = args.indexOf('--codex')
   if (codexFlag >= 0) args.splice(codexFlag, 1)
   const noCodexFlag = args.indexOf('--no-codex')
@@ -194,6 +208,11 @@ async function main() {
     return lines.map((line) => line.slice(indent.length))
   }
   switch (args[0]) {
+    case 'debugger':
+      if (args.length !== 3 || args[1] !== 'install' || args[2] !== 'js')
+        throw new Error('Usage: abele-node debugger install js [--state-dir PATH]')
+      output(await installJsAdapter(state))
+      return
     case '--version':
     case 'version':
       console.log(version)
@@ -220,7 +239,8 @@ async function main() {
         pairedConfig,
         tailscalePath,
         piOptions,
-        codexOptions
+        codexOptions,
+        { enabled: debuggerEnabled }
       )
       output({
         type: 'listening',
@@ -334,9 +354,12 @@ async function main() {
     case 'status': {
       const running = readRuntime(state)
       const paired = running?.paired ?? pairedConfig
+      // Discovery metadata is local-only; keep the existing status JSON field set stable.
+      const publicRuntime = { ...running }
+      delete publicRuntime.node_name
       const report = {
         running: !!running,
-        ...running,
+        ...publicRuntime,
         state_dir: state,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
         tailscale: await tailscale.doctor(
@@ -428,7 +451,34 @@ async function main() {
     case 'pair': {
       const action = args[1],
         installation_id = args[2]
-      if (action === 'invite') {
+      if (!action) {
+        const endpoint = (readRuntime(state)?.paired ?? pairedConfig)?.endpoint
+        if (!endpoint)
+          throw new Error(
+            'paired_config_required: configure a paired WSS endpoint before issuing a code; run abele-node doctor'
+          )
+        const invite = InviteSchema.parse(
+          await offlineToken(state, {
+            action: 'pairing.issue',
+            endpoint,
+            label: 'device',
+            ...(pairInstallation ? { installation_id: pairInstallation } : {}),
+          })
+        )
+        const code = encodePairCode({ version: 1, node_name: nodeName, invite })
+        if (json) output({ code, node_name: nodeName, invite })
+        else {
+          console.log(code)
+          console.error(
+            'Paste this code into Connect node in Abele. Keep it private. Approve the waiting device with abele-node approve-pair.'
+          )
+        }
+      } else if (action === 'routes') {
+        if (args.length !== 2) throw new Error('Usage: pair routes [--json]')
+        const paired = readRuntime(state)?.paired ?? pairedConfig
+        if (!paired) throw new Error('paired_config_required')
+        output({ endpoint: paired.endpoint, accepted_routes: paired.accepted_routes ?? [] })
+      } else if (action === 'invite') {
         const endpoint = (readRuntime(state)?.paired ?? pairedConfig)?.endpoint
         if (!endpoint) throw new Error('paired_config_required')
         output(
@@ -459,6 +509,83 @@ async function main() {
         throw new Error(
           'Usage: pair invite LABEL | list | confirm INSTALLATION_ID FINGERPRINT | revoke INSTALLATION_ID | rotate'
         )
+      return
+    }
+    case 'approve-pair': {
+      const installationId = option('--installation-id', '') || undefined
+      const expectedFingerprint = option('--fingerprint', '') || undefined
+      const listIndex = args.indexOf('--list')
+      const listOnly = listIndex >= 0
+      if (listOnly) args.splice(listIndex, 1)
+      if (args.length > 2 || (listOnly && (args[1] || installationId || expectedFingerprint)))
+        throw new Error(
+          'Usage: approve-pair [NAME] [--installation-id ID] [--fingerprint FULL] | --list [--json]'
+        )
+      const entries = PairingListEntrySchema.array()
+        .parse(await offlineToken(state, { action: 'pairing.list' }))
+        .filter((entry) => entry.state === 'pending')
+      const listing = humanOutput(['approve-pair', '--list'], entries)
+      if (listOnly) {
+        output(entries)
+        return
+      }
+      let selected
+      if (args[1] || installationId) {
+        try {
+          selected = selectPendingPairing(entries, args[1], installationId)
+        } catch (error) {
+          console.error(listing)
+          throw error
+        }
+      } else {
+        if (!process.stdin.isTTY || !process.stderr.isTTY) {
+          console.error(listing)
+          throw new Error('selection_required')
+        }
+        console.error(listing)
+        if (!entries.length) return
+        const prompt = createInterface({ input: process.stdin, output: process.stderr })
+        try {
+          const answer = (
+            await prompt.question('Choose a device by name or number (empty to cancel): ')
+          ).trim()
+          if (!answer) return
+          const number = /^\d+$/.test(answer) ? Number(answer) : 0
+          selected =
+            number > 0 && number <= entries.length
+              ? selectPendingPairing(entries, undefined, entries[number - 1]!.installation_id)
+              : selectPendingPairing(entries, answer)
+          const yes = (
+            await prompt.question(
+              `Approve ${JSON.stringify(selected.device_name)} (${shortPairingFingerprint(selected.fingerprint)})? [y/N] `
+            )
+          ).trim()
+          if (!/^y(es)?$/i.test(yes)) return
+        } finally {
+          prompt.close()
+        }
+      }
+      if (expectedFingerprint && expectedFingerprint !== selected.fingerprint)
+        throw new Error('key_mismatch')
+      output(
+        await offlineToken(state, {
+          action: 'pairing.approve',
+          installation_id: selected.installation_id,
+          device_fingerprint: selected.fingerprint,
+        })
+      )
+      return
+    }
+    case 'recover-worktree-deletion': {
+      if (args.length > 3)
+        throw new Error('Usage: recover-worktree-deletion [OPERATION_ID] [INSTALLATION_ID]')
+      output(
+        await offlineToken(state, {
+          action: 'worktree.recover',
+          ...(args[1] ? { operation_id: args[1] } : {}),
+          ...(args[2] ? { installation_id: args[2] } : {}),
+        })
+      )
       return
     }
     case 'serve': {
@@ -558,6 +685,7 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
+        ...(debuggerEnabled ? ['--debugger'] : []),
         ...(!codexOptions.enabled ? ['--no-codex'] : []),
         ...(codexPath ? ['--codex-path', codexPath] : []),
         ...(codexModel ? ['--codex-model', codexModel] : []),
@@ -622,7 +750,7 @@ async function main() {
     }
     default:
       throw new Error(
-        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]\n       abele-node update [--version X.Y.Z] [--check] [--force] [--json]'
+        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]\n       abele-node update [--version X.Y.Z] [--check] [--force] [--json]\n       abele-node debugger install js [--state-dir PATH] [--json]\n       abele-node pair [--node-name NAME] [--json]\n       abele-node approve-pair [NAME] [--installation-id ID] | --list [--json]'
       )
   }
 }

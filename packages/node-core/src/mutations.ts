@@ -14,10 +14,14 @@ import {
   unlinkSync,
   mkdirSync,
   chmodSync,
+  linkSync,
 } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, basename } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
 import {
+  FileOperationMethodSchemas,
+  FileOperationResultSchema,
+  type FileOperationMethod,
   FileWriteSchema,
   FileRestoreSchema,
   FileMutationResultSchema,
@@ -51,6 +55,12 @@ type Intent = {
   content_id: string
 }
 type IntentRow = { principal_id: string; operation_id: string; request_hash: string; body: string }
+type OperationIntent = {
+  kind: 'file_operation'
+  method: FileOperationMethod
+  params: Record<string, unknown>
+  recovery_path: string | null
+}
 type Copy = {
   ordinal: number
   workspace_id: string
@@ -66,6 +76,7 @@ const sameInode = (a: { dev: number; ino: number }, b: { dev: number; ino: numbe
 /** API writes serialize, but ordinary external editors can interleave. No filesystem CAS is claimed. */
 export class FileMutationCoordinator {
   fault?: (point: 'before_check' | 'after_intent' | 'after_truncate' | 'after_write') => void
+  operationFault?: (point: 'after_intent' | 'destination_created' | 'source_removed') => void
   private serial: Promise<unknown> = Promise.resolve()
   constructor(private r: ResourceServices) {}
   write(actor: AuthorityContext, params: FileWrite, operation?: string) {
@@ -89,6 +100,276 @@ export class FileMutationCoordinator {
       )
       return this.apply(actor, 'repository.v1.restore', params, operation)
     })
+  }
+  fileOperation(
+    actor: AuthorityContext,
+    method: FileOperationMethod,
+    params: Record<string, unknown>,
+    operation?: string
+  ) {
+    return this.schedule(async () => {
+      const previous = this.r.core.operationReceipt(actor, method, params, operation)
+      if (previous) return previous.result
+      const pending = this.r.core.db
+        .prepare('SELECT * FROM file_mutations WHERE principal_id=? AND operation_id=?')
+        .get(actor.installation_id, operation!) as IntentRow | undefined
+      if (pending)
+        return this.finishOperation(
+          pending,
+          JSON.parse(pending.body) as OperationIntent,
+          'outcome_unknown'
+        )
+      if (!params.worktree_id) this.plainFileTarget(String(params.workspace_id))
+      if (params.worktree_id) {
+        for (const path of [params.path, params.from, params.to].filter((p) => p !== undefined))
+          await this.r.repository.prepareEdit(actor, String(params.worktree_id), String(path))
+      }
+      return this.applyOperation(actor, method, params, operation!)
+    })
+  }
+  private plainFileTarget(id: string) {
+    const workspace = this.r.workspaces.get(id),
+      project = this.r.projects.get(workspace.project_id)
+    if (workspace.kind !== 'root' || project.repository_path || project.git_common_dir)
+      throw new ChannelError('git_required')
+  }
+  private finishOperation(
+    row: IntentRow,
+    intent: OperationIntent,
+    state: 'applied' | 'conflict' | 'outcome_unknown'
+  ) {
+    const result = FileOperationResultSchema.parse({
+      operation_id: row.operation_id,
+      state,
+      recovery_path: intent.recovery_path,
+    })
+    return this.r.core.transaction(() => {
+      const previous = this.r.core.storedOperationReceipt(
+        row.principal_id,
+        row.operation_id,
+        row.request_hash
+      )
+      if (previous) {
+        this.r.core.db
+          .prepare('DELETE FROM file_mutations WHERE principal_id=? AND operation_id=?')
+          .run(row.principal_id, row.operation_id)
+        return previous.result
+      }
+      this.r.core.db
+        .prepare('INSERT INTO operations VALUES(?,?,?,?)')
+        .run(row.principal_id, row.operation_id, row.request_hash, JSON.stringify(result))
+      this.r.core.db
+        .prepare('DELETE FROM file_mutations WHERE principal_id=? AND operation_id=?')
+        .run(row.principal_id, row.operation_id)
+      if (intent.params.worktree_id) {
+        const target = this.r.core.db
+          .prepare('SELECT project_id FROM repository_targets WHERE worktree_id=?')
+          .get(String(intent.params.worktree_id)) as { project_id: string }
+        this.r.core.append(
+          'catalog',
+          'repository.invalidated',
+          { kind: 'installation', installation_id: row.principal_id },
+          {
+            project_id: target.project_id,
+            worktree_id: intent.params.worktree_id,
+            reason: 'filesystem',
+            generation: randomUUID(),
+          }
+        )
+      } else
+        this.r.core.append(
+          'catalog',
+          'workspace.invalidated',
+          { kind: 'installation', installation_id: row.principal_id },
+          {
+            workspace_id: intent.params.workspace_id,
+            reason: 'filesystem',
+            generation: randomUUID(),
+          }
+        )
+      return result
+    }, true)
+  }
+  private applyOperation(
+    actor: AuthorityContext,
+    method: FileOperationMethod,
+    params: Record<string, unknown>,
+    operation: string
+  ) {
+    const core = this.r.core,
+      repository = params.worktree_id !== undefined,
+      id = String(params.worktree_id ?? params.workspace_id)
+    const previous = core.operationReceipt(actor, method, params, operation)
+    if (previous) return previous.result
+    const kind = method.split('.').at(-1)!,
+      sourcePath = String(params.from ?? params.path),
+      destPath = String(params.to ?? params.path)
+    const intent: OperationIntent = { kind: 'file_operation', method, params, recovery_path: null }
+    const row: IntentRow = {
+      principal_id: actor.installation_id,
+      operation_id: operation,
+      request_hash: hash(canonical({ method, params })),
+      body: '',
+    }
+    const initial = kind === 'mkdir' ? null : this.current(id, sourcePath, repository)
+    if (initial?.too_large) throw new ChannelError('file_too_large')
+    if (kind !== 'mkdir' && initial?.content_id !== params.expected_content_id)
+      return this.finishOperation(row, intent, 'conflict')
+    const source =
+      kind === 'mkdir' ? null : this.r.files.writeTarget(id, sourcePath, false, repository)
+    const destination =
+      kind === 'remove' ? null : this.r.files.childTarget(id, destPath, repository)
+    const exists = (path: string) => {
+      try {
+        lstatSync(path)
+        return true
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw e
+      }
+    }
+    if (destination && exists(destination)) return this.finishOperation(row, intent, 'conflict')
+    const parents = new Map<string, number>(),
+      parentStamps = new Map<string, { dev: number; ino: number }>()
+    let sourceFd: number | undefined, destinationFd: number | undefined
+    const pin = (path: string) => {
+      const parent = dirname(path)
+      if (!parents.has(parent)) {
+        const before = lstatSync(parent),
+          fd = openSync(parent, constants.O_RDONLY | constants.O_NOFOLLOW)
+        parents.set(parent, fd)
+        parentStamps.set(parent, before)
+        if (
+          !sameInode(before, fstatSync(fd)) ||
+          !before.isDirectory() ||
+          realpathSync(parent) !== parent
+        )
+          throw new ChannelError('unsafe_path')
+      }
+    }
+    const anchored = (path: string) =>
+      process.platform === 'linux'
+        ? `/proc/self/fd/${parents.get(dirname(path))!}/${basename(path)}`
+        : path
+    const recheck = () => {
+      core.authority.check(actor, 'mutate', id)
+      if (repository) this.r.repository.fileRoot(id)
+      else this.plainFileTarget(id)
+      for (const [parent, fd] of parents)
+        if (
+          realpathSync(parent) !== parent ||
+          !sameInode(lstatSync(parent), fstatSync(fd)) ||
+          !sameInode(parentStamps.get(parent)!, fstatSync(fd))
+        )
+          throw new ChannelError('unsafe_path')
+      this.r.files.childTarget(id, kind === 'remove' ? sourcePath : destPath, repository)
+      if (source) {
+        const current = this.current(id, sourcePath, repository)
+        if (
+          current?.content_id !== params.expected_content_id ||
+          !sameInode(fstatSync(sourceFd!), lstatSync(source))
+        )
+          throw new ChannelError('stale_revision')
+      }
+    }
+    try {
+      if (source) {
+        pin(source)
+        sourceFd = openSync(
+          source,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+        )
+        if (!fstatSync(sourceFd).isFile() || !sameInode(fstatSync(sourceFd), lstatSync(source)))
+          throw new ChannelError('unsafe_path')
+      }
+      if (destination) pin(destination)
+      if (
+        kind === 'move' &&
+        parentStamps.get(dirname(source!))!.dev !== parentStamps.get(dirname(destination!))!.dev
+      )
+        throw new ChannelError('unsafe_path')
+      recheck()
+      const bytes = initial
+        ? this.r.files.bytes(id, initial.content_id!, repository)
+        : Buffer.alloc(0)
+      if (kind === 'move' || kind === 'remove')
+        intent.recovery_path = this.retainCopy(id, sourcePath, bytes, repository)
+      row.body = JSON.stringify(intent)
+      const reserved = core.reserveOperation(actor, method, params, operation, () => {
+        core.db
+          .prepare('INSERT INTO file_mutations VALUES(?,?,?,?)')
+          .run(row.principal_id, row.operation_id, row.request_hash, row.body)
+      })
+      if (reserved) return reserved.result
+      this.operationFault?.('after_intent')
+      try {
+        recheck()
+        if (kind === 'mkdir') mkdirSync(anchored(destination!), { mode: 0o755 })
+        else if (kind === 'copy') {
+          destinationFd = openSync(
+            anchored(destination!),
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+            0o644
+          )
+          for (let offset = 0; offset < bytes.length;) {
+            const n = writeSync(destinationFd, bytes, offset, bytes.length - offset)
+            if (!n) throw new Error('short_file_write')
+            offset += n
+          }
+          fsyncSync(destinationFd)
+        } else if (kind === 'move') {
+          // Exclusive hard-link publication is a same-target move, never an overwriting rename.
+          linkSync(anchored(source!), anchored(destination!))
+          if (!sameInode(fstatSync(sourceFd!), lstatSync(destination!)))
+            throw new ChannelError('stale_revision')
+          fsyncSync(parents.get(dirname(destination!))!)
+          this.operationFault?.('destination_created')
+          recheck()
+          unlinkSync(anchored(source!))
+          this.operationFault?.('source_removed')
+        } else {
+          unlinkSync(anchored(source!))
+          this.operationFault?.('source_removed')
+        }
+        for (const fd of parents.values()) fsyncSync(fd)
+        if (kind === 'copy' || kind === 'mkdir') this.operationFault?.('destination_created')
+        if (source && (kind === 'move' || kind === 'remove') && exists(source))
+          return this.finishOperation(row, intent, 'outcome_unknown')
+        if (
+          destination &&
+          kind === 'move' &&
+          !sameInode(fstatSync(sourceFd!), lstatSync(destination))
+        )
+          return this.finishOperation(row, intent, 'outcome_unknown')
+        if (
+          destination &&
+          kind === 'copy' &&
+          !sameInode(fstatSync(destinationFd!), lstatSync(destination))
+        )
+          return this.finishOperation(row, intent, 'outcome_unknown')
+        if (destination) {
+          this.r.files.childTarget(id, destPath, repository)
+          if (
+            kind !== 'mkdir' &&
+            this.current(id, destPath, repository)?.content_id !== params.expected_content_id
+          )
+            return this.finishOperation(row, intent, 'outcome_unknown')
+        }
+        for (const [parent, fd] of parents)
+          if (!sameInode(lstatSync(parent), fstatSync(fd)))
+            return this.finishOperation(row, intent, 'outcome_unknown')
+        return this.finishOperation(row, intent, 'applied')
+      } catch (e) {
+        if (e instanceof Error && !('code' in e) && !(e instanceof ChannelError)) throw e
+        if ((e as NodeJS.ErrnoException).code === 'EEXIST')
+          return this.finishOperation(row, intent, 'conflict')
+        return this.finishOperation(row, intent, 'outcome_unknown')
+      }
+    } finally {
+      if (sourceFd !== undefined) closeSync(sourceFd)
+      if (destinationFd !== undefined) closeSync(destinationFd)
+      for (const fd of parents.values()) closeSync(fd)
+    }
   }
   private schedule(work: () => unknown) {
     const task = this.serial.then(work)
@@ -233,7 +514,18 @@ export class FileMutationCoordinator {
       predecessor_content_id: predecessor,
       recovery_path: recovery,
     })
-    this.r.core.transaction(() => {
+    return this.r.core.transaction(() => {
+      const previous = this.r.core.storedOperationReceipt(
+        row.principal_id,
+        row.operation_id,
+        row.request_hash
+      )
+      if (previous) {
+        this.r.core.db
+          .prepare('DELETE FROM file_mutations WHERE principal_id=? AND operation_id=?')
+          .run(row.principal_id, row.operation_id)
+        return previous.result
+      }
       this.r.core.db
         .prepare('INSERT INTO operations VALUES(?,?,?,?)')
         .run(row.principal_id, row.operation_id, row.request_hash, JSON.stringify(result))
@@ -267,8 +559,8 @@ export class FileMutationCoordinator {
             paths: [intent.params.path],
           }
         )
+      return result
     }, true)
-    return result
   }
   private sweepRecoveryDirectory() {
     const root = join(this.r.core.stateDir, 'file-recovery')
@@ -307,7 +599,12 @@ export class FileMutationCoordinator {
   recover() {
     this.sweepRecoveryDirectory()
     for (const row of this.r.core.db.prepare('SELECT * FROM file_mutations').all() as IntentRow[]) {
-      const raw = JSON.parse(row.body) as Intent
+      const raw = JSON.parse(row.body) as Intent | OperationIntent
+      if (raw.kind === 'file_operation') {
+        const params = FileOperationMethodSchemas[raw.method].parse(raw.params)
+        this.finishOperation(row, { ...raw, params }, 'outcome_unknown')
+        continue
+      }
       if (raw.kind !== 'in_place')
         throw new Error(
           'Mutation requires manual inspection: ' +
@@ -410,12 +707,13 @@ export class FileMutationCoordinator {
         )
       }
       row.body = JSON.stringify(intent)
-      core.transaction(() => {
+      const reserved = core.reserveOperation(actor, method, params, operation!, () => {
         core.authority.check(actor, method, workspace)
         core.db
           .prepare('INSERT INTO file_mutations VALUES(?,?,?,?)')
           .run(row.principal_id, row.operation_id, row.request_hash, row.body)
       })
+      if (reserved) return reserved.result
       this.fault?.('after_intent')
       core.authority.check(actor, method, workspace)
       // Revalidate approval/identity even for exclusive creation, immediately before the effect.

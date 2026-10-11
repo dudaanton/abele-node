@@ -19,7 +19,16 @@ export const IdentitySchema = z
     fingerprint: z.string().min(1).max(65535),
   })
   .strict()
+export const DebuggerToolSchema = z
+  .object({
+    name: z.string().min(1).max(128).startsWith('debug_'),
+    description: z.string().max(4096),
+    inputSchema: z.record(z.unknown()),
+  })
+  .strict()
 export const WorkerMessageSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('debugger_call'), id, name: id, args: z.unknown() }).strict(),
+  z.object({ kind: z.literal('debugger_cancel'), id }).strict(),
   z.object({ kind: z.literal('ready'), evidence: IdentitySchema }).strict(),
   z
     .object({
@@ -61,9 +70,11 @@ export const ConfigurationSchema = z
     model: z.string().max(256),
     profile: z.enum(['inherited', 'isolated']),
     maxTokens: z.number().int().min(64).max(32768),
+    debugger_tools: z.array(DebuggerToolSchema).max(32).optional(),
   })
   .strict()
 export const ParentMessageSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('debugger_result'), id, result: z.unknown() }).strict(),
   z
     .object({
       kind: z.literal('start'),

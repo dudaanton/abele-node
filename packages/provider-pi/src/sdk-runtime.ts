@@ -6,6 +6,8 @@ import { materializeNativeState } from './native-state.js'
 import { normalizeResponsesInput } from './responses-input.js'
 import { randomUUID } from 'node:crypto'
 import type { HostProcessHooks } from './processes.js'
+import type { DebuggerToolDefinition } from '@abele/provider-contract'
+import { registerDebuggerTools, registerDebuggerContext } from './debugger.js'
 import {
   PiSdkWorker,
   PiApprovalPolicy,
@@ -23,6 +25,7 @@ export interface HostConfiguration {
   model: string
   profile: 'inherited' | 'isolated'
   maxTokens: number
+  debugger_tools?: DebuggerToolDefinition[]
 }
 export async function createSdkHost(
   sdk: typeof PiSdk,
@@ -107,6 +110,10 @@ export async function createSdkHost(
           {
             name: 'abele-node-policy',
             factory: (pi) => {
+              if (hooks?.debugger) {
+                registerDebuggerTools(pi, hooks.debugger)
+                registerDebuggerContext(pi, hooks.debugger)
+              }
               pi.on('before_provider_request', (event, ctx) => {
                 if (
                   ctx.model &&
@@ -146,8 +153,12 @@ export async function createSdkHost(
                     }
                   : { operations }
               })
-              pi.on('tool_call', (event, ctx) =>
-                policy.intercept(
+              pi.on('tool_call', (event, ctx) => {
+                // These tools still authorize through the node debugger grant
+                // and exact-command approval. Do not route active-turn timers
+                // through a queued chat/ordinary permission prompt.
+                if (hooks?.debugger?.tools.some((t) => t.name === event.toolName)) return
+                return policy.intercept(
                   {
                     tool_use_id: event.toolCallId,
                     tool_name: event.toolName,
@@ -156,7 +167,7 @@ export async function createSdkHost(
                   },
                   ctx.signal
                 )
-              )
+              })
               pi.on('project_trust', async (event) => ({
                 trusted: realpathSync(event.cwd) === cwd ? 'yes' : 'no',
                 remember: false,

@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from 'vitest'
+import { testTlsRoute } from './fixtures/paired-route.js'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import {
@@ -6,6 +7,7 @@ import {
   processStepDeadlineMs,
   waitForProcessCondition,
 } from '../scripts/process-test-budget.mjs'
+import { encodePairCode } from '@abele/node-protocol'
 import { PairedListenerSchema, pairedAdmission } from '../packages/node-daemon/src/paired.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -56,7 +58,7 @@ class Keys implements DeviceKeyStore {
   }
 }
 const endpoint = 'wss://node.example.ts.net:8443/channel'
-async function setup() {
+async function setup(acceptedRoutes?: string[]) {
   const dir = mkdtempSync(resolve('.scratch/paired-daemon-'))
   dirs.push(dir)
   const local = (await offlineToken(dir, { action: 'create', value: 'owner' })) as {
@@ -74,6 +76,7 @@ async function setup() {
       origins: ['app://obsidian.md'],
       allow_missing_origin: false,
       allow_null_origin: false,
+      ...(acceptedRoutes ? { accepted_routes: acceptedRoutes } : {}),
     }
   )
   stops.push(daemon.stop)
@@ -130,6 +133,8 @@ it(
       installation_id: claim.installation_id,
       fingerprint: claim.device_fingerprint,
       state: 'pending',
+      device_name: 'cli-device',
+      created_at: expect.any(Number),
     })
     await command('pair', 'confirm', claim.installation_id, claim.device_fingerprint)
     const client = new NodeClient(
@@ -273,6 +278,226 @@ it(
     await expect(restored.connect()).rejects.toThrow('node_identity_mismatch')
   }
 )
+it(
+  'bare pair prints one code line and approve-pair selects only a unique waiting name',
+  { timeout: processScenarioDeadline(12) },
+  async () => {
+    const { dir, daemon, open } = await setup()
+    const command = (...args: string[]) =>
+      promisify(execFile)(
+        process.execPath,
+        [resolve('packages/node-daemon/dist/cli.js'), ...args, '--state-dir', dir],
+        { timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
+      )
+    const printed = await command('pair', '--node-name', 'Test node')
+    expect(printed.stdout.trim()).toMatch(/^abele1:[A-Za-z0-9_-]+$/)
+    expect(printed.stdout.trim().split('\n')).toHaveLength(1)
+    const first = JSON.parse((await command('pair', '--node-name', 'Test node', '--json')).stdout)
+    expect(first.node_name).toBe('Test node')
+    const connector = new PairedWssConnector(new Keys(), open)
+    const claim = await connector.claim(first.invite, { deviceName: 'Test device' })
+    expect(JSON.parse((await command('approve-pair', '--list', '--json')).stdout)).toContainEqual({
+      installation_id: claim.installation_id,
+      fingerprint: claim.device_fingerprint,
+      state: 'pending',
+      device_name: 'Test device',
+      created_at: expect.any(Number),
+    })
+    await expect(command('approve-pair')).rejects.toThrow('selection_required')
+    await expect(
+      command('approve-pair', 'Test device', '--fingerprint', '0'.repeat(64))
+    ).rejects.toThrow('key_mismatch')
+    const duplicateInvite = JSON.parse((await command('pair', '--json')).stdout).invite
+    const duplicate = await new PairedWssConnector(new Keys(), open).claim(duplicateInvite, {
+      deviceName: 'Test device',
+    })
+    await expect(command('approve-pair', 'Test device')).rejects.toThrow('ambiguous_device_name')
+    const approved = JSON.parse(
+      (
+        await command(
+          'approve-pair',
+          'Test device',
+          '--installation-id',
+          claim.installation_id,
+          '--json'
+        )
+      ).stdout
+    )
+    expect(approved.state).toBe('confirmed')
+    const client = new NodeClient(
+      await connector.target(daemon.node_id),
+      new MemoryClientStore(),
+      connector
+    )
+    clients.push(client)
+    await client.connect()
+    await command('approve-pair', 'Test device')
+    expect(JSON.parse((await command('approve-pair', '--list', '--json')).stdout)).toEqual([])
+    expect(duplicate.installation_id).not.toBe(claim.installation_id)
+  }
+)
+it('accepted routes preserve exact Host, Origin, path and TLS-only admission', () => {
+  const route = 'wss://alternate.example:9443/channel'
+  const config = PairedListenerSchema.parse({
+    endpoint,
+    accepted_routes: [route],
+    origins: ['app://obsidian.md'],
+  })
+  expect(pairedAdmission(config, 'alternate.example:9443', 'app://obsidian.md', '/channel')).toBe(
+    true
+  )
+  expect(pairedAdmission(config, 'alternate.example:9444', 'app://obsidian.md', '/channel')).toBe(
+    false
+  )
+  expect(pairedAdmission(config, 'unlisted.example:9443', 'app://obsidian.md', '/channel')).toBe(
+    false
+  )
+  expect(
+    pairedAdmission(config, 'alternate.example:9443', 'https://evil.example', '/channel')
+  ).toBe(false)
+  expect(pairedAdmission(config, 'alternate.example:9443', 'app://obsidian.md', '/other')).toBe(
+    false
+  )
+  for (const bad of [
+    'ws://alternate.example/channel',
+    'wss://alternate.example/other',
+    'wss://alternate.example/channel?query',
+    'wss://user:secret@alternate.example/channel',
+  ])
+    expect(() => PairedListenerSchema.parse({ endpoint, accepted_routes: [bad] })).toThrow()
+})
+it('editable transport host and port retain the code pin, invite and canonical proof endpoint', async () => {
+  const tls = await testTlsRoute()
+  stops.push(tls.stop)
+  const alternate = tls.endpoint
+  const { dir, daemon } = await setup([alternate])
+  tls.setBackendPort(daemon.paired_port!)
+  const invite = (await control(dir, {
+    action: 'pairing.issue',
+    endpoint,
+    label: 'device',
+  })) as PairingInvite
+  const routes: string[] = []
+  const connector = new PairedWssConnector(new Keys(), async (url) => {
+    routes.push(url)
+    return tls.open(url)
+  })
+  const claim = await connector.claim(invite, { deviceName: 'Test device', endpoint: alternate })
+  expect(routes).toEqual([alternate])
+  await control(dir, {
+    action: 'pairing.confirm',
+    installation_id: claim.installation_id,
+    device_fingerprint: claim.device_fingerprint,
+  })
+  await connector.claim(invite, { endpoint: alternate })
+  const target = await connector.target(daemon.node_id)
+  expect(target.url).toBe(alternate)
+  expect(target.profile === 'paired-wss-v1' && target.node_fingerprint).toBe(
+    invite.node_fingerprint
+  )
+  const client = new NodeClient(target, new MemoryClientStore(), connector)
+  clients.push(client)
+  await client.connect()
+  expect(tls.hosts.length).toBeGreaterThan(0)
+  expect(tls.hosts.every((host) => host === new URL(alternate).host)).toBe(true)
+  expect(tls.hosts).not.toContain(new URL(endpoint).host)
+  await expect(
+    new PairedWssConnector(new Keys(), tls.open).claim(
+      { ...invite, node_fingerprint: '0'.repeat(64) },
+      { endpoint: alternate }
+    )
+  ).rejects.toMatchObject({ details: { reason: 'different_node' } })
+  const listed = JSON.parse(
+    (
+      await promisify(execFile)(
+        process.execPath,
+        [
+          resolve('packages/node-daemon/dist/cli.js'),
+          'pair',
+          'routes',
+          '--json',
+          '--state-dir',
+          dir,
+        ],
+        { timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
+      )
+    ).stdout
+  )
+  expect(listed).toEqual({ endpoint, accepted_routes: [alternate] })
+  await expect(
+    connector.claim({ ...invite, node_fingerprint: '0'.repeat(64) }, { endpoint: alternate })
+  ).rejects.toThrow('node_identity_mismatch')
+  await expect(
+    connector.claim(invite, { endpoint: 'ws://alternate.example/channel' })
+  ).rejects.toThrow('endpoint_refused')
+})
+it('edited TLS routes return typed host, TLS and unreachable failures', async () => {
+  const tls = await testTlsRoute()
+  stops.push(tls.stop)
+  const { dir, daemon } = await setup()
+  tls.setBackendPort(daemon.paired_port!)
+  const invite = (await control(dir, {
+    action: 'pairing.issue',
+    endpoint,
+    label: 'device',
+  })) as PairingInvite
+  const connector = new PairedWssConnector(new Keys(), tls.open)
+  await expect(connector.claim(invite, { endpoint: tls.endpoint })).rejects.toMatchObject({
+    details: { reason: 'host_not_accepted' },
+  })
+  const invalidTls = tls.endpoint.replace('127.0.0.1', 'localhost')
+  await expect(connector.claim(invite, { endpoint: invalidTls })).rejects.toMatchObject({
+    details: { reason: 'tls' },
+  })
+  const unavailable = 'wss://127.0.0.1:1/channel'
+  await expect(connector.claim(invite, { endpoint: unavailable })).rejects.toMatchObject({
+    details: { reason: 'unreachable' },
+  })
+  expect(tls.hosts).toEqual([new URL(tls.endpoint).host])
+  const command = (...args: string[]) =>
+    promisify(execFile)(
+      process.execPath,
+      [resolve('packages/node-daemon/dist/cli.js'), ...args, '--state-dir', dir],
+      { timeout: processStepDeadlineMs, killSignal: 'SIGKILL' }
+    )
+  const routes = JSON.parse((await command('pair', 'routes', '--json')).stdout)
+  expect(routes).toEqual({ endpoint, accepted_routes: [] })
+  expect((await command('pair', 'routes')).stdout).toContain(endpoint)
+})
+it('waiting session completes only after owner approval and authenticated fake-daemon connection', async () => {
+  const { dir, open } = await setup()
+  const invite = (await control(dir, {
+    action: 'pairing.issue',
+    endpoint,
+    label: 'device',
+  })) as PairingInvite
+  const connector = new PairedWssConnector(new Keys(), open)
+  const model = connector.createPairingSession({
+    createClient: (target) => {
+      const client = new NodeClient(target, new MemoryClientStore(), connector)
+      clients.push(client)
+      return client
+    },
+    wait: async () => {
+      const entries = (await control(dir, { action: 'pairing.list' })) as Array<{
+        installation_id: string
+        fingerprint: string
+        device_name: string
+      }>
+      expect(model.state.phase).toBe('waiting')
+      expect(entries[0]!.device_name).toBe('Test device')
+      await control(dir, {
+        action: 'pairing.approve',
+        installation_id: entries[0]!.installation_id,
+        device_fingerprint: entries[0]!.fingerprint,
+      })
+    },
+  })
+  model.decode(encodePairCode({ version: 1, node_name: 'Test node', invite }))
+  const client = await model.connect('Test device')
+  expect(client?.connected).toBe(true)
+  expect(model.state.phase).toBe('connected')
+})
 it('paired listener refuses local-token from loopback and exact Host/path/Origin policy ignores forwarded headers', async () => {
   const { daemon, local } = await setup()
   async function admission(headers: Record<string, string>, path = '/channel') {

@@ -1,10 +1,17 @@
-import { spawn } from 'node:child_process'
+import { spawn, fork } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { systemProcessProbe } from '@abele/provider-claude'
+import type { ProcessIdentity } from '@abele/provider-contract'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { dirname } from 'node:path'
 import { ChannelError } from '@abele/channel-protocol'
 
 /** Internal typed commands, never a client-supplied argv or shell string. */
 export type GitCommand =
+  | { kind: 'branch.validate'; branch: string }
+  | { kind: 'empty.tree' }
+  | { kind: 'init'; branch: string }
+  | { kind: 'divergence'; base: string; head: string }
   | { kind: 'root' }
   | { kind: 'common' }
   | { kind: 'directory' }
@@ -60,6 +67,10 @@ export function decodeGit(bytes: Uint8Array): string {
     throw new ChannelError('unsupported_name')
   }
 }
+export interface GitEffectLifecycle {
+  started(evidence: ProcessIdentity): void
+  settled(): void
+}
 export class GitRunner {
   private locks = new Map<string, Promise<unknown>>()
   private deadlines = new AsyncLocalStorage<number>()
@@ -91,7 +102,8 @@ export class GitRunner {
     cwd: string,
     command: GitCommand,
     beforeEffect?: () => void,
-    deadlineMs?: number
+    deadlineMs?: number,
+    effect?: GitEffectLifecycle
   ): Promise<Buffer> {
     if (
       ['tree', 'blob', 'blob.size'].includes(command.kind) &&
@@ -110,6 +122,22 @@ export class GitRunner {
       throw new ChannelError('unsafe_path')
     let args: string[]
     switch (command.kind) {
+      case 'branch.validate':
+        args = ['check-ref-format', '--branch', command.branch]
+        break
+      case 'empty.tree':
+        args = ['hash-object', '-t', 'tree', '--stdin']
+        break
+      case 'init':
+        if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(command.branch) || command.branch.includes('..'))
+          throw new ChannelError('invalid_ref')
+        args = ['init', '--template=', '--initial-branch=' + command.branch, '.']
+        break
+      case 'divergence':
+        if (![command.base, command.head].every((c) => /^[a-f0-9]{40,64}$/.test(c)))
+          throw new ChannelError('invalid_ref')
+        args = ['rev-list', '--left-right', '--count', command.base + '...' + command.head, '--']
+        break
       case 'root':
         args = ['rev-parse', '--path-format=absolute', '--show-toplevel']
         break
@@ -325,67 +353,104 @@ export class GitRunner {
       Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))
     )
     return new Promise<Buffer>((resolve, reject) => {
-      const child = spawn(
-        this.executable,
-        [
-          '--no-pager',
-          '--literal-pathspecs',
-          '-c',
-          'log.showSignature=false',
-          '-c',
-          'gpg.program=/usr/bin/false',
-          '-c',
-          'gpg.openpgp.program=/usr/bin/false',
-          '-c',
-          'gpg.x509.program=/usr/bin/false',
-          '-c',
-          'gpg.ssh.program=/usr/bin/false',
-          '-c',
-          'commit.gpgSign=false',
-          '-c',
-          'tag.gpgSign=false',
-          '-c',
-          'core.hooksPath=/dev/null',
-          '-c',
-          'core.fsmonitor=false',
-          '-c',
-          'core.pager=/usr/bin/false',
-          '-c',
-          'core.quotepath=false',
-          '-c',
-          'diff.suppressBlankEmpty=false',
-          '-c',
-          'diff.submodule=short',
-          '-c',
-          'submodule.recurse=false',
-          '-c',
-          'core.attributesFile=/dev/null',
-          '-c',
-          'diff.ignoreSubmodules=all',
-          ...overrides,
-          ...args,
-        ],
-        {
-          cwd,
-          shell: false,
-          stdio: [command.kind === 'blame' && command.contents ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-          env: {
-            ...env,
-            // Repository metadata is needed, but host-level executable customization is not.
-            GIT_CONFIG_NOSYSTEM: '1',
-            GIT_CONFIG_GLOBAL: '/dev/null',
-            // Recognized by current Git; older versions may ignore this best-effort pin.
-            GIT_NO_LAZY_FETCH: '1',
-            // Fail closed on older Git too: repository protocol.*.allow cannot override this.
-            // No typed operation needs a transport, including local worktree mutations.
-            GIT_ALLOW_PROTOCOL: '',
-            GIT_TERMINAL_PROMPT: '0',
-            GIT_OPTIONAL_LOCKS: '0',
-            GIT_CEILING_DIRECTORIES: dirname(cwd),
-            LC_ALL: 'C',
-          },
-        }
-      )
+      const argv = [
+        '--no-pager',
+        '--literal-pathspecs',
+        '-c',
+        'log.showSignature=false',
+        '-c',
+        'gpg.program=/usr/bin/false',
+        '-c',
+        'gpg.openpgp.program=/usr/bin/false',
+        '-c',
+        'gpg.x509.program=/usr/bin/false',
+        '-c',
+        'gpg.ssh.program=/usr/bin/false',
+        '-c',
+        'commit.gpgSign=false',
+        '-c',
+        'tag.gpgSign=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'core.pager=/usr/bin/false',
+        '-c',
+        'core.quotepath=false',
+        '-c',
+        'diff.suppressBlankEmpty=false',
+        '-c',
+        'diff.submodule=short',
+        '-c',
+        'submodule.recurse=false',
+        '-c',
+        'core.attributesFile=/dev/null',
+        '-c',
+        'diff.ignoreSubmodules=all',
+        ...overrides,
+        ...args,
+      ]
+      const executionEnv = {
+        ...env,
+        // Repository metadata is needed, but host-level executable customization is not.
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        // Recognized by current Git; older versions may ignore this best-effort pin.
+        GIT_NO_LAZY_FETCH: '1',
+        // Fail closed on older Git too: repository protocol.*.allow cannot override this.
+        // No typed operation needs a transport, including local worktree mutations.
+        GIT_ALLOW_PROTOCOL: '',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_OPTIONAL_LOCKS: '0',
+        GIT_CEILING_DIRECTORIES: dirname(cwd),
+        LC_ALL: 'C',
+      }
+      const worker = new URL('./git-effect-worker.js', import.meta.url)
+      const child = effect
+        ? fork(
+            existsSync(worker) ? worker : new URL('../dist/git-effect-worker.js', import.meta.url),
+            [],
+            {
+              cwd,
+              detached: true,
+              execArgv: [],
+              env: executionEnv,
+              stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+            }
+          )
+        : spawn(this.executable, argv, {
+            cwd,
+            shell: false,
+            stdio: [
+              command.kind === 'blame' && command.contents ? 'pipe' : 'ignore',
+              'pipe',
+              'pipe',
+            ],
+            env: executionEnv,
+          })
+      let evidence: ProcessIdentity | undefined
+      if (effect)
+        child.on('message', (message: unknown) => {
+          if ((message as { kind?: string }).kind !== 'ready' || evidence) return
+          try {
+            evidence = systemProcessProbe.identity(child.pid!)
+            if (!evidence || evidence.pid !== evidence.group)
+              throw new ChannelError('git_process_unconfirmed')
+            effect.started(evidence)
+            beforeEffect?.()
+            child.send!({
+              kind: 'start',
+              executable: this.executable,
+              args: argv,
+              cwd,
+              env: executionEnv,
+            })
+          } catch (e) {
+            failure = e instanceof ChannelError ? e.code : 'storage_unavailable'
+            child.kill('SIGKILL')
+          }
+        })
       if (command.kind === 'blame' && command.contents && child.stdin) {
         child.stdin.on('error', () => {})
         child.stdin.end(command.contents)
@@ -427,6 +492,15 @@ export class GitRunner {
       })
       child.once('close', (code) => {
         clearTimeout(timer)
+        if (effect) {
+          try {
+            if (evidence && systemProcessProbe.groupMembers(evidence).length)
+              throw new ChannelError('git_process_unconfirmed')
+            effect.settled()
+          } catch (e) {
+            failure = e instanceof ChannelError ? e.code : 'git_process_unconfirmed'
+          }
+        }
         if (failure) reject(new ChannelError(failure))
         else if (code !== 0 && !(command.kind === 'filters' && code === 1))
           reject(new ChannelError('git_failed'))

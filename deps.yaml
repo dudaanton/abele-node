@@ -145,3 +145,13 @@ dependencies:
     vulns_at_install: []
     why: >-
       Patch pi SDK minimatch transitive CPU/stack exhaustion advisories; exact audited override
+  - name: '@vscode/debugprotocol'
+    ecosystem: npm
+    version: '1.68.0'
+    released: 2024-10-03
+    installed: 2026-10-10
+    checked: 2026-10-10
+    downloads_month: 1138888
+    project_age_days: 1737
+    vulns_at_install: []
+    why: 'Development-only DAP types for the node-owned bounded debugger transport'

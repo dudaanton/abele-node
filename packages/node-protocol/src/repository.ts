@@ -11,12 +11,9 @@ import { StatusEntrySchema } from './resources.js'
 const id = z.string().min(1).max(128)
 const path = RelativePathSchema.refine((p) => !p.split('/').some((s) => s.toLowerCase() === '.git'))
 const file = path.refine((p) => p.length > 0)
-const ref = z
-  .string()
-  .min(1)
-  .max(256)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/)
-  .refine((v) => !v.includes('..') && !v.includes('//'))
+import { RepositoryRefSchema } from './refs.js'
+export { RepositoryRefSchema } from './refs.js'
+const ref = RepositoryRefSchema
 export const RepositoryRevisionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('commit'), commit: CommitSchema }).strict(),
   z
@@ -43,6 +40,7 @@ export const WorktreeEntrySchema = z
     locked: z.boolean(),
     prunable: z.boolean(),
     dirty: z.boolean().nullable(),
+    listed: z.boolean().optional(),
   })
   .strict()
 export type WorktreeEntry = z.infer<typeof WorktreeEntrySchema>
@@ -101,8 +99,21 @@ export const RepositoryTreePageSchema = z
 export const RepositoryHistoryPageSchema = z
   .object({ entries: z.array(RepositoryCommitSchema).max(100), ...page })
   .strict()
+export const ChangeDetailSchema = z
+  .object({
+    kind: z.enum(['M', 'A', 'D', 'R', 'conflict']),
+    stage: z.enum(['unstaged', 'staged', 'partly']),
+    change_id: id,
+    changed_at: z.string().datetime(),
+    time_basis: z.literal('observed'),
+  })
+  .strict()
+export const DetailedStatusEntrySchema = StatusEntrySchema.merge(ChangeDetailSchema)
 export const RepositoryStatusPageSchema = z
-  .object({ entries: z.array(StatusEntrySchema).max(256), ...page })
+  .object({
+    entries: z.array(z.union([DetailedStatusEntrySchema, StatusEntrySchema])).max(256),
+    ...page,
+  })
   .strict()
 export const RepositorySearchPageSchema = z
   .object({ entries: z.array(RepositorySearchMatchSchema).max(100), ...page })
@@ -124,10 +135,15 @@ export const RepositoryRefsPageSchema = z
     ...page,
   })
   .strict()
+export const RepositoryComparisonBaseSchema = z.union([
+  RepositoryRevisionSchema,
+  z.object({ kind: z.literal('empty') }).strict(),
+])
+export type RepositoryComparisonBase = z.infer<typeof RepositoryComparisonBaseSchema>
 export const RepositoryComparisonSchema = z
   .object({
     comparison_id: id,
-    base: RepositoryRevisionSchema,
+    base: RepositoryComparisonBaseSchema,
     head: RepositoryRevisionSchema,
     mode: z.enum(['endpoint', 'merge-base', 'staged', 'unstaged']),
     entries: z.array(RepositoryChangeSchema).max(256),
@@ -204,13 +220,17 @@ export const RepositoryMethodSchemas = {
       length: z.number().int().min(1).max(131072).default(131072),
     })
     .strict(),
-  'repository.v1.worktrees': z.object({ project_id: id, ...paging }).strict(),
+  'repository.v1.worktrees': z
+    .object({ project_id: id, include_selection: z.boolean().optional(), ...paging })
+    .strict(),
   'repository.v1.refs': z.object({ ...target, ...paging }).strict(),
   'repository.v1.resolve': z.object({ ...target, ref }).strict(),
   'repository.v1.observe': z
     .object({ ...target, include_ignored: z.boolean().default(false) })
     .strict(),
-  'repository.v1.status': z.object({ ...revision, ...paging }).strict(),
+  'repository.v1.status': z
+    .object({ ...revision, include_change_details: z.boolean().optional(), ...paging })
+    .strict(),
   'repository.v1.tree': z.object({ ...revision, path: path.default(''), ...paging }).strict(),
   'repository.v1.blob': z
     .object({ ...revision, path: file, larger: z.boolean().default(false) })
@@ -235,7 +255,7 @@ export const RepositoryMethodSchemas = {
   'repository.v1.compare': z
     .object({
       ...target,
-      base: RepositoryRevisionSchema,
+      base: RepositoryComparisonBaseSchema,
       head: RepositoryRevisionSchema,
       mode: z.enum(['endpoint', 'merge-base', 'staged', 'unstaged']).default('endpoint'),
       ...paging,

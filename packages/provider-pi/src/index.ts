@@ -16,6 +16,7 @@ import {
 import { WorkerMessageSchema } from './wire.js'
 import type { PiAction, Answer } from './host.js'
 export { PiApprovalPolicy, PiExtensionUiBridge, PiSdkWorker, PiEventMapper } from './host.js'
+export { registerDebuggerTools, registerDebuggerContext } from './debugger.js'
 export type { PiAction, Answer, PiEvent, HostRuntime, HostSession } from './host.js'
 export interface PiOptions {
   stateDir: string
@@ -180,7 +181,15 @@ export class PiProviderAdapter {
       evidence = new Map<number, ProcessIdentity>(),
       answers = new Map<string, Answer>(),
       questions = new Map<string, AbortController>(),
-      claims = new Set<string>()
+      claims = new Set<string>(),
+      debuggerClaims = new Set<string>(),
+      debuggerCalls = new Map<string, AbortController>()
+    let debuggerClosed = false
+    const closeDebugger = () => {
+      if (debuggerClosed) return
+      debuggerClosed = true
+      sink.debugger?.close()
+    }
     let result: Record<string, any> | undefined,
       reason: string | undefined,
       bytes = 0,
@@ -197,6 +206,11 @@ export class PiProviderAdapter {
       finalizing = (async () => {
         clearTimeout(timer)
         abort.abort()
+        try {
+          closeDebugger()
+        } catch {
+          reason ??= 'debugger_settlement_failed'
+        }
         try {
           if (worker.pid && !evidence.has(worker.pid) && this.probe.identity(worker.pid))
             throw new Error('worker_identity_unconfirmed')
@@ -241,6 +255,11 @@ export class PiProviderAdapter {
       stopping = (async () => {
         reason ??= 'interrupted'
         abort.abort()
+        try {
+          closeDebugger()
+        } catch {
+          reason ??= 'debugger_settlement_failed'
+        }
         send({ kind: 'stop' })
         await Promise.race([done, delay(200)])
         await finalize()
@@ -278,12 +297,40 @@ export class PiProviderAdapter {
               model: this.options.model,
               profile: this.options.profile,
               maxTokens: this.options.maxTokens,
+              ...(sink.debugger?.tools.length ? { debugger_tools: sink.debugger.tools } : {}),
               ...(turn.native_session_id ? { native_session_id: turn.native_session_id } : {}),
               ...(turn.native_session_file
                 ? { native_session_file: turn.native_session_file }
                 : {}),
             },
           })
+        } else if (m.kind === 'debugger_call') {
+          if (
+            !sink.debugger ||
+            abort.signal.aborted ||
+            debuggerClaims.has(m.id) ||
+            debuggerClaims.size >= 256 ||
+            debuggerCalls.size >= 64
+          )
+            throw new Error('invalid_debugger_call')
+          debuggerClaims.add(m.id)
+          const call = new AbortController()
+          debuggerCalls.set(m.id, call)
+          const signal = AbortSignal.any([abort.signal, call.signal])
+          try {
+            const result = await sink.debugger.call(m.name, m.args, signal)
+            if (!signal.aborted)
+              send({
+                kind: 'debugger_result',
+                id: m.id,
+                result: sink.debugger.publish(m.args, result),
+              })
+          } finally {
+            debuggerCalls.delete(m.id)
+          }
+        } else if (m.kind === 'debugger_cancel') {
+          debuggerCalls.get(m.id)?.abort()
+          debuggerCalls.delete(m.id)
         } else if (m.kind === 'process_claim') {
           const p = m.evidence
           if (

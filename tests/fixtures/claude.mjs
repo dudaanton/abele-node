@@ -85,6 +85,49 @@ if (text === 'worker-loss') {
   report('question', 'question', 'Which direction?')
   report('result', 'result', 'Structured final answer')
   emit({ type: 'result', subtype: 'success', is_error: false, result: 'Structured final answer' })
+} else if (text === 'debugger-tools' || text === 'debugger-sleep-loss') {
+  const spec = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--mcp-config') + 1]))
+    .mcpServers.abele_debugger
+  if (!spec) process.exit(1)
+  const bridge = spawn(spec.command, spec.args, { env: { ...process.env, ...spec.env } })
+  const pending = new Map()
+  let buffer = ''
+  bridge.stdout.on('data', (chunk) => {
+    buffer += chunk
+    let nl
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const message = JSON.parse(buffer.slice(0, nl))
+      buffer = buffer.slice(nl + 1)
+      pending.get(message.id)?.(message.result)
+      pending.delete(message.id)
+    }
+  })
+  bridge.on('close', () => {
+    for (const resolve of pending.values()) resolve({})
+    pending.clear()
+  })
+  let next = 0
+  const request = (method, params = {}) =>
+    new Promise((resolve) => {
+      const id = ++next
+      pending.set(id, resolve)
+      bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    })
+  const { tools } = await request('tools/list')
+  const results = []
+  for (let i = 0; i < 2; i++) {
+    const result = await request('tools/call', {
+      name: text === 'debugger-sleep-loss' ? 'debug_sleep' : 'debug_status',
+      arguments: {
+        debug_session_id: 'selected',
+        ...(text === 'debugger-sleep-loss' ? { duration_ms: 0 } : {}),
+      },
+    })
+    results.push(JSON.parse(result.content[0].text))
+  }
+  writeFileSync('debugger-results.json', JSON.stringify({ tools, results }))
+  bridge.stdin.end()
+  emit({ type: 'result', subtype: 'success', is_error: false, result: 'debugger tools complete' })
 } else if (text === 'echo') {
   emit({ type: 'assistant', message: { id: 'm', content: [{ type: 'text', text: 'followup' }] } })
   emit({ type: 'result', subtype: 'success', is_error: false, result: 'followup' })

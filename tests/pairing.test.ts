@@ -41,6 +41,76 @@ it('single-use invite requires device possession and exact owner confirmation; r
   core.revokeToken(claim.installation_id)
   expect(() => pairing.actor(claim.installation_id, device.public_key)).toThrow('unauthorized')
 })
+it('persists a proven enrolling device name and age; retries cannot rename it', async () => {
+  const { pairing } = setup()
+  const invite = await pairing.issue('wss://node.example.ts.net:8443/channel', 'invitation label')
+  const device = await generateIdentity()
+  const before = Date.now()
+  const claim = await pairing.claim(invite, device.public_key, () => {}, 'Test device')
+  expect(pairing.list()).toContainEqual({
+    installation_id: claim.installation_id,
+    fingerprint: claim.device_fingerprint,
+    state: 'pending',
+    device_name: 'Test device',
+    created_at: expect.any(Number),
+  })
+  expect(pairing.list()[0]!.created_at).toBeGreaterThanOrEqual(before)
+  await pairing.claim(invite, device.public_key, () => {}, 'Spoofed rename')
+  expect(pairing.list()[0]!.device_name).toBe('Test device')
+  expect(() => pairing.approve(claim.installation_id, '0'.repeat(64))).toThrow('key_mismatch')
+  pairing.approve(claim.installation_id, claim.device_fingerprint)
+  expect(() => pairing.approve(claim.installation_id, claim.device_fingerprint)).toThrow(
+    'not_pending'
+  )
+})
+it('rejects unsafe names and never stores a name before proof succeeds', async () => {
+  const { pairing } = setup()
+  const invite = await pairing.issue('wss://node.example.ts.net:8443/channel', 'label')
+  const device = await generateIdentity()
+  await expect(
+    pairing.claim(
+      invite,
+      device.public_key,
+      () => {
+        throw new Error('proof_failed')
+      },
+      'Test device'
+    )
+  ).rejects.toThrow('proof_failed')
+  expect(pairing.list()).toEqual([])
+  for (const name of ['bad\u001b[0m', 'bad\nname', '', 'x'.repeat(129)])
+    await expect(pairing.claim(invite, device.public_key, () => {}, name)).rejects.toThrow()
+})
+it('keeps the legacy paired-device table layout compatible with existing inserts', () => {
+  const { core, pairing } = setup()
+  const installation = core.createToken('Legacy device')
+  core.db
+    .prepare("INSERT INTO paired_devices VALUES(?,?,?,'confirmed')")
+    .run(installation.installation_id, 'fixture-key', 'a'.repeat(64))
+  expect(pairing.list()).toContainEqual({
+    installation_id: installation.installation_id,
+    fingerprint: 'a'.repeat(64),
+    state: 'confirmed',
+    device_name: 'Legacy device',
+    created_at: 0,
+  })
+})
+it('additive migration keeps pending legacy devices selectable by their existing installation label', async () => {
+  const { core, pairing } = setup()
+  const invite = await pairing.issue('wss://node.example.ts.net:8443/channel', 'Legacy device')
+  const device = await generateIdentity()
+  const claim = await pairing.claim(invite, device.public_key)
+  core.db.exec('DROP TABLE paired_device_metadata')
+  const migrated = new PairingService(core)
+  expect(migrated.list()).toContainEqual({
+    installation_id: claim.installation_id,
+    fingerprint: claim.device_fingerprint,
+    state: 'pending',
+    device_name: 'Legacy device',
+    created_at: 0,
+  })
+  expect(migrated.approve(claim.installation_id, claim.device_fingerprint).state).toBe('confirmed')
+})
 it('WebCrypto identity signatures detect transcript substitution', async () => {
   const identity = await generateIdentity()
   const signature = await signProof(identity.private_key, [

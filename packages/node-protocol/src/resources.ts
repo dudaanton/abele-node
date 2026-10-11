@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { RepositoryRefSchema } from './refs.js'
 const id = z.string().min(1).max(128)
 const path = z.string().min(1).max(4096)
 const timestamp = z.string().datetime()
@@ -56,6 +57,7 @@ export const JobSchema = z
     created_at: timestamp,
     updated_at: timestamp,
     error: z.string().max(128).nullable(),
+    branch_preexisting: z.boolean().optional(),
   })
   .strict()
 export type Job = z.infer<typeof JobSchema>
@@ -85,7 +87,9 @@ export const WorkspaceDiffSchema = z
   .strict()
 const page = { after_id: id.optional(), limit: z.number().int().min(1).max(256).default(256) }
 export const ResourceMethodSchemas = {
-  'project.register': z.object({ path, trust: TrustSchema }).strict(),
+  'project.register': z
+    .object({ path, trust: TrustSchema, exact_root: z.boolean().optional() })
+    .strict(),
   'project.list': z.object(page).strict(),
   'project.get': z.object({ project_id: id }).strict(),
   'project.remove': z.object({ project_id: id }).strict(),
@@ -95,6 +99,7 @@ export const ResourceMethodSchemas = {
   'workspace.create': z
     .object({
       project_id: id,
+      branch: RepositoryRefSchema.optional(),
       // Ref names only, not Git options, revision expressions, or shell text.
       base_ref: z
         .string()

@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { systemProcessProbe } from '@abele/provider-claude'
+import type { ProcessIdentity, ProcessProbe } from '@abele/provider-contract'
 import {
   constants,
   openSync,
@@ -16,7 +19,9 @@ import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
 import {
   WorkspaceSchema,
   WorktreePageSchema,
+  RepositoryRefsPageSchema,
   type RepositoryRevision,
+  type RepositoryComparisonBase,
   type WorktreeEntry,
   type Project,
   type RepositoryMethod,
@@ -25,6 +30,7 @@ import {
   type RepositoryRestore,
 } from '@abele/node-protocol'
 import type { ResourceServices } from './resources.js'
+import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
 import { decodeGit, parseWorktrees, type GitCommand } from './git.js'
 
@@ -44,6 +50,28 @@ const safePath = (path: string) =>
     path.split('/').every((p) => p && p !== '.' && p !== '..' && p.toLowerCase() !== '.git'))
 const ttl = 10 * 60 * 1000
 const contentLimit = 64 * 1024 * 1024
+interface DeletionIntent {
+  target: Target
+  project_fingerprint: string
+  common_stamp: string
+  phase: 'prepared' | 'armed' | 'settled'
+  process: ProcessIdentity | null
+}
+interface DeletionRow {
+  principal_id: string
+  operation_id: string
+  request_hash: string
+  body: string | null
+}
+interface DeletionResult {
+  worktree_id: string
+  state: 'deleted' | 'not_applied' | 'outcome_unknown'
+  reconciliation: 'applied_as_observed' | 'not_applied' | 'unresolved'
+  observed_at: string
+  reason: string
+  reservation_retained: boolean
+}
+type DeletionReceipt = DeletionResult | { worktree_id: string; state: 'deleted' }
 interface Target {
   worktree_id: string
   project_id: string
@@ -77,6 +105,11 @@ interface Status {
   worktree: string
   path: string
   original_path?: string
+  kind?: 'M' | 'A' | 'D' | 'R' | 'conflict'
+  stage?: 'unstaged' | 'staged' | 'partly'
+  change_id?: string
+  changed_at?: string
+  time_basis?: 'observed'
 }
 interface Continuation {
   owner: string
@@ -91,7 +124,8 @@ interface Continuation {
 interface Comparison {
   owner: string
   target: string
-  base: RepositoryRevision
+  base: RepositoryComparisonBase
+  baseObject: string
   head: RepositoryRevision
   mode: 'endpoint' | 'merge-base' | 'staged' | 'unstaged'
   paths: Set<string>
@@ -121,6 +155,8 @@ interface Subscription {
 
 /** Repository targets deliberately do not enter the managed-workspace/provider tables. */
 export class RepositoryService {
+  deleteFault?: () => void
+  deletionProbe: ProcessProbe = systemProcessProbe
   private objectCache = new RepositoryObjectCache()
   private cacheGeneration = 0
   private readGenerations = new Map<string, number>()
@@ -160,11 +196,21 @@ export class RepositoryService {
       CREATE TABLE IF NOT EXISTS repository_projects(project_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, external_read INTEGER NOT NULL DEFAULT 0, default_branch TEXT);
       CREATE TABLE IF NOT EXISTS repository_targets(worktree_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, workspace_id TEXT, fingerprint TEXT NOT NULL, active INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_contents(worktree_id TEXT NOT NULL, content_id TEXT NOT NULL, content BLOB NOT NULL, touched INTEGER NOT NULL, PRIMARY KEY(worktree_id,content_id));
+      CREATE TABLE IF NOT EXISTS repository_deletions(principal_id TEXT NOT NULL, operation_id TEXT NOT NULL, request_hash TEXT NOT NULL, body TEXT, PRIMARY KEY(principal_id,operation_id));
+      CREATE TABLE IF NOT EXISTS repository_deletion_outcomes(principal_id TEXT NOT NULL, operation_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(principal_id,operation_id));
+      CREATE TABLE IF NOT EXISTS repository_change_stamps(worktree_id TEXT NOT NULL, path TEXT NOT NULL, fingerprint TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(worktree_id,path));
+      CREATE TABLE IF NOT EXISTS repository_selections(installation_id TEXT NOT NULL, project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, listed INTEGER NOT NULL, PRIMARY KEY(installation_id,project_id,worktree_id));
       CREATE TABLE IF NOT EXISTS repository_edit_permissions(worktree_id TEXT PRIMARY KEY REFERENCES repository_targets(worktree_id), enabled INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS repository_recovery_copies(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES repository_targets(worktree_id), path TEXT UNIQUE NOT NULL, file_path TEXT NOT NULL, content_id TEXT NOT NULL, size INTEGER NOT NULL);
       INSERT INTO meta VALUES('repository_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2';
       COMMIT;
     `)
+    if (
+      !(
+        r.core.db.prepare('PRAGMA table_info(repository_deletions)').all() as { name: string }[]
+      ).some((c) => c.name === 'body')
+    )
+      r.core.db.exec('ALTER TABLE repository_deletions ADD COLUMN body TEXT')
   }
   private projectFingerprint(p: Project) {
     return hash(
@@ -197,6 +243,15 @@ export class RepositoryService {
     const core = this.r.core
     return core.commitOperation(actor, 'project.repository_settings', p, operation, () => {
       const project = this.r.projects.get(String(p.project_id))
+      if (
+        !p.external_read &&
+        this.r.core.db
+          .prepare(
+            "SELECT 1 FROM execution_target_leases l JOIN repository_targets t ON t.path=l.path WHERE t.project_id=? AND t.kind='external'"
+          )
+          .get(project.project_id)
+      )
+        throw new ChannelError('resource_busy')
       this.clearObjectCache()
       this.registered(project)
       if (!p.external_read) this.invalidateReads(project.project_id)
@@ -274,6 +329,22 @@ export class RepositoryService {
       throw new ChannelError('stale_resource')
     }
     return row
+  }
+  checkWorkspaceIdentity(project: string) {
+    return this.config(project).fingerprint
+  }
+  executionIdentity(id: string) {
+    const target = this.get(id)
+    this.checkRead(target)
+    if (!target.active || this.targetFingerprint(target.path) !== target.fingerprint)
+      throw new ChannelError('stale_resource')
+    if (target.workspace_id && this.r.workspaces.get(target.workspace_id).state !== 'ready')
+      throw new ChannelError('resource_busy')
+    return { project_id: target.project_id, path: target.path, fingerprint: target.fingerprint }
+  }
+  async executionTarget(id: string) {
+    await this.validate(this.get(id))
+    return this.executionIdentity(id)
   }
   private targetFingerprint(path: string) {
     return hash(JSON.stringify([stamp(path), stamp(join(path, '.git'))]))
@@ -457,7 +528,8 @@ export class RepositoryService {
     if (
       ['repository.v1.write', 'repository.v1.restore', 'repository.v1.recovery.read'].includes(
         method
-      )
+      ) ||
+      method.startsWith('repository.v1.file.')
     ) {
       this.checkPublication(actor, p)
       this.fileRoot(String(p.worktree_id))
@@ -643,6 +715,22 @@ export class RepositoryService {
         locked: record.locked,
         prunable: record.prunable,
         dirty,
+        ...(p.include_selection
+          ? {
+              listed:
+                kind === 'root' ||
+                Boolean(
+                  (
+                    this.r.core.db
+                      .prepare(
+                        'SELECT listed FROM repository_selections WHERE installation_id=? AND project_id=? AND worktree_id=?'
+                      )
+                      .get(actor.installation_id, project.project_id, target.worktree_id) as
+                      { listed: number } | undefined
+                  )?.listed ?? (kind === 'managed' ? 1 : 0)
+                ),
+            }
+          : {}),
       })
     }
     // Removed records cannot retain read authority even if a directory remains at the old path.
@@ -662,6 +750,7 @@ export class RepositoryService {
         readGeneration !== (this.readGenerations.get(project.project_id) ?? 0))
     )
       throw new ChannelError('unauthorized')
+    entries.sort((a, b) => (a.kind === 'root' ? 0 : 1) - (b.kind === 'root' ? 0 : 1))
     const resumed = this.continuation(actor, method, p)
     // Catalogue cursors must not silently publish stale authority/discovery results.
     if (resumed) {
@@ -671,6 +760,429 @@ export class RepositoryService {
       return resumed
     }
     return this.page(actor, method, p, entries)
+  }
+  private deletionSettled(intent: DeletionIntent | undefined): boolean {
+    if (intent?.phase === 'prepared' || intent?.phase === 'settled') return true
+    if (intent?.process) {
+      const p = intent.process,
+        actual = this.deletionProbe.identity(p.pid)
+      if (actual && (actual.fingerprint !== p.fingerprint || actual.group !== p.group))
+        throw new Error('process_identity_changed')
+      return !actual && this.deletionProbe.groupMembers(p).length === 0
+    }
+    // Legacy intents predate the gated process evidence. The old daemon cannot
+    // launch another effect after ownership recovery; conservatively require no
+    // removal command in a successful system inventory before observing its result.
+    const inventory = spawnSync('/bin/ps', ['-axo', 'args='], {
+      encoding: 'utf8',
+      timeout: 2000,
+      maxBuffer: 1024 * 1024,
+    })
+    if (inventory.error || inventory.signal || inventory.status !== 0 || !inventory.stdout.trim())
+      throw new Error('process_inventory_unavailable')
+    return !inventory.stdout.split('\n').some((line) => /\bworktree\s+remove\b/.test(line))
+  }
+  private async reconcileDeletion(
+    row: DeletionRow,
+    legacySuccess = false
+  ): Promise<DeletionReceipt> {
+    const core = this.r.core
+    const reservation = core.db
+      .prepare(
+        'SELECT * FROM execution_target_reservations WHERE principal_id=? AND operation_id=?'
+      )
+      .get(row.principal_id, row.operation_id) as
+      { worktree_id: string; project_id: string; path: string } | undefined
+    let intent: DeletionIntent | undefined, target: Target | undefined
+    let reason = 'target_unconfirmed',
+      state: DeletionResult['state'] = 'outcome_unknown'
+    try {
+      intent = row.body ? (JSON.parse(row.body) as DeletionIntent) : undefined
+      target = intent?.target ?? (reservation ? this.get(reservation.worktree_id) : undefined)
+      if (
+        !target ||
+        target.kind !== 'external' ||
+        (reservation &&
+          (target.project_id !== reservation.project_id || target.path !== reservation.path))
+      )
+        throw new Error('target_unconfirmed')
+      reason = 'git_process_unconfirmed'
+      if (!this.deletionSettled(intent)) reason = 'git_process_live'
+      else {
+        reason = 'target_unconfirmed'
+        const project = this.r.projects.get(target.project_id),
+          config = this.config(project.project_id)
+        if (
+          intent &&
+          (config.fingerprint !== intent.project_fingerprint ||
+            stamp(project.git_common_dir!) !== intent.common_stamp)
+        )
+          throw new Error('target_unconfirmed')
+        await this.r.projects.available(project)
+        const records = parseWorktrees(
+          await this.r.git.run(project.root_path, { kind: 'worktrees' })
+        )
+        const listed = records.find((w) => w.path === target!.path)
+        let present = true
+        try {
+          lstatSync(target.path)
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+          present = false
+        }
+        if (!listed && !present) state = 'deleted'
+        else if (
+          listed &&
+          !listed.bare &&
+          present &&
+          this.targetFingerprint(target.path) === target.fingerprint
+        ) {
+          // Recovery is an owner/state inspection, not a browsing/edit grant. Do
+          // not let revoked external-read epochs prevent releasing a settled fence.
+          if (
+            realpathSync(target.path) !== target.path ||
+            lstatSync(target.path).isSymbolicLink() ||
+            realpathSync(await this.r.git.text(target.path, { kind: 'root' })) !== target.path ||
+            realpathSync(await this.r.git.text(target.path, { kind: 'common' })) !==
+              project.git_common_dir
+          )
+            throw new Error('target_unconfirmed')
+          state = 'not_applied'
+        }
+        if (state !== 'outcome_unknown') reason = 'observed'
+      }
+    } catch {
+      /* Missing identity, failed probes or incomplete Git state retain the fence. */
+    }
+    const result: DeletionResult = {
+      worktree_id: target?.worktree_id ?? reservation?.worktree_id ?? 'unknown',
+      state,
+      reconciliation:
+        state === 'deleted'
+          ? 'applied_as_observed'
+          : state === 'not_applied'
+            ? 'not_applied'
+            : 'unresolved',
+      observed_at: new Date().toISOString(),
+      reason,
+      reservation_retained: false,
+    }
+    return core.transaction(() => {
+      const previous = core.storedOperationReceipt(
+        row.principal_id,
+        row.operation_id,
+        row.request_hash
+      )
+      if (previous && (previous.result as { state?: string }).state !== 'outcome_unknown')
+        return previous.result as DeletionReceipt
+      result.reservation_retained =
+        state === 'outcome_unknown' &&
+        !!core.db
+          .prepare(
+            'SELECT 1 FROM execution_target_reservations WHERE principal_id=? AND operation_id=?'
+          )
+          .get(row.principal_id, row.operation_id)
+      core.db
+        .prepare(
+          'INSERT INTO repository_deletion_outcomes VALUES(?,?,?) ON CONFLICT(principal_id,operation_id) DO UPDATE SET body=excluded.body'
+        )
+        .run(row.principal_id, row.operation_id, JSON.stringify(result))
+      if (state === 'outcome_unknown') return result
+      // This is an observed terminal outcome, not an execution/replay of removal.
+      // Normal successful calls retain the established response/receipt shape.
+      const receipt: DeletionReceipt =
+        legacySuccess && state === 'deleted'
+          ? { worktree_id: result.worktree_id, state: 'deleted' }
+          : result
+      core.db
+        .prepare(
+          'INSERT INTO operations VALUES(?,?,?,?) ON CONFLICT(principal_id,operation_id) DO UPDATE SET receipt=excluded.receipt'
+        )
+        .run(row.principal_id, row.operation_id, row.request_hash, JSON.stringify(receipt))
+      if (state === 'deleted') {
+        core.db
+          .prepare('UPDATE repository_targets SET active=0 WHERE worktree_id=?')
+          .run(result.worktree_id)
+        core.db
+          .prepare('DELETE FROM repository_edit_permissions WHERE worktree_id=?')
+          .run(result.worktree_id)
+        for (const [id, lease] of this.subscriptions)
+          if (lease.target.worktree_id === result.worktree_id) this.unwatch(id)
+        core.append(
+          'catalog',
+          'project.worktree.deleted',
+          { kind: 'node' },
+          { project_id: target!.project_id, worktree_id: result.worktree_id }
+        )
+      }
+      core.db
+        .prepare('DELETE FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+        .run(row.principal_id, row.operation_id)
+      core.db
+        .prepare(
+          'DELETE FROM execution_target_reservations WHERE principal_id=? AND operation_id=?'
+        )
+        .run(row.principal_id, row.operation_id)
+      core.append('catalog', 'project.worktree.deletion.reconciled', { kind: 'node' }, result)
+      return receipt
+    })
+  }
+  /** Startup and protected owner CLI inspection. Never starts or repeats a removal. */
+  async recoverDeletions(operation?: string, installation?: string) {
+    const rows = this.r.core.db
+      .prepare(
+        'SELECT * FROM repository_deletions WHERE (? IS NULL OR operation_id=?) AND (? IS NULL OR principal_id=?)'
+      )
+      .all(
+        operation ?? null,
+        operation ?? null,
+        installation ?? null,
+        installation ?? null
+      ) as unknown as DeletionRow[]
+    for (const row of rows) {
+      const reservation = this.r.core.db
+        .prepare(
+          'SELECT project_id FROM execution_target_reservations WHERE principal_id=? AND operation_id=?'
+        )
+        .get(row.principal_id, row.operation_id) as { project_id: string } | undefined
+      let key = row.principal_id + ':' + row.operation_id
+      try {
+        key =
+          this.r.projects.get(
+            reservation?.project_id ?? (JSON.parse(row.body!) as DeletionIntent).target.project_id
+          ).git_common_dir ?? key
+      } catch {
+        /* preserve incomplete evidence */
+      }
+      await this.r.git.serialize(key, async () => {
+        const current = this.r.core.db
+          .prepare('SELECT * FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+          .get(row.principal_id, row.operation_id) as DeletionRow | undefined
+        if (current) await this.r.git.bounded(15000, () => this.reconcileDeletion(current))
+      })
+    }
+    return (
+      this.r.core.db
+        .prepare(
+          'SELECT * FROM repository_deletion_outcomes WHERE (? IS NULL OR operation_id=?) AND (? IS NULL OR principal_id=?) ORDER BY rowid'
+        )
+        .all(operation ?? null, operation ?? null, installation ?? null, installation ?? null) as {
+        principal_id: string
+        operation_id: string
+        body: string
+      }[]
+    ).map((row) => ({
+      installation_id: row.principal_id,
+      operation_id: row.operation_id,
+      ...(JSON.parse(row.body) as DeletionResult),
+    }))
+  }
+  checkDeletionPublication(actor: AuthorityContext, p: Record<string, unknown>) {
+    const target = this.get(String(p.worktree_id))
+    this.r.core.authority.check(actor, 'publish', target.worktree_id)
+    this.checkRead(target)
+  }
+  deleteWorktree(actor: AuthorityContext, p: Record<string, unknown>, operation?: string) {
+    return this.editJob(async () => {
+      const method = 'repository.v1.worktree.delete',
+        core = this.r.core
+      const previous = core.operationReceipt(actor, method, p, operation)
+      if (
+        previous &&
+        ((previous.result as { state?: string }).state !== 'outcome_unknown' ||
+          !core.db
+            .prepare('SELECT 1 FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+            .get(actor.installation_id, operation!))
+      )
+        return previous.result
+      const request_hash = hash(canonical({ method, params: p }))
+      const target = this.get(String(p.worktree_id))
+      if (target.kind !== 'external') throw new ChannelError('unmanaged_workspace')
+      const project = this.r.projects.get(target.project_id)
+      return this.r.git.serialize(project.git_common_dir!, async () => {
+        const previous = core.operationReceipt(actor, method, p, operation)
+        // An in-flight effect owns this same common-directory lock. Only a surviving
+        // intent after it releases the lock is uncertain; concurrent retries wait for its receipt.
+        const pending = core.db
+          .prepare('SELECT * FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+          .get(actor.installation_id, operation!) as DeletionRow | undefined
+        if (
+          previous &&
+          ((previous.result as { state?: string }).state !== 'outcome_unknown' || !pending)
+        )
+          return previous.result
+        if (pending) {
+          if (pending.request_hash !== request_hash) throw new ChannelError('idempotency_mismatch')
+          return this.reconcileDeletion(pending)
+        }
+        const releaseReservation = this.r.targets.reserveDeletion(
+          actor,
+          target.project_id,
+          target.path,
+          target.worktree_id,
+          operation!
+        )
+        try {
+          await this.validate(target)
+          const observed = this.observations.get(String(p.expected_observation_id))
+          if (
+            !observed ||
+            observed.owner !== actor.installation_id ||
+            observed.target !== target.worktree_id ||
+            observed.revision.head !== p.expected_head
+          )
+            throw new ChannelError('stale_revision')
+          await this.observation(actor, target, observed.revision)
+          const records = parseWorktrees(
+            await this.r.git.run(project.root_path, { kind: 'worktrees' })
+          )
+          const record = records.find((w) => w.path === target.path)
+          if (!record || record.bare || record.prunable)
+            throw new ChannelError('unmanaged_workspace')
+          if (
+            record.locked ||
+            this.r.targets.leasedPath(target.path) ||
+            (target.workspace_id && this.r.workspaces.leased(target.workspace_id))
+          )
+            throw new ChannelError('resource_busy')
+          const gitDir = await this.r.git.text(target.path, { kind: 'directory' })
+          const effectFingerprint = () =>
+            hash(
+              JSON.stringify([
+                this.r.nodePath.snapshot(target.path),
+                this.r.nodePath.snapshot(join(project.git_common_dir!, 'refs')),
+                ...[
+                  join(target.path, '.git'),
+                  join(gitDir, 'HEAD'),
+                  join(gitDir, 'locked'),
+                  join(gitDir, 'gitdir'),
+                  join(project.git_common_dir!, 'packed-refs'),
+                ].map((path) => {
+                  try {
+                    return metadata(path)
+                  } catch {
+                    return null
+                  }
+                }),
+              ])
+            )
+          const inspected = effectFingerprint()
+          if ((await this.head(target)) !== p.expected_head)
+            throw new ChannelError('stale_revision')
+          if (
+            (await this.r.git.run(target.path, { kind: 'status' })).length ||
+            (await this.r.git.run(target.path, { kind: 'untracked' })).length
+          )
+            throw new ChannelError('workspace_dirty')
+          if (effectFingerprint() !== inspected) throw new ChannelError('stale_revision')
+          core.authority.check(actor, 'mutate', target.worktree_id)
+          this.checkPublication(actor, p)
+          const intent: DeletionIntent = {
+            target,
+            project_fingerprint: this.config(project.project_id).fingerprint,
+            common_stamp: stamp(project.git_common_dir!),
+            phase: 'prepared',
+            process: null,
+          }
+          const saveIntent = () =>
+            core.transaction(() =>
+              core.db
+                .prepare(
+                  'UPDATE repository_deletions SET body=? WHERE principal_id=? AND operation_id=?'
+                )
+                .run(JSON.stringify(intent), actor.installation_id, operation!)
+            )
+          const reserved = core.reserveOperation(actor, method, p, operation!, () => {
+            core.db
+              .prepare(
+                'INSERT INTO repository_deletions(principal_id,operation_id,request_hash,body) VALUES(?,?,?,?)'
+              )
+              .run(actor.installation_id, operation!, request_hash, JSON.stringify(intent))
+          })
+          if (reserved) return reserved.result
+          try {
+            await this.r.git.run(
+              project.root_path,
+              { kind: 'worktree.remove', path: target.path },
+              () => {
+                core.authority.check(actor, 'mutate', target.worktree_id)
+                this.checkPublication(actor, p)
+                this.r.targets.checkDeletionReservation(actor, target.path, operation!)
+                if (effectFingerprint() !== inspected) throw new ChannelError('stale_revision')
+              },
+              undefined,
+              {
+                started: (evidence) => {
+                  intent.phase = 'armed'
+                  intent.process = evidence
+                  saveIntent()
+                },
+                settled: () => {
+                  intent.phase = 'settled'
+                  saveIntent()
+                },
+              }
+            )
+          } catch (e) {
+            if (
+              !(e instanceof ChannelError) ||
+              ![
+                'git_process_unconfirmed',
+                'git_timeout',
+                'git_failed',
+                'repository_unavailable',
+                'output_limit',
+              ].includes(e.code)
+            )
+              throw e
+            const row = core.db
+              .prepare('SELECT * FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+              .get(actor.installation_id, operation!) as unknown as DeletionRow
+            return await this.reconcileDeletion(row)
+          }
+          this.deleteFault?.()
+          const row = core.db
+            .prepare('SELECT * FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+            .get(actor.installation_id, operation!) as unknown as DeletionRow
+          return await this.reconcileDeletion(row, true)
+        } finally {
+          // Settlement of Git is only process evidence. A surviving durable
+          // intent must remain fenced until target inspection commits a terminal
+          // observation. Preflight failures without an intent can release safely.
+          if (
+            !core.db
+              .prepare('SELECT 1 FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+              .get(actor.installation_id, operation!)
+          )
+            releaseReservation()
+        }
+      })
+    })
+  }
+  async select(actor: AuthorityContext, p: Record<string, unknown>, operation?: string) {
+    const target = await this.validate(this.get(String(p.worktree_id)))
+    if (target.project_id !== p.project_id || (target.kind === 'root' && !p.listed))
+      throw new ChannelError('invalid_params')
+    return this.r.core.commitOperation(actor, 'project.worktree_selection', p, operation, () => {
+      this.checkPublication(actor, { worktree_id: target.worktree_id })
+      this.r.core.db
+        .prepare(
+          'INSERT INTO repository_selections VALUES(?,?,?,?) ON CONFLICT(installation_id,project_id,worktree_id) DO UPDATE SET listed=excluded.listed'
+        )
+        .run(actor.installation_id, target.project_id, target.worktree_id, p.listed ? 1 : 0)
+      const result = {
+        project_id: target.project_id,
+        worktree_id: target.worktree_id,
+        listed: Boolean(p.listed),
+      }
+      this.r.core.append(
+        'catalog',
+        'project.worktree_selection.changed',
+        { kind: 'installation', installation_id: actor.installation_id },
+        result
+      )
+      return result
+    })
   }
   private checked(target: Target, path: string) {
     if (!safePath(path)) throw new ChannelError('unsafe_path')
@@ -808,6 +1320,135 @@ export class RepositoryService {
       status,
       fingerprint: hash(JSON.stringify([head, status, stamps, internal])),
     }
+  }
+  private async changeDetails(target: Target, rows: Status[]) {
+    const tracked = decodeGit(await this.r.git.run(target.path, { kind: 'tracked' }))
+      .split('\0')
+      .filter(Boolean)
+    let bytes = 0
+    const detailed: Status[] = []
+    for (const row of rows) {
+      const conflict = ['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'].includes(row.index + row.worktree)
+      const untracked = row.index === '?'
+      const staged = !untracked && row.index !== ' '
+      const unstaged = untracked || row.worktree !== ' '
+      const kind = conflict
+        ? 'conflict'
+        : untracked
+          ? 'A'
+          : /R/.test(row.index + row.worktree)
+            ? 'R'
+            : /D/.test(row.index + row.worktree)
+              ? 'D'
+              : /A/.test(row.index + row.worktree)
+                ? 'A'
+                : 'M'
+      const stage = conflict
+        ? 'unstaged'
+        : staged && unstaged
+          ? 'partly'
+          : staged
+            ? 'staged'
+            : 'unstaged'
+      let content: string | null = null
+      try {
+        const parent = row.path.includes('/') ? row.path.slice(0, row.path.lastIndexOf('/')) : ''
+        this.checked(target, parent)
+        const full = join(target.path, row.path),
+          s = lstatSync(full)
+        if (s.isFile() && bytes + s.size <= 16 * 1024 * 1024) {
+          const result = this.readFile(target, row.path, 16 * 1024 * 1024)
+          if (result.bytes) {
+            content = hash(result.bytes)
+            bytes += result.bytes.length
+          }
+        } else content = metadata(full)
+      } catch (e) {
+        if (e instanceof ChannelError && e.code === 'stale_revision') throw e
+        content = null
+      }
+      const fingerprint = hash(
+        JSON.stringify([
+          row,
+          tracked.filter((f) => f.slice(f.indexOf('\t') + 1) === row.path),
+          content,
+        ])
+      )
+      const old = this.r.core.db
+        .prepare(
+          'SELECT fingerprint,body FROM repository_change_stamps WHERE worktree_id=? AND path=?'
+        )
+        .get(target.worktree_id, row.path) as { fingerprint: string; body: string } | undefined
+      const detail =
+        old?.fingerprint === fingerprint
+          ? (JSON.parse(old.body) as Record<string, unknown>)
+          : {
+              kind,
+              stage,
+              change_id: randomUUID(),
+              changed_at: new Date().toISOString(),
+              time_basis: 'observed',
+            }
+      this.r.core.db
+        .prepare(
+          'INSERT INTO repository_change_stamps VALUES(?,?,?,?) ON CONFLICT(worktree_id,path) DO UPDATE SET fingerprint=excluded.fingerprint,body=excluded.body'
+        )
+        .run(target.worktree_id, row.path, fingerprint, JSON.stringify(detail))
+      detailed.push({ ...row, ...detail })
+    }
+    // A clean interval separates successive changes, even if bytes later match an old edit.
+    const dirty = new Set(rows.map((row) => row.path))
+    for (const row of this.r.core.db
+      .prepare('SELECT path FROM repository_change_stamps WHERE worktree_id=?')
+      .all(target.worktree_id) as { path: string }[])
+      if (!dirty.has(row.path))
+        this.r.core.db
+          .prepare('DELETE FROM repository_change_stamps WHERE worktree_id=? AND path=?')
+          .run(target.worktree_id, row.path)
+    return detailed
+  }
+  private async divergence(actor: AuthorityContext, target: Target, p: Record<string, unknown>) {
+    const base_ref =
+      p.base_ref === undefined
+        ? RepositoryRefsPageSchema.parse(
+            await this.refs(actor, target, 'repository.v1.refs', {
+              worktree_id: target.worktree_id,
+              limit: 256,
+            })
+          ).default_branch
+        : String(p.base_ref)
+    const head_commit = await this.head(target)
+    let base_commit: string | null = null
+    if (base_ref) {
+      try {
+        base_commit = await this.r.git.text(target.path, { kind: 'resolve', ref: base_ref })
+      } catch (e) {
+        if (!(e instanceof ChannelError) || e.code !== 'git_failed') throw e
+      }
+    }
+    const result = {
+      base_ref,
+      base_commit,
+      head_commit,
+      ahead: null as number | null,
+      behind: null as number | null,
+    }
+    if (!base_ref) return { ...result, reason: 'default_branch_required' }
+    if (!head_commit) return { ...result, reason: 'unborn_head' }
+    if (!base_commit) return { ...result, reason: 'unborn_base' }
+    const counts = (
+      await this.r.git.text(target.path, {
+        kind: 'divergence',
+        base: base_commit,
+        head: head_commit,
+      })
+    )
+      .trim()
+      .split(/\s+/)
+      .map(Number)
+    if (counts.length !== 2 || counts.some((n) => !Number.isSafeInteger(n) || n < 0))
+      throw new ChannelError('git_failed')
+    return { ...result, behind: counts[0], ahead: counts[1], reason: 'ok' }
   }
   private async observation(actor: AuthorityContext, target: Target, revision: RepositoryRevision) {
     if (revision.kind !== 'working') throw new ChannelError('invalid_revision')
@@ -1104,14 +1745,19 @@ export class RepositoryService {
     method: string,
     p: Record<string, unknown>
   ) {
-    let base = p.base as RepositoryRevision,
+    let base = p.base as RepositoryComparisonBase,
       head = p.head as RepositoryRevision
     const mode = p.mode as Comparison['mode']
-    if (base.kind !== 'commit') throw new ChannelError('invalid_revision')
+    if (base.kind === 'working') throw new ChannelError('invalid_revision')
+    if (
+      base.kind === 'empty' &&
+      (head.kind !== 'working' || head.head !== null || mode === 'merge-base')
+    )
+      throw new ChannelError('invalid_revision')
     if (head.kind === 'working') await this.observation(actor, target, head)
     if (mode === 'merge-base') {
       const commit = head.kind === 'commit' ? head.commit : head.head
-      if (!commit) throw new ChannelError('invalid_revision')
+      if (!commit || base.kind !== 'commit') throw new ChannelError('invalid_revision')
       base = {
         kind: 'commit',
         commit: await this.r.git.text(target.path, {
@@ -1125,10 +1771,14 @@ export class RepositoryService {
       throw new ChannelError('invalid_revision')
     const continued = this.continuation(actor, method, p)
     if (continued) return continued
+    const baseObject =
+      base.kind === 'empty'
+        ? await this.r.git.text(target.path, { kind: 'empty.tree' })
+        : base.commit
     const fields = decodeGit(
       await this.r.git.run(target.path, {
         kind: 'changes',
-        base: base.commit,
+        base: baseObject,
         ...(head.kind === 'commit' ? { head: head.commit } : {}),
         staged: mode === 'staged',
         unstaged: mode === 'unstaged',
@@ -1156,6 +1806,7 @@ export class RepositoryService {
       owner: actor.installation_id,
       target: target.worktree_id,
       base,
+      baseObject,
       head,
       mode,
       paths: new Set(rows.map((r) => r.path)),
@@ -1174,8 +1825,7 @@ export class RepositoryService {
       comparison.target !== target.worktree_id
     )
       throw new ChannelError('comparison_expired')
-    if (!comparison.paths.has(path) || comparison.base.kind !== 'commit')
-      throw new ChannelError('not_found')
+    if (!comparison.paths.has(path)) throw new ChannelError('not_found')
     const captured = comparison.patches.get(path)
     if (captured) {
       this.content(target, captured.content_id)
@@ -1197,7 +1847,7 @@ export class RepositoryService {
       } else
         bytes = await this.r.git.run(target.path, {
           kind: 'patch',
-          base: comparison.base.commit,
+          base: comparison.baseObject,
           staged: comparison.mode === 'staged',
           unstaged: comparison.mode === 'unstaged',
           path,
@@ -1206,7 +1856,7 @@ export class RepositoryService {
     } else
       bytes = await this.r.git.run(target.path, {
         kind: 'patch',
-        base: comparison.base.commit,
+        base: comparison.baseObject,
         head: comparison.head.commit,
         path,
       })
@@ -1643,6 +2293,9 @@ export class RepositoryService {
               commit: await this.r.git.text(target.path, { kind: 'resolve', ref: String(p.ref) }),
             }
             break
+          case 'repository.v1.divergence':
+            result = await this.divergence(actor, target, p)
+            break
           case 'repository.v1.refs':
             result = await this.refs(actor, target, method, p)
             break
@@ -1664,7 +2317,7 @@ export class RepositoryService {
               revision,
               fingerprint: after.fingerprint,
               files: after.files,
-              status: after.status,
+              status: await this.changeDetails(target, after.status),
               expires: Date.now() + ttl,
               includeIgnored,
             })
@@ -1677,7 +2330,18 @@ export class RepositoryService {
               actor,
               method,
               p,
-              (await this.observation(actor, target, revision!)).status
+              (await this.observation(actor, target, revision!)).status.map((row) => {
+                if (p.include_change_details) return row
+                const {
+                  kind: _kind,
+                  stage: _stage,
+                  change_id: _id,
+                  changed_at: _at,
+                  time_basis: _basis,
+                  ...raw
+                } = row
+                return raw
+              })
             )
             break
           case 'repository.v1.tree': {
@@ -1806,7 +2470,7 @@ export class RepositoryService {
   }
 }
 
-const searchWorker = `
+export const searchWorker = `
 const { parentPort } = require('node:worker_threads');
 let query, mode, sensitive, expression, glob;
 parentPort.on('message', data => {

@@ -1,6 +1,6 @@
 {
   "name": "abele-node",
-  "version": "0.3.11",
+  "version": "0.4.0",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
@@ -31,6 +31,7 @@
     "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@vscode/debugprotocol": "1.68.0",
     "@types/node": "22.20.1",
     "@types/ws": "8.18.1",
     "prettier": "3.9.6",

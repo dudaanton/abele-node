@@ -4,7 +4,9 @@ import { isAbsolute } from 'node:path'
 import { ProcessSupervisor, systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
 import type { BashOperations } from '@earendil-works/pi-coding-agent'
 import { ShellMessageSchema } from './shell-wire.js'
+import type { DebuggerToolBridge } from '@abele/provider-contract'
 export interface HostProcessHooks {
+  debugger?: DebuggerToolBridge
   bashOperations(shellPath?: string): BashOperations
 }
 export interface GroupCallbacks {

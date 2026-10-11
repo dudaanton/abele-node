@@ -1,3 +1,5 @@
+import { shortPairingFingerprint } from '@abele/node-protocol'
+
 // Keep presentation separate from the machine protocol: never mutate JSON reports.
 type Report = Record<string, unknown>
 const record = (value: unknown): Report =>
@@ -95,6 +97,13 @@ export function humanOutput(
 ): string {
   const r = record(value)
   switch (args[0]) {
+    case 'recover-worktree-deletion':
+      return list(
+        value,
+        'No deletion recovery records match.',
+        (item) =>
+          `${line(item.operation_id)} (${line(item.installation_id)}): ${line(item.reconciliation)} — ${line(item.reason)}${item.state === 'outcome_unknown' ? (item.reservation_retained === true ? '. Reservation retained; check again after the Git process/state is settled.' : '. No reservation confirmed; deletion unresolved. Check node state before proceeding.') : '. Observed without replaying removal.'}`
+      )
     case 'status':
       return [
         `AbeleNode: ${r.running ? 'running' : 'not running'}`,
@@ -225,6 +234,15 @@ export function humanOutput(
           `${line(item.installation_id)} — ${line(item.label)} (${item.revoked ? 'revoked' : 'active'})`
       )
     case 'pair':
+      if (args[1] === 'routes')
+        return [
+          `Canonical paired route: ${line(r.endpoint)}`,
+          'Extra accepted routes:',
+          ...(Array.isArray(r.accepted_routes) && r.accepted_routes.length
+            ? r.accepted_routes.map((route) => line(route))
+            : ['None.']),
+          'TLS must be valid for each route; configure accepted_routes in the paired configuration and restart to change them.',
+        ].join('\n')
       if (args[1] === 'list')
         return list(
           value,
@@ -237,6 +255,25 @@ export function humanOutput(
       if (args[1] === 'revoke') return `Revoked paired installation ${line(r.revoked)}.`
       if (args[1] === 'rotate') return `Rotated node key: ${fields(record(r.node_key))}`
       return `Paired installation ${line(r.installation_id)}: ${line(r.state)}; fingerprint ${line(r.device_fingerprint)}.`
+    case 'approve-pair':
+      if (Array.isArray(value))
+        return value.length
+          ? value
+              .map((entry, index) => {
+                const item = record(entry)
+                const age =
+                  Number(item.created_at) > 0
+                    ? `${Math.max(0, Math.floor((Date.now() - Number(item.created_at)) / 1000))}s ago`
+                    : 'age unknown'
+                const name = JSON.stringify(String(item.device_name)).replace(
+                  /[\p{Cc}\p{Cf}]/gu,
+                  (character) => `\\u{${character.codePointAt(0)!.toString(16)}}`
+                )
+                return `${index + 1}. ${name} — ${shortPairingFingerprint(String(item.fingerprint))}; ${age}; ID ${line(item.installation_id)}`
+              })
+              .join('\n')
+          : 'No devices waiting to pair.'
+      return `Approved installation ${line(r.installation_id)}; fingerprint ${shortPairingFingerprint(String(r.device_fingerprint))}.`
     case 'serve':
       return `Tailscale Serve ${args[1] === 'enable' ? 'enabled' : 'disabled'}.`
     default:

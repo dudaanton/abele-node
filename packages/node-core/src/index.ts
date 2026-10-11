@@ -26,10 +26,29 @@ import {
   type FakeStep,
 } from '@abele/node-protocol'
 
+import { DebuggerService, migrateDebugger } from './debugger/index.js'
+import { DebuggerCoordinator } from './debugger/coordinator.js'
+import { migrateDebuggerControl, migrateDebuggerModes } from './debugger/storage.js'
+export { DebuggerCoordinator } from './debugger/coordinator.js'
+export { DebuggerAgentBinding, debuggerToolDefinitions } from './debugger/agent.js'
+export { DebuggerRunBinding } from './debugger/run.js'
+export type { DebuggerRunContext } from './debugger/run.js'
+export { DapDebuggerBackend } from './debugger/dap-backend.js'
+export type {
+  DebuggerPrincipal,
+  DebuggerBackend,
+  DebuggerDispatchGuard,
+} from './debugger/coordinator.js'
+export { DebuggerService, DebuggerStateError, reduceDebugger } from './debugger/index.js'
+export type { DebuggerObservation, DebuggerAdapterSink } from './debugger/index.js'
+export { installJsAdapter, JS_DEBUG_AUDIT, JS_DEBUG_PIN } from './debugger/js-install.js'
+export { JsDebugProfile } from './debugger/js-profile.js'
+export type { JsLaunch, JsAttach } from './debugger/js-profile.js'
 import { canonicalStateDir } from './state.js'
 export { canonicalStateDir } from './state.js'
 export { acquireUpdateLock } from './update-lock.js'
 import { ResourceServices } from './resources.js'
+import type { ResolvedExecutionTarget } from './execution-targets.js'
 import { DelegationService } from './delegation.js'
 export { DelegationService, DelegationMailbox, WorkerReporter } from './delegation.js'
 import { PairingService } from './pairing.js'
@@ -75,6 +94,13 @@ export function canonical(value: unknown): string {
 }
 /** All current local installations own all resources, but every boundary rechecks revocation. */
 export class AuthorityService {
+  private readonly invalidationListeners = new Set<() => void>()
+  subscribeInvalidation(listener: () => void) {
+    this.invalidationListeners.add(listener)
+    return () => {
+      this.invalidationListeners.delete(listener)
+    }
+  }
   constructor(private db: DatabaseSync) {}
   authenticate(token: string): AuthorityContext {
     if (!/^[a-f0-9]{64}$/.test(token)) throw new ChannelError('unauthorized')
@@ -100,7 +126,8 @@ export class AuthorityService {
     this.check(explicit, 'retain_authority')
     return DelegationAuthoritySchema.parse(explicit)
   }
-  /** Inside the device-revocation transaction: a later claim of the same key cannot revive grants. */
+  /** Inside device revocation: a later claim of the same key cannot revive
+   * grants OR exact approvals that the revoked registration authored. */
   invalidatePairedGrants(installation_id?: string) {
     this.db
       .prepare(
@@ -114,6 +141,31 @@ export class AuthorityService {
         installation_id ?? null,
         installation_id ?? null
       )
+    this.db
+      .prepare(
+        `UPDATE debug_grants SET body=json_set(body,'$.revoked',json('true'))
+      WHERE (json_extract(body,'$.owner_authority.profile')='paired-wss-v1' AND (? IS NULL OR json_extract(body,'$.owner_authority.installation_id')=?))
+         OR (json_extract(body,'$.controller_authority.profile')='paired-wss-v1' AND (? IS NULL OR json_extract(body,'$.controller_authority.installation_id')=?))`
+      )
+      .run(
+        installation_id ?? null,
+        installation_id ?? null,
+        installation_id ?? null,
+        installation_id ?? null
+      )
+    this.db
+      .prepare(
+        `UPDATE debug_operations SET body=json_set(body,'$.approval_revoked',json('true'))
+        WHERE json_extract(body,'$.receipt.outcome')='pending'
+          AND json_extract(body,'$.approval_authority.profile')='paired-wss-v1'
+          AND (? IS NULL OR json_extract(body,'$.approval_authority.installation_id')=?)`
+      )
+      .run(installation_id ?? null, installation_id ?? null)
+    // Revocation may be inside an outer transaction. Publish only after that
+    // synchronous commit boundary, never from an intermediate authority row.
+    queueMicrotask(() => {
+      for (const listener of this.invalidationListeners) listener()
+    })
   }
   checkGrant(grant: DelegationGrant) {
     const retained = (id: string, saved?: AuthorityContext) => {
@@ -195,6 +247,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   readonly stateDir: string
   readonly authority: AuthorityService
   readonly pairing: PairingService
+  readonly debugger: DebuggerService
+  readonly debuggerControl: DebuggerCoordinator
   readonly node_id: string
   readonly provider = new FakeProvider()
   readonly resources: ResourceServices
@@ -209,6 +263,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     stateDir: string,
     options: {
       worktreeRoot?: string
+      /** Authorized control infrastructure, off by default. Native profiles
+       * require a separate explicit switch and an audited adapter installation. */
+      debuggerEnabled?: boolean
       claude?: ProviderAdapter
       pi?: ProviderAdapter
       codex?: ProviderAdapter
@@ -222,7 +279,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 12) {
+    if (version > 15) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -331,6 +388,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.db.exec(`BEGIN IMMEDIATE;
       CREATE TABLE codex_thread_bindings(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), thread_id TEXT NOT NULL UNIQUE, workspace_path TEXT NOT NULL, policy_fingerprint TEXT NOT NULL, model TEXT NOT NULL);
       PRAGMA user_version=12; COMMIT;`)
+    if (version < 13) migrateDebugger(this.db)
+    if (version < 14) migrateDebuggerControl(this.db)
+    if (version < 15) migrateDebuggerModes(this.db)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -339,6 +399,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.pairing = new PairingService(this)
     this.delegations = new DelegationService(this)
     try {
+      this.debugger = new DebuggerService(this, options.debuggerEnabled)
+      this.debuggerControl = new DebuggerCoordinator(this)
+      this.authority.subscribeInvalidation(() => {
+        if (!this.closed) this.debuggerControl.notifyPermissions()
+      })
       this.resources = new ResourceServices(this, options.worktreeRoot)
       this.resources.mutations.recover()
     } catch (error) {
@@ -381,6 +446,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   close() {
     if (!this.closed) {
+      this.debuggerControl.close()
       this.protectFiles()
       this.db.close()
       this.closed = true
@@ -401,11 +467,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   revokeToken(id: string) {
     this.db.prepare('UPDATE installations SET revoked=1 WHERE installation_id=?').run(id)
+    this.debuggerControl.notifyPermissions()
     this.resources.repository.revoked(id)
+  }
+  /** Fence external effects after any audit transaction failure, across sessions. */
+  assertAuditStorageAvailable() {
+    if (this.storageFailed) throw new ChannelError('storage_unavailable')
   }
   /** Synchronous state/receipt/event commit only; Git effects must stay outside. */
   transaction<T>(work: () => T, inject = false): T {
-    if (this.storageFailed) throw new ChannelError('storage_unavailable')
+    this.assertAuditStorageAvailable()
     this.db.exec('BEGIN IMMEDIATE')
     let result: T
     try {
@@ -479,6 +550,35 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       providers: [this.provider.capabilities(), claude, this.claude.capabilities('pi')],
       capabilities: {
         ...this.provider.capabilities().capabilities,
+        ...this.debugger.capabilities(),
+        node_path_v2: {
+          status: 'supported',
+          evidence:
+            'exact-folders; owner-picker; durable-init; observed-status; divergence; watch-selection',
+        },
+        node_path_worktrees: {
+          status: 'supported',
+          evidence: 'named-branch-create; owner-selection; preconditioned-nonforce-external-delete',
+        },
+        node_path_file_operations: {
+          status: 'supported',
+          evidence:
+            'single-regular-file-durable-coordinator; plain-root-workspaces-only; git-targets-repository-only; exclusive-destinations; recovery; unknown-outcomes',
+        },
+        node_path_execution: {
+          status: 'supported',
+          evidence:
+            'identity-bound-owner-grants; root-plain-external-cwd; exclusive-execution-time-leases',
+        },
+        node_path_switching: {
+          status: 'supported',
+          evidence:
+            'expected-target-owner-switch; run-bound-pending-switch; confirmed-cleanup-boundary; unbound-native-sessions-only',
+        },
+        node_path_native_switching: {
+          status: 'unsupported',
+          reason: 'Provider-native continuation across targets requires explicit rebinding',
+        },
         repository_read_v1: {
           status: 'supported',
           evidence: 'repository.v1; opaque-worktrees; frozen-objects; bounded-worker-search',
@@ -523,8 +623,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.db.prepare('SELECT body FROM prompts WHERE session_id=?').all(session) as Row[]
     ).map((r) => PromptSchema.parse(JSON.parse(String(r.body))))
   }
-  request(actor: AuthorityContext, method: string, raw: unknown, operation?: string): unknown {
+  request(
+    actor: AuthorityContext,
+    method: string,
+    raw: unknown,
+    operation?: string,
+    signal?: AbortSignal
+  ): unknown {
     this.authority.check(actor, 'request')
+    if (method.startsWith('debugger.v1.'))
+      return this.debuggerControl.request(actor, method, raw, operation, signal)
     if (method === 'pairing.list' || method === 'pairing.confirm') {
       if (actor.profile !== 'local-token-v1') throw new ChannelError('local_owner_required')
       const parsed = PairingMethodSchemas[method].safeParse(raw)
@@ -543,14 +651,26 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           : 'invalid_params'
       )
     }
+    if (
+      [
+        'project.trust',
+        'project.execution',
+        'session.worktree.get',
+        'session.worktree.set',
+      ].includes(method) ||
+      (method === 'session.create' && params.target)
+    )
+      return this.resources.targets.request(actor, method, params, operation)
     if (method.startsWith('delegation.'))
       return this.delegations.request(actor, method, params, operation)
-    if (/^(project|workspace|job|review|repository)\./.test(method))
+    if (/^(project|workspace|job|review|repository|filesystem)\./.test(method))
       return this.resources.request(actor, method, params, operation)
     if (!MUTATIONS.has(method as Method)) return this.query(actor, method, params)
-    return this.commitOperation(actor, method, params, operation, () =>
+    const result = this.commitOperation(actor, method, params, operation, () =>
       this.mutate(actor, method, params)
     )
+    if (method === 'session.interrupt') this.debuggerControl.interruptedRun(String(params.run_id))
+    return result
   }
   /** Invalidations are hints, not evidence that obsolete external authority can be replayed. */
   canPublishEvent(actor: AuthorityContext, event: JournalEvent) {
@@ -563,6 +683,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   /** Recheck the exact resource of a successful response at the actual transport boundary. */
   checkPublication(actor: AuthorityContext, method: string, raw: unknown, result?: unknown) {
     this.authority.check(actor, 'publish')
+    if (method.startsWith('debugger.v1.'))
+      return this.debuggerControl.checkRpcPublication(actor, method, raw, result)
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
     this.authority.check(
@@ -579,6 +701,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       )
     )
     this.delegations.checkPublication(actor, method, p)
+    if (method === 'repository.v1.worktree.delete')
+      return this.resources.repository.checkDeletionPublication(actor, p)
     if (method.startsWith('repository.v1.')) {
       this.resources.repository.checkPublication(actor, p, result)
       this.resources.repository.mutationPublication(actor, method, p)
@@ -592,21 +716,55 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   ): { result: unknown } | undefined {
     this.authority.check(actor, 'mutate')
     if (!operation || operation.length > 128) throw new ChannelError('operation_id_required')
-    const hash = digest(canonical({ method, params }))
+    return this.storedOperationReceipt(
+      actor.installation_id,
+      operation,
+      digest(canonical({ method, params }))
+    )
+  }
+  private pendingOperations(principal: string, operation: string): Row[] {
+    return this.db
+      .prepare(
+        `SELECT request_hash FROM file_mutations WHERE principal_id=?1 AND operation_id=?2
+      UNION ALL SELECT request_hash FROM node_path_effects WHERE principal_id=?1 AND operation_id=?2
+      UNION ALL SELECT request_hash FROM repository_deletions WHERE principal_id=?1 AND operation_id=?2`
+      )
+      .all(principal, operation) as Row[]
+  }
+  /** Trusted receipt/recovery boundary; callers keep the identity check and insertion in one transaction. */
+  storedOperationReceipt(
+    principal: string,
+    operation: string,
+    requestHash: string
+  ): { result: unknown } | undefined {
     const previous = this.db
       .prepare(
         'SELECT request_hash,receipt FROM operations WHERE principal_id=? AND operation_id=?'
       )
-      .get(actor.installation_id, operation) as Row | undefined
-    if (!previous) {
-      const pending = this.db
-        .prepare('SELECT request_hash FROM file_mutations WHERE principal_id=? AND operation_id=?')
-        .get(actor.installation_id, operation) as Row | undefined
-      if (pending && pending.request_hash !== hash) throw new ChannelError('idempotency_mismatch')
-      return
-    }
-    if (previous.request_hash !== hash) throw new ChannelError('idempotency_mismatch')
-    return { result: JSON.parse(String(previous.receipt)) as unknown }
+      .get(principal, operation) as Row | undefined
+    if (
+      (previous && previous.request_hash !== requestHash) ||
+      this.pendingOperations(principal, operation).some((row) => row.request_hash !== requestHash)
+    )
+      throw new ChannelError('idempotency_mismatch')
+    return previous ? { result: JSON.parse(String(previous.receipt)) as unknown } : undefined
+  }
+  /** Atomically claim the global operation namespace with the durable effect intent. No effects inside SQL. */
+  reserveOperation(
+    actor: AuthorityContext,
+    method: string,
+    params: unknown,
+    operation: string,
+    insertIntent: () => void
+  ) {
+    return this.transaction(() => {
+      const previous = this.operationReceipt(actor, method, params, operation)
+      if (previous) return previous
+      if (this.pendingOperations(actor.installation_id, operation).length)
+        throw new ChannelError('outcome_unknown')
+      insertIntent()
+      return undefined
+    })
   }
   commitOperation(
     actor: AuthorityContext,
@@ -703,12 +861,19 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   acceptInput(actor: AuthorityContext, p: Record<string, unknown>): unknown {
     return this.mutate(actor, 'session.send', p)
   }
-  acceptSession(actor: AuthorityContext, p: Record<string, unknown>, provisioning = false) {
+  acceptSession(
+    actor: AuthorityContext,
+    p: Record<string, unknown>,
+    provisioning = false,
+    executionTarget?: ResolvedExecutionTarget
+  ) {
     if (p.provider !== 'fake') {
-      if (!p.workspace_id) throw new ChannelError('workspace_required')
-      const workspace = this.resources.workspaces.get(String(p.workspace_id))
-      if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')
-        throw new ChannelError('project_untrusted')
+      if (!executionTarget) {
+        if (!p.workspace_id) throw new ChannelError('workspace_required')
+        const workspace = this.resources.workspaces.get(String(p.workspace_id))
+        if (this.resources.projects.get(workspace.project_id).trust !== 'trusted')
+          throw new ChannelError('project_untrusted')
+      } else this.resources.targets.check(executionTarget)
       if (!this.claude.isAvailable(String(p.provider)))
         throw new ChannelError('provider_unavailable')
     }
@@ -742,6 +907,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     const session = String(p.session_id)
     this.head(session)
     if (method === 'session.detach') {
+      this.resources.targets.detach(session)
       if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
       if (
         this.db
@@ -771,9 +937,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (method === 'session.send') {
       const current = this.session(session)
+      this.resources.targets.checkSession(session)
       if (current.workspace_id) this.resources.workspaces.assertLease(current.workspace_id, session)
       if (current.provider !== 'fake') {
-        if (!current.workspace_id) throw new ChannelError('workspace_required')
+        if (!current.workspace_id && !this.resources.targets.bound(session))
+          throw new ChannelError('workspace_required')
         if (!this.claude.isAvailable(current.provider))
           throw new ChannelError('provider_unavailable')
         if (canonical(p.script) !== canonical([{ kind: 'echo' }]))
@@ -847,10 +1015,13 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         )
         .get(session, String(p.run_id)) as Row | undefined
       if (!input) throw new ChannelError('stale_revision')
+      this.debuggerControl.revokeRunInTransaction(String(p.run_id))
       this.transition(
         input,
         this.session(session).provider !== 'fake' ? 'delivery_unknown' : 'interrupted'
       )
+      if (this.session(session).provider === 'fake')
+        this.resources.targets.settle(session, String(p.run_id))
       this.append(session, 'run.interrupted', installationActor, {
         run_id: p.run_id,
         outcome: 'unknown',
@@ -919,6 +1090,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       if (this.resources.workspaces.get(session.workspace_id).state !== 'ready')
         throw new ChannelError('resource_busy')
     }
+    this.resources.targets.checkSession(session_id)
     this.delegations.checkExecution(session_id)
   }
   /** One durable worker per session; at most four sessions execute per tick. No socket participates. */
@@ -959,7 +1131,15 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
             this.transition(input, 'cancelled')
             continue
           }
+          const binding = this.resources.targets.bound(String(input.session_id))
+          if (binding && !this.resources.targets.canLease(binding, String(input.session_id)))
+            continue
           input.run_id = randomUUID()
+          if (
+            binding &&
+            !this.resources.targets.lease(binding, String(input.session_id), String(input.run_id))
+          )
+            continue
           this.db
             .prepare('UPDATE inputs SET run_id=? WHERE input_id=?')
             .run(String(input.run_id), String(input.input_id))
@@ -1053,6 +1233,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         }
         if (!blocked) {
           this.transition(input, failed ? 'failed' : 'completed')
+          this.resources.targets.settle(String(input.session_id), String(input.run_id))
           this.append(String(input.session_id), failed ? 'run.failed' : 'run.completed', actor, {
             run_id: input.run_id,
           })

@@ -114,8 +114,13 @@ production runtime dependency.
 - The process helper owns synthetic POSIX groups and uses bounded TERM/KILL/reaping.
   It is probe lifecycle support, not an OS sandbox or reviewed production supervisor.
 
-Shared-command receipts, authorization, stop epochs, stale rejection, bounded
-backpressure, adapter/node recovery, target ownership and source identity remain
-future debugger-service work. An adapter reply alone is not proof of attaching to
-an existing process; the real profiles explicitly compare target PIDs and verify
-continued liveness after detach.
+[Debugger v1 infrastructure](debugger-v1.md) now supplies gated schemas, bounded
+persistent state/history, stop epochs, stale reference rejection and snapshot/replay
+recovery tested with fake adapters. It exposes no production debugger RPC or real
+profile. [B2's bounded DAP driver](debugger-js-profile.md) adds internal transport, isolated
+sessions and node-owned process cleanup, but its real JS/TS profile remains blocked
+because no clean adapter release is available. Shared-command receipts,
+authorization, adapter recovery and executing-source identity remain later work.
+An adapter reply alone is not proof of attaching to an existing process; the
+experimental probe profiles explicitly compare target PIDs and verify continued
+liveness after detach.

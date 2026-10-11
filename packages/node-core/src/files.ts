@@ -37,6 +37,7 @@ export class WorkspaceFileService {
     if (repository) return this.r.repository.fileRoot(id)
     const w = this.r.workspaces.get(id)
     this.r.projects.get(w.project_id)
+    this.r.repository.checkWorkspaceIdentity(w.project_id)
     if (w.state !== 'ready') throw new ChannelError('resource_busy')
     try {
       if (realpathSync(w.path) !== w.path || lstatSync(w.path).isSymbolicLink()) throw new Error()
@@ -65,6 +66,15 @@ export class WorkspaceFileService {
       if (e instanceof ChannelError) throw e
       throw new ChannelError('not_found')
     }
+  }
+  childTarget(id: string, path: string, repository = false) {
+    const root = this.root(id, repository)
+    if (!path || !RelativePathSchema.safeParse(path).success) throw new ChannelError('unsafe_path')
+    const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
+    const directory = this.checked(root, parent)
+    if (!lstatSync(directory).isDirectory() || realpathSync(directory) !== directory)
+      throw new ChannelError('unsafe_path')
+    return join(directory, path.split('/').at(-1)!)
   }
   writeTarget(id: string, path: string, create = false, repository = false) {
     const root = this.root(id, repository)

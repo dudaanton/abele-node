@@ -1,6 +1,8 @@
 /** Stable stage 0 fixture types, with stage 1 runtime schemas below. */
 import { z } from 'zod'
 export * from './pairing.js'
+export * from './debugger.js'
+export * from './debugger-control.js'
 export type NodeId = string
 export type SessionId = string
 export type StreamId = string

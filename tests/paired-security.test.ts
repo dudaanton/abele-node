@@ -120,6 +120,89 @@ async function read(t: RecordTransport): Promise<RecordFrame | undefined> {
   const row = await t.receive()[Symbol.asyncIterator]().next()
   return row.done ? undefined : FrameCodec.decode(row.value)
 }
+it('a different key or invalid node signature at an edited route receives neither invite secret nor device name', async () => {
+  for (const wrongKey of [true, false]) {
+    const genuine = setup(),
+      other = wrongKey ? setup() : genuine
+    const invite = await genuine.core.pairing.issue(genuine.endpoint, 'private invitation')
+    const sent: string[] = []
+    const connector = new PairedWssConnector(new Keys(), async (url) => {
+      expect(url).toBe('wss://alternate.example:9443/channel')
+      const t = await other.open()
+      return {
+        ...t,
+        send: async (bytes) => {
+          sent.push(new TextDecoder().decode(bytes))
+          await t.send(bytes)
+        },
+        receive: async function* () {
+          for await (const bytes of t.receive()) {
+            const record = FrameCodec.decode(bytes)
+            if (record.kind !== 'paired.challenge') {
+              yield bytes
+              continue
+            }
+            // An attacker can copy the advertised node ID. Reject its DIFFERENT key
+            // even when all public challenge fields and its own signature are valid.
+            const challenge = { ...record, node_id: genuine.core.node_id }
+            challenge.signature = wrongKey
+              ? await signProof(
+                  (await other.core.pairing.identity.load()).private_key,
+                  proofTranscript(challenge, 'node')
+                )
+              : 'a'.repeat(86)
+            yield FrameCodec.encode(challenge)
+          }
+        },
+      }
+    })
+    await expect(
+      connector.claim(invite, {
+        deviceName: 'Private device label',
+        endpoint: 'wss://alternate.example:9443/channel',
+      })
+    ).rejects.toThrow('node_identity_mismatch')
+    expect(sent.length).toBeGreaterThan(0)
+    expect(sent.join('\n')).not.toContain(invite.secret)
+    expect(sent.join('\n')).not.toContain('Private device label')
+    expect(sent.some((record) => JSON.parse(record).kind === 'paired.proof')).toBe(false)
+    expect(genuine.core.pairing.list()).toHaveLength(0)
+  }
+})
+it('refuses legacy secret-bearing enrollment with an explicit upgrade reason', async () => {
+  const { core, endpoint, open } = setup()
+  const invite = await core.pairing.issue(endpoint, 'legacy')
+  const device = await generateIdentity(),
+    t = await open()
+  await t.send(
+    FrameCodec.encode({
+      kind: 'paired.begin',
+      profile: 'paired-wss-v1',
+      client_nonce: randomNonce(),
+      public_key: device.public_key,
+      invite,
+    })
+  )
+  expect(await read(t)).toMatchObject({ kind: 'paired.error', code: 'pairing_upgrade_required' })
+  expect(core.pairing.list()).toHaveLength(0)
+})
+it('new enrollment fails clearly when an old daemon closes on a secret-free begin', async () => {
+  const { core, endpoint } = setup()
+  const invite = await core.pairing.issue(endpoint, 'legacy-daemon')
+  const sent: string[] = []
+  const connector = new PairedWssConnector(new Keys(), async () => ({
+    send: async (bytes) => {
+      sent.push(new TextDecoder().decode(bytes))
+    },
+    receive: async function* () {},
+    close: async () => {},
+  }))
+  await expect(connector.claim(invite, { deviceName: 'Test device' })).rejects.toThrow(
+    'pairing_upgrade_required'
+  )
+  expect(sent.join('\n')).not.toContain(invite.secret)
+  expect(sent.join('\n')).not.toContain('Test device')
+})
 it('actual claim response loss recovers only with the persisted device private key', async () => {
   const { core, endpoint, open } = setup()
   const invite = await core.pairing.issue(endpoint, 'lost-reply')

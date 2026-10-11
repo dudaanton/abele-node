@@ -55,6 +55,35 @@ async function cleanupOwned() {
 // Bounded by the supervisor's per-turn question limit; late answers to cancelled
 // dialogs are ignored, never retargeted to a newer question or granted.
 const cancelled = new Set<string>()
+const debuggerPending = new Map<
+  string,
+  { started: number; resolve(result: any): void; cleanup(): void }
+>()
+function debuggerCall(name: string, args: unknown, signal?: AbortSignal): Promise<any> {
+  return new Promise((resolve) => {
+    const id = randomUUID(),
+      started = Date.now()
+    const lost = () => {
+      debuggerPending.delete(id)
+      signal?.removeEventListener('abort', lost)
+      if (process.connected && !abort.signal.aborted) send({ kind: 'debugger_cancel', id })
+      resolve({
+        reason: 'cancelled',
+        elapsed_ms: Math.max(0, Date.now() - started),
+        snapshot: null,
+        observation: 'unknown',
+      })
+    }
+    if (signal?.aborted || abort.signal.aborted || debuggerPending.size >= 64) return lost()
+    debuggerPending.set(id, {
+      started,
+      resolve,
+      cleanup: () => signal?.removeEventListener('abort', lost),
+    })
+    signal?.addEventListener('abort', lost, { once: true })
+    send({ kind: 'debugger_call', id, name, args })
+  })
+}
 const pending = new Map<
   string,
   {
@@ -114,6 +143,16 @@ async function stop() {
   if (stopping) return
   stopping = true
   abort.abort()
+  for (const p of debuggerPending.values()) {
+    p.cleanup()
+    p.resolve({
+      reason: 'connection_lost',
+      elapsed_ms: Math.max(0, Date.now() - p.started),
+      snapshot: null,
+      observation: 'unknown',
+    })
+  }
+  debuggerPending.clear()
   for (const r of registrations.values()) r.reject(new Error('pi_parent_lost'))
   registrations.clear()
   for (const p of pending.values()) {
@@ -164,6 +203,15 @@ process.on('message', (raw) => {
   void (async () => {
     const m = ParentMessageSchema.parse(raw)
     if (m.kind === 'stop') return stop()
+    if (m.kind === 'debugger_result') {
+      const p = debuggerPending.get(m.id)
+      if (p) {
+        debuggerPending.delete(m.id)
+        p.cleanup()
+        p.resolve(m.result)
+      }
+      return
+    }
     if (m.kind === 'ack') {
       unacked = Math.max(0, unacked - m.bytes)
       return
@@ -206,6 +254,16 @@ process.on('message', (raw) => {
     try {
       const module = await import(pathToFileURL(m.hostModule).href)
       host = await module.createHost(m.config, ask, abort.signal, emit, {
+        ...(m.config.debugger_tools?.length
+          ? {
+              debugger: {
+                tools: m.config.debugger_tools,
+                call: debuggerCall,
+                publish: (_args: unknown, result: any) => result,
+                close() {},
+              },
+            }
+          : {}),
         bashOperations: (shellPath?: string) =>
           managedBashOperations(groups, abort.signal, shellPath),
       })

@@ -2,6 +2,7 @@ import {
   ChannelError,
   InviteSchema,
   PublicKeySchema,
+  DeviceNameSchema,
   assertPairedEndpoint,
   fingerprint,
   randomNonce,
@@ -68,6 +69,7 @@ export class PairingService {
     core.db.exec(`BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS paired_devices(installation_id TEXT PRIMARY KEY REFERENCES installations(installation_id), public_key TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','confirmed','revoked')));
       CREATE TABLE IF NOT EXISTS pairing_invites(invite_id TEXT PRIMARY KEY, body TEXT NOT NULL, secret_hash TEXT NOT NULL, label TEXT NOT NULL, installation_id TEXT, claim_key TEXT, recovery_until INTEGER);
+      CREATE TABLE IF NOT EXISTS paired_device_metadata(installation_id TEXT PRIMARY KEY REFERENCES paired_devices(installation_id), device_name TEXT NOT NULL, created_at INTEGER NOT NULL);
       COMMIT;`)
     this.identity = new IdentityStore(core)
   }
@@ -121,9 +123,15 @@ export class PairingService {
     return invite
   }
   /** Called only after a fresh challenge verified possession of the submitted key. */
-  async claim(raw: PairingInvite, rawKey: PublicKey, checkProof: () => void = () => {}) {
+  async claim(
+    raw: PairingInvite,
+    rawKey: PublicKey,
+    checkProof: () => void = () => {},
+    deviceName?: string
+  ) {
     const invite = InviteSchema.parse(raw),
       key = PublicKeySchema.parse(rawKey)
+    if (deviceName !== undefined) DeviceNameSchema.parse(deviceName)
     const fp = await fingerprint(key),
       secretHash = await hashSecret(invite.secret)
     return this.core.transaction(() => {
@@ -160,7 +168,7 @@ export class PairingService {
       else
         this.core.db
           .prepare('INSERT INTO installations(installation_id,label,token_hash) VALUES(?,?,?)')
-          .run(id, row.label, 'paired:' + randomNonce())
+          .run(id, deviceName ?? row.label, 'paired:' + randomNonce())
       if (
         this.core.db
           .prepare("SELECT 1 FROM paired_devices WHERE installation_id=? AND state!='revoked'")
@@ -169,9 +177,14 @@ export class PairingService {
         throw new ChannelError('already_paired')
       this.core.db
         .prepare(
-          "INSERT INTO paired_devices VALUES(?,?,?,'pending') ON CONFLICT(installation_id) DO UPDATE SET public_key=excluded.public_key,fingerprint=excluded.fingerprint,state='pending'"
+          "INSERT INTO paired_devices(installation_id,public_key,fingerprint,state) VALUES(?,?,?,'pending') ON CONFLICT(installation_id) DO UPDATE SET public_key=excluded.public_key,fingerprint=excluded.fingerprint,state='pending'"
         )
         .run(id, JSON.stringify(key), fp)
+      this.core.db
+        .prepare(
+          'INSERT INTO paired_device_metadata VALUES(?,?,?) ON CONFLICT(installation_id) DO UPDATE SET device_name=excluded.device_name,created_at=excluded.created_at'
+        )
+        .run(id, deviceName ?? row.label, Date.now())
       this.core.db
         .prepare(
           'UPDATE pairing_invites SET installation_id=?,claim_key=?,recovery_until=? WHERE invite_id=? AND claim_key IS NULL'
@@ -189,9 +202,10 @@ export class PairingService {
     this.core.authority.check({ installation_id: id }, 'pair')
     return { installation_id: id, device_fingerprint: device.fingerprint, state: device.state }
   }
-  confirm(id: string, expectedFingerprint: string) {
+  confirm(id: string, expectedFingerprint: string, requirePending = false) {
     return this.core.transaction(() => {
       const result = this.claimResult(id)
+      if (requirePending && result.state !== 'pending') throw new ChannelError('not_pending')
       if (result.device_fingerprint !== expectedFingerprint) throw new ChannelError('key_mismatch')
       this.core.db
         .prepare("UPDATE paired_devices SET state='confirmed' WHERE installation_id=?")
@@ -199,10 +213,22 @@ export class PairingService {
       return { ...result, state: 'confirmed' as const }
     })
   }
+  /** Approval captures an exact principal/key and refuses stale list selections. */
+  approve(id: string, expectedFingerprint: string) {
+    return this.confirm(id, expectedFingerprint, true)
+  }
   list() {
     return this.core.db
-      .prepare('SELECT installation_id,fingerprint,state FROM paired_devices')
-      .all()
+      .prepare(
+        "SELECT d.installation_id,d.fingerprint,d.state,COALESCE(m.device_name,i.label,'') AS device_name,COALESCE(m.created_at,0) AS created_at FROM paired_devices d LEFT JOIN paired_device_metadata m USING(installation_id) LEFT JOIN installations i USING(installation_id)"
+      )
+      .all() as Array<{
+      installation_id: string
+      fingerprint: string
+      state: 'pending' | 'confirmed' | 'revoked'
+      device_name: string
+      created_at: number
+    }>
   }
   actor(id: string, key: PublicKey) {
     const actor = {
