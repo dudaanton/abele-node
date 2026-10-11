@@ -27,8 +27,17 @@ const dirs: string[] = []
 const children: ChildProcess[] = []
 const clients: NodeClient[] = []
 const cli = resolve('packages/node-daemon/dist/cli.js')
-const eventually = (test: () => Promise<boolean>) =>
-  waitForProcessCondition(test, 'CLI daemon convergence')
+const eventually = (test: () => Promise<boolean>, phase = 'CLI daemon convergence') =>
+  waitForProcessCondition(test, phase)
+function journalComplete(history: ReadonlyArray<{ type: string }>, runs: number) {
+  const inputs = history.filter(
+    (event) => event.type === 'input.completed' || event.type === 'input.failed'
+  ).length
+  const terminals = history.filter(
+    (event) => event.type === 'run.completed' || event.type === 'run.failed'
+  ).length
+  return inputs === runs && terminals === runs
+}
 async function start(dir: string) {
   const child = spawn(
     process.execPath,
@@ -49,7 +58,7 @@ async function start(dir: string) {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(err)
     return text.includes('"listening"')
-  })
+  }, 'CLI daemon startup')
   const ready = JSON.parse(
     text
       .trim()
@@ -164,10 +173,27 @@ it(
     ])
     first = new NodeClient(target(t1.token), new FileClientStore(store.path))
     clients.push(first)
+    // Reproduce the exact stream/store interleaving without a timing sleep: the
+    // input's terminal event is visible before its following run terminal event.
+    const terminalPrefix = new Promise<Awaited<ReturnType<NodeClient['history']>>>(
+      (resolve, reject) => {
+        const sendingClient = first
+        let inputs = 0
+        sendingClient.onEvent((event) => {
+          if (
+            event.stream_id === session.session_id &&
+            (event.type === 'input.completed' || event.type === 'input.failed') &&
+            ++inputs === 3
+          )
+            void sendingClient.history(session.session_id).then(resolve, reject)
+        })
+      }
+    )
     await first.connect()
     await first.subscribe(session.session_id)
-    await eventually(async () =>
-      (await first.prompts(session.session_id)).some((p) => p.state === 'pending')
+    await eventually(
+      async () => (await first.prompts(session.session_id)).some((p) => p.state === 'pending'),
+      'CLI daemon pending prompt'
     )
     const prompt = (await first.prompts(session.session_id)).find((p) => p.state === 'pending')!
     await Promise.all([first.answerPrompt(prompt, 'allow'), second.answerPrompt(prompt, 'deny')])
@@ -175,11 +201,20 @@ it(
       first.send(session.session_id, 'one', 0),
       second.send(session.session_id, 'two', 0),
     ])
+    const prefix = await withProcessDeadline(
+      () => terminalPrefix,
+      'CLI daemon terminal input prefix'
+    )
+    expect(
+      prefix.filter((event) => event.type === 'input.completed' || event.type === 'input.failed')
+    ).toHaveLength(3)
+    expect(
+      prefix.filter((event) => event.type === 'run.completed' || event.type === 'run.failed')
+    ).toHaveLength(2)
+    expect(journalComplete(prefix, 3)).toBe(false)
     await eventually(
-      async () =>
-        (await first.history(session.session_id)).filter(
-          (e) => e.type === 'input.completed' || e.type === 'input.failed'
-        ).length === 3
+      async () => journalComplete(await first.history(session.session_id), 3),
+      'CLI daemon complete run journal'
     )
     expect(await first.operationResult(op.operation_id)).toBeDefined()
     const before = await first.history(session.session_id)
@@ -193,7 +228,8 @@ it(
     await Promise.all([first.connect(), observer.connect()])
     await Promise.all([first.subscribe(session.session_id), observer.subscribe(session.session_id)])
     await eventually(
-      async () => (await observer.history(session.session_id)).length === before.length
+      async () => (await observer.history(session.session_id)).length === before.length,
+      'CLI daemon replay after restart'
     )
     expect(await observer.history(session.session_id)).toEqual(before)
     expect(await first.history(session.session_id)).toEqual(before)

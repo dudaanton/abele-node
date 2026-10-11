@@ -1,8 +1,11 @@
 // Every automated daemon/doctor process uses a fake executable, including version/help checks.
 import { afterAll } from 'vitest'
-import { mkdtempSync, cpSync, chmodSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, cpSync, chmodSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+// Every scratch-based fixture must work in isolation on a fresh checkout, not
+// depend on another test file creating this ignored parent first.
+mkdirSync('.scratch', { recursive: true })
 const dir = mkdtempSync(join(tmpdir(), 'abele-test-cli-'))
 const executable = join(dir, 'claude.mjs')
 cpSync(new URL('./fixtures/claude.mjs', import.meta.url), executable)
