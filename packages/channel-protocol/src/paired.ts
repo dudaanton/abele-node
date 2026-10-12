@@ -30,7 +30,8 @@ export const ClaimSchema = z
     device_fingerprint: FingerprintSchema,
     state: z.enum(['pending', 'confirmed']),
   })
-  .strict()
+  // Retain future server response fields without weakening identity validation.
+  .passthrough()
 /** Display labels are untrusted; refuse terminal controls and invisible direction changes. */
 export const DeviceNameSchema = z
   .string()
@@ -80,7 +81,7 @@ export const PairedRecordSchemas = [
       device_name: DeviceNameSchema.optional(),
     })
     .strict(),
-  z.object({ kind: z.literal('paired.claimed'), claim: ClaimSchema }).strict(),
+  z.object({ kind: z.literal('paired.claimed'), claim: ClaimSchema }).passthrough(),
   z
     .object({ kind: z.literal('paired.error'), code: z.literal('pairing_upgrade_required') })
     .strict(),

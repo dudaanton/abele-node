@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { PairingService } from '../packages/node-core/src/pairing.js'
+import { Claim042Schema } from './fixtures/channel-0.4.2.js'
 import {
   generateIdentity,
   fingerprint,
@@ -29,6 +30,17 @@ it('single-use invite requires device possession and exact owner confirmation; r
   const device = await generateIdentity()
   const claim = await pairing.claim(invite, device.public_key)
   expect(claim.state).toBe('pending')
+  const description = core.request(
+    core.authority.authenticate(core.createToken('discovery').token),
+    'node.describe',
+    {}
+  ) as any
+  // Claim has no extensible field in 0.4.2. Keep discovery on describe/welcome.
+  expect(Claim042Schema.parse(claim)).toEqual(claim)
+  expect(description.node_version).toBe(core.discovery().node_version)
+  expect(description.supported_capabilities).toEqual(
+    expect.arrayContaining(['expected_target', 'session.rename', 'session.delete'])
+  )
   expect(() => pairing.actor(claim.installation_id, device.public_key)).toThrow('unauthorized')
   expect(() => pairing.confirm(claim.installation_id, '0'.repeat(64))).toThrow('key_mismatch')
   expect(await pairing.claim(invite, device.public_key)).toEqual(claim)

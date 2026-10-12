@@ -143,7 +143,11 @@ export class DelegationService {
   }
   /** Repair pre-reservation children, including cancelled ones, without stealing another session's lease. */
   repairLeases() {
-    for (const row of this.core.db.prepare('SELECT * FROM delegations').all() as Row[]) {
+    for (const row of this.core.db
+      .prepare(
+        'SELECT * FROM delegations WHERE session_id NOT IN (SELECT session_id FROM deleted_sessions)'
+      )
+      .all() as Row[]) {
       const d = DelegationSchema.parse(JSON.parse(row.body))
       const session = this.core.session(d.session_id)
       if (

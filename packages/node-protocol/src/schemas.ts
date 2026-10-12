@@ -104,6 +104,7 @@ export const SessionSchema = z
       z.string().uuid().safeParse(s.native_session_id).success,
     { message: 'Native ID must be a UUID for this provider', path: ['native_session_id'] }
   )
+export const SessionDeletedSchema = z.object({ session_id: id, deleted: z.literal(true) }).strict()
 export const CapabilitySchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('supported'), evidence: z.string() }),
   z.object({ status: z.literal('unsupported'), reason: z.string() }),
@@ -169,6 +170,7 @@ const EventPayloads = {
   'job.changed': JobSchema,
   'session.worktree.changed': SessionTargetChangedSchema,
   'session.updated': SessionSchema,
+  'session.deleted': SessionDeletedSchema,
   'session.created': SessionSchema,
   'prompt.opened': PromptSchema,
   'prompt.resolved': PromptSchema,
@@ -220,6 +222,8 @@ export const MethodSchemas = {
     .strict()
     .refine((p) => !(p.workspace_id && p.target)),
   'session.get': z.object(session).strict(),
+  'session.rename': z.object({ ...session, title: z.string().max(256) }).strict(),
+  'session.delete': z.object(session).strict(),
   'session.send': z
     .object({
       ...session,
@@ -294,6 +298,8 @@ export const MUTATIONS = new Set<Method>([
   'repository.v1.restore',
   'session.detach',
   'session.create',
+  'session.rename',
+  'session.delete',
   'session.send',
   'session.interrupt',
   'input.cancel',

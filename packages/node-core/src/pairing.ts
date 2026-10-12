@@ -200,7 +200,13 @@ export class PairingService {
     if (!device || !['pending', 'confirmed'].includes(device.state))
       throw new ChannelError('unauthorized')
     this.core.authority.check({ installation_id: id }, 'pair')
-    return { installation_id: id, device_fingerprint: device.fingerprint, state: device.state }
+    return {
+      installation_id: id,
+      device_fingerprint: device.fingerprint,
+      // Existing clients use a strict claim schema. Discover release/features
+      // after approval via welcome.capabilities or node.describe instead.
+      state: device.state,
+    }
   }
   confirm(id: string, expectedFingerprint: string, requirePending = false) {
     return this.core.transaction(() => {

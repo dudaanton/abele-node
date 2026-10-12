@@ -99,6 +99,30 @@ async function setup(repository = false) {
   }
 }
 for (const repository of [false, true]) {
+  it(`renames only the title and deletes idle ${repository ? 'worktree' : 'folder'} bindings without removing files`, async () => {
+    const s = await setup(repository)
+    const before = await s.displayed()
+    const p = { session_id: s.chat.session_id }
+    expect(await s.request('session.rename', { ...p, title: 'Display only' })).toEqual({
+      ...s.chat,
+      title: 'Display only',
+    })
+    expect(await s.displayed()).toEqual(before)
+    await s.send(before)
+    s.core.tick()
+    expect(await s.request('session.delete', p, 'delete')).toEqual({ ...p, deleted: true })
+    expect(s.core.resources.targets.bound(s.chat.session_id)).toBeUndefined()
+    expect(
+      s.core.db.prepare('SELECT 1 FROM workspace_leases WHERE session_id=?').get(s.chat.session_id)
+    ).toBeUndefined()
+    await s.restart()
+    expect(await s.request('session.list', {})).toEqual([])
+    expect(await s.request('session.delete', p, 'delete')).toEqual({ ...p, deleted: true })
+    // The target still exists and can be bound to a fresh chat.
+    expect(
+      await s.request('session.create', { provider: 'fake', target: before.target })
+    ).toMatchObject({ provider: 'fake' })
+  })
   it(`admits matching ${repository ? 'worktree' : 'folder'} incarnations, preserving legacy sends`, async () => {
     const s = await setup(repository)
     const expected = await s.displayed()

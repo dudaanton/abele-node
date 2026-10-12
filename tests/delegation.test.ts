@@ -72,6 +72,26 @@ it('creates once by delegation key across operation IDs and restart, with one of
     })
   ).rejects.toThrow(/idempotency_mismatch/)
 })
+it('refuses active-child deletion and preserves completed delegation history after chat deletion/restart', async () => {
+  const f = fixture()
+  const child = await f.create()
+  const p = { session_id: child.session_id }
+  expect(() => f.request('session.delete', p, 'delete-child')).toThrow('resource_busy')
+  f.core.tick()
+  const status = f.request('delegation.status', { delegation_id: child.delegation_id })
+  expect(status.state).toBe('completed')
+  const deleted = f.request('session.delete', p, 'delete-child')
+  f.restart()
+  expect(f.request('session.delete', p, 'delete-child')).toEqual(deleted)
+  expect(f.request('session.list', {})).toEqual([])
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toEqual({
+    ...status,
+    session_head_seq: status.session_head_seq + 1, // The deletion is an additional audit event.
+  })
+  expect(
+    f.core.read(child.mailbox_stream_id, 0).filter((e) => e.type === 'delegation.result')
+  ).toHaveLength(1)
+})
 it('isolates mailboxes between delegations and principals, and keeps human permissions out of controller grants', async () => {
   const f = fixture()
   const first = await f.create('one', [{ kind: 'permission' }, { kind: 'echo' }])

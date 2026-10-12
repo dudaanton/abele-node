@@ -40,7 +40,7 @@ it('forward-migrates pi native mapping without losing identity, receipts or hist
     )
     db.close()
     core = new NodeCore(dir)
-    expect(core.db.prepare('PRAGMA user_version').get()!.user_version).toBe(15)
+    expect(core.db.prepare('PRAGMA user_version').get()!.user_version).toBe(16)
     expect(core.db.prepare('SELECT * FROM provider_native_sessions').get()).toMatchObject({
       session_id: session.session_id,
       native_session_id: native,
@@ -53,7 +53,7 @@ it('forward-migrates pi native mapping without losing identity, receipts or hist
     core.close()
     core = undefined
     const future = new DatabaseSync(join(dir, 'node.sqlite'))
-    future.exec('PRAGMA user_version=16')
+    future.exec('PRAGMA user_version=17')
     future.close()
     expect(() => new NodeCore(dir)).toThrow(/unsupported_database_version/)
   } finally {

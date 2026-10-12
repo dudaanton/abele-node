@@ -12,6 +12,8 @@ export { DebuggerClient } from './debugger.js'
 export type { DebuggerObservationState } from './debugger.js'
 import {
   SessionSchema,
+  SessionDeletedSchema,
+  MethodSchemas,
   DelegationSchema,
   DelegationStatusSchema,
   DelegationSendResultSchema,
@@ -312,6 +314,26 @@ export class NodeClient {
         provider,
         ...(workspace_id ? { workspace_id } : {}),
       })
+    )
+  }
+  /** Rename a chat's display title without altering provider-native identity. */
+  async renameSession(session_id: string, title: string, operation?: string) {
+    return SessionSchema.parse(
+      await this.mutation(
+        'session.rename',
+        MethodSchemas['session.rename'].parse({ session_id, title }),
+        operation
+      )
+    )
+  }
+  /** Delete only an idle chat. The node retains its audit journal and receipt. */
+  async deleteSession(session_id: string, operation?: string) {
+    return SessionDeletedSchema.parse(
+      await this.mutation(
+        'session.delete',
+        MethodSchemas['session.delete'].parse({ session_id }),
+        operation
+      )
     )
   }
   describe() {

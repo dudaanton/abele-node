@@ -78,6 +78,9 @@ export {
   ReviewBatchService,
 } from './files.js'
 
+import { nodeReleaseVersion } from './release.js'
+const NODE_RELEASE_VERSION = nodeReleaseVersion()
+
 type Row = Record<string, string | number | null>
 const nodeActor = { kind: 'node' } as const
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -281,7 +284,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 15) {
+    if (version > 16) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -393,6 +396,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (version < 13) migrateDebugger(this.db)
     if (version < 14) migrateDebuggerControl(this.db)
     if (version < 15) migrateDebuggerModes(this.db)
+    if (version < 16)
+      this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS deleted_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id));
+      PRAGMA user_version=16; COMMIT;`)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -543,6 +550,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         return bytes <= Math.min(LIMITS.page_bytes, LIMITS.record_bytes - 1024)
       })
   }
+  discovery() {
+    return {
+      node_version: NODE_RELEASE_VERSION,
+      supported_capabilities: Object.entries(this.capabilities().capabilities)
+        .filter(([, capability]) => capability.status === 'supported')
+        .map(([name]) => name),
+    }
+  }
   capabilities() {
     const claude = this.claude.capabilities()
     return {
@@ -553,6 +568,18 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       capabilities: {
         ...this.provider.capabilities().capabilities,
         ...this.debugger.capabilities(),
+        expected_target: {
+          status: 'supported',
+          evidence: 'atomic-target-admission: session.send; delegation.send; review.submit',
+        },
+        'session.rename': {
+          status: 'supported',
+          evidence: 'journaled-display-title; operation-receipts',
+        },
+        'session.delete': {
+          status: 'supported',
+          evidence: 'idle-only-catalog-removal; retained-journal; operation-receipts',
+        },
         node_path_v2: {
           status: 'supported',
           evidence:
@@ -796,6 +823,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       case 'node.describe':
         return {
           node_id: this.node_id,
+          ...this.discovery(),
           capabilities: this.capabilities(),
           providers: [
             this.provider.capabilities(),
@@ -806,16 +834,13 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       case 'session.list':
         return (
           this.db
-            .prepare('SELECT body FROM sessions WHERE session_id>? ORDER BY session_id LIMIT ?')
+            .prepare(
+              'SELECT body FROM sessions WHERE session_id>? AND session_id NOT IN (SELECT session_id FROM deleted_sessions) ORDER BY session_id LIMIT ?'
+            )
             .all(String(p.after_id ?? ''), Number(p.limit)) as Row[]
         ).map((r) => SessionSchema.parse(JSON.parse(String(r.body))))
-      case 'session.get': {
-        const row = this.db
-          .prepare('SELECT body FROM sessions WHERE session_id=?')
-          .get(String(p.session_id)) as Row | undefined
-        if (!row) throw new ChannelError('not_found')
-        return SessionSchema.parse(JSON.parse(String(row.body)))
-      }
+      case 'session.get':
+        return this.session(String(p.session_id))
       case 'prompt.list': {
         this.head(String(p.session_id))
         const rows = this.db
@@ -908,6 +933,30 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (method === 'session.create') return this.acceptSession(actor, p)
     const session = String(p.session_id)
     this.head(session)
+    const currentSession = this.session(session)
+    if (method === 'session.rename') {
+      const updated = SessionSchema.parse({ ...currentSession, title: p.title })
+      this.db
+        .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+        .run(JSON.stringify(updated), session)
+      this.append(session, 'session.updated', installationActor, updated)
+      this.append('catalog', 'session.updated', installationActor, updated)
+      return updated
+    }
+    if (method === 'session.delete') {
+      // Preserve audit streams, provider-native history and receipts. Only remove
+      // the catalog entry and its idle bindings; never stop a turn as a side effect.
+      if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
+      this.resources.targets.detach(session)
+      this.db.prepare('DELETE FROM workspace_leases WHERE session_id=?').run(session)
+      const deleted = { session_id: session, deleted: true }
+      this.append(session, 'session.deleted', installationActor, deleted)
+      this.append('catalog', 'session.deleted', installationActor, deleted)
+      // Tombstone keeps historical foreign keys (inputs, artifacts, native bindings)
+      // valid without making the chat available for new work.
+      this.db.prepare('INSERT INTO deleted_sessions VALUES(?)').run(session)
+      return deleted
+    }
     if (method === 'session.detach') {
       this.resources.targets.detach(session)
       if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
@@ -1041,8 +1090,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     throw new ChannelError('unsupported_method')
   }
   session(id: string) {
-    const row = this.db.prepare('SELECT body FROM sessions WHERE session_id=?').get(id) as
-      Row | undefined
+    const row = this.db
+      .prepare(
+        'SELECT body FROM sessions WHERE session_id=? AND session_id NOT IN (SELECT session_id FROM deleted_sessions)'
+      )
+      .get(id) as Row | undefined
     if (!row) throw new ChannelError('not_found')
     return SessionSchema.parse(JSON.parse(String(row.body)))
   }

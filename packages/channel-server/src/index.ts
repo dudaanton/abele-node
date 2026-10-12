@@ -184,7 +184,9 @@ export async function serveChannel(
             ...(actor.profile === 'local-token-v1' ? Object.keys(PairingMethodSchemas) : []),
           ],
           limits: LIMITS,
-          capabilities: core.capabilities(),
+          // 0.4.2 welcome readers are strict at the envelope, but this
+          // existing map is extensible. Never add unnegotiated top-level keys.
+          capabilities: { ...core.capabilities(), ...core.discovery() },
         })
         continue
       }

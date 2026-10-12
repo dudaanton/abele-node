@@ -465,6 +465,15 @@ it.each([-86400000, -1000, 1000, 86400000])(
     core.pairing.confirm(claim.installation_id, claim.device_fingerprint)
     const channel = await connector.connect(await connector.target(core.node_id))
     expect(channel.authority.installation_id).toBe(claim.installation_id)
+    expect(claim).not.toHaveProperty('node_version')
+    expect(claim).not.toHaveProperty('supported_capabilities')
+    expect(channel.welcome.capabilities.node_version).toBe(core.discovery().node_version)
+    expect(channel.welcome.capabilities.supported_capabilities).toEqual(
+      core.discovery().supported_capabilities
+    )
+    expect(channel.welcome.capabilities.supported_capabilities).toEqual(
+      expect.arrayContaining(['expected_target', 'session.rename', 'session.delete'])
+    )
     await channel.transport.close('skew_verified')
     await clockDomain.run('server', () => core.pairing.identity.rotate())
     const renewed = await clockDomain.run('server', () =>

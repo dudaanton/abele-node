@@ -576,7 +576,7 @@ it('migration 9 drops only an empty legacy table and preserves normal recovery r
   db.close()
   const c = new NodeCore(join(s.dir, 'state'))
   cores.push(c)
-  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(15)
+  expect(c.db.prepare('PRAGMA user_version').get()!.user_version).toBe(16)
   expect(
     c.db.prepare("SELECT name FROM sqlite_master WHERE name='legacy_file_recoveries'").get()
   ).toBeUndefined()

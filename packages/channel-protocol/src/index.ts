@@ -58,6 +58,8 @@ const ResponseSchema = z
     (r) => Object.hasOwn(r, 'result') !== Object.hasOwn(r, 'error'),
     'Exactly one result or error'
   )
+export { NodeDiscoveryFields } from './discovery.js'
+import { NodeDiscoveryFields } from './discovery.js'
 export const WelcomeSchema = z
   .object({
     kind: z.literal('welcome'),
@@ -80,9 +82,11 @@ export const WelcomeSchema = z
         connections: Sequence,
       })
       .strict(),
-    capabilities: z.record(z.unknown()),
+    capabilities: z.object(NodeDiscoveryFields).passthrough(),
   })
-  .strict()
+  // Discovery responses may gain optional fields. Authority-bearing inputs
+  // remain strict; emission must still respect older strict welcome readers.
+  .passthrough()
 export const RecordSchema = z.union([
   ...PairedRecordSchemas,
   z
