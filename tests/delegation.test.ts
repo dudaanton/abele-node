@@ -120,6 +120,25 @@ it('isolates mailboxes between delegations and principals, and keeps human permi
     f.core.read(first.mailbox_stream_id, 0).filter((e) => e.type === 'delegation.result')
   ).toHaveLength(1)
 })
+it('refuses a delegated turn whose displayed target is no longer bound', async () => {
+  const f = fixture()
+  const child = await f.create('guarded', [{ kind: 'hang' }])
+  const params = {
+    delegation_id: child.delegation_id,
+    text: 'not here',
+    observed_seq: 0,
+    expected_target: {
+      target: { kind: 'worktree', worktree_id: 'formerly-bound' },
+      incarnation: 'old',
+    },
+  }
+  const receipt = await f.request('delegation.send', params, 'guarded-child')
+  expect(receipt).toEqual({ code: 'target_changed', current_target: null })
+  expect(await f.request('delegation.send', params, 'guarded-child')).toEqual(receipt)
+  expect(f.core.read(child.session_id, 0).filter((e) => e.type === 'input.accepted')).toHaveLength(
+    1
+  )
+})
 it('cancels a blocked child, fails prompts closed, and fences a revoked grant', async () => {
   const f = fixture()
   const child = await f.create('blocked', [{ kind: 'permission' }])

@@ -212,6 +212,56 @@ it('schedules a run-bound agent switch inside one project only after cleanup and
   expect(s.provider.turns[1]!.context.cwd).toBe(external)
   s.provider.turns[1]!.complete()
 })
+it('refuses a send after the displayed worktree was switched, without ever starting the provider', async () => {
+  const s = await setup(true)
+  s.git('worktree', 'add', '-b', 'side', join(s.dir, 'external'))
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.repository_settings', {
+    project_id: s.project.project_id,
+    external_read: true,
+  })
+  const destination = {
+    kind: 'worktree',
+    worktree_id: (
+      await s.request('repository.v1.worktrees', { project_id: s.project.project_id })
+    ).entries.find((e: any) => e.kind === 'external').worktree_id,
+  }
+  for (const target of [s.target, destination])
+    await s.request('project.execution', {
+      project_id: s.project.project_id,
+      target,
+      enabled: true,
+    })
+  const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+  const displayed = await s.request('session.worktree.get', {
+    session_id: chat.session_id,
+    include_incarnation: true,
+  })
+  const expected_target = { target: displayed.target, incarnation: displayed.incarnation }
+  await s.request('session.worktree.set', {
+    session_id: chat.session_id,
+    expected_target: displayed.target,
+    target: destination,
+  })
+  const current = await s.request('session.worktree.get', {
+    session_id: chat.session_id,
+    include_incarnation: true,
+  })
+  expect(
+    await s.request('session.send', {
+      session_id: chat.session_id,
+      text: 'only in the displayed target',
+      observed_seq: 0,
+      expected_target,
+    })
+  ).toEqual({
+    code: 'target_changed',
+    current_target: { target: current.target, incarnation: current.incarnation },
+  })
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(0)
+  expect(s.core.db.prepare('SELECT count(*) AS n FROM inputs').get()).toEqual({ n: 0 })
+})
 it('owner switching is expected-target guarded and refuses unsupported native continuation visibly', async () => {
   const s = await setup(true),
     external = join(s.dir, 'external')

@@ -1,6 +1,11 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { ChannelError } from '@abele/channel-protocol'
-import { PromptSchema, SessionSchema, type Prompt } from '@abele/node-protocol'
+import {
+  PromptSchema,
+  SessionSchema,
+  type Prompt,
+  type ExpectedExecutionTarget,
+} from '@abele/node-protocol'
 import type {
   ProviderRun,
   DebuggerToolBridge,
@@ -158,7 +163,10 @@ export class ProviderSessions {
       const slot: ActiveRun = { run_id, starting: true }
       this.active.set(session.session_id, slot)
       try {
-        this.core.checkExecution(String(input.principal_id), session.session_id)
+        const expected = (
+          JSON.parse(String(input.body)) as { expected_target?: ExpectedExecutionTarget }
+        ).expected_target
+        this.core.checkExecution(String(input.principal_id), session.session_id, expected)
         const executionTarget = await this.core.resources.targets.runtime(session.session_id)
         const project = executionTarget.project
         if (!this.core.resources.targets.canLease(executionTarget, session.session_id)) {
@@ -189,7 +197,7 @@ export class ProviderSessions {
             const currentProject = this.core.resources.projects.get(project.project_id)
             if (currentProject.trust !== 'trusted') throw new ChannelError('project_untrusted')
             useRepositoryPermissions = currentProject.use_repository_claude_permissions
-            this.core.checkExecution(String(input.principal_id), session.session_id)
+            this.core.checkExecution(String(input.principal_id), session.session_id, expected)
             if (!this.core.resources.targets.lease(executionTarget, session.session_id, run_id))
               throw new ChannelError('resource_busy')
             input.run_id = run_id

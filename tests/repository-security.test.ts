@@ -158,7 +158,7 @@ it('treats leading-dash filenames literally while refusing ref and revision opti
     ).rejects.toThrow('invalid_params')
 })
 
-it('never dereferences in-root, out-of-root or metadata symlinks in working or historical reads and writes', async () => {
+async function symlinkFixture() {
   const s = await setup()
   mkdirSync(join(s.repo, 'ordinary'))
   writeFileSync(join(s.repo, 'ordinary', 'child'), 'inside sentinel\n')
@@ -174,58 +174,72 @@ it('never dereferences in-root, out-of-root or metadata symlinks in working or h
     symlinkSync(target!, join(s.repo, name!))
   git(s.repo, 'add', '.')
   git(s.repo, 'commit', '-m', 'link traps')
-  const committed = await s.request('repository.v1.resolve', {
-    worktree_id: s.worktree_id,
-    ref: 'HEAD',
-  })
-  const working = (await s.request('repository.v1.observe', { worktree_id: s.worktree_id }))
-    .revision
-  for (const revision of [committed, working]) {
-    const entries = (
-      await s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision })
-    ).entries
-    expect(entries.filter((e: any) => e.kind === 'symlink')).toHaveLength(5)
-    for (const path of [
-      'inside-file',
-      'outside-file',
-      'inside-dir/child',
-      'outside-dir/child',
-      'metadata/config',
-    ]) {
-      await expect(
-        s.request('repository.v1.blob', { worktree_id: s.worktree_id, revision, path })
-      ).rejects.toThrow('unsafe_path')
-      await expect(
-        s.request('repository.v1.blame', { worktree_id: s.worktree_id, revision, path })
-      ).rejects.toThrow('unsafe_path')
-    }
-    for (const path of ['inside-dir', 'outside-dir', 'metadata'])
-      await expect(
-        s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision, path })
-      ).rejects.toThrow('unsafe_path')
-    const page = await s.request('repository.v1.search', {
-      worktree_id: s.worktree_id,
-      revision,
-      query: 'outside sentinel',
-    })
-    expect(page.entries).toEqual([])
-  }
+  return s
+}
+const revisionKinds = ['committed', 'working'] as const
+async function fixtureRevision(
+  s: Awaited<ReturnType<typeof setup>>,
+  kind: (typeof revisionKinds)[number]
+) {
+  return kind === 'committed'
+    ? s.request('repository.v1.resolve', { worktree_id: s.worktree_id, ref: 'HEAD' })
+    : (await s.request('repository.v1.observe', { worktree_id: s.worktree_id })).revision
+}
+// Each boundary/revision gets its own fixture and timeout; no long combined Git loop.
+it.each(revisionKinds)('lists but never follows symlinks in %s trees', async (kind) => {
+  const s = await symlinkFixture(),
+    revision = await fixtureRevision(s, kind)
+  const entries = (await s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision }))
+    .entries
+  expect(entries.filter((e: any) => e.kind === 'symlink')).toHaveLength(5)
+  for (const path of ['inside-dir', 'outside-dir', 'metadata'])
+    await expect(
+      s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision, path })
+    ).rejects.toThrow('unsafe_path')
+})
+it.each(
+  revisionKinds.flatMap((kind) => ['blob', 'blame'].map((method) => [kind, method] as const))
+)('never dereferences symlinks in %s %s reads', async (kind, method) => {
+  const s = await symlinkFixture(),
+    revision = await fixtureRevision(s, kind)
   for (const path of [
     'inside-file',
     'outside-file',
     'inside-dir/child',
     'outside-dir/child',
     'metadata/config',
-    'outside-dir/new',
   ])
     await expect(
-      s.request('repository.v1.write', {
-        worktree_id: s.worktree_id,
-        path,
-        expected_content_id: null,
-        text: 'escape',
-      })
+      s.request(`repository.v1.${method}`, { worktree_id: s.worktree_id, revision, path })
     ).rejects.toThrow('unsafe_path')
+})
+it.each(revisionKinds)('never searches through symlinks in %s reads', async (kind) => {
+  const s = await symlinkFixture(),
+    revision = await fixtureRevision(s, kind)
+  const page = await s.request('repository.v1.search', {
+    worktree_id: s.worktree_id,
+    revision,
+    query: 'outside sentinel',
+  })
+  expect(page.entries).toEqual([])
+})
+it.each([
+  'inside-file',
+  'outside-file',
+  'inside-dir/child',
+  'outside-dir/child',
+  'metadata/config',
+  'outside-dir/new',
+])('never dereferences the %s symlink during writes', async (path) => {
+  const s = await symlinkFixture()
+  await expect(
+    s.request('repository.v1.write', {
+      worktree_id: s.worktree_id,
+      path,
+      expected_content_id: null,
+      text: 'escape',
+    })
+  ).rejects.toThrow('unsafe_path')
   expect(readFileSync(join(s.dir, 'outside', 'child'), 'utf8')).toBe('outside sentinel\n')
   expect(existsSync(join(s.dir, 'outside', 'new'))).toBe(false)
 })
@@ -353,7 +367,7 @@ it('never exposes linked-worktree shared metadata through trees, blobs, search o
   )
 })
 
-it('disables hooks, aliases, fsmonitor and included filter/diff programs across repository reads without index writes', async () => {
+async function maliciousConfigFixture() {
   const s = await setup(),
     t = trap(s.dir),
     hooks = join(s.dir, 'hooks'),
@@ -371,24 +385,48 @@ it('disables hooks, aliases, fsmonitor and included filter/diff programs across 
   const index = readFileSync(join(s.repo, '.git', 'index'))
   const working = (await s.request('repository.v1.observe', { worktree_id: s.worktree_id }))
     .revision
+  return { ...s, t, index, working }
+}
+function assertConfigHardening(s: Awaited<ReturnType<typeof maliciousConfigFixture>>) {
+  expect(readFileSync(join(s.repo, '.git', 'index'))).toEqual(s.index)
+  expect(existsSync(s.t.marker)).toBe(false)
+  // Sensitivity control: the condition really includes the malicious settings, and the trap is executable.
+  expect(git(s.repo, 'config', '--get', 'filter.evil.clean')).toBe(s.t.program)
+  expect(spawnSync(s.t.program, { input: '' }).status).toBe(0)
+  expect(existsSync(s.t.marker)).toBe(true)
+}
+it('disables hooks, aliases and fsmonitor while observing and listing worktrees/refs without index writes', async () => {
+  const s = await maliciousConfigFixture()
   await s.request('repository.v1.worktrees', { project_id: s.project.project_id })
   await s.request('repository.v1.refs', { worktree_id: s.worktree_id })
-  for (const revision of [s.revision, working]) {
-    await s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision })
-    await s.request('repository.v1.blob', { worktree_id: s.worktree_id, revision, path: 'file' })
-    await s.request('repository.v1.history', { worktree_id: s.worktree_id, revision })
-    await s.request('repository.v1.blame', { worktree_id: s.worktree_id, revision, path: 'file' })
-    await s.request('repository.v1.search', {
+  assertConfigHardening(s)
+})
+it.each(
+  revisionKinds.flatMap((kind) =>
+    ['tree', 'blob', 'history', 'blame', 'search'].map((method) => [kind, method] as const)
+  )
+)(
+  'disables hooks, aliases, fsmonitor and included filter/diff programs in %s %s reads without index writes',
+  async (kind, method) => {
+    const s = await maliciousConfigFixture()
+    const revision = kind === 'committed' ? s.revision : s.working
+    await s.request(`repository.v1.${method}`, {
       worktree_id: s.worktree_id,
       revision,
-      query: 'content',
+      ...(['blob', 'blame'].includes(method) ? { path: 'file' } : {}),
+      ...(method === 'search' ? { query: 'content' } : {}),
     })
+    assertConfigHardening(s)
   }
-  for (const mode of ['endpoint', 'staged', 'unstaged']) {
+)
+it.each(['endpoint', 'staged', 'unstaged'])(
+  'disables hooks, fsmonitor and included filter/diff programs in %s comparisons/patches without index writes',
+  async (mode) => {
+    const s = await maliciousConfigFixture()
     const comparison = await s.request('repository.v1.compare', {
       worktree_id: s.worktree_id,
       base: s.revision,
-      head: working,
+      head: s.working,
       mode,
     })
     for (const entry of comparison.entries)
@@ -397,14 +435,9 @@ it('disables hooks, aliases, fsmonitor and included filter/diff programs across 
         comparison_id: comparison.comparison_id,
         path: entry.path,
       })
+    assertConfigHardening(s)
   }
-  expect(readFileSync(join(s.repo, '.git', 'index'))).toEqual(index)
-  expect(existsSync(t.marker)).toBe(false)
-  // Sensitivity control: the condition really includes the malicious settings, and the trap is executable.
-  expect(git(s.repo, 'config', '--get', 'filter.evil.clean')).toBe(t.program)
-  expect(spawnSync(t.program, { input: '' }).status).toBe(0)
-  expect(existsSync(t.marker)).toBe(true)
-})
+)
 
 it('blocks lazy promisor fetch even on Git versions that ignore GIT_NO_LAZY_FETCH', async () => {
   const s = await setup(),

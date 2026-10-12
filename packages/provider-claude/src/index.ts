@@ -25,6 +25,7 @@ export interface ClaudeOptions {
   permissionTtlMs?: number
   processProbe?: ProcessProbe
 }
+import { recoverProviderLauncher } from '@abele/provider-contract'
 import type {
   PermissionAction,
   TurnContext,
@@ -57,17 +58,20 @@ export class ClaudeProviderAdapter {
   readonly configuration: Record<string, unknown>
   private options: Required<Omit<ClaudeOptions, 'executable' | 'processProbe'>>
   private probe: ProcessProbe
+  private readonly checkedExecutable: string
   constructor(options: ClaudeOptions = {}) {
     this.probe = options.processProbe ?? systemProcessProbe
     const requestedExecutable =
       options.executable ?? process.env.ABELE_CLAUDE_PATH ?? join(homedir(), '.local/bin/claude')
     if (!isAbsolute(requestedExecutable)) throw new Error('invalid_claude_configuration')
-    // Do not let an auto-updating global symlink switch binaries between compatibility check and launch.
-    let executable = requestedExecutable
+    this.executable = recoverProviderLauncher(requestedExecutable, 'claude')
+    // Resolve only for this compatibility probe; configuration retains the launcher.
+    // A turn repeats the probe and pins that checked target for its launch.
+    let executable = this.executable
     try {
-      executable = realpathSync(requestedExecutable)
+      executable = realpathSync(executable)
     } catch {}
-    this.executable = executable
+    this.checkedExecutable = executable
     this.options = {
       profile: options.profile ?? 'inherited',
       model: options.model ?? 'haiku',
@@ -91,14 +95,14 @@ export class ClaudeProviderAdapter {
       this.options.permissionTtlMs > 3600000
     )
       throw new Error('invalid_claude_configuration')
-    const v = spawnSync(this.executable, ['--version'], {
+    const v = spawnSync(executable, ['--version'], {
       encoding: 'utf8',
       timeout: 5000,
       maxBuffer: 65536,
     })
     this.version = v.stdout?.trim().split(' ')[0] ?? 'unavailable'
     const help = spawnSync(
-      this.executable,
+      executable,
       [
         '--permission-prompts',
         'host',
@@ -260,7 +264,13 @@ export class ClaudeProviderAdapter {
     if (ipcDirectory) cleanupRunIpc(ipcDirectory)
   }
   async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
-    if (!this.available) throw new Error(this.diagnostic)
+    const checked = new ClaudeProviderAdapter({
+      ...this.options,
+      executable: this.executable,
+      processProbe: this.probe,
+    })
+    if (!checked.available) throw new Error(checked.diagnostic)
+    const executable = checked.checkedExecutable
     const dir = createRunIpc()
     try {
       sink.ipc?.(dir)
@@ -270,7 +280,7 @@ export class ClaudeProviderAdapter {
     }
     const socketPath = join(dir, 'p.sock'),
       configPath = join(dir, 'mcp.json')
-    const configuration = this.configurationForTurn(turn)
+    const configuration = checked.configurationForTurn(turn)
     const settingsSources = configuration.settings_sources
     const token = randomBytes(32).toString('hex'),
       generation = randomUUID()
@@ -665,7 +675,7 @@ export class ClaudeProviderAdapter {
         if (m?.kind === 'ready' && m.evidence) {
           persistProcesses([m.evidence])
           if (abort.signal.aborted) worker.send({ kind: 'stop' }, () => {})
-          else worker.send({ kind: 'start', executable: this.executable, cwd: turn.cwd, args })
+          else worker.send({ kind: 'start', executable, cwd: turn.cwd, args })
         } else if (m?.kind === 'spawned' && m.evidence) {
           persistProcesses([m.evidence])
           if (abort.signal.aborted) worker.send({ kind: 'stop' }, () => {})

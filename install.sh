@@ -253,7 +253,8 @@ if [ "$uninstall" = 0 ] && [ "$codex_enabled" = true ] && [ -z "$codex" ]; then
   fi
 fi
 if [ -n "$codex" ]; then
-  codex=$(physical_path "$codex") || fail 'Cannot resolve codex-path.'
+  # Store the launcher, not its auto-updating per-version symlink target.
+  codex=$("$node" -e 'console.log(require("node:path").resolve(process.argv[1]))' "$codex") || fail 'Cannot normalize codex-path.'
   valid_path "$codex" || fail 'Invalid codex-path: use an absolute normalized executable path.'
 fi
 if [ -n "$codex_home" ]; then
@@ -270,7 +271,8 @@ selected_cli() {
 # End provider discovery
 if [ "$uninstall" = 1 ]; then claude=${old_claude:-$HOME/.local/bin/claude}
 else discover_claude; fi
-claude=$(physical_path "$claude") || fail 'Cannot resolve claude-path.'
+# State/runtime paths are physical identities; CLI paths are stable launchers.
+claude=$("$node" -e 'console.log(require("node:path").resolve(process.argv[1]))' "$claude") || fail 'Cannot normalize claude-path.'
 valid_path "$state" || fail 'Invalid state-dir: use an absolute normalized path other than / or HOME.'
 valid_path "$claude" || fail 'Invalid claude-path: use an absolute normalized executable path.'
 service_path=${claude%/*}:${node%/*}:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin

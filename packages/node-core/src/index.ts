@@ -24,6 +24,8 @@ import {
   FAKE_CAPABILITIES,
   type Prompt,
   type FakeStep,
+  type ExpectedExecutionTarget,
+  type TurnAdmissionResult,
 } from '@abele/node-protocol'
 
 import { DebuggerService, migrateDebugger } from './debugger/index.js'
@@ -858,8 +860,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         throw new ChannelError('unsupported_method')
     }
   }
-  acceptInput(actor: AuthorityContext, p: Record<string, unknown>): unknown {
-    return this.mutate(actor, 'session.send', p)
+  acceptInput(actor: AuthorityContext, p: Record<string, unknown>): TurnAdmissionResult {
+    return this.mutate(actor, 'session.send', p) as TurnAdmissionResult
   }
   acceptSession(
     actor: AuthorityContext,
@@ -936,6 +938,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return updated
     }
     if (method === 'session.send') {
+      const refusal = this.resources.targets.refusal(
+        session,
+        p.expected_target as ExpectedExecutionTarget | undefined
+      )
+      if (refusal) return refusal
       const current = this.session(session)
       this.resources.targets.checkSession(session)
       if (current.workspace_id) this.resources.workspaces.assertLease(current.workspace_id, session)
@@ -1081,9 +1088,15 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.resources.workspaces.get(session.workspace_id).state === 'provisioning'
     )
   }
-  checkExecution(installation_id: string, session_id: string) {
+  checkExecution(
+    installation_id: string,
+    session_id: string,
+    expected_target?: ExpectedExecutionTarget
+  ) {
     const actor = { installation_id }
     this.authority.check(actor, 'execute', session_id)
+    if (this.resources.targets.refusal(session_id, expected_target))
+      throw new ChannelError('target_changed')
     const session = this.session(session_id)
     if (session.workspace_id) {
       this.resources.workspaces.assertLease(session.workspace_id, session_id)
@@ -1123,10 +1136,15 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         const body = validateParams('session.send', JSON.parse(String(input.body))) as {
           text: string
           script: FakeStep[]
+          expected_target?: ExpectedExecutionTarget
         }
         if (input.state === 'queued' || input.state === 'accepted') {
           try {
-            this.checkExecution(String(input.principal_id), String(input.session_id))
+            this.checkExecution(
+              String(input.principal_id),
+              String(input.session_id),
+              body.expected_target
+            )
           } catch {
             this.transition(input, 'cancelled')
             continue

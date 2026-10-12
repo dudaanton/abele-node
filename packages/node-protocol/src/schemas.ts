@@ -16,6 +16,8 @@ import {
   SessionTargetChangedSchema,
 } from './node-path.js'
 export * from './node-path.js'
+import { ExpectedExecutionTargetSchema } from './turn.js'
+export * from './turn.js'
 import { RepositoryMethodSchemas, RepositoryInvalidationSchema } from './repository.js'
 export * from './repository.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
@@ -223,6 +225,7 @@ export const MethodSchemas = {
       ...session,
       text: z.string().min(1).max(32768),
       observed_seq: SeqSchema,
+      expected_target: ExpectedExecutionTargetSchema.optional(),
       script: z
         .array(FakeStepSchema)
         .min(1)
@@ -275,6 +278,7 @@ export const MethodSchemas = {
     })
     .strict(),
 } as const
+export type SessionSendRequest = z.input<(typeof MethodSchemas)['session.send']>
 export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([

@@ -78,10 +78,9 @@ export class CodexProviderAdapter {
     }
   }
   protected async inspect(): Promise<CodexDoctorReport> {
-    if (!this.executable) {
-      this.executable = discoverCodex({ executable: this.options.executable })
-      this.configuration.version = this.executable.version
-    }
+    // Each preflight pins the current launcher target, not a previous version directory.
+    this.executable = discoverCodex({ executable: this.options.executable })
+    this.configuration.version = this.executable.version
     this.executable.recheck()
     return doctorCodex(
       {

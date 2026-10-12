@@ -46,6 +46,9 @@ import {
   type FileRestore,
   type ReviewBatch,
   type DiffMode,
+  type ExpectedExecutionTarget,
+  type TurnAdmissionResult,
+  TurnAdmissionResultSchema,
 } from '@abele/node-protocol'
 import { NodePathClient } from './node-path.js'
 export * from './node-path.js'
@@ -87,6 +90,18 @@ export type {
   DelegationCreateRequest,
   DelegationGrantRequest,
   WorkerReport,
+  ExecutionTarget,
+  ExpectedExecutionTarget,
+  TargetChangedRefusal,
+  TurnAdmissionResult,
+  SessionSendRequest,
+  ReviewResult,
+} from '@abele/node-protocol'
+export {
+  ExecutionTargetSchema,
+  ExpectedExecutionTargetSchema,
+  TargetChangedRefusalSchema,
+  TurnAdmissionResultSchema,
 } from '@abele/node-protocol'
 export interface OutboxEntry {
   operation_id: string
@@ -321,10 +336,16 @@ export class NodeClient {
   async sendDelegation(
     delegation_id: string,
     text: string,
-    observed_seq: number
+    observed_seq: number,
+    expected_target?: ExpectedExecutionTarget,
+    retainedOperationId?: string
   ): Promise<DelegationSendResult> {
     return DelegationSendResultSchema.parse(
-      await this.mutation('delegation.send', { delegation_id, text, observed_seq })
+      await this.mutation(
+        'delegation.send',
+        { delegation_id, text, observed_seq, ...(expected_target ? { expected_target } : {}) },
+        retainedOperationId
+      )
     )
   }
   async cancelDelegation(delegation_id: string): Promise<Delegation> {
@@ -529,15 +550,33 @@ export class NodeClient {
     if (!Array.isArray(result)) throw new ChannelError('invalid_result')
     return result.map((r) => JobSchema.parse(r))
   }
-  async send(session_id: string, text: string, observed_seq: number, script?: FakeStep[]) {
-    const operation_id = await this.enqueue('session.send', {
-      session_id,
-      text,
-      observed_seq,
-      ...(script ? { script } : {}),
-    })
+  async send(
+    session_id: string,
+    text: string,
+    observed_seq: number,
+    script?: FakeStep[],
+    expected_target?: ExpectedExecutionTarget,
+    retainedOperationId?: string
+  ) {
+    const operation_id = await this.enqueue(
+      'session.send',
+      {
+        session_id,
+        text,
+        observed_seq,
+        ...(script ? { script } : {}),
+        ...(expected_target ? { expected_target } : {}),
+      },
+      retainedOperationId
+    )
     if (this.connected) await this.flush()
     return { operation_id }
+  }
+  /** Refusals are durable receipts too; reconnect/retry never substitutes a new target. */
+  async sendResult(operation_id: string): Promise<TurnAdmissionResult | undefined> {
+    const receipt = await this.operationResult(operation_id)
+    if (receipt?.error) throw new ChannelError(receipt.error)
+    return receipt ? TurnAdmissionResultSchema.parse(receipt.result) : undefined
   }
   async prompts(session_id: string, after_id?: string, state?: Prompt['state']) {
     const result = await this.request('prompt.list', {

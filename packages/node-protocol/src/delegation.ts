@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { Id, Sequence } from '@abele/channel-protocol'
+import { ExpectedExecutionTargetSchema, TurnAdmissionResultSchema } from './turn.js'
 
 export const DelegationActionSchema = z.enum(['create', 'send', 'status', 'cancel', 'read'])
 export const DelegationStateSchema = z.enum([
@@ -71,9 +72,7 @@ export const DelegationStatusSchema = DelegationSchema.extend({
   pending_human_prompts: Sequence,
 })
 export type DelegationStatus = z.infer<typeof DelegationStatusSchema>
-export const DelegationSendResultSchema = z
-  .object({ input_id: Id, accepted_seq: Sequence })
-  .strict()
+export const DelegationSendResultSchema = TurnAdmissionResultSchema
 export type DelegationSendResult = z.infer<typeof DelegationSendResultSchema>
 export const DelegationTerminalSchema = z
   .object({
@@ -127,7 +126,12 @@ export const DelegationMethodSchemas = {
   'delegation.status': z.object({ delegation_id: Id }).strict(),
   'delegation.cancel': z.object({ delegation_id: Id }).strict(),
   'delegation.send': z
-    .object({ delegation_id: Id, text: z.string().min(1).max(32768), observed_seq: Sequence })
+    .object({
+      delegation_id: Id,
+      text: z.string().min(1).max(32768),
+      observed_seq: Sequence,
+      expected_target: ExpectedExecutionTargetSchema.optional(),
+    })
     .strict(),
 } as const
 export const DELEGATION_MUTATIONS = [

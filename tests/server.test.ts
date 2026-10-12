@@ -244,47 +244,80 @@ it('revocation fences queued publication records, not only the start of a replay
 it('a no-ack slow consumer is bounded across all streams and cannot stall another session', async () => {
   const dir = mkdtempSync(resolve('.scratch/slow-')),
     core = new NodeCore(dir)
-  const token = core.createToken('slow'),
-    actor = core.authority.authenticate(token.token)
-  const streams: string[] = []
-  for (let s = 0; s < 4; s++) {
-    const session = core.request(actor, 'session.create', { title: 'slow' }, 'create-' + s) as {
-      session_id: string
-    }
-    streams.push(session.session_id)
-    for (let i = 0; i < 40; i++) {
-      core.request(
-        actor,
-        'session.send',
-        { session_id: session.session_id, text: 'x'.repeat(8000), observed_seq: 0 },
-        'send-' + s + '-' + i
-      )
-      core.tick()
-    }
-  }
   const queue = new RecordQueue(),
-    sent: RecordFrame[] = []
-  let closed = false
-  let bytes = 0
+    sent: RecordFrame[] = [],
+    publishedStreams = new Set<string>()
+  let closeReason: string | undefined,
+    bytes = 0,
+    server: Promise<void> | undefined
   const transport: RecordTransport = {
     receive: () => queue,
     send: async (record) => {
       const frame = FrameCodec.decode(record)
-      if (frame.kind === 'event') bytes += record.byteLength
-      else sent.push(frame)
+      if (frame.kind === 'event') {
+        bytes += record.byteLength
+        publishedStreams.add(frame.stream_id)
+      } else sent.push(frame)
     },
-    close: async () => {
-      closed = true
+    close: async (reason) => {
+      closeReason = reason
       queue.end()
     },
   }
-  const server = serveChannel(transport, core)
   const push = (value: unknown) => queue.push(FrameCodec.encode(value))
   try {
+    const token = core.createToken('slow'),
+      actor = core.authority.authenticate(token.token)
+    const streams: string[] = []
+    let historyBytes = 0
+    for (let s = 0; s < 4; s++) {
+      const session = core.request(actor, 'session.create', { title: 'slow' }, 'create-' + s) as {
+        session_id: string
+      }
+      streams.push(session.session_id)
+      // Many inline events, not hundreds of durable turns: this tests channel
+      // backpressure, not filesystem commit throughput. Stay below the artifact
+      // threshold so the actual transmitted records exceed the aggregate cap.
+      for (let i = 0; i < 3; i++) {
+        core.request(
+          actor,
+          'session.send',
+          {
+            session_id: session.session_id,
+            text: 'x'.repeat(8000),
+            observed_seq: 0,
+            script: Array.from({ length: 32 }, () => ({ kind: 'echo' })),
+          },
+          'send-' + s + '-' + i
+        )
+        core.tick()
+      }
+      let cursor = 0,
+        streamBytes = 0,
+        pages = 0
+      while (cursor < core.head(session.session_id)) {
+        const page = core.read(session.session_id, cursor)
+        expect(page.length).toBeGreaterThan(0)
+        streamBytes += page.reduce((sum, event) => sum + FrameCodec.encode(event).byteLength, 0)
+        cursor = page.at(-1)!.seq
+        pages++
+      }
+      // A per-stream-only cap must fail this test, as must resetting accounting
+      // at a replay-page boundary.
+      expect(streamBytes).toBeLessThan(LIMITS.unacked_bytes)
+      expect(pages).toBeGreaterThan(1)
+      historyBytes += streamBytes
+    }
+    expect(historyBytes).toBeGreaterThan(LIMITS.unacked_bytes)
+
+    vi.useFakeTimers()
+    server = serveChannel(transport, core)
     push({ kind: 'auth', profile: 'local-token-v1', token: token.token })
-    await sleep(10)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sent.map((frame) => frame.kind)).toEqual(['authenticated'])
     push({ kind: 'hello', version: { major: 0, minor: 0 } })
-    await sleep(10)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sent.map((frame) => frame.kind)).toEqual(['authenticated', 'welcome'])
     for (const [i, stream_id] of streams.entries())
       push({
         kind: 'request',
@@ -292,8 +325,16 @@ it('a no-ack slow consumer is bounded across all streams and cannot stall anothe
         method: 'stream.subscribe',
         params: { stream_id, after_seq: 0 },
       })
-    for (let i = 0; i < 100 && !closed; i++) await sleep(10)
-    expect(closed).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    const replies = sent.filter((frame) => frame.kind === 'response')
+    expect(replies).toHaveLength(streams.length)
+    expect(replies.every((frame) => !frame.error)).toBe(true)
+    // Preserve the original one-second bound, but measure channel time, not
+    // host scheduling latency. Auth/heartbeat expiry cannot satisfy closure.
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(closeReason).toBe('publication_failed')
+    expect(publishedStreams.size).toBeGreaterThan(1)
+    expect(bytes).toBeGreaterThan(0)
     expect(bytes).toBeLessThanOrEqual(LIMITS.unacked_bytes)
     const fast = core.request(actor, 'session.create', { title: 'not stalled' }, 'fast') as {
       session_id: string
@@ -309,6 +350,7 @@ it('a no-ack slow consumer is bounded across all streams and cannot stall anothe
   } finally {
     await transport.close('test_done')
     await server
+    vi.useRealTimers()
     core.close()
     rmSync(dir, { recursive: true, force: true })
   }

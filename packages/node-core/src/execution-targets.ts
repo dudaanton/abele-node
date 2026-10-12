@@ -6,6 +6,8 @@ import {
   ExecutionTargetSchema,
   WorktreePageSchema,
   type ExecutionTarget,
+  type ExpectedExecutionTarget,
+  type TargetChangedRefusal,
   type Project,
 } from '@abele/node-protocol'
 import { canonical } from './index.js'
@@ -61,6 +63,36 @@ export class ExecutionTargetService {
       .prepare('SELECT body FROM session_execution_targets WHERE session_id=?')
       .get(session) as { body: string } | undefined
     return row ? (JSON.parse(row.body) as ResolvedExecutionTarget) : undefined
+  }
+  /** Synchronous snapshot: admission calls this under the turn/receipt write transaction. */
+  currentTarget(session: string): ExpectedExecutionTarget | null {
+    const binding = this.bound(session)
+    if (binding) return { target: binding.target, incarnation: binding.generation }
+    const current = this.r.core.session(session)
+    if (!current.workspace_id) return null
+    const workspace = this.r.workspaces.get(current.workspace_id)
+    const project = this.r.projects.get(workspace.project_id)
+    if (!project.repository_path) {
+      return {
+        target: { kind: 'workspace', workspace_id: workspace.workspace_id },
+        incarnation: identity(workspace.path),
+      }
+    }
+    const row = this.r.core.db
+      .prepare(
+        'SELECT worktree_id,fingerprint FROM repository_targets WHERE workspace_id=? AND active=1 ORDER BY rowid DESC LIMIT 1'
+      )
+      .get(workspace.workspace_id) as { worktree_id: string; fingerprint: string } | undefined
+    return row
+      ? { target: { kind: 'worktree', worktree_id: row.worktree_id }, incarnation: row.fingerprint }
+      : null
+  }
+  refusal(session: string, expected?: ExpectedExecutionTarget): TargetChangedRefusal | undefined {
+    if (expected === undefined) return undefined
+    const current_target = this.currentTarget(session)
+    if (canonical(current_target) !== canonical(expected))
+      return { code: 'target_changed', current_target }
+    return undefined
   }
   private save(session: string, binding: ResolvedExecutionTarget) {
     this.r.core.db
@@ -220,6 +252,11 @@ export class ExecutionTargetService {
     const current = this.r.core.session(session)
     if (!current.workspace_id) throw new ChannelError('workspace_required')
     const w = this.r.workspaces.get(current.workspace_id)
+    if (!this.r.projects.get(w.project_id).repository_path)
+      return {
+        project_id: w.project_id,
+        target: { kind: 'workspace' as const, workspace_id: w.workspace_id },
+      }
     let cursor: string | undefined
     do {
       const page = WorktreePageSchema.parse(
@@ -406,7 +443,20 @@ export class ExecutionTargetService {
     operation?: string
   ): Promise<unknown> {
     const core = this.r.core
-    if (method === 'session.worktree.get') return this.state(actor, String(p.session_id))
+    if (method === 'session.worktree.get') {
+      const session = String(p.session_id)
+      const state = await this.state(actor, session)
+      if (!p.include_incarnation) return state
+      // Legacy discovery can yield; take the displayed snapshot again after it completes.
+      const current = this.currentTarget(session)
+      if (!current) throw new ChannelError('workspace_required')
+      return {
+        project_id:
+          this.bound(session)?.project_id ??
+          this.r.workspaces.get(core.session(session).workspace_id!).project_id,
+        ...current,
+      }
+    }
     const previous = core.operationReceipt(actor, method, p, operation)
     if (previous) return previous.result
     if (method === 'session.create') {

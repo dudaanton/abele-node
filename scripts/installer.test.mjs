@@ -22,6 +22,36 @@ import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+test('installer retains launcher symlinks across version-directory replacement', async () => {
+  const h = await home(),
+    bin = join(h, 'launchers'),
+    versions = join(h, 'versions'),
+    old = join(versions, 'old'),
+    current = join(versions, 'new')
+  for (const dir of [bin, old, current]) await mkdir(dir, { recursive: true })
+  for (const provider of ['claude', 'codex']) {
+    for (const dir of [old, current])
+      await writeFile(join(dir, provider), '#!/bin/sh\necho 2.1.292\n', { mode: 0o755 })
+    await symlink(join(old, provider), join(bin, provider))
+  }
+  const result = await install(h, ['--no-service', '--claude-path', join(bin, 'claude')], {
+    PATH: bin + ':' + process.env.PATH,
+  })
+  assert.equal(result.code, 0, result.stderr)
+  const configPath = join(h, '.local/share/abele-node/config.json')
+  const config = JSON.parse(await readFile(configPath, 'utf8'))
+  for (const provider of ['claude', 'codex']) {
+    assert.equal(config[provider], join(bin, provider))
+    await rm(join(bin, provider))
+    await symlink(join(current, provider), join(bin, provider))
+  }
+  await rm(old, { recursive: true })
+  for (const provider of ['claude', 'codex'])
+    assert.equal(await realpath(config[provider]), await realpath(join(current, provider)))
+  const wrapper = await readFile(join(h, '.local/bin/abele-node'), 'utf8')
+  assert.ok(wrapper.includes(join(bin, 'claude')))
+  assert.ok(wrapper.includes(join(bin, 'codex')))
+})
 test('Claude discovery records normalized paths and probes with service PATH', async () => {
   const h = await home(),
     bin = join(h, 'custom-bin'),
@@ -39,11 +69,11 @@ test('Claude discovery records normalized paths and probes with service PATH', a
   })
   assert.equal(result.code, 0, result.stderr)
   const config = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
-  assert.equal(config.claude, await realpath(target))
+  assert.equal(config.claude, alias)
   assert.equal(config.prefix, join(h, '.local'))
   const probe = JSON.parse(await readFile(join(h, 'claude-probe.json'), 'utf8'))
   assert.deepEqual(probe.args, ['--version'])
-  assert.equal(probe.path.split(':')[0], await realpath(bin))
+  assert.equal(probe.path.split(':')[0], bin)
   assert.ok(
     probe.path.split(':').includes(process.execPath.slice(0, process.execPath.lastIndexOf('/')))
   )
@@ -58,7 +88,7 @@ test('Codex discovery records common-location executable and no node model overr
   assert.equal(first.code, 0, first.stderr)
   const configPath = join(h, '.local/share/abele-node/config.json')
   let config = JSON.parse(await readFile(configPath, 'utf8'))
-  assert.equal(config.codex, await realpath(codex))
+  assert.equal(config.codex, codex)
   assert.equal(config.codex_model, '')
   assert.equal(config.codex_enabled, true)
   const wrapper = await readFile(join(h, '.local/bin/abele-node'), 'utf8')
@@ -89,7 +119,7 @@ test('Codex PATH discovery reaches systemd service arguments and survives its re
   const result = await install(h, [], { ...env, PATH: bin + ':' + env.PATH })
   assert.equal(result.code, 0, result.stderr)
   const unit = await readFile(join(h, '.config/systemd/user/abele-node.service'), 'utf8')
-  assert.ok(unit.includes('"--codex-path" "' + (await realpath(join(bin, 'codex'))) + '"'))
+  assert.ok(unit.includes('"--codex-path" "' + join(bin, 'codex') + '"'))
   assert.doesNotMatch(unit, /--codex-model/)
 })
 test('missing Claude still installs and explains how to configure it later', async () => {
@@ -100,7 +130,7 @@ test('missing Claude still installs and explains how to configure it later', asy
   assert.equal(result.code, 0, result.stderr)
   assert.match(result.stdout, /pi still works.*sh install.sh --claude-path/)
   const config = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
-  assert.equal(config.claude, join(await realpath(h), 'missing-claude'))
+  assert.equal(config.claude, join(h, 'missing-claude'))
 })
 const platform = `${process.platform}-${process.arch === 'x64' ? 'x64' : 'arm64'}`
 let scratch, server, base, archive

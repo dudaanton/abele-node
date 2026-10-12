@@ -67,6 +67,44 @@ fake providers exercise the switching state machine; they are not evidence of
 native conversation continuity. Initial root/plain/external execution and
 subsequent turns at the same approved target are implemented.
 
+### Guarded turn admission
+
+To pin a draft to the target the user saw, read
+`nodePath.sessionWorktreeGet({session_id, include_incarnation:true})` and retain
+`{target, incarnation}` with the draft. `incarnation` is opaque and stable across
+reads and node restarts; a binding switch (including away and back to the same
+ID) replaces it. Legacy workspace bindings expose their inspected target identity.
+Omitting `include_incarnation` preserves the original response shape.
+
+`session.send`, `delegation.send` and `review.submit` accept an optional
+`expected_target: {target, incarnation}`. The node compares it to the session's
+binding **inside the transaction that records the input and operation receipt**.
+A mismatch records only a typed refusal receipt:
+`{code:'target_changed', current_target:{target, incarnation}}`. An unbound session
+has `current_target:null`. No input, review event or provider turn is created.
+Clients omitting the precondition keep the original admission behaviour.
+`delegation.create` creates a new target rather than admitting into an existing
+displayed binding, so it has no expected-target precondition.
+
+The client surface is
+`send(session_id, text, observed_seq, script?, expected_target?, operationId?)`;
+inspect `sendResult(operation_id)` for the validated acceptance/refusal union.
+`sendDelegation` accepts the precondition and retained operation ID after
+`observed_seq`; review batches carry the field directly. The client exports
+`ExpectedExecutionTarget`, `TargetChangedRefusal`, `TurnAdmissionResult` and their
+schemas. Persist the precondition and operation ID **with** the draft, including
+offline drafts. Reload/reconnect/retry replays that exact request; changing or
+removing the precondition under the same ID is an `idempotency_mismatch`, not a
+new send. A refusal is durable too: a later target switch does not turn its retry
+into an admission. An intentional resend after checking the new target needs a
+new operation ID and explicit confirmation, never automatic retargeting.
+
+Guarded queued inputs are checked again before dispatch. If a previously scheduled
+agent switch settles after admission, an input pinned to the previous incarnation
+is cancelled/failed without dispatch, rather than executed in the new target.
+Admission receipts remain immutable; inspect the session input events for this
+post-admission outcome.
+
 ## Lifecycle and file operations
 
 `nodePath.createWorkspace({project_id, branch?, base_ref?}, operationId)` uses a

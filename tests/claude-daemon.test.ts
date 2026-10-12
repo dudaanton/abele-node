@@ -16,7 +16,6 @@ import {
   readFileSync,
   rmSync,
   statSync,
-  realpathSync,
   renameSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -34,6 +33,10 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     cli = resolve('packages/node-daemon/dist/cli.js')
   // Same frozen Date.now budget pattern as repository pagination, across a real
   // daemon process. Child startup, WebSocket traffic and cleanup keep real time.
+  // The logical clock below proves the exact expiry boundary. Give real bridge
+  // and turn watchdogs the phase budget too: freezing Date.now does not freeze
+  // their I/O timers, and a 700 ms TTL gives the bridge only 3.7 s under load.
+  const permissionTtlMs = processStepDeadlineMs
   const clockFile = join(dir, 'clock'),
     clockStart = Date.now()
   const advanceClockTo = (now: number) => {
@@ -74,9 +77,9 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
         '--claude-profile',
         'isolated',
         '--permission-ttl-ms',
-        '700',
+        String(permissionTtlMs),
         '--claude-deadline-ms',
-        '15000',
+        String(3 * processStepDeadlineMs),
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     )
@@ -168,7 +171,9 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
       command(dir, process.execPath, [cli, '--json', 'doctor', '--state-dir', state])
     ) as { claude: { configuration: { profile: string; executable: string } } }
     expect(doctor.claude.configuration.profile).toBe('isolated')
-    expect(doctor.claude.configuration.executable).toBe(realpathSync(executable))
+    // Configuration retains the launcher spelling, including macOS /var aliases;
+    // resolving it here would hide the launcher's identity after CLI updates.
+    expect(doctor.claude.configuration.executable).toBe(executable)
     const project = await a.registerProject(repo, 'trusted')
     const jobs = await Promise.all([
       a.createWorkspace(project.project_id),
@@ -194,11 +199,16 @@ it('drives protected approvals, expiry, bridge loss, serialized queue, interrupt
     const config = invocation.args[invocation.args.indexOf('--mcp-config') + 1]!
     expect(statSync(config).mode & 0o777).toBe(0o600)
     expect(statSync(join(config, '..')).mode & 0o777).toBe(0o700)
-    expect(p1.expires_at).toBe(clockStart + 700)
-    expect(p2.expires_at).toBe(clockStart + 700)
-    // Deliberately slower than the permission TTL: real scheduling must not
-    // advance the logical authorization budget in this lifecycle test.
-    await new Promise((r) => setTimeout(r, 1000))
+    expect(p1.expires_at).toBe(clockStart + permissionTtlMs)
+    expect(p2.expires_at).toBe(clockStart + permissionTtlMs)
+    advanceClockTo(p1.expires_at - 1)
+    // Deliberately longer than the old 3.7 s bridge watchdog. With only 1 ms of
+    // logical authority left, scheduling latency must not expire either prompt.
+    await new Promise((r) => setTimeout(r, 4000))
+    for (const [i, pending] of [p1, p2].entries())
+      expect(
+        (await a.prompts(sessions[i]!.session_id)).find((p) => p.prompt_id === pending.prompt_id)
+      ).toMatchObject({ state: 'pending', delivered: false })
     const allow = await a.answerPrompt(p1, 'allow')
     await a.answerPrompt(p2, 'deny')
     // The winner is immutable, but delivery is a separate committed transition.

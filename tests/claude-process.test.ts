@@ -11,7 +11,6 @@ import {
   writeFileSync,
   symlinkSync,
   unlinkSync,
-  realpathSync,
   mkdirSync,
 } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -182,7 +181,7 @@ it('keeps user-level allow rules and journals their execution as settings author
     label: 'Allowed by your Claude settings',
   })
 })
-it('pins a resolved executable so a global symlink update cannot switch a checked binary', async () => {
+it('rechecks the launcher at spawn and refuses a symlink update to an incompatible binary', async () => {
   const f = fixture(),
     alias = join(f.cwd, 'current-cli'),
     replacement = join(f.cwd, 'replacement.mjs')
@@ -192,17 +191,18 @@ it('pins a resolved executable so a global symlink update cannot switch a checke
   chmodSync(replacement, 0o700)
   unlinkSync(alias)
   symlinkSync(replacement, alias)
-  expect(adapter.executable).toBe(realpathSync(f.executable))
-  const run = await adapter.startTurn(
-    { session_id: 's', run_id: 'r', cwd: f.cwd, text: 'no-result' },
-    {
-      event: () => {},
-      processes: () => {},
-      permission: async () => ({ choice: 'deny', delivered() {} }),
-    }
-  )
-  runs.push(run)
-  expect((await run.done).reason).toBe('no_terminal_result')
+  expect(adapter.executable).toBe(alias)
+  await expect(
+    adapter.startTurn(
+      { session_id: 's', run_id: 'r', cwd: f.cwd, text: 'no-result' },
+      {
+        event: () => {},
+        processes: () => {},
+        permission: async () => ({ choice: 'deny', delivered() {} }),
+      }
+    )
+  ).rejects.toThrow('outside supported range')
+  expect(existsSync(join(f.cwd, 'invocations.jsonl'))).toBe(false)
 })
 it('journals an independently owned worker group before any external CLI launch', async () => {
   const f = fixture(),

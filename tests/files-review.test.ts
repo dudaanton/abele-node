@@ -110,6 +110,66 @@ it('accepts saved review context when the current patch exceeds the capture limi
     s.core.read(session.session_id, 0).filter((e) => e.type === 'input.accepted')
   ).toHaveLength(1)
 })
+it('refuses a review turn with a stale displayed target before recording review events', async () => {
+  const s = await setup(true)
+  const session = (await s.request('session.create', { workspace_id: s.workspace_id })) as {
+    session_id: string
+  }
+  const state = (await s.request('session.worktree.get', {
+    session_id: session.session_id,
+    include_incarnation: true,
+  })) as any
+  writeFileSync(join(s.repo, 'sample.txt'), 'one\nnew\nthree\n')
+  const snap = (await s.request('workspace.diff.capture', {
+    workspace_id: s.workspace_id,
+    mode: 'head',
+  })) as DiffSnapshot
+  const params = {
+    session_id: session.session_id,
+    observed_seq: 0,
+    expected_target: { target: state.target, incarnation: 'stale' },
+    anchors: [
+      {
+        node_id: s.core.node_id,
+        workspace_id: s.workspace_id,
+        diff_id: snap.diff_id,
+        path: 'sample.txt',
+        side: 'new',
+        start_line: 2,
+        end_line: 2,
+        context_hash: createHash('sha256').update('new').digest('hex'),
+        comment: 'Check this',
+      },
+    ],
+  }
+  const receipt = await s.request('review.submit', params, 'guarded-review')
+  expect(receipt).toEqual({
+    code: 'target_changed',
+    current_target: { target: state.target, incarnation: state.incarnation },
+  })
+  const capture = s.core.resources.views.capture.bind(s.core.resources.views)
+  vi.spyOn(s.core.resources.views, 'capture').mockImplementationOnce(async (...args) => {
+    await s.request('session.detach', { session_id: session.session_id })
+    return capture(...args)
+  })
+  const matching = {
+    ...params,
+    expected_target: { target: state.target, incarnation: state.incarnation },
+  }
+  expect(await s.request('review.submit', matching, 'racing-review')).toEqual({
+    code: 'target_changed',
+    current_target: null,
+  })
+  expect(await s.request('review.submit', matching, 'detached-review')).toEqual({
+    code: 'target_changed',
+    current_target: null,
+  })
+  expect(
+    s.core
+      .read(session.session_id, 0)
+      .some((e) => ['input.accepted', 'review.submitted'].includes(e.type))
+  ).toBe(false)
+})
 it.each([1536, 2048])(
   'pages Git history by serialized bytes, including JSON escaping (%i repetitions)',
   async (repetitions) => {

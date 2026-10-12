@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ExpectedExecutionTargetSchema, TargetChangedRefusalSchema } from './turn.js'
 const id = z.string().min(1).max(128)
 export const RelativePathSchema = z
   .string()
@@ -77,16 +78,21 @@ export const ReviewBatchSchema = z
     session_id: id,
     observed_seq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     anchors: z.array(ReviewAnchorSchema).min(1).max(32),
+    expected_target: ExpectedExecutionTargetSchema.optional(),
   })
   .strict()
 export type ReviewBatch = z.infer<typeof ReviewBatchSchema>
-export const ReviewResultSchema = z
-  .object({
-    input_id: id,
-    accepted_seq: z.number().int().nonnegative(),
-    stale: z.array(z.boolean()),
-  })
-  .strict()
+export const ReviewResultSchema = z.union([
+  z
+    .object({
+      input_id: id,
+      accepted_seq: z.number().int().nonnegative(),
+      stale: z.array(z.boolean()),
+    })
+    .strict(),
+  TargetChangedRefusalSchema,
+])
+export type ReviewResult = z.infer<typeof ReviewResultSchema>
 const contentId = z.string().regex(/^[a-f0-9]{64}$/)
 export const FileWriteSchema = z
   .object({

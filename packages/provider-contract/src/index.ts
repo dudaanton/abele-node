@@ -1,3 +1,5 @@
+export { recoverProviderLauncher } from './launcher.js'
+
 export interface ProcessIdentity {
   pid: number
   fingerprint: string

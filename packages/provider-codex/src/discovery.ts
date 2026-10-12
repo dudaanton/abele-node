@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
+import { recoverProviderLauncher } from '@abele/provider-contract'
 
 export interface CodexDiscoveryOptions {
   executable?: string
@@ -47,7 +48,7 @@ export function resolveCodexExecutable(requested: string): string {
 }
 export function discoverCodex(options: CodexDiscoveryOptions = {}): CodexExecutable {
   const requested = options.executable || process.env.ABELE_CODEX_PATH
-  if (requested) return inspectExecutable(requested, options)
+  if (requested) return inspectExecutable(recoverProviderLauncher(requested, 'codex'), options)
   const candidates = [
     join(homedir(), '.local/bin/codex'),
     join(homedir(), '.codex/local/codex'),

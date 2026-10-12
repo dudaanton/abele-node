@@ -78,6 +78,62 @@ it('opens, watches, creates and initializes a folder over the existing channel w
     await client.nodePath.divergence({ worktree_id: root.worktree_id, base_ref: 'trunk' })
   ).toMatchObject({ reason: 'unborn_head', ahead: null, behind: null })
 })
+it('replays an offline guarded send and exports the typed refusal over the channel', async () => {
+  mkdirSync('.scratch', { recursive: true })
+  const dir = mkdtempSync(resolve('.scratch/send-target-client-'))
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }))
+  const folder = join(dir, 'folder')
+  mkdirSync(folder)
+  const state = join(dir, 'state')
+  const token = (await offlineToken(state, { action: 'create', value: 'fixture' })) as {
+    token: string
+  }
+  const daemon = await startDaemon(state, 0)
+  cleanup.push(() => daemon.stop())
+  const endpoint = {
+    url: `ws://127.0.0.1:${daemon.port}/channel`,
+    profile: 'local-token-v1' as const,
+    token: token.token,
+  }
+  const store = new MemoryClientStore()
+  const client = new NodeClient(endpoint, store)
+  cleanup.push(() => client.disconnect())
+  await client.connect()
+  const project = await client.registerProject(folder, 'trusted')
+  const workspace = (await client.listWorkspaces(project.project_id))[0]!
+  const target = { kind: 'workspace' as const, workspace_id: workspace.workspace_id }
+  await client.nodePath.execution({ project_id: project.project_id, target, enabled: true })
+  const chat = await client.nodePath.createSession({ provider: 'fake', target })
+  const displayed = await client.nodePath.sessionWorktreeGet({
+    session_id: chat.session_id,
+    include_incarnation: true,
+  })
+  expect(displayed.incarnation).toEqual(expect.any(String))
+  const expected = { target: displayed.target, incarnation: displayed.incarnation! }
+  await client.disconnect()
+  await client.send(chat.session_id, 'offline draft', 0, undefined, expected, 'offline-send')
+  const owner = new NodeClient(endpoint, new MemoryClientStore())
+  cleanup.push(() => owner.disconnect())
+  await owner.connect()
+  await owner.detachSession(chat.session_id)
+  const reloaded = new NodeClient(endpoint, store)
+  cleanup.push(() => reloaded.disconnect())
+  await reloaded.connect()
+  await reloaded.flush()
+  expect(await reloaded.sendResult('offline-send')).toEqual({
+    code: 'target_changed',
+    current_target: null,
+  })
+  expect(await reloaded.pending()).toEqual([])
+  await reloaded.send(chat.session_id, 'offline draft', 0, undefined, expected, 'offline-send')
+  expect(await reloaded.sendResult('offline-send')).toEqual({
+    code: 'target_changed',
+    current_target: null,
+  })
+  await expect(
+    reloaded.send(chat.session_id, 'offline draft', 0, undefined, undefined, 'offline-send')
+  ).rejects.toThrow('idempotency_mismatch')
+})
 it('rejects malformed directory and divergence results rather than trusting UI-shaped fakes', async () => {
   const client = new NodePathClient(
     async () => ({ entries: [], extra: true }),

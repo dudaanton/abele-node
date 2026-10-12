@@ -62,8 +62,20 @@ export class BrowserRecordTransport implements RecordTransport {
         void this.close('invalid_record')
       }
     }
-    ws.onclose = () => this.queue.end()
-    ws.onerror = () => this.queue.end()
+    ws.onclose = (event) => {
+      const known =
+        /^(heartbeat_timeout|idle_timeout|auth_timeout|slow_consumer|client_disconnect|disconnected|unauthorized|node_shutdown)$/
+      RequestChannel.debug('[Abele node] socket closed', {
+        code: event.code,
+        clean: event.wasClean,
+        reason: known.test(event.reason) ? event.reason : 'peer_close',
+      })
+      this.queue.end()
+    }
+    ws.onerror = () => {
+      RequestChannel.debug('[Abele node] socket error')
+      this.queue.end()
+    }
   }
   async send(bytes: Uint8Array) {
     if (this.ws.readyState !== 1) throw new ChannelError('disconnected')
@@ -77,6 +89,7 @@ export class BrowserRecordTransport implements RecordTransport {
     return this.queue
   }
   async close(reason: string) {
+    RequestChannel.debug('[Abele node] transport close', { reason })
     this.queue.end()
     this.ws.close(1000, reason.slice(0, 100))
   }
@@ -164,6 +177,12 @@ export class LocalChannelConnector implements ChannelConnector {
 }
 
 export class RequestChannel {
+  /** Host policy, evaluated at the deadline, not cached at connection admission. */
+  static backgroundActive: () => boolean = () => false
+  /** Hosts opt into diagnostics without contaminating command-line response output. */
+  static debug: (...args: unknown[]) => void = () => {}
+  private probeTimer?: ReturnType<typeof setTimeout>
+  private probeDue = 0
   private pending = new Map<
     string,
     {
@@ -185,6 +204,11 @@ export class RequestChannel {
         for await (const bytes of this.channel.transport.receive()) {
           const frame = FrameCodec.decode(bytes)
           this.lastRecord = Date.now()
+          if (this.probeTimer !== undefined) {
+            RequestChannel.debug('[Abele node] heartbeat probe answered', { kind: frame.kind })
+            clearTimeout(this.probeTimer)
+            this.probeTimer = undefined
+          }
           if (frame.kind === 'response') {
             const pending = this.pending.get(frame.request_id)
             if (pending) {
@@ -201,31 +225,76 @@ export class RequestChannel {
             await this.channel.transport.send(FrameCodec.encode({ kind: 'pong' }))
           else if (frame.kind !== 'pong') throw new ChannelError('unexpected_record')
         }
+      } catch (error) {
+        RequestChannel.debug('[Abele node] channel reader ended', {
+          reason: error instanceof ChannelError ? error.code : 'reader_failed',
+        })
       } finally {
-        this.fail()
-        await this.channel.transport.close('disconnected')
+        if (!this.stopped) {
+          this.fail('transport_ended')
+          await this.channel.transport.close('disconnected')
+        }
       }
     })().catch(() => {})
     this.heartbeat = setInterval(() => {
-      if (Date.now() - this.lastRecord > LIMITS.dead_ms) void this.close()
-      else
+      if (this.stopped) return
+      const idleMs = Date.now() - this.lastRecord
+      if (idleMs > LIMITS.dead_ms) {
+        if (RequestChannel.backgroundActive()) this.probe('heartbeat_idle')
+        else void this.close('heartbeat_timeout')
+      } else {
         void this.channel.transport
           .send(FrameCodec.encode({ kind: 'ping' }))
-          .catch(() => this.close())
+          .catch(() => this.close('heartbeat_send_failed'))
+      }
     }, LIMITS.heartbeat_ms)
+  }
+  private probe(reason: string): void {
+    if (this.stopped || this.probeTimer !== undefined) return
+    RequestChannel.debug('[Abele node] heartbeat probe', {
+      reason,
+      idleMs: Date.now() - this.lastRecord,
+    })
+    this.probeDue = Date.now() + 5000
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = undefined
+      if (this.stopped) return
+      const lateMs = Date.now() - this.probeDue
+      if (RequestChannel.backgroundActive() && lateMs >= 1000) {
+        RequestChannel.debug('[Abele node] delayed heartbeat probe deadline', { lateMs })
+        this.probe('timer_delayed')
+      } else void this.close('heartbeat_probe_timeout')
+    }, 5000)
+    void this.channel.transport
+      .send(FrameCodec.encode({ kind: 'ping' }))
+      .catch(() => this.close('heartbeat_probe_send_failed'))
   }
   request(method: string, params: unknown, operation_id?: string): Promise<unknown> {
     if (this.stopped) return Promise.reject(new ChannelError('disconnected'))
     const request_id = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => {
-          this.pending.delete(request_id)
-          reject(new ChannelError('outcome_unknown'))
-          void this.close()
-        },
-        /^(project|workspace|review)\./.test(method) ? 30000 : 5000
-      )
+      const ms = /^(project|workspace|review)\./.test(method) ? 30000 : 5000
+      let due = Date.now() + ms
+      const expire = () => {
+        const pending = this.pending.get(request_id)
+        if (!pending || this.stopped) return
+        const lateMs = Date.now() - due
+        if (RequestChannel.backgroundActive() && lateMs >= 1000) {
+          RequestChannel.debug('[Abele node] delayed request deadline: receive grace', {
+            method,
+            lateMs,
+          })
+          due = Date.now() + 1500
+          pending.timer = setTimeout(expire, 1500)
+          return
+        }
+        this.pending.delete(request_id)
+        reject(new ChannelError('outcome_unknown'))
+        RequestChannel.debug('[Abele node] request timeout', { method })
+        if (RequestChannel.backgroundActive()) this.probe('request_timeout')
+        else void this.close('request_timeout')
+      }
+      const timer = setTimeout(expire, ms)
       this.pending.set(request_id, { resolve, reject, timer })
       void this.channel.transport
         .send(
@@ -238,15 +307,22 @@ export class RequestChannel {
           })
         )
         .catch((error) => {
-          clearTimeout(timer)
+          clearTimeout(this.pending.get(request_id)?.timer)
           this.pending.delete(request_id)
           reject(error)
         })
     })
   }
-  private fail() {
+  private fail(reason: string) {
     if (this.stopped) return
+    RequestChannel.debug('[Abele node] channel close', {
+      reason,
+      idleMs: Date.now() - this.lastRecord,
+      backgroundAudio: RequestChannel.backgroundActive(),
+    })
     this.stopped = true
+    clearTimeout(this.probeTimer)
+    this.probeTimer = undefined
     if (this.heartbeat) clearInterval(this.heartbeat)
     for (const p of this.pending.values()) {
       clearTimeout(p.timer)
@@ -255,9 +331,11 @@ export class RequestChannel {
     this.pending.clear()
     this.onClose()
   }
-  async close() {
-    this.fail()
-    await this.channel.transport.close('client_disconnect')
+  async close(reason = 'client_disconnect') {
+    if (!this.stopped) {
+      this.fail(reason)
+      await this.channel.transport.close(reason)
+    }
     await this.reader
   }
 }

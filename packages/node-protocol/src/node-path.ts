@@ -82,16 +82,13 @@ export const FileOperationMethodSchemas = {
   'repository.v1.file.mkdir': z.object({ worktree_id: id, path: file }).strict(),
 } as const
 export type FileOperationMethod = keyof typeof FileOperationMethodSchemas
-export const ExecutionTargetSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('workspace'), workspace_id: id }).strict(),
-  z.object({ kind: z.literal('worktree'), worktree_id: id }).strict(),
-])
-export type ExecutionTarget = z.infer<typeof ExecutionTargetSchema>
+import { ExecutionTargetSchema } from './turn.js'
+export { ExecutionTargetSchema, type ExecutionTarget } from './turn.js'
 export const ExecutionGrantSchema = z
   .object({ project_id: id, target: ExecutionTargetSchema, enabled: z.boolean() })
   .strict()
 export const SessionTargetSchema = z
-  .object({ project_id: id, target: ExecutionTargetSchema })
+  .object({ project_id: id, target: ExecutionTargetSchema, incarnation: id.optional() })
   .strict()
 export const SessionTargetSetSchema = z
   .object({ session_id: id, target: ExecutionTargetSchema })
@@ -108,7 +105,9 @@ export const SessionTargetChangedSchema = z
 export const ExecutionMethodSchemas = {
   'project.trust': z.object({ project_id: id, trust: TrustSchema }).strict(),
   'project.execution': ExecutionGrantSchema,
-  'session.worktree.get': z.object({ session_id: id }).strict(),
+  'session.worktree.get': z
+    .object({ session_id: id, include_incarnation: z.boolean().optional() })
+    .strict(),
   'session.worktree.set': z
     .object({
       session_id: id,

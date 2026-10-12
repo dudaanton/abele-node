@@ -343,6 +343,13 @@ export class ReviewBatchService {
       core = this.r.core
     const previous = core.operationReceipt(actor, 'review.submit', batch, operation)
     if (previous) return previous.result
+    // A stale displayed binding is a durable refusal even if it also invalidated the anchors.
+    if (this.r.targets.refusal(batch.session_id, batch.expected_target))
+      return core.commitOperation(actor, 'review.submit', batch, operation, () => {
+        const refusal = this.r.targets.refusal(batch.session_id, batch.expected_target)
+        if (!refusal) throw new ChannelError('resource_busy')
+        return refusal
+      })
     const session = core.session(batch.session_id)
     const stale: boolean[] = [],
       contexts: string[] = []
@@ -388,14 +395,19 @@ export class ReviewBatchService {
         .join('\n')
     if (Buffer.byteLength(text) > 32768) throw new ChannelError('output_limit')
     return core.commitOperation(actor, 'review.submit', batch, operation, () => {
+      // Snapshot capture yields; recheck inside admission, before anchor/binding validation.
+      const refusal = this.r.targets.refusal(batch.session_id, batch.expected_target)
+      if (refusal) return refusal
       if (core.session(batch.session_id).workspace_id !== session.workspace_id)
         throw new ChannelError('invalid_anchor')
       const result = core.acceptInput(actor, {
         session_id: batch.session_id,
         observed_seq: batch.observed_seq,
         text,
+        expected_target: batch.expected_target,
         script: [{ kind: 'echo' }],
-      }) as { input_id: string; accepted_seq: number }
+      })
+      if ('code' in result) return result
       core.append(
         batch.session_id,
         'review.submitted',

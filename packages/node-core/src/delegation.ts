@@ -6,6 +6,7 @@ import {
   DelegationStatusSchema,
   WorkerReportSchema,
   type DelegationGrant,
+  type ExpectedExecutionTarget,
   type Delegation,
   type WorkerReport,
 } from '@abele/node-protocol'
@@ -248,12 +249,18 @@ export class DelegationService {
         return d
       }
       if (method === 'delegation.send') {
+        const refusal = this.core.resources.targets.refusal(
+          d.session_id,
+          p.expected_target as ExpectedExecutionTarget | undefined
+        )
+        if (refusal) return refusal
         if (!active(d)) throw new ChannelError('resource_busy')
         this.checkExecution(d.session_id)
         return this.core.acceptInput(actor, {
           session_id: d.session_id,
           text: p.text,
           observed_seq: p.observed_seq,
+          expected_target: p.expected_target,
           script: [{ kind: 'echo' }],
         })
       }
