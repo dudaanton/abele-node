@@ -210,6 +210,25 @@ it('a forged prefix cannot redirect a service change to another installation', (
   expect(result.status).toBe(1)
   expect(result.stderr).toContain('prefix')
 })
+it('service admission accepts migrated marker and legacy boot-local device identities', () => {
+  const f = fixture(),
+    s = statSync(f.state, { bigint: true })
+  writeFileSync(
+    f.configFile,
+    JSON.stringify({ ...f.config, state_identity: `${s.dev + 1n}:${s.ino}` })
+  )
+  expect(run(f.entry, f.state, 'service', 'enable').status).toBe(0)
+  const token = 'a'.repeat(64),
+    marker = join(f.state, '.abele-state-identity')
+  writeFileSync(marker, token)
+  writeFileSync(
+    f.configFile,
+    JSON.stringify({ ...f.config, state_identity: `marker:${s.ino}:${token}` })
+  )
+  expect(run(f.entry, f.state, 'service', 'enable').status).toBe(0)
+  writeFileSync(marker, 'b'.repeat(64))
+  expect(run(f.entry, f.state, 'service', 'disable').stderr).toContain('identity changed')
+})
 
 it('source deployments have an explicit foreground status and safe enable refusal', () => {
   const f = fixture()

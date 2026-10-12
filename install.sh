@@ -153,9 +153,28 @@ old='' old_state='' old_claude='' old_service=0
 expected_state_identity=''
 state_path_pinned=0
 state_identity() {
-  "$node" - "$1" <<'NODE'
+  "$node" - "$1" "$expected_state_identity" <<'NODE'
 const fs=require('node:fs');
-try{const s=fs.statSync(process.argv[2],{bigint:true});if(!s.isDirectory())throw new Error('state_is_not_a_directory');console.log(s.dev+':'+s.ino)}
+try{
+const state=process.argv[2],expected=process.argv[3],s=fs.statSync(state,{bigint:true});
+if(!s.isDirectory())throw new Error('state_is_not_a_directory');
+// Legacy device numbers are boot-local on APFS. Admit their inode once, then
+// bind subsequent checks to a private random marker as well as the inode.
+const legacy=/^\d+:\d+$/.test(expected);
+if(legacy && expected.split(':')[1]!==String(s.ino))throw new Error('state_identity_changed');
+const marker=state+'/.abele-state-identity';
+if(!expected || expected==='missing' || legacy){
+  try{fs.writeFileSync(marker,require('node:crypto').randomBytes(32).toString('hex'),{flag:'wx',mode:0o600})}
+  catch(e){if(e.code!=='EEXIST')throw e}
+}
+const m=fs.lstatSync(marker);
+if(!m.isFile() || m.isSymbolicLink())throw new Error('state_identity_changed');
+const token=fs.readFileSync(marker,'utf8');
+if(!/^[a-f0-9]{64}$/.test(token))throw new Error('state_identity_changed');
+const observed='marker:'+s.ino+':'+token;
+if(expected && expected!=='missing' && !legacy && expected!==observed)throw new Error('state_identity_changed');
+console.log(observed);
+}
 catch(e){if(e.code!=='ENOENT')throw e;console.log('missing')}
 NODE
 }
@@ -168,7 +187,10 @@ verify_state_identity() {
     fi
   fi
   observed_state_identity=$(state_identity "$1") || return 1
-  if [ -z "$expected_state_identity" ]; then expected_state_identity=$observed_state_identity; fi
+  case "$expected_state_identity" in
+    '') expected_state_identity=$observed_state_identity ;;
+    [0-9]*:[0-9]*) [ "$observed_state_identity" = missing ] || expected_state_identity=$observed_state_identity ;;
+  esac
   if [ "$expected_state_identity" != "$observed_state_identity" ]; then
     printf '%s\n' 'Installed state identity changed or disappeared; refusing to stop or purge an unknown state.' >&2
     return 1
@@ -244,7 +266,12 @@ elif [ -e "$plist" ] || [ -L "$plist" ] || [ -e "$unit" ] || [ -L "$unit" ]; the
 fi
 # Check the recorded object before resolving paths or inspecting a daemon, for
 # foreground deployments as well as services. Never adopt a replacement inode.
-if [ -n "$old" ]; then verify_state_identity "$old_state" || fail 'Installed state identity changed; nothing was stopped or removed.'; fi
+if [ -n "$old" ]; then
+  # Recorded state paths are already canonical: do not adopt a relocated object
+  # merely because an alias now leads to its original inode and marker.
+  state_path_pinned=1
+  verify_state_identity "$old_state" || fail 'Installed state identity changed; nothing was stopped or removed.'
+fi
 if [ -n "$old" ] && [ -n "$state" ]; then
   state_matches=$(path_relation same "$state" "$old_state") || fail 'Cannot compare installed state paths.'
   [ "$state_matches" = true ] || fail 'Changing an installed state directory is unsafe; uninstall without purging first.'
@@ -374,15 +401,6 @@ check_effective_unit() {
     if [ "$fragment_matches" != true ]; then printf '%s\n' 'Loaded systemd fragment differs from the owned unit.' >&2; return 1; fi
   fi
 }
-if [ "$service" = 1 ] || [ "$old_service" = 1 ]; then
-  if [ "$os" = linux ]; then
-    check_dropins || fail 'Unmanaged systemd drop-in overrides; refusing to stop or overwrite the service.'
-    command -v systemctl >/dev/null 2>&1 || fail 'systemctl --user unavailable; use --no-service.'
-    systemctl --user show-environment >/dev/null 2>&1 || fail 'No systemd user manager; use --no-service and start manually.'
-    check_manager_dropins || fail 'Cannot exclude unloaded systemd drop-in overrides before stopping anything.'
-    check_effective_unit "$old_service" || fail 'Cannot confirm systemd service ownership before stopping anything.'
-  fi
-fi
 # A fresh service installation must not adopt or signal a manual daemon.
 assert_foreground_stopped() {
   installed_command=$("$node" - "$prefix/bin/abele-node" <<'NODE'
@@ -398,6 +416,15 @@ try{process.kill(lock.pid,0);process.exit(1)}catch(e){if(e.code!=='ESRCH')throw 
 NODE
 }
 if [ "$service" = 1 ] && [ "$old_service" = 0 ]; then assert_foreground_stopped; fi
+if [ "$service" = 1 ] || [ "$old_service" = 1 ]; then
+  if [ "$os" = linux ]; then
+    check_dropins || fail 'Unmanaged systemd drop-in overrides; refusing to stop or overwrite the service.'
+    command -v systemctl >/dev/null 2>&1 || fail 'systemctl --user unavailable; use --no-service.'
+    systemctl --user show-environment >/dev/null 2>&1 || fail 'No systemd user manager; use --no-service and start manually.'
+    check_manager_dropins || fail 'Cannot exclude unloaded systemd drop-in overrides before stopping anything.'
+    check_effective_unit "$old_service" || fail 'Cannot confirm systemd service ownership before stopping anything.'
+  fi
+fi
 work=''
 backup=''
 retain_backup=0
@@ -952,7 +979,8 @@ if [ "$service" = 1 ]; then
 fi
 "$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" <<'NODE'
 const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled]=process.argv.slice(2);
-const stateStat=fs.statSync(state,{bigint:true}),state_identity=stateStat.dev+':'+stateStat.ino;
+const stateStat=fs.statSync(state,{bigint:true}),marker=state+'/.abele-state-identity',markerStat=fs.lstatSync(marker),state_identity='marker:'+stateStat.ino+':'+fs.readFileSync(marker,'utf8');
+if(!markerStat.isFile() || markerStat.isSymbolicLink())throw new Error('state_identity_changed_before_publication');
 if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathSync(state)!==state)throw new Error('state_identity_changed_before_publication');
 const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];

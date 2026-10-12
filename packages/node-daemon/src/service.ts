@@ -99,7 +99,22 @@ export function installedService(runtime: string, state: string) {
       'Installer configuration differs from this runtime/state; inspect the installation before changing its service.'
     )
   const identity = statSync(state, { bigint: true })
-  if (!identity.isDirectory() || `${identity.dev}:${identity.ino}` !== config.state_identity)
+  let matches = false
+  if (/^\d+:\d+$/.test(config.state_identity))
+    matches = String(identity.ino) === config.state_identity.split(':')[1]
+  else if (/^marker:\d+:[a-f0-9]{64}$/.test(config.state_identity)) {
+    try {
+      const marker = join(state, '.abele-state-identity'),
+        m = lstatSync(marker)
+      matches =
+        m.isFile() &&
+        !m.isSymbolicLink() &&
+        config.state_identity === `marker:${identity.ino}:${readFileSync(marker, 'utf8')}`
+    } catch {
+      /* A missing marker must refuse service changes. */
+    }
+  }
+  if (!identity.isDirectory() || !matches)
     throw new Error(
       'Installed state identity changed or is unrecorded; nothing was stopped or changed.'
     )

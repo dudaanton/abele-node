@@ -6,6 +6,7 @@ const result = spawnSync(
   [
     '--test',
     'scripts/installer.test.mjs',
+    'scripts/state-identity.test.mjs',
     'scripts/install-runtime.test.mjs',
     'scripts/publish-release.test.mjs',
   ],

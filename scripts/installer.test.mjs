@@ -1151,8 +1151,38 @@ test('fresh foreground installation binds a private state directory before recor
   const physical = await realpath(state),
     s = await stat(physical, { bigint: true })
   assert.equal(config.state, physical)
-  assert.equal(config.state_identity, s.dev + ':' + s.ino)
+  assert.equal(
+    config.state_identity,
+    'marker:' + s.ino + ':' + (await readFile(join(state, '.abele-state-identity'), 'utf8'))
+  )
   assert.equal(Number(s.mode) & 0o777, 0o700)
+  assert.equal(Number((await stat(join(state, '.abele-state-identity'))).mode) & 0o777, 0o600)
+})
+test('upgrade migrates legacy identity despite a changed device number', async () => {
+  const h = await home(),
+    state = join(h, 'state')
+  assert.equal(
+    (await install(h, ['--version', '0.2.0', '--no-service', '--state-dir', state])).code,
+    0
+  )
+  const file = join(h, '.local/share/abele-node/config.json')
+  const config = JSON.parse(await readFile(file, 'utf8'))
+  const s = await stat(state, { bigint: true })
+  config.state_identity = s.dev + ':' + s.ino + 'invalid'
+  await writeFile(file, JSON.stringify(config))
+  const malformed = await install(h, ['--version', '0.2.3', '--no-service'])
+  assert.notEqual(malformed.code, 0, malformed.stderr)
+  await assert.rejects(access(join(h, 'cli-stop.log')))
+  config.state_identity = s.dev + 1n + ':' + s.ino
+  await writeFile(file, JSON.stringify(config))
+  const result = await install(h, ['--version', '0.2.3', '--no-service'])
+  assert.equal(result.code, 0, result.stderr)
+  const updated = JSON.parse(await readFile(file, 'utf8'))
+  assert.match(updated.state_identity, /^marker:\d+:[a-f0-9]{64}$/)
+  assert.equal(
+    await readFile(join(state, '.abele-state-identity'), 'utf8'),
+    updated.state_identity.split(':')[2]
+  )
 })
 test('legacy foreground configurations cannot adopt a new state identity before destructive actions', async () => {
   const h = await home(),
@@ -1177,6 +1207,93 @@ test('legacy foreground configurations cannot adopt a new state identity before 
   assert.match(result.stderr, /state identity.*missing|missing.*state identity/i)
   await assert.rejects(access(join(h, 'cli-stop.log')))
   await access(join(h, '.local/share/abele-node/current'))
+})
+test('legacy migration refuses a missing, non-directory or replaced state', async () => {
+  const h = await home(),
+    state = join(h, 'state'),
+    moved = join(h, 'original')
+  assert.equal(
+    (await install(h, ['--version', '0.2.0', '--no-service', '--state-dir', state])).code,
+    0
+  )
+  const file = join(h, '.local/share/abele-node/config.json'),
+    config = JSON.parse(await readFile(file, 'utf8'))
+  const s = await stat(state, { bigint: true })
+  config.state_identity = s.dev + 1n + ':' + s.ino
+  const before = JSON.stringify(config)
+  await writeFile(file, before)
+  await rename(state, moved)
+  for (const damage of ['missing', 'file', 'directory']) {
+    if (damage === 'file') await writeFile(state, 'foreign state')
+    if (damage === 'directory') await mkdir(state)
+    const result = await install(h, [
+      '--uninstall',
+      '--no-service',
+      '--purge-state',
+      '--confirm-purge-state',
+      state,
+    ])
+    assert.notEqual(result.code, 0, result.stderr)
+    await assert.rejects(access(join(h, 'cli-stop.log')))
+    assert.equal(await readFile(file, 'utf8'), before)
+    await access(join(moved, '.abele-state-identity'))
+    await rm(state, { recursive: true, force: true })
+  }
+})
+test('a recorded state moved behind an alias is refused even with the same inode and marker', async () => {
+  const h = await home(),
+    state = join(h, 'state'),
+    moved = join(h, 'moved')
+  assert.equal(
+    (await install(h, ['--version', '0.2.0', '--no-service', '--state-dir', state])).code,
+    0
+  )
+  await rename(state, moved)
+  await symlink(moved, state)
+  const result = await install(h, ['--version', '0.2.3', '--no-service'])
+  assert.notEqual(result.code, 0, result.stderr)
+  await assert.rejects(access(join(h, 'cli-stop.log')))
+  assert.equal(await readlink(join(h, '.local/share/abele-node/current')), '0.2.0')
+})
+test('marker identity survives device changes and refuses missing, replaced or aliased markers', async () => {
+  const h = await home(),
+    state = join(h, 'state')
+  assert.equal(
+    (await install(h, ['--version', '0.2.0', '--no-service', '--state-dir', state])).code,
+    0
+  )
+  const fault = join(h, 'changed-device.cjs')
+  await writeFile(
+    fault,
+    `const fs=require('node:fs'),stat=fs.statSync;fs.statSync=(p,...args)=>{const s=stat(p,...args);if(String(p)===${JSON.stringify(state)})s.dev=typeof s.dev==='bigint'?s.dev+1n:s.dev+1;return s}`
+  )
+  const result = await install(h, ['--version', '0.2.3', '--no-service'], {
+    NODE_OPTIONS: '--require=' + fault,
+  })
+  assert.equal(result.code, 0, result.stderr)
+  const marker = join(state, '.abele-state-identity'),
+    token = await readFile(marker, 'utf8')
+  for (const damage of ['missing', 'replaced', 'alias']) {
+    await rm(join(h, 'cli-stop.log'), { force: true })
+    await rm(marker, { force: true })
+    if (damage === 'replaced') await writeFile(marker, '0'.repeat(64))
+    if (damage === 'alias') {
+      const target = join(h, 'foreign-marker')
+      await writeFile(target, token)
+      await symlink(target, marker)
+    }
+    const rejected = await install(h, [
+      '--uninstall',
+      '--no-service',
+      '--purge-state',
+      '--confirm-purge-state',
+      state,
+    ])
+    assert.notEqual(rejected.code, 0, rejected.stderr)
+    await assert.rejects(access(join(h, 'cli-stop.log')))
+    await access(join(h, '.local/share/abele-node/current'))
+    await access(state)
+  }
 })
 test('foreground state identity is verified before uninstall, purge or upgrade can stop anything', async () => {
   for (const action of ['uninstall', 'purge', 'upgrade']) {

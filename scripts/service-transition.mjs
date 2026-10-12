@@ -1,7 +1,7 @@
 // Offline crash recovery for service-only installer transactions. No provider execution.
 import fs from 'node:fs'
 import path from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -69,6 +69,37 @@ function identity(p) {
   const s = fs.statSync(p, { bigint: true })
   if (!s.isDirectory()) throw new Error('State is not a directory')
   return s.dev + ':' + s.ino
+}
+function stateMatches(p, expected) {
+  try {
+    const s = fs.statSync(p, { bigint: true })
+    if (!s.isDirectory()) return false
+    const legacy = /^\d+:\d+$/.test(expected)
+    if (legacy) {
+      if (String(s.ino) !== expected.split(':')[1]) return false
+    } else if (
+      !/^marker:\d+:[a-f0-9]{64}$/.test(expected) ||
+      String(s.ino) !== expected.split(':')[1]
+    )
+      return false
+    const marker = path.join(p, '.abele-state-identity')
+    // Only legacy records may acquire a marker. A missing marker for a new
+    // identity is evidence of replacement, never permission to adopt it.
+    if (legacy) {
+      try {
+        fs.writeFileSync(marker, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 })
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e
+      }
+    }
+    const m = fs.lstatSync(marker)
+    if (!m.isFile() || m.isSymbolicLink()) return false
+    const token = fs.readFileSync(marker, 'utf8')
+    return /^[a-f0-9]{64}$/.test(token) && (legacy || expected === `marker:${s.ino}:${token}`)
+  } catch (e) {
+    if (['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'ELOOP'].includes(e.code)) return false
+    throw e
+  }
 }
 function physical(p) {
   const tail = []
@@ -323,7 +354,7 @@ if (action === 'prepare') {
         fs.realpathSync(root) !== root ||
         identity(root) !== m.rootIdentity ||
         physical(m.state) !== m.state ||
-        identity(m.state) !== m.stateIdentity
+        !stateMatches(m.state, m.stateIdentity)
       )
         throw new Error('Installed state/root identity changed; recovery refused')
     }
@@ -353,7 +384,8 @@ if (action === 'prepare') {
     if (
       old.version !== m.oldVersion ||
       old.state !== m.state ||
-      old.state_identity !== m.stateIdentity ||
+      (old.state_identity !== m.stateIdentity &&
+        !(/^\d+:\d+$/.test(old.state_identity) && stateMatches(m.state, old.state_identity))) ||
       old.service !== m.oldService
     )
       throw new Error('Recovery snapshot differs from recorded installation')
