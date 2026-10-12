@@ -1,10 +1,15 @@
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 
+// Shared macOS CI took up to 83s for the 75k case and over 10s for cleanup.
+// These are capacity/correctness tests, not benchmarks: allow >2x that worst case
+// for setup and reads separately, and give high-churn FSEvents teardown 60s.
+const largeFixtureTimeout = 180_000
+const cleanupTimeout = 60_000
 const fixtures: { dir: string; core: NodeCore }[] = []
 function git(cwd: string, ...args: string[]) {
   const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
@@ -18,14 +23,39 @@ async function setup(count = 8) {
   git(repo, 'init', '-b', 'trunk')
   git(repo, 'config', 'user.name', 'Fixture')
   git(repo, 'config', 'user.email', 'fixture@example.invalid')
-  for (let i = 0; i < count; i++)
-    writeFileSync(
-      join(repo, 'deep', `f${String(i).padStart(5, '0')}.txt`),
-      i === count - 1 ? 'needle\n' : 'plain\n'
-    )
-  writeFileSync(join(repo, '.gitignore'), 'ignored\n')
-  git(repo, 'add', '.')
-  git(repo, 'commit', '-m', 'fixture')
+  if (count >= 10500) {
+    // Import two shared content blobs rather than write, stat and hash tens of
+    // thousands of identical files in JS + git add. Checkout materializes the
+    // same real tracked worktree; no repository operation under test is mocked.
+    const commands = [
+      'blob\nmark :1\ndata 6\nplain\n',
+      'blob\nmark :2\ndata 7\nneedle\n',
+      'commit refs/heads/trunk\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\ndata 8\nfixture\n',
+      'M 100644 inline .gitignore\ndata 8\nignored\n',
+    ]
+    for (let i = 0; i < count; i++)
+      commands.push(
+        `M 100644 :${i === count - 1 ? 2 : 1} deep/f${String(i).padStart(5, '0')}.txt\n`
+      )
+    commands.push('\ndone\n')
+    const imported = spawnSync('/usr/bin/git', ['fast-import', '--quiet'], {
+      cwd: repo,
+      encoding: 'utf8',
+      input: commands.join(''),
+    })
+    if (imported.error) throw imported.error
+    if (imported.status !== 0) throw new Error(imported.stderr)
+    git(repo, 'checkout', 'HEAD', '--', '.')
+  } else {
+    for (let i = 0; i < count; i++)
+      writeFileSync(
+        join(repo, 'deep', `f${String(i).padStart(5, '0')}.txt`),
+        i === count - 1 ? 'needle\n' : 'plain\n'
+      )
+    writeFileSync(join(repo, '.gitignore'), 'ignored\n')
+    git(repo, 'add', '.')
+    git(repo, 'commit', '-m', 'fixture')
+  }
   const core = new NodeCore(join(dir, 'state'))
   fixtures.push({ dir, core })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
@@ -46,7 +76,7 @@ afterEach(async () => {
     core.close()
     rmSync(dir, { recursive: true, force: true })
   }
-})
+}, cleanupTimeout)
 it('does not enumerate the repository or rebuild its snapshot for warm tree/blob/content reads', async () => {
   const s = await setup()
   const revision = await s.observe()
@@ -73,32 +103,42 @@ it('does not enumerate the repository or rebuild its snapshot for warm tree/blob
     )
   ).toEqual([])
 })
-it('browses and pages a 10,500-file worktree and finds content beyond the old 2048-file ceiling', async () => {
-  const s = await setup(10500)
-  const p = { worktree_id: s.worktree_id, revision: await s.observe() }
-  expect((await s.request('repository.v1.tree', p)).entries.map((e: any) => e.path)).toContain(
-    'deep'
+describe('10,500-file worktree', () => {
+  let s: Awaited<ReturnType<typeof setup>>
+  beforeAll(async () => {
+    s = await setup(10500)
+  }, largeFixtureTimeout)
+
+  it(
+    'browses and pages a 10,500-file worktree and finds content beyond the old 2048-file ceiling',
+    async () => {
+      const p = { worktree_id: s.worktree_id, revision: await s.observe() }
+      expect((await s.request('repository.v1.tree', p)).entries.map((e: any) => e.path)).toContain(
+        'deep'
+      )
+      let page = await s.request('repository.v1.tree', { ...p, path: 'deep', limit: 256 })
+      let count = page.entries.length
+      while (page.cursor) {
+        page = await s.request('repository.v1.tree', {
+          ...p,
+          path: 'deep',
+          limit: 256,
+          cursor: page.cursor,
+        })
+        count += page.entries.length
+      }
+      expect(count).toBe(10500)
+      const search = { ...p, query: 'needle' }
+      page = await s.request('repository.v1.search', search)
+      const found = [...page.entries]
+      while (page.cursor) {
+        page = await s.request('repository.v1.search', { ...search, cursor: page.cursor })
+        found.push(...page.entries)
+      }
+      expect(found.map((e: any) => e.path)).toEqual(['deep/f10499.txt'])
+    },
+    largeFixtureTimeout
   )
-  let page = await s.request('repository.v1.tree', { ...p, path: 'deep', limit: 256 })
-  let count = page.entries.length
-  while (page.cursor) {
-    page = await s.request('repository.v1.tree', {
-      ...p,
-      path: 'deep',
-      limit: 256,
-      cursor: page.cursor,
-    })
-    count += page.entries.length
-  }
-  expect(count).toBe(10500)
-  const search = { ...p, query: 'needle' }
-  page = await s.request('repository.v1.search', search)
-  const found = [...page.entries]
-  while (page.cursor) {
-    page = await s.request('repository.v1.search', { ...search, cursor: page.cursor })
-    found.push(...page.entries)
-  }
-  expect(found.map((e: any) => e.path)).toEqual(['deep/f10499.txt'])
 })
 it.each([
   'custom-relative',
@@ -474,17 +514,26 @@ it('returns a resumable hostile-regex deadline well before the client five-secon
   writeFileSync(join(s.repo, 'attack'), 'a'.repeat(64000) + '!')
   const revision = await s.observe()
   const start = performance.now()
-  const result = await s.request('repository.v1.search', {
-    worktree_id: s.worktree_id,
-    revision,
-    query: '(a+)+$',
-    mode: 'regex',
-    path_glob: 'attack',
-  })
-  expect(result.incomplete).toBe(true)
-  expect(result.omissions.join(' ')).toContain('deadline')
-  expect(result.cursor).toBeTruthy()
-  expect(performance.now() - start).toBeLessThan(2000)
+  // Measure the client deadline in the same run so scheduler delays affect the
+  // baseline too. Preserve the former 2s / 5s margin as a ratio, not wall time.
+  const [result, clientDeadline] = await Promise.all([
+    s
+      .request('repository.v1.search', {
+        worktree_id: s.worktree_id,
+        revision,
+        query: '(a+)+$',
+        mode: 'regex',
+        path_glob: 'attack',
+      })
+      .then((response) => ({ response, elapsed: performance.now() - start })),
+    new Promise<number>((resolve) => {
+      setTimeout(() => resolve(performance.now() - start), 5000)
+    }),
+  ])
+  expect(result.response.incomplete).toBe(true)
+  expect(result.response.omissions.join(' ')).toContain('deadline')
+  expect(result.response.cursor).toBeTruthy()
+  expect(result.elapsed / clientDeadline).toBeLessThan(2 / 5)
 })
 it('invalidates the index, ignores newly ignored paths, and never follows a replaced directory link', async () => {
   const s = await setup()
@@ -518,37 +567,50 @@ it('invalidates the index, ignores newly ignored paths, and never follows a repl
 })
 // Keep the high-churn fixture last so its teardown cannot flood a subsequent
 // small fixture's macOS FSEvents delivery. The fixture and assertions stay real.
-it('keeps freshly issued observations and tree cursors usable for 75,000 short tracked paths', async () => {
-  const s = await setup(75000)
-  const p = { worktree_id: s.worktree_id, revision: await s.observe() }
-  const root = await s.request('repository.v1.tree', p)
-  expect(root.entries.map((entry: any) => entry.path)).toContain('deep')
-  const first = await s.request('repository.v1.tree', { ...p, path: 'deep', limit: 2 })
-  expect(first.cursor).toBeTruthy()
-  const second = await s.request('repository.v1.tree', {
-    ...p,
-    path: 'deep',
-    limit: 2,
-    cursor: first.cursor,
-  })
-  expect(second.entries.map((entry: any) => entry.path)).toEqual([
-    'deep/f00002.txt',
-    'deep/f00003.txt',
-  ])
-  expect(
-    (await s.request('repository.v1.blob', { ...p, path: 'deep/f74999.txt' })).content_id
-  ).toBeTruthy()
-  const again = { ...p, revision: await s.observe() }
-  expect((await s.request('repository.v1.tree', again)).entries).toEqual(root.entries)
-  expect((await s.request('repository.v1.tree', p)).entries).toEqual(root.entries)
-  // Two visibility variants exceed the shared index budget together. Evict the
-  // older index/leases, not the newly issued include_ignored observation.
-  const allowed = (
-    await s.request('repository.v1.observe', { worktree_id: s.worktree_id, include_ignored: true })
-  ).revision
-  const next = { ...p, revision: allowed }
-  expect((await s.request('repository.v1.tree', next)).entries).toEqual(root.entries)
-  expect(
-    (await s.request('repository.v1.blob', { ...next, path: 'deep/f74999.txt' })).content_id
-  ).toBeTruthy()
-}, 60000)
+describe('75,000 short tracked paths', () => {
+  let s: Awaited<ReturnType<typeof setup>>
+  beforeAll(async () => {
+    s = await setup(75000)
+  }, largeFixtureTimeout)
+
+  it(
+    'keeps freshly issued observations and tree cursors usable for 75,000 short tracked paths',
+    async () => {
+      const p = { worktree_id: s.worktree_id, revision: await s.observe() }
+      const root = await s.request('repository.v1.tree', p)
+      expect(root.entries.map((entry: any) => entry.path)).toContain('deep')
+      const first = await s.request('repository.v1.tree', { ...p, path: 'deep', limit: 2 })
+      expect(first.cursor).toBeTruthy()
+      const second = await s.request('repository.v1.tree', {
+        ...p,
+        path: 'deep',
+        limit: 2,
+        cursor: first.cursor,
+      })
+      expect(second.entries.map((entry: any) => entry.path)).toEqual([
+        'deep/f00002.txt',
+        'deep/f00003.txt',
+      ])
+      expect(
+        (await s.request('repository.v1.blob', { ...p, path: 'deep/f74999.txt' })).content_id
+      ).toBeTruthy()
+      const again = { ...p, revision: await s.observe() }
+      expect((await s.request('repository.v1.tree', again)).entries).toEqual(root.entries)
+      expect((await s.request('repository.v1.tree', p)).entries).toEqual(root.entries)
+      // Two visibility variants exceed the shared index budget together. Evict the
+      // older index/leases, not the newly issued include_ignored observation.
+      const allowed = (
+        await s.request('repository.v1.observe', {
+          worktree_id: s.worktree_id,
+          include_ignored: true,
+        })
+      ).revision
+      const next = { ...p, revision: allowed }
+      expect((await s.request('repository.v1.tree', next)).entries).toEqual(root.entries)
+      expect(
+        (await s.request('repository.v1.blob', { ...next, path: 'deep/f74999.txt' })).content_id
+      ).toBeTruthy()
+    },
+    largeFixtureTimeout
+  )
+})
