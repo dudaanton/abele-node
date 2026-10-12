@@ -50,6 +50,7 @@ import { canonicalStateDir } from './state.js'
 export { canonicalStateDir } from './state.js'
 export { acquireUpdateLock } from './update-lock.js'
 import { ResourceServices } from './resources.js'
+import type { GitRunner } from './git.js'
 import type { ResolvedExecutionTarget } from './execution-targets.js'
 import { DelegationService } from './delegation.js'
 export { DelegationService, DelegationMailbox, WorkerReporter } from './delegation.js'
@@ -268,6 +269,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     stateDir: string,
     options: {
       worktreeRoot?: string
+      /** Optional Git executor; omitted uses the product's bounded defaults. */
+      git?: GitRunner
       /** Authorized control infrastructure, off by default. Native profiles
        * require a separate explicit switch and an audited adapter installation. */
       debuggerEnabled?: boolean
@@ -413,7 +416,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.authority.subscribeInvalidation(() => {
         if (!this.closed) this.debuggerControl.notifyPermissions()
       })
-      this.resources = new ResourceServices(this, options.worktreeRoot)
+      this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
       this.resources.mutations.recover()
     } catch (error) {
       this.db.close()

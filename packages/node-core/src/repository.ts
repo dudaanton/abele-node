@@ -2584,7 +2584,10 @@ export class RepositoryService {
     }
   }
   request(actor: AuthorityContext, method: string, p: Record<string, unknown>): Promise<unknown> {
-    return this.r.git.bounded(15000, () => this.dispatch(actor, method, p))
+    // The injected runner controls the whole-read budget as well as individual
+    // Git processes. Normal construction still uses 15s; search/blame keep their
+    // separate, tighter execution budgets below.
+    return this.r.git.bounded(this.r.git.timeoutMs, () => this.dispatch(actor, method, p))
   }
   private async dispatch(
     actor: AuthorityContext,

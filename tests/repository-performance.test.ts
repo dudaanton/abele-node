@@ -3,20 +3,23 @@ import { spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { NodeCore } from '../packages/node-core/src/index.js'
+import { GitRunner, NodeCore } from '../packages/node-core/src/index.js'
 
 // Shared macOS CI took up to 83s for the 75k case and over 10s for cleanup.
 // These are capacity/correctness tests, not benchmarks: allow >2x that worst case
 // for setup and reads separately, and give high-churn FSEvents teardown 60s.
 const largeFixtureTimeout = 180_000
 const cleanupTimeout = 60_000
+// Capacity/invalidation assertions must not inherit the product's 15s Git budget
+// on shared Intel runners. Keep the real runner and all output/path ceilings.
+const capacityGitTimeout = 120_000
 const fixtures: { dir: string; core: NodeCore }[] = []
 function git(cwd: string, ...args: string[]) {
   const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-async function setup(count = 8) {
+async function setup(count = 8, gitRunner: GitRunner | null = new GitRunner(capacityGitTimeout)) {
   const dir = mkdtempSync(resolve('.scratch/repository-perf-'))
   const repo = join(dir, 'repo')
   mkdirSync(join(repo, 'deep'), { recursive: true })
@@ -56,7 +59,7 @@ async function setup(count = 8) {
     git(repo, 'add', '.')
     git(repo, 'commit', '-m', 'fixture')
   }
-  const core = new NodeCore(join(dir, 'state'))
+  const core = new NodeCore(join(dir, 'state'), { git: gitRunner ?? undefined })
   fixtures.push({ dir, core })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let op = 0
@@ -77,6 +80,31 @@ afterEach(async () => {
     rmSync(dir, { recursive: true, force: true })
   }
 }, cleanupTimeout)
+it('honors an injected capacity Git budget without changing product defaults', async () => {
+  const normal = await setup(8, null)
+  expect(normal.core.resources.git.timeoutMs).toBe(15_000)
+  const defaultBudget = vi.spyOn(normal.core.resources.git, 'bounded')
+  await normal.observe()
+  expect(defaultBudget).toHaveBeenCalledWith(15_000, expect.any(Function))
+
+  const gitRunner = new GitRunner(capacityGitTimeout)
+  const capacity = await setup(8, gitRunner)
+  expect(capacity.core.resources.git).toBe(gitRunner)
+  const capacityBudget = vi.spyOn(gitRunner, 'bounded')
+  const revision = await capacity.observe()
+  expect(capacityBudget).toHaveBeenCalledWith(capacityGitTimeout, expect.any(Function))
+  expect(gitRunner.outputBytes).toBe(normal.core.resources.git.outputBytes)
+  expect(gitRunner.metadataOutputBytes).toBe(normal.core.resources.git.metadataOutputBytes)
+
+  // Injecting a capacity budget must not relax the specialized execution limits.
+  const p = { worktree_id: capacity.worktree_id, revision }
+  capacityBudget.mockClear()
+  await capacity.request('repository.v1.search', { ...p, mode: 'filename', query: 'needle' })
+  expect(capacityBudget).toHaveBeenCalledWith(5000, expect.any(Function))
+  capacityBudget.mockClear()
+  await capacity.request('repository.v1.blame', { ...p, path: 'deep/f00000.txt', count: 1 })
+  expect(capacityBudget).toHaveBeenCalledWith(5000, expect.any(Function))
+})
 it('does not enumerate the repository or rebuild its snapshot for warm tree/blob/content reads', async () => {
   const s = await setup()
   const revision = await s.observe()
@@ -323,29 +351,35 @@ it('reconciles fresh observations when a tracked edit precedes filesystem delive
   })
   expect(Buffer.from(content.base64, 'base64').toString()).toBe('new snapshot\n')
 })
-it('rejects same-path edits immediately and unrelated nested edits after filesystem delivery', async () => {
-  const s = await setup()
-  const p = { worktree_id: s.worktree_id, revision: await s.observe() }
-  writeFileSync(join(s.repo, 'deep/f00000.txt'), 'edited\n')
-  await expect(s.request('repository.v1.blob', { ...p, path: 'deep/f00000.txt' })).rejects.toThrow(
-    'stale_revision'
-  )
-  const revision = await s.observe()
-  const fresh = await s.request('repository.v1.blob', { ...p, revision, path: 'deep/f00000.txt' })
-  const content = await s.request('repository.v1.content', {
-    worktree_id: s.worktree_id,
-    content_id: fresh.content_id,
-  })
-  expect(Buffer.from(content.base64, 'base64').toString()).toBe('edited\n')
-  const monitor = (s.core.resources.repository as any).monitors.get(s.worktree_id)
-  const generation = monitor.generation
-  writeFileSync(join(s.repo, 'deep/f00007.txt'), 'other\n')
-  // FSEvents delivery is asynchronous; wait for the actual hint, not an assumed latency.
-  await vi.waitFor(() => expect(monitor.generation).toBeGreaterThan(generation), { timeout: 2000 })
-  await expect(
-    s.request('repository.v1.blob', { ...p, revision, path: 'deep/f00000.txt' })
-  ).rejects.toThrow('stale_revision')
-})
+it(
+  'rejects same-path edits immediately and unrelated nested edits after filesystem delivery',
+  async () => {
+    const s = await setup()
+    const p = { worktree_id: s.worktree_id, revision: await s.observe() }
+    writeFileSync(join(s.repo, 'deep/f00000.txt'), 'edited\n')
+    await expect(
+      s.request('repository.v1.blob', { ...p, path: 'deep/f00000.txt' })
+    ).rejects.toThrow('stale_revision')
+    const revision = await s.observe()
+    const fresh = await s.request('repository.v1.blob', { ...p, revision, path: 'deep/f00000.txt' })
+    const content = await s.request('repository.v1.content', {
+      worktree_id: s.worktree_id,
+      content_id: fresh.content_id,
+    })
+    expect(Buffer.from(content.base64, 'base64').toString()).toBe('edited\n')
+    const monitor = (s.core.resources.repository as any).monitors.get(s.worktree_id)
+    const generation = monitor.generation
+    writeFileSync(join(s.repo, 'deep/f00007.txt'), 'other\n')
+    // FSEvents delivery is asynchronous; wait for the actual hint, not an assumed latency.
+    await vi.waitFor(() => expect(monitor.generation).toBeGreaterThan(generation), {
+      timeout: 30_000,
+    })
+    await expect(
+      s.request('repository.v1.blob', { ...p, revision, path: 'deep/f00000.txt' })
+    ).rejects.toThrow('stale_revision')
+  },
+  cleanupTimeout
+)
 it('normalizes macOS root-self hints without hiding deletion of a same-named child', async () => {
   const s = await setup()
   await s.observe()
