@@ -160,7 +160,7 @@ afterEach(async () => {
   child = undefined
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
-it('stopped status is human by default, read-only, and JSON retains its exact keys', () => {
+it('stopped status is human by default, read-only, and JSON adds the deployment mode', () => {
   const state = join(fixture(), 'absent')
   const human = command(state, 'status')
   expect(human.status, human.stderr).toBe(0)
@@ -172,7 +172,13 @@ it('stopped status is human by default, read-only, and JSON retains its exact ke
   const json = command(state, 'status', '--json')
   expect(json.status, json.stderr).toBe(0)
   const report = JSON.parse(json.stdout)
-  expect(Object.keys(report).sort()).toEqual(['claude', 'running', 'state_dir', 'tailscale'])
+  expect(Object.keys(report).sort()).toEqual([
+    'claude',
+    'mode',
+    'running',
+    'state_dir',
+    'tailscale',
+  ])
   expect(report).toMatchObject({
     running: false,
     state_dir: state,
@@ -301,6 +307,7 @@ it.each([false, true])(
       'claude',
       'codex',
       'control_socket',
+      'mode',
       'node_id',
       'pi',
       'pid',

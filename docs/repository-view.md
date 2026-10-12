@@ -120,8 +120,27 @@ commit ID instead.
 Working revisions carry `observation_id`, captured nullable HEAD and observation
 time. They are not Git objects and are not atomically captured whole trees.
 Status, visible tracked/untracked paths, file identity/size/timestamps and
-HEAD/index metadata are checked before/after observation and around mutable
-reads. Changed observations return `stale_revision`; refresh intentionally to
+HEAD/index metadata are captured before/after observation. A shared working index
+holds path lookups and pre-sorted directory children. Mutable reads check a cheap
+HEAD/index/ref signature and recursive filesystem generation, plus metadata for
+only the requested file or returned tree page. Descriptor checks still fence file
+replacement during reads. Filesystem hints are asynchronous: these observations
+remain non-atomic, not a synchronous guarantee against unrelated same-turn edits.
+An item-level mismatch also invalidates the shared cache before a new observation.
+Fresh observations reconcile known file/directory metadata before reusing an
+unchanged index; item reads never do this whole-index reconciliation. Cache misses,
+filesystem errors and unsupported recursive watching take the conservative
+capture/full-validation route.
+
+Ignore dependencies include the effective `core.excludesFile` (Git-resolved relative
+and tilde paths), the default XDG ignore file when applicable, `info/exclude`, and
+configuration origins/includes, including worktree and conditional configuration.
+External or symlinked sources are fenced by metadata signatures even without a
+filesystem hint. Each requested item/page also checks ancestor `.gitignore`
+dependencies, including absent files that could be created. Fresh captures confirm
+status/path enumeration while those rule stamps are pinned, so a rule edit during
+capture cannot admit old visible paths under new rules. System/global Git config
+remains disabled; this does not disable Git's default XDG ignore file. Changed observations return `stale_revision`; refresh intentionally to
 get another revision. Ignored files are excluded unless an observation explicitly
 requests `include_ignored: true`. Submodule contents and symlinks are never read.
 Unborn observations can be browsed, read, searched, and blamed without inventing
@@ -136,7 +155,10 @@ not inspected by Git diffs. Per-file patches already captured stay fixed even
 when the working tree changes. Uncaptured working patches then require retry;
 there is no claim that lazily captured patches form an atomic repository image.
 Blame uses retained captured contents, marks new/modified lines uncommitted,
-and gives untracked files no historical attribution.
+and gives untracked files no historical attribution. Working blame continuations
+recheck the source path and ancestor ignore dependencies before serving cached
+lines and again before publication; frozen commit blame remains independent of
+working-file changes.
 
 Content identities are SHA-256 of exact retained bytes and are scoped to the
 worktree identity. Content survives daemon restart/external edits subject to
@@ -144,7 +166,10 @@ retention and authorization. Expired/evicted contents return `content_expired`,
 never reread a mutable file under an old identity. Observations, comparison
 manifests and cursors are bounded in-memory leases and explicitly expire on
 restart; persist content/diff identities, not just ephemeral observation IDs,
-for exact-byte citations.
+for exact-byte citations. Monitor baselines borrow the accounted snapshot stamp
+maps, rather than copying every path/stamp. Eviction detaches those references or
+reattaches a surviving visibility variant; failed/rejected captures and shutdown
+release them too. Filesystem hints never refill a detached per-file baseline.
 
 ## Durable editing adapter
 
@@ -197,25 +222,27 @@ admission was added here. Human Save is an explicit owner action.
 
 ## Bounds and incomplete coverage
 
-| Resource                                  | v1 bound                                                                                                                                                                    |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ordinary result pages                     | 32 KiB serialized, with envelope headroom                                                                                                                                   |
-| Trees, refs, catalogue, changes/status    | 256 entries/page, also byte-bounded                                                                                                                                         |
-| Catalogue enumeration                     | 512 KiB Git output, at most 1,024 worktree records; at most 64 dirty checks per catalogue read, remaining dirty states unknown                                              |
-| Tree/ref/status/path enumeration          | 512 KiB Git output; working observations at most 10,000 paths; limit errors are explicit                                                                                    |
-| Blob display                              | 1 MiB automatic, explicit larger load through 16 MiB                                                                                                                        |
-| Content transport                         | 128 KiB bytes/chunk in a channel record below 256 KiB                                                                                                                       |
-| Per-file patches                          | 8 MiB capture ceiling; untracked additions at most 1 MiB, binary additions explicitly unsupported                                                                           |
-| History                                   | 100 commits/page (default 50), 30 KiB maximum individual serialized metadata; a single multi-command read deadline                                                          |
-| Blame                                     | 400 lines default, at most 1,500/request, 1 MiB input, 5-second execution budget; byte-bounded continuations for the selected window                                        |
-| Search                                    | 100 matches/page, at most 1,000 retained matches, 2,048 scanned regular files / 32 MiB scanned bytes, skip content over 1 MiB and binary content, 5-second execution budget |
-| Search regex worker                       | Terminable worker, 32 MiB V8 old-generation heap / 2 MiB stack; terminated on deadline and shutdown                                                                         |
-| Concurrent repository jobs                | 4 total, including watcher reconciliation; excess requests get `resource_busy`                                                                                              |
-| Other Git-backed reads                    | 15-second aggregate multi-command execution budget, bounded subprocess stdout plus stderr                                                                                   |
-| Observations/cursors/comparison manifests | Each below 128 entries and 8 MiB serialized state, ten-minute leases, oldest-first eviction                                                                                 |
-| Retained content                          | 64 MiB global byte-bounded LRU store, at most 16 MiB/item, independent of legacy workspace contents                                                                         |
-| Immutable Git object cache                | 16 MiB / 512 entries byte-bounded memory LRU, at most 1 MiB per item; trees, blob sizes and displayed blobs only                                                            |
-| Watchers                                  | 16 leases, at most three filesystem handles per lease, 100 ms coalescing, two-second reconciliation, 60-second expiry                                                       |
+| Resource                                  | v1 bound                                                                                                                                                                                                                                                                 |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Ordinary result pages                     | 32 KiB serialized, with envelope headroom                                                                                                                                                                                                                                |
+| Trees, refs, catalogue, changes/status    | 256 entries/page, also byte-bounded                                                                                                                                                                                                                                      |
+| Catalogue enumeration                     | 512 KiB Git output, at most 1,024 worktree records; at most 64 dirty checks per catalogue read, remaining dirty states unknown                                                                                                                                           |
+| Tree/status/path enumeration              | 64 MiB Git stdout plus stderr; tracked/untracked paths consumed as NUL-delimited records; at most 250,000 working paths; limit errors are explicit                                                                                                                       |
+| Ref enumeration                           | 512 KiB Git output                                                                                                                                                                                                                                                       |
+| Working index cache                       | At most 8 monitored worktrees, 32 MiB estimated serialized snapshot footprint including indexes retained by leases; each shared index charged once, ten-minute idle expiry; eviction explicitly stales associated old observations/cursors                               |
+| Blob display                              | 1 MiB automatic, explicit larger load through 16 MiB                                                                                                                                                                                                                     |
+| Content transport                         | 128 KiB bytes/chunk in a channel record below 256 KiB                                                                                                                                                                                                                    |
+| Per-file patches                          | 8 MiB capture ceiling; untracked additions at most 1 MiB, binary additions explicitly unsupported                                                                                                                                                                        |
+| History                                   | 100 commits/page (default 50), 30 KiB maximum individual serialized metadata; a single multi-command read deadline                                                                                                                                                       |
+| Blame                                     | 400 lines default, at most 1,500/request, 1 MiB input, 5-second execution budget; byte-bounded continuations for the selected window                                                                                                                                     |
+| Search                                    | 100 matches/page, at most 1,000 retained matches per scan segment, 750 ms cooperative scan budget / 32 MiB scanned bytes per segment, skip content over 1 MiB and binary content; 1-second hard worker/Git segment budget, 5-second aggregate request budget             |
+| Search regex worker                       | Terminable worker, 32 MiB V8 old-generation heap / 2 MiB stack; terminated on deadline and shutdown                                                                                                                                                                      |
+| Concurrent repository jobs                | 4 total, including watcher reconciliation; excess requests get `resource_busy`                                                                                                                                                                                           |
+| Other Git-backed reads                    | 15-second aggregate multi-command execution budget, bounded subprocess stdout plus stderr                                                                                                                                                                                |
+| Observations/cursors/comparison manifests | Each collection below 128 entries and 8 MiB lease-owned serialized state (shared working arrays charged to the separate index budget), ten-minute leases; oversized admissions fail explicitly before returning an ID                                                    |
+| Retained content                          | 64 MiB global byte-bounded LRU store, at most 16 MiB/item, independent of legacy workspace contents                                                                                                                                                                      |
+| Immutable Git object cache                | 16 MiB / 512 entries byte-bounded memory LRU, at most 1 MiB per item; trees, blob sizes and displayed blobs only                                                                                                                                                         |
+| Watchers                                  | 16 notification leases, at most three handles per lease, 100 ms coalescing, two-second metadata reconciliation, 60-second expiry; working indexes also use up to three recursive watch roots per monitored worktree (OS implementations may use multiple native handles) |
 
 Search runs on the node, never downloads repository archives. Regular expressions
 are ECMAScript, line-oriented and case-configurable; invalid syntax returns
@@ -226,19 +253,26 @@ search results are truncated to 4,096 characters with an omission notice;
 retained bytes still identify the exact original file.
 
 `incomplete` and `omissions` distinguish skipped binary/large files, truncated
-match text, scan/match ceilings and execution deadlines. Cursors page retained
-hits; they do not resume uncovered scan ranges. Refine the path/query to cover
-omitted ranges. Enumeration beyond hard input/scan bounds returns an explicit
-limit error rather than an apparently complete prefix. Fixture limits are
-initial values, not representative large-monorepo benchmark results.
+match text, scan/match ceilings and execution deadlines. Cursors first page retained
+hits, then resume uncovered files under a fresh segment budget, including empty
+pages with remaining coverage. Keep following the cursor with the same query,
+target and revision; a changed working observation explicitly stales the scan.
+Truncated matches within one file and skipped binary/oversized files still require
+refinement; a cursor is not a promise of unlimited per-file matches. Enumeration
+beyond hard input/scan bounds returns an explicit limit error rather than an
+apparently complete prefix. No schema fields were added for continuation scans;
+existing v1 clients can use the existing cursor/incomplete/omissions contract.
+See [repository read measurements](repository-performance.md) for disposable
+large-repository benchmarks.
 
 ## Refresh, safety and verification
 
 Subscribe to `catalog`, call `watch`, and handle `repository.invalidated` by
 refreshing mutable views. Renew before lease expiry (repeated watch replaces the
 same owner's previous target lease); reconnect always requires refresh and a new
-lease. Watchers cover workspace/common metadata and periodic reconciliation covers
-nested edits, index/HEAD/refs and worktree records. Overflow forces invalidation;
+lease. Recursive working-index watchers cover nested edits; periodic cheap
+reconciliation covers index/HEAD/refs and worktree records without rebuilding the
+whole working tree. Overflow forces invalidation;
 missing/moved targets invalidate before their lease stops. Every invalidation is a
 **refresh-all-mutable-state** hint for that target and its project catalogue (including
 editing permission), not a patch or an atomic snapshot:
@@ -248,8 +282,9 @@ editing permission), not a patch or an atomic snapshot:
 ```
 
 Overflow/change hints arriving during an in-flight check or a full job budget remain
-pending. Rapid hints coalesce; periodic reconciliation covers missed filesystem
-notifications. On reconnect or any event-stream gap, refresh all mutable state and
+pending. Rapid hints coalesce; item metadata checks additionally detect requested
+path changes before filesystem delivery. Watch errors/overflow invalidate cached
+state rather than trusting it; refresh/re-observe after a filesystem event gap. On reconnect or any event-stream gap, refresh all mutable state and
 renew leases; do not rely on replayed old hints. Revocation immediately releases the
 owner's watcher handles; opt-out releases external leases. Queued external hints
 are fenced at transport publication. On reconnect replay, an unauthorized obsolete
@@ -307,10 +342,10 @@ methods, literal leading-dash filenames and ref/revision option injection,
 inward/outward/metadata symlinks at working and historical revisions, real nested
 repositories, linked metadata isolation, malicious conditional configuration,
 index-write suppression, legacy-Git promisor transports, binary/large inputs,
-oversized trees, search byte/file/match ceilings, cache/publication isolation,
+oversized trees, search byte/time/match ceilings, cache/publication isolation,
 pending-read/catalogue/watch-setup opt-out/reapproval, mid-write authority/approval revocation and terminal
 unknown client receipts. Executable traps have sensitivity controls, and deadline
-coverage remains separate from deterministic byte/file-limit fixtures. All tests
+coverage remains separate from deterministic byte/time-budget fixtures. All tests
 use invented disposable repositories, not personal projects or providers.
 
 Plugin rendering, navigation/pins, markdown safety, chat-scoped per-edit approvals, remote

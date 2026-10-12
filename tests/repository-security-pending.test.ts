@@ -162,7 +162,7 @@ it('does not read a file that would exceed the 32 MiB search scan budget', async
   expect(result.omissions.join(' ')).toContain('scan limit')
 })
 
-it('stops scanning after 2048 files with explicit incomplete coverage', async () => {
+it('stops at the time budget with explicit incomplete coverage and resumes beyond 2048 files', async () => {
   const s = await setup(),
     oid = git(s.repo, 'rev-parse', 'HEAD:file')
   const tree = spawnSync('/usr/bin/git', ['mktree'], {
@@ -180,14 +180,26 @@ it('stops scanning after 2048 files with explicit incomplete coverage', async ()
     input: 'scan fixture\n',
   })
   expect(commit.status, commit.stderr).toBe(0)
-  vi.spyOn(Date, 'now').mockReturnValue(Date.now())
-  const result = await s.request('repository.v1.search', {
+  // The safety guarantee is now elapsed-time bounded, not a fixed file-count cutoff.
+  let clock = Date.now()
+  vi.spyOn(Date, 'now').mockImplementation(() => ++clock)
+  const params = {
     worktree_id: s.worktree_id,
     revision: { kind: 'commit', commit: commit.stdout.trim() },
     mode: 'filename',
     query: 'entry-02049',
-  })
+  }
+  let result = await s.request('repository.v1.search', params)
   expect(result.entries).toEqual([])
   expect(result.incomplete).toBe(true)
   expect(result.omissions.join(' ')).toContain('scan limit')
+  expect(result.cursor).toBeTruthy()
+  vi.restoreAllMocks()
+  const found = [...result.entries]
+  while (result.cursor) {
+    result = await s.request('repository.v1.search', { ...params, cursor: result.cursor })
+    found.push(...result.entries)
+  }
+  expect(found.map((entry: any) => entry.path)).toEqual(['entry-02049'])
+  expect(result.incomplete).toBe(false)
 })

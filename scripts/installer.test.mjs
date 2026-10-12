@@ -14,6 +14,7 @@ import {
   chmod,
   realpath,
   stat,
+  lstat,
   readdir,
   rename,
 } from 'node:fs/promises'
@@ -137,7 +138,10 @@ let scratch, server, base, archive
 const routes = new Map()
 async function run(command, args, env = {}, input = '') {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(command, args, { env: { ...process.env, ...env } })
+    const child = spawn(command, args, {
+      env: { ...process.env, ...env },
+      detached: args.includes('--service-action'),
+    })
     let stdout = '',
       stderr = ''
     child.stdin.on('error', reject)
@@ -156,6 +160,10 @@ async function release(version, broken = false, badChecksum = false) {
   const tree = join(scratch, `release-${version}`)
   await mkdir(join(tree, 'packages/node-daemon/dist'), { recursive: true })
   await writeFile(join(tree, 'package.json'), JSON.stringify({ version, type: 'module' }))
+  await writeFile(
+    join(tree, 'service-transition.mjs'),
+    await readFile('scripts/service-transition.mjs', 'utf8')
+  )
   await writeFile(
     join(tree, 'packages/node-daemon/dist/cli.js'),
     `import fs from 'node:fs';
@@ -179,11 +187,15 @@ if(isMac && args[0]==='install'){
   fs.mkdirSync(state,{recursive:true,mode:0o700});fs.mkdirSync(process.env.HOME+'/Library/LaunchAgents',{recursive:true});
   const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude'];
   const xml=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-  fs.writeFileSync(plist,'<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>',{mode:0o600});
+  const text='<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>';
+  if(process.env.ABELE_SERVICE_TRANSITION)fs.writeFileSync(process.env.ABELE_SERVICE_TRANSITION+'/next-service',text,{mode:0o600});
+  fs.writeFileSync(plist,text,{mode:0o600});
   completed('write-service',plist);
   if(fs.existsSync(process.env.HOME+'/fail-bootstrap')){console.error('launchctl bootstrap failed');process.exit(1)}
   const record={state,arguments:command,runtime:{cli_path:cliPath,version:${JSON.stringify(version)}}};
-  fs.writeFileSync(job,JSON.stringify(record));fs.writeFileSync(marker,JSON.stringify(record));completed('started-service',plist);console.log('{}');process.exit(0);
+  fs.writeFileSync(job,JSON.stringify(record));fs.writeFileSync(marker,JSON.stringify(record));
+  if(fs.existsSync(process.env.HOME+'/foreground-on-start')){fs.writeFileSync(job,JSON.stringify({...record,pid:2337}));fs.copyFileSync(process.env.HOME+'/foreground-on-start',marker)}
+  completed('started-service',plist);console.log('{}');process.exit(0);
 }
 if(args[0]==='stop'){
   fs.appendFileSync(process.env.HOME+'/cli-stop.log',state+'\\n');
@@ -276,10 +288,12 @@ if(args[0]==='print'){
   }
   if(!fs.existsSync(file)){console.error('Could not find service dev.abele.node in domain');process.exit(113)}
   const record=JSON.parse(fs.readFileSync(file,'utf8'));
-  console.log('job = {\\n\\targuments = {\\n'+record.arguments.map(s=>'\\t\\t'+s).join('\\n')+'\\n\\t}\\n}');
+  console.log('job = {\\n\\tpid = '+(record.pid || 1337)+'\\n\\targuments = {\\n'+record.arguments.map(s=>'\\t\\t'+s).join('\\n')+'\\n\\t}\\n}');
 }else if(args[0]==='bootout'){
   if(fs.existsSync(home+'/block-unload'))process.exit(1);
-  fs.rmSync(file,{force:true});fs.rmSync(home+'/.test-service-running',{force:true});
+  const job=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):null, marker=home+'/.test-service-running';
+  const daemon=fs.existsSync(marker)?JSON.parse(fs.readFileSync(marker,'utf8')):null;
+  fs.rmSync(file,{force:true});if((job?.pid || 1337)===(daemon?.pid || 1337))fs.rmSync(marker,{force:true});
 }else if(args[0]==='bootstrap'){
   const text=fs.readFileSync(args[2],'utf8'),array=text.match(/<array>(.*?)<\\/array>/s)[1];
   const command=[...array.matchAll(/<string>(.*?)<\\/string>/gs)].map(m=>m[1].replaceAll('&quot;','"').replaceAll('&gt;','>').replaceAll('&lt;','<').replaceAll('&amp;','&'));
@@ -294,6 +308,28 @@ if(args[0]==='print'){
 `,
       { mode: 0o755 }
     )
+    const root = join(homeDir, '.local/share/abele-node')
+    if (
+      await access(root).then(
+        () => true,
+        () => false
+      )
+    ) {
+      for (const name of await readdir(root)) {
+        if (!/^\d+\.\d+\.\d+$/.test(name)) continue
+        const helper = join(root, name, 'service-transition.mjs')
+        if (
+          await access(helper).then(
+            () => true,
+            () => false
+          )
+        )
+          await writeFile(
+            helper,
+            (await readFile(helper, 'utf8')).replaceAll("'/bin/launchctl'", JSON.stringify(fake))
+          )
+      }
+    }
     installer = join(homeDir, 'isolated-install.sh')
     await writeFile(
       installer,
@@ -336,6 +372,525 @@ after(async () => {
   await new Promise((done) => server.close(done))
   await rm(scratch, { recursive: true, force: true })
 })
+for (const platform of ['mac', 'linux']) {
+  test(`service-only transitions preserve deployment and installer ownership: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+    const root = join(h, '.local/share/abele-node'),
+      configFile = join(root, 'config.json')
+    const state = JSON.parse(await readFile(configFile, 'utf8')).state
+    await writeFile(join(state, 'keep'), 'state stays')
+    // Deliberately unusable download endpoints: service changes must be offline.
+    const offline = {
+      ...env,
+      ABELE_INSTALL_BASE_URL: 'http://127.0.0.1:1',
+      ABELE_INSTALL_API_URL: 'http://127.0.0.1:1',
+    }
+    const enable = await install(h, ['--service-action', 'enable'], offline)
+    assert.equal(enable.code, 0, enable.stderr)
+    let config = JSON.parse(await readFile(configFile, 'utf8'))
+    assert.equal(config.service, 1)
+    assert.equal(
+      config.service_sha256,
+      createHash('sha256')
+        .update(await readFile(config.service_file))
+        .digest('hex')
+    )
+    const original = await readFile(config.service_file, 'utf8')
+    assert.equal((await install(h, ['--service-action', 'enable'], offline)).code, 0)
+    assert.equal(await readFile(config.service_file, 'utf8'), original)
+    assert.equal(await readlink(join(root, 'current')), '0.2.0')
+    // A regular installer rerun must accept the ownership record.
+    const rerun = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(rerun.code, 0, rerun.stderr)
+    const disable = await install(h, ['--service-action', 'disable'], offline)
+    assert.equal(disable.code, 0, disable.stderr)
+    config = JSON.parse(await readFile(configFile, 'utf8'))
+    assert.equal(config.service, 0)
+    assert.equal(config.service_sha256, undefined)
+    await assert.rejects(
+      access(
+        platform === 'mac'
+          ? join(h, 'Library/LaunchAgents/dev.abele.node.plist')
+          : join(h, '.config/systemd/user/abele-node.service')
+      )
+    )
+    await assert.rejects(access(join(h, '.test-service-running')))
+    assert.equal((await install(h, ['--service-action', 'disable'], offline)).code, 0)
+    assert.equal(await readFile(join(state, 'keep'), 'utf8'), 'state stays')
+    assert.equal(await readlink(join(root, 'current')), '0.2.3')
+  })
+  test(`service-only refuses modified files before stopping: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    assert.equal((await install(h, ['--version', '0.2.0'], env)).code, 0)
+    const configFile = join(h, '.local/share/abele-node/config.json'),
+      before = await readFile(configFile, 'utf8')
+    const file = JSON.parse(before).service_file
+    await writeFile(file, (await readFile(file, 'utf8')) + '\nforeign modification')
+    await rm(join(h, 'cli-stop.log'), { force: true })
+    const result = await install(h, ['--service-action', 'disable'], env)
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /ownership.*modified/i)
+    await assert.rejects(access(join(h, 'cli-stop.log')))
+    await access(join(h, '.test-service-running'))
+    assert.equal(await readFile(configFile, 'utf8'), before)
+  })
+}
+
+for (const platform of ['mac', 'linux']) {
+  test(`service-only enable refuses a foreground daemon appearing under the install lock: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+    const configFile = join(h, '.local/share/abele-node/config.json'),
+      before = await readFile(configFile, 'utf8')
+    const config = JSON.parse(before),
+      record = {
+        state: config.state,
+        pid: process.pid,
+        runtime: {
+          cli_path: join(h, '.local/share/abele-node/0.2.0/packages/node-daemon/dist/cli.js'),
+          version: '0.2.0',
+        },
+      }
+    await writeFile(join(h, 'late-daemon.json'), JSON.stringify(record))
+    const fault = join(h, 'late-daemon.cjs')
+    await writeFile(
+      fault,
+      `const fs=require('node:fs'),original=fs.symlinkSync;fs.symlinkSync=(target,file,...rest)=>{const r=original(target,file,...rest);if(String(file).endsWith('/.install-lock')){fs.copyFileSync(process.env.HOME+'/late-daemon.json',process.env.HOME+'/.local/state/abele-node/daemon.lock');fs.copyFileSync(process.env.HOME+'/late-daemon.json',process.env.HOME+'/.test-service-running')}return r}`
+    )
+    env.NODE_OPTIONS = '--require=' + fault
+    const result = await install(h, ['--service-action', 'enable'], env)
+    assert.notEqual(result.code, 0, result.stderr)
+    assert.match(result.stderr, /foreground daemon is running/)
+    assert.equal(await readFile(configFile, 'utf8'), before)
+    await access(join(h, '.test-service-running'))
+    await assert.rejects(access(join(h, 'cli-stop.log')))
+    await assert.rejects(lstat(join(h, '.local/share/abele-node/.service-transition')))
+    await assert.rejects(lstat(join(h, '.local/share/abele-node/.install-lock')))
+    await assert.rejects(
+      access(
+        platform === 'mac'
+          ? join(h, 'Library/LaunchAgents/dev.abele.node.plist')
+          : join(h, '.config/systemd/user/abele-node.service')
+      )
+    )
+  })
+}
+
+test('service-only enable cannot nest its lock inside an active deployment lock', async () => {
+  const h = await home(),
+    env = await mockedLinuxService(h)
+  assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+  const root = join(h, '.local/share/abele-node'),
+    file = join(root, 'config.json'),
+    before = await readFile(file, 'utf8')
+  await mkdir(join(root, '.install-lock'), { mode: 0o700 })
+  const result = await install(h, ['--service-action', 'enable'], env)
+  assert.notEqual(result.code, 0, result.stderr)
+  assert.match(result.stderr, /Another install is active/)
+  assert.equal(await readFile(file, 'utf8'), before)
+  assert.deepEqual(await readdir(join(root, '.install-lock')), [])
+})
+
+for (const platform of ['mac', 'linux']) {
+  for (const point of [
+    'disable-remove',
+    'disable-publish',
+    'enable-publish',
+    'disable-cleanup',
+    'enable-cleanup',
+    'enable-write',
+    'enable-start',
+    'disable-stop',
+  ]) {
+    test(`service-only recovers SIGKILL at ${point}: ${platform}`, async () => {
+      const h = await home(),
+        env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+      const action = point.startsWith('disable') ? 'disable' : 'enable'
+      assert.equal(
+        (
+          await install(
+            h,
+            ['--version', '0.2.0', ...(action === 'enable' ? ['--no-service'] : [])],
+            env
+          )
+        ).code,
+        0
+      )
+      const root = join(h, '.local/share/abele-node'),
+        file =
+          platform === 'mac'
+            ? join(h, 'Library/LaunchAgents/dev.abele.node.plist')
+            : join(h, '.config/systemd/user/abele-node.service')
+      const tool = point === 'disable-remove' || point.endsWith('cleanup') ? 'rm' : 'mv',
+        target = point === 'disable-remove' ? await realpath(file) : join(root, 'config.json')
+      await writeFile(
+        join(h, 'mocks', tool),
+        `#!${process.execPath}\nconst cp=require('node:child_process'),fs=require('node:fs'),args=process.argv.slice(2);const r=cp.spawnSync('/bin/${tool}',args,{stdio:'inherit'});if(r.status!==0)process.exit(r.status);if(${point.endsWith('cleanup') ? "args.at(-1).includes('/.download.')" : 'args.at(-1)===' + JSON.stringify(target)}){fs.unlinkSync(__filename);process.kill(process.ppid,'SIGKILL')}\n`,
+        { mode: 0o755 }
+      )
+      if (['enable-write', 'enable-start', 'disable-stop'].includes(point)) {
+        await rm(join(h, 'mocks', tool))
+        const fault = join(h, 'kill-mutation.cjs')
+        await writeFile(
+          fault,
+          `const fs=require('node:fs'),originalWrite=fs.writeFileSync,originalRename=fs.renameSync,originalRm=fs.rmSync;const kill=()=>{process.kill(process.ppid,'SIGKILL');process.exit(0)};const active=()=>fs.existsSync(${JSON.stringify(join(root, '.service-transition'))});fs.renameSync=(from,to,...rest)=>{const r=originalRename(from,to,...rest);if(active()&&${JSON.stringify(point)}==='enable-write'&&String(to).endsWith('abele-node.service'))kill();return r};fs.writeFileSync=(file,...rest)=>{const r=originalWrite(file,...rest);if(active()&&((${JSON.stringify(point)}==='enable-write'&&String(file).endsWith('dev.abele.node.plist'))||(${JSON.stringify(point)}==='enable-start'&&String(file).endsWith('.test-service-running'))))kill();return r};fs.rmSync=(file,...rest)=>{const r=originalRm(file,...rest);if(active()&&${JSON.stringify(point)}==='disable-stop'&&String(file).endsWith('.test-service-running'))kill();return r}`
+        )
+        env.NODE_OPTIONS = '--require=' + fault
+      }
+      const killed = await install(h, ['--service-action', action], env)
+      delete env.NODE_OPTIONS
+      assert.notEqual(killed.code, 0)
+      const next = await install(
+        h,
+        ['--service-action', action === 'disable' ? 'enable' : 'disable'],
+        env
+      )
+      assert.equal(next.code, 0, next.stderr)
+      assert.match(next.stderr, /Recovering interrupted service transition/)
+      const config = JSON.parse(await readFile(join(root, 'config.json'), 'utf8'))
+      assert.equal(config.service, action === 'disable' ? 1 : 0)
+      assert.equal(await readlink(join(root, 'current')), '0.2.0')
+      await assert.rejects(access(join(root, '.service-transition')))
+      await assert.rejects(lstat(join(root, '.install-lock')))
+      if (config.service === 1)
+        assert.equal(
+          config.service_sha256,
+          createHash('sha256')
+            .update(await readFile(config.service_file))
+            .digest('hex')
+        )
+      else await assert.rejects(access(file))
+    })
+  }
+}
+
+async function killedDisable() {
+  const h = await home(),
+    env = await mockedLinuxService(h)
+  assert.equal((await install(h, ['--version', '0.2.0'], env)).code, 0)
+  const root = join(h, '.local/share/abele-node'),
+    configFile = join(root, 'config.json'),
+    before = await readFile(configFile, 'utf8'),
+    file = JSON.parse(before).service_file
+  await writeFile(
+    join(h, 'mocks/rm'),
+    `#!${process.execPath}\nconst cp=require('node:child_process'),fs=require('node:fs'),args=process.argv.slice(2);const r=cp.spawnSync('/bin/rm',args,{stdio:'inherit'});if(r.status!==0)process.exit(r.status);if(args.at(-1)===${JSON.stringify(file)}){fs.unlinkSync(__filename);process.kill(process.ppid,'SIGKILL')}\n`,
+    { mode: 0o755 }
+  )
+  assert.notEqual((await install(h, ['--service-action', 'disable'], env)).code, 0)
+  return { h, env, root, configFile, before, file }
+}
+for (const change of ['service-file', 'state', 'config', 'live-owner']) {
+  test(`service-only crash recovery refuses changed ${change} without touching evidence`, async () => {
+    const f = await killedDisable(),
+      config = JSON.parse(f.before)
+    if (change === 'service-file') await writeFile(f.file, 'foreign service file')
+    else if (change === 'state') {
+      await rename(config.state, join(f.h, 'original-state'))
+      await mkdir(config.state)
+    } else if (change === 'config')
+      await writeFile(f.configFile, JSON.stringify({ ...config, claude: '/foreign/selection' }))
+    else {
+      const file = join(f.root, '.service-transition/transaction.json'),
+        m = JSON.parse(await readFile(file, 'utf8'))
+      await writeFile(file, JSON.stringify({ ...m, pid: process.pid, pgid: process.pid }))
+    }
+    await writeFile(join(f.h, 'systemctl.log'), '')
+    const result = await install(f.h, ['--service-action', 'enable'], f.env)
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /recovery refused|changed|transition is active/i)
+    await access(join(f.root, '.service-transition/transaction.json'))
+    assert.equal(await readFile(join(f.h, 'systemctl.log'), 'utf8'), '')
+    if (change === 'service-file')
+      assert.equal(await readFile(f.file, 'utf8'), 'foreign service file')
+    if (change !== 'config') assert.equal(await readFile(f.configFile, 'utf8'), f.before)
+  })
+}
+test('service-only recovery refuses a surviving mutation process group after its shell dies', async () => {
+  const h = await home(),
+    env = await mockedLinuxService(h)
+  assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+  const root = join(h, '.local/share/abele-node'),
+    fault = join(h, 'surviving-child.cjs'),
+    release = join(h, 'release-child'),
+    ready = join(h, 'survivor.json'),
+    published = join(h, 'child-published')
+  await writeFile(
+    fault,
+    `const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=(from,to,...rest)=>{if(String(to).endsWith('/abele-node.service')&&process.env.ABELE_SERVICE_TRANSITION){fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid}));fs.closeSync(1);fs.closeSync(2);process.kill(process.ppid,'SIGKILL');const until=Date.now()+15000;while(!fs.existsSync(${JSON.stringify(release)})&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);const r=rename(from,to,...rest);fs.writeFileSync(${JSON.stringify(published)},'published');return r}return rename(from,to,...rest)}`
+  )
+  let pid
+  try {
+    const killed = await install(h, ['--service-action', 'enable'], {
+      ...env,
+      NODE_OPTIONS: '--require=' + fault,
+    })
+    assert.notEqual(killed.code, 0)
+    pid = JSON.parse(await readFile(ready, 'utf8')).pid
+    const next = await install(h, ['--service-action', 'disable'], env)
+    assert.notEqual(next.code, 0, next.stderr)
+    assert.match(next.stderr, /process group.*active/i)
+    await access(join(root, '.service-transition/transaction.json'))
+  } finally {
+    await writeFile(release, 'exit')
+    for (
+      let i = 0;
+      i < 500 &&
+      !(await access(published).then(
+        () => true,
+        () => false
+      ));
+      i++
+    )
+      await new Promise((done) => setTimeout(done, 10))
+    assert.equal(
+      await access(published).then(
+        () => true,
+        () => false
+      ),
+      true,
+      'surviving mutation child must finish before test cleanup'
+    )
+    if (pid)
+      for (let i = 0; i < 500; i++) {
+        try {
+          process.kill(pid, 0)
+        } catch (e) {
+          if (e.code === 'ESRCH') break
+          throw e
+        }
+        await new Promise((done) => setTimeout(done, 10))
+      }
+  }
+  const retried = await install(h, ['--service-action', 'disable'], env)
+  assert.equal(retried.code, 0, retried.stderr)
+})
+
+test('service-only crash recovery can itself be killed and retried', async () => {
+  const f = await killedDisable(),
+    fault = join(f.h, 'kill-recovery.cjs')
+  await writeFile(
+    fault,
+    `const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=(from,to,...rest)=>{const r=rename(from,to,...rest);if(String(from).endsWith('restore-candidate')){process.kill(process.pid,'SIGKILL')}return r}`
+  )
+  const interrupted = await install(f.h, ['--service-action', 'enable'], {
+    ...f.env,
+    NODE_OPTIONS: '--require=' + fault,
+  })
+  assert.notEqual(interrupted.code, 0)
+  await access(join(f.root, '.service-transition'))
+  const next = await install(f.h, ['--service-action', 'enable'], f.env)
+  assert.equal(next.code, 0, next.stderr)
+  await access(join(f.h, '.test-service-running'))
+  assert.equal(await readFile(f.configFile, 'utf8'), f.before)
+  await assert.rejects(access(join(f.root, '.service-transition')))
+})
+
+async function awaitMarker(file) {
+  for (let i = 0; i < 1000; i++) {
+    if (
+      await access(file).then(
+        () => true,
+        () => false
+      )
+    )
+      return
+    await new Promise((done) => setTimeout(done, 10))
+  }
+  throw new Error('Timed out waiting for test marker: ' + file)
+}
+test('service-only stale recovery takeover is exclusive when contenders observe the same owner', async () => {
+  const f = await killedDisable(),
+    kill = join(f.h, 'stale-recovery.cjs')
+  await writeFile(
+    kill,
+    `const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=(from,to,...rest)=>{const r=rename(from,to,...rest);if(String(from).endsWith('restore-candidate'))process.kill(process.pid,'SIGKILL');return r}`
+  )
+  assert.notEqual(
+    (
+      await install(f.h, ['--service-action', 'enable'], {
+        ...f.env,
+        NODE_OPTIONS: '--require=' + kill,
+      })
+    ).code,
+    0
+  )
+  const physicalRoot = await realpath(f.root),
+    lock = join(physicalRoot, '.service-recovery-lock'),
+    stale = join(physicalRoot, await readlink(lock))
+  const fault = join(f.h, 'contended-recovery.cjs'),
+    paused = join(f.h, 'B-paused'),
+    ready = join(f.h, 'A-ready'),
+    releaseA = join(f.h, 'release-A'),
+    releaseB = join(f.h, 'release-B')
+  await writeFile(
+    fault,
+    `const fs=require('node:fs'),rename=fs.renameSync,unlink=fs.unlinkSync,symlink=fs.symlinkSync;let paused=false;const wait=file=>{const until=Date.now()+15000;while(!fs.existsSync(file)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)};const pause=()=>{if(process.env.TEST_RECOVERY_WORKER==='B'&&!paused){paused=true;fs.writeFileSync(${JSON.stringify(paused)},'observed stale owner');wait(${JSON.stringify(releaseB)})}};fs.unlinkSync=(file,...rest)=>{if(String(file)===${JSON.stringify(lock)})pause();return unlink(file,...rest)};fs.renameSync=(from,to,...rest)=>{if(String(from)===${JSON.stringify(stale)})pause();return rename(from,to,...rest)};fs.symlinkSync=(target,file,...rest)=>{const r=symlink(target,file,...rest);if(String(file)===${JSON.stringify(lock)}&&process.env.TEST_RECOVERY_WORKER==='A'){fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({target,pid:process.pid}));wait(${JSON.stringify(releaseA)})}return r}`
+  )
+  const helper = join(f.root, 'current/service-transition.mjs'),
+    env = { ...f.env, HOME: f.h, NODE_OPTIONS: '--require=' + fault }
+  let a, b
+  try {
+    b = run(process.execPath, [helper, 'recover', f.root], { ...env, TEST_RECOVERY_WORKER: 'B' })
+    await awaitMarker(paused)
+    a = run(process.execPath, [helper, 'recover', f.root], { ...env, TEST_RECOVERY_WORKER: 'A' })
+    await awaitMarker(ready)
+    const owner = JSON.parse(await readFile(ready, 'utf8'))
+    await writeFile(releaseB, 'continue')
+    const loser = await b
+    assert.notEqual(loser.code, 0, loser.stderr)
+    assert.equal(await readlink(lock), owner.target, "loser must not unlink the winner's lock")
+    await writeFile(releaseA, 'continue')
+    const winner = await a
+    assert.equal(winner.code, 0, winner.stderr)
+  } finally {
+    await writeFile(releaseB, 'continue')
+    await writeFile(releaseA, 'continue')
+    await Promise.all([a, b].filter(Boolean))
+  }
+})
+test('service-only stale recovery takeover can itself be killed and resumed', async () => {
+  const f = await killedDisable(),
+    first = join(f.h, 'leave-stale-recovery.cjs'),
+    second = join(f.h, 'kill-takeover.cjs')
+  await writeFile(
+    first,
+    `const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=(from,to,...rest)=>{const r=rename(from,to,...rest);if(String(from).endsWith('restore-candidate'))process.kill(process.pid,'SIGKILL');return r}`
+  )
+  assert.notEqual(
+    (
+      await install(f.h, ['--service-action', 'enable'], {
+        ...f.env,
+        NODE_OPTIONS: '--require=' + first,
+      })
+    ).code,
+    0
+  )
+  await writeFile(
+    second,
+    `const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=(from,to,...rest)=>{const r=rename(from,to,...rest);if(String(to).includes('.service-recovery-owner.')&&String(to).includes('.claimed-'))process.kill(process.pid,'SIGKILL');return r}`
+  )
+  assert.notEqual(
+    (
+      await install(f.h, ['--service-action', 'enable'], {
+        ...f.env,
+        NODE_OPTIONS: '--require=' + second,
+      })
+    ).code,
+    0
+  )
+  const next = await install(f.h, ['--service-action', 'enable'], f.env)
+  assert.equal(next.code, 0, next.stderr)
+  await assert.rejects(lstat(join(f.root, '.service-recovery-lock')))
+  await assert.rejects(lstat(join(f.root, '.service-transition')))
+})
+
+test('service-only recovery never releases a replacement lock owned by another recovery', async () => {
+  const f = await killedDisable(),
+    root = await realpath(f.root),
+    lock = join(root, '.service-recovery-lock'),
+    fault = join(f.h, 'replace-recovery-lock.cjs')
+  await writeFile(
+    fault,
+    `const fs=require('node:fs'),rm=fs.rmSync;let replaced=false;fs.rmSync=(file,...rest)=>{const r=rm(file,...rest);if(!replaced&&String(file).includes('.service-transition-retired.')){replaced=true;fs.unlinkSync(${JSON.stringify(lock)});fs.symlinkSync('replacement-owned-by-test',${JSON.stringify(lock)})}return r}`
+  )
+  const result = await run(
+    process.execPath,
+    [join(f.root, 'current/service-transition.mjs'), 'recover', f.root],
+    { ...f.env, HOME: f.h, NODE_OPTIONS: '--require=' + fault }
+  )
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(await readlink(lock), 'replacement-owned-by-test')
+})
+
+for (const platform of ['mac', 'linux']) {
+  test(`service-only enable never mistakes a late foreground daemon for service health: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+    const root = join(h, '.local/share/abele-node'),
+      configFile = join(root, 'config.json'),
+      before = await readFile(configFile, 'utf8'),
+      config = JSON.parse(before)
+    await writeFile(
+      join(h, 'foreground-on-start'),
+      JSON.stringify({
+        state: config.state,
+        runtime: {
+          version: config.version,
+          cli_path: join(root, config.version, 'packages/node-daemon/dist/cli.js'),
+        },
+      })
+    )
+    const result = await install(h, ['--service-action', 'enable'], env)
+    assert.notEqual(result.code, 0, result.stderr)
+    assert.equal(await readFile(configFile, 'utf8'), before)
+    await access(join(h, '.test-service-running'))
+    await assert.rejects(access(join(h, 'cli-stop.log')))
+    if (platform === 'linux')
+      assert.doesNotMatch(
+        await readFile(join(h, 'systemctl.log'), 'utf8'),
+        /--user stop abele-node/
+      )
+  })
+}
+
+test('service-only enable failure rolls back its newly registered unit and config', async () => {
+  const h = await home(),
+    env = await mockedLinuxService(h)
+  assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+  const file = join(h, '.local/share/abele-node/config.json'),
+    before = await readFile(file, 'utf8')
+  await writeFile(join(h, 'fail-start-before-mutation'), 'start refuses')
+  const result = await install(h, ['--service-action', 'enable'], env)
+  assert.notEqual(result.code, 0)
+  assert.match(result.stderr, /rolling back/)
+  assert.equal(await readFile(file, 'utf8'), before)
+  await assert.rejects(access(join(h, '.config/systemd/user/abele-node.service')))
+  await assert.rejects(access(join(h, '.test-service-enabled')))
+  await assert.rejects(access(join(h, '.test-service-running')))
+})
+
+test('service-only disable publication failure restores the owned running service', async () => {
+  const h = await home(),
+    env = await mockedLinuxService(h)
+  assert.equal((await install(h, ['--version', '0.2.0'], env)).code, 0)
+  const file = join(h, '.local/share/abele-node/config.json'),
+    before = await readFile(file, 'utf8')
+  const unit = JSON.parse(before).service_file,
+    original = await readFile(unit, 'utf8')
+  await writeFile(
+    join(h, 'mocks/mv'),
+    '#!/bin/sh\ncase "$*" in *config.json*) exit 1 ;; *) exec /bin/mv "$@" ;; esac\n',
+    { mode: 0o755 }
+  )
+  const result = await install(h, ['--service-action', 'disable'], env)
+  assert.notEqual(result.code, 0)
+  assert.match(result.stderr, /rolling back/)
+  assert.equal(await readFile(file, 'utf8'), before)
+  assert.equal(await readFile(unit, 'utf8'), original)
+  await access(join(h, '.test-service-enabled'))
+  await access(join(h, '.test-service-running'))
+})
+
+test('service-only foreground refusal gives an exact stop command and changes nothing', async () => {
+  const h = await home()
+  assert.equal((await install(h, ['--version', '0.2.0', '--no-service'])).code, 0)
+  const file = join(h, '.local/share/abele-node/config.json'),
+    before = await readFile(file, 'utf8')
+  const state = JSON.parse(before).state
+  await writeFile(join(state, 'daemon.lock'), JSON.stringify({ pid: process.pid }))
+  const result = await install(h, ['--service-action', 'enable'])
+  assert.notEqual(result.code, 0)
+  assert.ok(result.stderr.includes("'" + join(h, '.local/bin/abele-node') + "' stop"))
+  assert.equal(await readFile(file, 'utf8'), before)
+  await assert.rejects(access(join(h, 'cli-stop.log')))
+})
+
 test('argument validation and help work without downloads', async () => {
   for (const args of [
     ['--bogus'],
@@ -944,9 +1499,9 @@ const root=(process.env.TEST_INSTALL_PREFIX || home+'/.local')+'/share/abele-nod
 fs.appendFileSync(home+'/systemctl.log',args+' current='+(fs.existsSync(root+'/current')?fs.readlinkSync(root+'/current'):'')+'\\n');
 if(args==='--user show abele-node.service --property=FragmentPath --value')console.log(fs.existsSync(home+'/simulate-fragment')?fs.readFileSync(home+'/simulate-fragment','utf8'):(fs.existsSync(unit)?unit:''));
 if(args==='--user show abele-node.service --property=DropInPaths --value')console.log(fs.existsSync(home+'/simulate-loaded-dropins')?fs.readFileSync(home+'/simulate-loaded-dropins','utf8'):'');
-if(args==='--user show abele-node.service --property=MainPID --value')console.log(fs.existsSync(home+'/simulate-foreign-pid')?'2337':(fs.existsSync(home+'/.test-service-running')?'1337':'0'));
+if(args==='--user show abele-node.service --property=MainPID --value')console.log(fs.existsSync(home+'/simulate-main-pid-zero')?'0':fs.existsSync(home+'/simulate-foreign-pid')?'2337':(fs.existsSync(home+'/.test-service-running')?'1337':'0'));
 if(args==='--user show abele-node.service --property=ActiveState --value'){
-  const active=fs.existsSync(home+'/.test-service-running')||fs.existsSync(home+'/simulate-active-job');console.log(active?'active':'inactive');
+  const active=(!fs.existsSync(home+'/simulate-main-pid-zero')&&fs.existsSync(home+'/.test-service-running'))||fs.existsSync(home+'/simulate-active-job');console.log(active?'active':'inactive');
   if(!active && fs.existsSync(home+'/reactivate-rejected-version') && fs.existsSync(home+'/loaded-unit-cli') && fs.readFileSync(home+'/loaded-unit-cli','utf8').includes('/0.2.1/'))fs.writeFileSync(home+'/timer-armed','armed');
 }
 if(args==='--user daemon-reload'){
@@ -975,6 +1530,7 @@ if(args==='--user enable --now abele-node.service'){
   fs.writeFileSync(home+'/.test-service-enabled','enabled');
   if(fs.existsSync(home+'/.test-service-running'))process.exit(0); // Enable is not restart.
 }
+if(args==='--user start abele-node.service' && fs.existsSync(home+'/foreground-on-start')){fs.copyFileSync(home+'/foreground-on-start',home+'/.test-service-running');fs.writeFileSync(home+'/simulate-main-pid-zero','foreground has no manager PID');process.exit(0)}
 if(args==='--user start abele-node.service' && fs.existsSync(home+'/fail-start-before-mutation'))process.exit(3);
 if(args==='--user start abele-node.service' && fs.existsSync(home+'/.test-service-running'))process.exit(0);
 if(args==='--user enable --now abele-node.service' || args==='--user start abele-node.service' || args==='--user restart abele-node.service'){
@@ -1779,6 +2335,14 @@ test(
     const tarball = resolve(process.env.ABELE_INSTALLER_TARBALL)
     const listing = await run('tar', ['-tzf', tarball])
     assert.equal(listing.code, 0, listing.stderr)
+    assert.ok(
+      listing.stdout.split('\n').includes('./install.sh'),
+      'release must bundle the offline service installer'
+    )
+    assert.ok(
+      listing.stdout.split('\n').includes('./service-transition.mjs'),
+      'release must bundle service crash recovery'
+    )
     const forbidden =
       /\.(map|tsbuildinfo)$|\/(test\.[^/]+|[^/]+\.(test|spec|tst)[.-][^/]+)$|\/(test|tests|__tests__|spec|probes)\/|\/node_modules\/(typescript|vitest|vite|prettier)\/|\.\/packages\/[^/]+\/src\//
     assert.deepEqual(
@@ -1810,6 +2374,29 @@ test(
         assert.equal(report.running, false)
         assert.equal(report.state_dir, join(await realpath(h), '.local/state/abele-node'))
       }
+      const serviceStatus = await run(
+        join(h, '.local/bin/abele-node'),
+        ['service', 'status', '--json'],
+        { HOME: h }
+      )
+      assert.equal(serviceStatus.code, 0, serviceStatus.stderr)
+      assert.deepEqual(JSON.parse(serviceStatus.stdout), {
+        mode: 'foreground',
+        managed: true,
+        enabled: false,
+        running: false,
+        ownership: 'none',
+        service_file: null,
+        state_dir: join(await realpath(h), '.local/state/abele-node'),
+      })
+      const help = await run(join(h, '.local/bin/abele-node'), ['service', '--help'], { HOME: h })
+      assert.equal(help.code, 0, help.stderr)
+      assert.match(help.stdout, /service enable/)
+      const background = await run(join(h, '.local/bin/abele-node'), ['start', '--background'], {
+        HOME: h,
+      })
+      assert.notEqual(background.code, 0)
+      assert.match(background.stderr, /Unknown option: --background/)
       const updateCheck = await run(
         join(h, '.local/bin/abele-node'),
         ['update', '--check', '--json'],

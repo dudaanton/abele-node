@@ -104,9 +104,17 @@ export function humanOutput(
         (item) =>
           `${line(item.operation_id)} (${line(item.installation_id)}): ${line(item.reconciliation)} — ${line(item.reason)}${item.state === 'outcome_unknown' ? (item.reservation_retained === true ? '. Reservation retained; check again after the Git process/state is settled.' : '. No reservation confirmed; deletion unresolved. Check node state before proceeding.') : '. Observed without replaying removal.'}`
       )
+    case 'service':
+      return [
+        `Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`,
+        `Service: ${r.enabled ? 'enabled' : 'disabled'}; daemon ${r.running ? 'running' : 'stopped'}`,
+        ...(r.enabled ? [`Ownership: ${shown(r.ownership)}`] : []),
+        ...(!r.enabled ? ['Start in a terminal: abele-node start'] : []),
+      ].join('\n')
     case 'status':
       return [
         `AbeleNode: ${r.running ? 'running' : 'not running'}`,
+        ...(r.mode ? [`Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`] : []),
         `Version: ${shown(r.version ?? record(r.runtime).version)}`,
         `Port: ${shown(r.port)}`,
         `Node ID: ${r.node_id == null ? 'not created' : line(r.node_id)}`,

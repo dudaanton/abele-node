@@ -128,6 +128,22 @@ installs under `$HOME/.local`, and starts a macOS LaunchAgent or Linux user serv
 It does not install Node, provider CLIs or credentials. Linux requires a running
 systemd user manager; use `sh -s -- --no-service` instead of `sh` above for a
 foreground-only installation, then run `abele-node start` yourself.
+Switch an existing installer deployment without reinstalling or downloading:
+
+```sh
+abele-node service status             # foreground or background, ownership and running state
+abele-node stop                       # stop a foreground daemon before enabling
+abele-node service enable             # register, start and verify the background service
+abele-node service disable            # stop/unregister; retain all state
+abele-node start                      # foreground after disable; service-aware while enabled
+abele-node --help                     # or: abele-node service --help
+```
+
+Service changes preserve the installer's ownership record and update mode, refuse
+foreign/modified service files, and are idempotent. `install` is a deprecated alias
+to `service enable` in installer deployments; source/manual installs retain the
+legacy macOS setup. Unknown options such as `start --background` are rejected—use
+`service enable`, not a background flag.
 See [installer options and the manual source path](docs/install.md).
 
 With `$HOME/.local/bin` on your PATH:

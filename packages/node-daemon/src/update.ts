@@ -12,6 +12,7 @@ import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { acquireUpdateLock } from '@abele/node-core'
+import { recoverServiceTransition } from './service.js'
 
 type Options = { version?: string; check: boolean; force: boolean }
 type ActiveRun = { run_id: string; session_id: string }
@@ -59,7 +60,7 @@ function parse(args: string[]): Options {
     else if (arg === '--version') options.version = version(args[++i] ?? '')
     else
       throw new Error(
-        `Unknown update option: ${arg}. Usage: abele-node update [--version X.Y.Z] [--check] [--force] [--json]`
+        `Unknown option: ${arg}. For background operation use abele-node service enable. Usage: abele-node update [--version X.Y.Z] [--check] [--force] [--json]`
       )
   }
   return options
@@ -210,6 +211,7 @@ async function performUpdate(
   report.force = options.force
   report.target_kind = options.version ? 'pinned' : 'latest'
   const notify = (status: UpdateReport['status']) => progress?.({ ...report, status })
+  recoverServiceTransition(runtime)
   const root = dirname(runtime)
   if (!existsSync(join(root, '.installer-owned'))) {
     report.status = 'source'

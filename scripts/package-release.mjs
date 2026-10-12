@@ -51,8 +51,9 @@ function nativeFiles(directory, files = []) {
   return files
 }
 try {
-  for (const file of ['package.json', 'package-lock.json', '.npmrc', 'LICENSE'])
+  for (const file of ['package.json', 'package-lock.json', '.npmrc', 'LICENSE', 'install.sh'])
     cpSync(join(root, file), join(staging, file))
+  cpSync(join(root, 'scripts/service-transition.mjs'), join(staging, 'service-transition.mjs'))
   for (const name of readdirSync('packages')) {
     const destination = join(staging, 'packages', name)
     copyWorkspaceRuntime(join(root, 'packages', name), destination)

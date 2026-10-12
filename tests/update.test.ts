@@ -593,6 +593,23 @@ it('JSON interruption reports the signal and resumed admission without human out
     await pending
   }
 })
+it('recovers an interrupted service publication before reading updater settings', async () => {
+  mkdirSync(join(root, '.service-transition'))
+  const recorded = JSON.parse(readFileSync(join(root, 'config.json'), 'utf8'))
+  writeFileSync(
+    join(runtime, 'service-transition.mjs'),
+    `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(join(root, 'config.json'))},${JSON.stringify(JSON.stringify({ ...recorded, service: 1 }))});fs.rmSync(${JSON.stringify(join(root, '.service-transition'))},{recursive:true});`
+  )
+  const result = await cli(['update', '--check', '--json'])
+  expect(result.code, result.stderr).toBe(0)
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    command: 'update',
+    status: 'checked',
+    service: true,
+  })
+  expect(existsSync(join(root, '.service-transition'))).toBe(false)
+})
+
 it('invalid update arguments are structured when --json is requested', async () => {
   const result = await cli(['update', '--bogus', '--json'])
   expect(result.code).toBe(1)

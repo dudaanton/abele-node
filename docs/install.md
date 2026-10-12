@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.3
+  sh -s -- --version 0.4.4
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -166,6 +166,73 @@ The installer records these options in its wrapper, service and config, preservi
 them across upgrades. When no model is configured, the wrapper and service pass
 no model override; doctor/status show the exposed selection or `Codex default`.
 No credentials are copied or written by the installer.
+
+### Switch between foreground and background (no reinstall)
+
+For an existing one-command installer deployment, use:
+
+```sh
+abele-node service status
+abele-node stop                 # if the foreground daemon is running
+abele-node status               # wait for it to report not running
+abele-node service enable       # register + start + verify the existing runtime
+abele-node service disable      # stop + unregister; retain state and runtime
+abele-node start                # now stays in the foreground until Ctrl-C
+abele-node service status --json
+```
+
+Enable and disable are idempotent. They use the **bundled local installer**, without
+network downloads, runtime copies, changing `current` or reinstalling. Enable uses
+the same LaunchAgent/systemd user unit, provider settings, ownership checks and
+write-ahead rollback as installation, and records the service path/fingerprint in
+the existing config. Disable stops and unregisters that owned service, records
+foreground mode, and keeps state, provider credentials and installed versions.
+Before service-only mutations, a private durable snapshot records the previous
+config, wrapper, state identity and service backup, plus the exact candidate service
+bytes. The service lock atomically publishes the ID of an isolated installer
+process group. Recovery refuses while any mutation child in that group is still
+alive, even if the installer shell has died; it never signals the caller's group.
+If the command is
+killed (including SIGKILL), the next service command, start/stop, update or installer
+rerun recovers **before ownership checks**: an unfinished transition rolls back
+journaled actions; a committed one finishes cleanup. Recovery itself is resumable.
+Stale recovery owners are claimed by an atomic rename of their unique owner
+directory. Concurrent attempts cannot replace a live winner or release its lock;
+a killed takeover can be resumed after its process group exits.
+Only matching cached manager jobs can be stopped, never a foreground daemon. An
+original service is restarted only for a journaled stop. Changed state identities,
+foreign service/config/wrapper files, live owners or unverifiable manager state
+are refused with the journal retained for inspection. This crash recovery applies
+to service-mode transitions, not interrupted runtime upgrades.
+
+Later `abele-node update` preserves the selected mode. For manual installer reruns,
+continue passing `--no-service` while foreground mode is selected.
+
+A running foreground daemon is not silently interrupted: enable refuses with the
+exact installed `stop` command. Wait for status to report stopped, then retry.
+For macOS, launchd must confirm matching cached arguments and unload; on Linux,
+the systemd user manager, busctl introspection, drop-in admission and PID checks
+must succeed. There is no root service or automatic lingering. Foreign,
+unrecorded, missing or modified service files are refused before any stop/write;
+inspect and explicitly stop/remove the old service rather than trying to adopt it.
+Service status reports the configured mode, running daemon and fingerprint status;
+it is not a replacement for manager diagnostics when ownership is missing/modified.
+
+In a service deployment, `abele-node start` starts/verifies the registered service
+and returns a service report, rather than launching a second foreground daemon.
+Generated manager commands use an internal startup marker to run the daemon under
+supervision. `status` shows foreground/background mode (also `mode` in JSON).
+Output is plain text unless `--json` is requested. `--help`, `help`,
+`start --help`, and `help service` exit successfully without starting anything.
+Unknown flags such as `start --background` are errors; use `service enable`.
+
+`abele-node install` now prints a deprecation notice and delegates to `service enable`
+**only for installer-owned deployments**, preserving their recorded provider settings.
+Use the installer to change those settings. The legacy macOS source/manual command
+still copies a runtime under state and announces that manual path; it does not
+silently become installer-owned. Source/manual deployments must use that path or
+the hand-written service examples below. Old runtimes lacking the bundled service
+installer need one upgrade to a supporting release before using these commands.
 
 ### Installer upgrades and removal
 
@@ -491,7 +558,8 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.abele.node.pl
 
 ## Linux: systemd --user
 
-The CLI's `install` command is macOS-only. On Linux use a stable source checkout
+For one-command installer deployments, use `abele-node service enable`/`disable`
+above. The legacy **source/manual** CLI `install` command is macOS-only. On Linux use a stable source checkout
 (or your own deployed runtime) and create
 `$HOME/.config/systemd/user/abele-node.service`:
 
@@ -602,8 +670,8 @@ application-level encryption, not disk encryption. Counts include registered pro
 They are read locally without starting the daemon;
 “unknown” means the database could not be read.
 
-For scripts, add `--json` to retain the original output schema (including the existing
-plain version string and error messages):
+For scripts, add `--json` for machine-readable reports (status adds a `mode` field;
+the existing plain version string and error messages are unchanged):
 
 ```sh
 abele-node status --json
@@ -634,7 +702,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.3  # example; select an existing release
+   git checkout v0.4.4  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

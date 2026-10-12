@@ -4,6 +4,7 @@
 abele_install() {
 set -eu
 umask 077
+unset ABELE_SERVICE_TRANSITION
 fail() { printf 'abele-node: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' 'Usage: sh install.sh [--version X.Y.Z] [--prefix PATH] [--state-dir PATH]' \
@@ -12,16 +13,16 @@ usage() {
     '  [--purge-state --confirm-purge-state ABSOLUTE_STATE_PATH]' \
     'Default prefix: ~/.local; Node 22.23.2 must already be installed.'
 }
-version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service=0 uninstall=0 purge=0 confirmation=''
+version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service=0 uninstall=0 purge=0 confirmation='' service_action=''
 codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABELE_CODEX_HOME:-} codex_enabled=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state)
+    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then fail "$1 requires a value"; fi
       case "$2" in --*) fail "$1 requires a value" ;; esac
       case "$1" in
         --version) version=${2#v} ;; --prefix) prefix=$2 ;; --state-dir) state=$2 ;;
-        --claude-path) claude=$2 ;; --confirm-purge-state) confirmation=$2 ;;
+        --claude-path) claude=$2 ;; --confirm-purge-state) confirmation=$2 ;; --service-action) service_action=$2 ;;
         --codex-path) codex=$2 ;; --codex-model) codex_model=$2 ;; --codex-home) codex_home=$2 ;;
       esac
       shift 2 ;;
@@ -31,6 +32,10 @@ while [ "$#" -gt 0 ]; do
     *) fail "Unknown option: $1" ;;
   esac
 done
+case "$service_action" in ''|enable|disable) ;; *) fail 'Invalid service action: enable or disable required.' ;; esac
+if [ -n "$service_action" ]; then
+  [ "$uninstall" = 0 ] && [ "$purge" = 0 ] && [ -z "$version" ] && [ "$no_service" = 0 ] || fail 'Service actions cannot be combined with deployment/removal options.'
+fi
 [ "$purge" = 0 ] || [ "$uninstall" = 1 ] || fail '--purge-state requires --uninstall'
 [ -z "$confirmation" ] || [ "$purge" = 1 ] || fail '--confirm-purge-state requires --purge-state'
 [ "$(id -u)" != 0 ] || fail 'Refusing root. Run as your ordinary user, without sudo.'
@@ -42,6 +47,11 @@ node=$(command -v node)
 "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number); if(major!==22 || minor<23) process.exit(1); const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); db.close()' >/dev/null 2>&1 || fail "$node_fix"
 # Resolve the executable now: services do not read shell startup files.
 node=$("$node" -p 'process.execPath')
+if [ -n "$service_action" ]; then
+  "$node" - "$$" <<'NODE' || fail 'Service transitions require an isolated process group; use abele-node service enable/disable.'
+const {spawnSync}=require('node:child_process');const pid=process.argv[2],r=spawnSync('/bin/ps',['-o','pgid=','-p',pid],{encoding:'utf8',timeout:1000});if(r.status!==0||r.stdout.trim()!==pid)process.exit(1);
+NODE
+fi
 for tool in curl tar mktemp; do command -v "$tool" >/dev/null 2>&1 || fail "Missing $tool; install it with your OS package manager."; done
 if command -v shasum >/dev/null 2>&1; then checksum=shasum
 elif command -v sha256sum >/dev/null 2>&1; then checksum=sha256sum
@@ -130,6 +140,14 @@ valid_path() {
 valid_path "$prefix" || fail 'Invalid prefix: use an absolute normalized path other than / or HOME.'
 root=$prefix/share/abele-node
 config=$root/config.json
+transition_helper=$root/current/service-transition.mjs
+# A killed service transaction must be recovered before service/config ownership
+# checks, which legitimately disagree while its publication is incomplete.
+if [ -d "$root/.service-transition" ] || [ -L "$root/.install-lock" ]; then
+  [ -f "$root/.installer-owned" ] && [ ! -L "$root" ] || fail 'Interrupted service transition is not in an installer-owned directory.'
+  [ -f "$transition_helper" ] || fail 'Interrupted service transition has no recovery helper; inspect its retained journal.'
+  "$node" "$transition_helper" recover "$root" || fail 'Interrupted service transition recovery failed; journal and state retained.'
+fi
 get_config() { "$node" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"))[process.argv[2]] ?? "")' "$config" "$1"; }
 old='' old_state='' old_claude='' old_service=0
 expected_state_identity=''
@@ -177,7 +195,15 @@ unit=$HOME/.config/systemd/user/abele-node.service
 service=1
 [ "$no_service" = 0 ] || service=0
 [ "$uninstall" = 0 ] || service=$old_service
-[ "$old_service" != 1 ] || [ "$service" = 1 ] || [ "$uninstall" = 1 ] || fail 'Existing install uses a service; omit --no-service for upgrades.'
+if [ -n "$service_action" ]; then
+  [ -n "$old" ] || fail 'Service changes require an existing installer-owned installation.'
+  version=$old
+  claude=$old_claude
+  codex=$(get_config codex); codex_model=$(get_config codex_model)
+  codex_home=$(get_config codex_home); codex_enabled=$(get_config codex_enabled)
+  [ "$service_action" != disable ] || service=0
+fi
+[ "$old_service" != 1 ] || [ "$service" = 1 ] || [ "$uninstall" = 1 ] || [ "$service_action" = disable ] || fail 'Existing install uses a service; omit --no-service for upgrades.'
 case "$old_service" in 0|1) ;; *) fail 'Invalid service ownership configuration.' ;; esac
 if [ "$os" = darwin ]; then service_file=$plist; other_service_file=$unit
 else service_file=$unit; other_service_file=$plist; fi
@@ -244,7 +270,7 @@ discover_claude() {
 codex_enabled=${codex_enabled:-true}
 case "$codex_enabled" in true|false) ;; *) fail 'Invalid Codex enabled configuration.' ;; esac
 [ -z "$codex_model" ] || "$node" -e 'if(!/^[A-Za-z0-9_.:-]{1,128}$/.test(process.argv[1]))process.exit(1)' "$codex_model" || fail 'Invalid codex-model.'
-if [ "$uninstall" = 0 ] && [ "$codex_enabled" = true ] && [ -z "$codex" ]; then
+if [ "$uninstall" = 0 ] && [ -z "$service_action" ] && [ "$codex_enabled" = true ] && [ -z "$codex" ]; then
   codex=$(command -v codex 2>/dev/null || true)
   if [ -z "$codex" ]; then
     for candidate in "$HOME/.local/bin/codex" "$HOME/.codex/local/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
@@ -358,14 +384,20 @@ if [ "$service" = 1 ] || [ "$old_service" = 1 ]; then
   fi
 fi
 # A fresh service installation must not adopt or signal a manual daemon.
-if [ "$service" = 1 ] && [ "$old_service" = 0 ]; then
-  "$node" - "$state" <<'NODE' || fail 'stop_before_install: stop the non-installer/foreground daemon yourself before installing a service.'
+assert_foreground_stopped() {
+  installed_command=$("$node" - "$prefix/bin/abele-node" <<'NODE'
+const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
+console.log(q(process.argv[2]));
+NODE
+  ) || fail 'Cannot render the installed stop command.'
+  "$node" - "$state" <<'NODE' || fail "stop_before_install: foreground daemon is running. Run: $installed_command stop ; then $installed_command service enable. Wait for status to report stopped first."
 const fs=require('node:fs'),path=require('node:path');let lock;
 try{lock=JSON.parse(fs.readFileSync(path.join(process.argv[2],'daemon.lock'),'utf8'))}catch(e){if(e.code==='ENOENT')process.exit(0);throw e}
 if(!Number.isSafeInteger(lock.pid)||lock.pid<1)throw new Error('unverifiable_daemon_lock');
 try{process.kill(lock.pid,0);process.exit(1)}catch(e){if(e.code!=='ESRCH')throw e}
 NODE
-fi
+}
+if [ "$service" = 1 ] && [ "$old_service" = 0 ]; then assert_foreground_stopped; fi
 work=''
 backup=''
 retain_backup=0
@@ -528,6 +560,9 @@ prepare_state() {
 }
 start_service() {
   runtime=$1
+  # Repeat under the install lock at the write boundary; never signal a daemon
+  # that appeared after the initial admission check.
+  if [ "$old_service" = 0 ]; then assert_foreground_stopped; fi
   prepare_state || return 1
   if [ "$os" = darwin ]; then
     # Treat install as a possibly partial write+bootstrap. The caller journals
@@ -551,8 +586,9 @@ if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
 const q=(s,expand=false)=>'"'+s.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%').replaceAll('$',()=>expand?'$$':'$')+'"';
-fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--claude-path',claude,...codexArgs].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[...(codex?[path.dirname(codex)]:[]),path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
+fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--service-run','--claude-path',claude,...codexArgs].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[...(codex?[path.dirname(codex)]:[]),path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
 const fd=fs.openSync(candidate,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
+if(process.env.ABELE_SERVICE_TRANSITION){const dir=process.env.ABELE_SERVICE_TRANSITION,stage=path.join(dir,'next-service');fs.copyFileSync(candidate,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};const parent=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(parent)}finally{fs.closeSync(parent)}}
 fs.renameSync(candidate,unit);
 }finally{fs.rmSync(temporary,{recursive:true,force:true})}
 NODE
@@ -578,7 +614,20 @@ check_health() {
   attempt=0
   while [ "$attempt" -lt 15 ]; do
     if cli "$1" status > "$work/status.json" && cli "$1" doctor > "$work/doctor.json" &&
-      "$node" -e 'const fs=require("node:fs"),path=require("node:path"),expected=process.argv[4];const same=(a,b)=>{const x=fs.statSync(a,{bigint:true}),y=fs.statSync(b,{bigint:true});return x.dev===y.dev && x.ino===y.ino}; for(const p of process.argv.slice(1,3)){const r=JSON.parse(fs.readFileSync(p,"utf8")); if(process.argv[3]==="1" && (!r.running || !r.runtime?.cli_path || !same(r.runtime.cli_path,expected) || !same(path.dirname(r.runtime.cli_path),path.dirname(expected)) || r.runtime.version!==process.argv[5]))process.exit(1)}' "$work/status.json" "$work/doctor.json" "$2" "$root/$1/packages/node-daemon/dist/cli.js" "$1"; then return 0; fi
+      "$node" -e 'const fs=require("node:fs"),path=require("node:path"),expected=process.argv[4];const same=(a,b)=>{const x=fs.statSync(a,{bigint:true}),y=fs.statSync(b,{bigint:true});return x.dev===y.dev && x.ino===y.ino}; for(const p of process.argv.slice(1,3)){const r=JSON.parse(fs.readFileSync(p,"utf8")); if(process.argv[3]==="1" && (!r.running || !r.runtime?.cli_path || !same(r.runtime.cli_path,expected) || !same(path.dirname(r.runtime.cli_path),path.dirname(expected)) || r.runtime.version!==process.argv[5]))process.exit(1)}' "$work/status.json" "$work/doctor.json" "$2" "$root/$1/packages/node-daemon/dist/cli.js" "$1"; then
+      if [ "$service_action" = enable ] && [ "$2" = 1 ]; then
+        if [ "$os" = linux ]; then
+          health_pid=$(systemctl --user show abele-node.service --property=MainPID --value) || return 1
+        else
+          health_pid=$("$node" - "gui/$(id -u)/dev.abele.node" <<'NODE'
+const {spawnSync}=require('node:child_process');const r=spawnSync('/bin/launchctl',['print',process.argv[2]],{encoding:'utf8',timeout:1000});const pid=r.stdout?.match(/^\s*pid = ([1-9][0-9]*)\s*$/m)?.[1];if(r.status!==0||!pid)process.exit(1);console.log(pid);
+NODE
+          ) || return 1
+        fi
+        "$node" -e 'const r=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));if(!/^[1-9][0-9]*$/.test(process.argv[2])||String(r.pid)!==process.argv[2])process.exit(1)' "$work/status.json" "$health_pid" || return 1
+      fi
+      return 0
+    fi
     [ "$2" = 1 ] || break
     attempt=$((attempt + 1)); sleep 1
   done
@@ -661,13 +710,19 @@ rollback() {
         else
           if undo_loaded=$(mac_manager_inspect 2); then
             if [ "$undo_loaded" = 1 ]; then
-              if ! cli "$version" stop > "$work/rollback-stop.json" || ! mac_manager_inspect 1; then rollback_failed=1; fi
+              if [ "$service_action" = enable ] && [ "$old_service" = 0 ]; then
+                # A late foreground owner must never be signaled by CLI stop.
+                /bin/launchctl bootout "gui/$(id -u)/dev.abele.node" || :
+                mac_manager_inspect 1 || rollback_failed=1
+              elif ! cli "$version" stop > "$work/rollback-stop.json" || ! mac_manager_inspect 1; then rollback_failed=1; fi
             fi
           else rollback_failed=1; fi
         fi
         if [ "$rollback_failed" != 0 ]; then printf '%s\n' 'New-service stop could not be confirmed; recovery will attempt only journaled inverse actions.' >&2; fi ;;
       enabled-service)
         systemctl --user disable abele-node.service || rollback_failed=1 ;;
+      disabled-service)
+        systemctl --user enable abele-node.service || rollback_failed=1 ;;
       write-service)
         restore_written_service || rollback_failed=1 ;;
       switched-current)
@@ -711,13 +766,23 @@ cleanup() {
     if rollback; then :
     else retain_backup=1; printf '%s\n' 'Automatic service rollback failed; inspect the retained state and service logs.' >&2; fi
   fi
+  if [ -n "$service_action" ] && [ "$retain_backup" = 0 ] && [ -d "$root/.service-transition" ]; then
+    "$node" "$transition_helper" commit "$root" || retain_backup=1
+  fi
   if [ -n "$backup" ]; then
     if [ "$retain_backup" = 1 ]; then
       if [ -n "$journal" ] && [ -f "$journal" ]; then cp -p "$journal" "$backup/actions.jsonl" || :; fi
       printf 'Previous service backup retained: %s\n' "$backup" >&2
     else rm -rf "$backup"; fi
   fi
-  if [ -n "$work" ]; then rm -rf "$work"; fi
+  if [ -n "$work" ]; then
+    if [ -n "$service_action" ] && [ "$retain_backup" = 1 ]; then printf 'Service recovery journal retained: %s\n' "$work" >&2
+    else rm -rf "$work"; fi
+  fi
+  if [ -n "$service_action" ] && [ "$retain_backup" = 0 ]; then
+    "$node" "$transition_helper" finish "$root" || { printf '%s\n' 'Service transition cleanup is incomplete; the next invocation will recover it.' >&2; exit 1; }
+    if [ -L "$root/.install-lock" ] && [ "$(readlink "$root/.install-lock")" = "service-group:$$" ]; then rm -f "$root/.install-lock"; fi
+  fi
   rmdir "$root/.install-lock" 2>/dev/null || :
   exit "$result"
 }
@@ -726,7 +791,15 @@ preflight_stop || fail 'Cannot confirm ownership before mutation; nothing was st
 [ ! -e "$root" ] || [ -f "$root/.installer-owned" ] || fail "Refusing unmanaged directory: $root"
 mkdir -p "$root" "$prefix/bin"
 : > "$root/.installer-owned"
-mkdir "$root/.install-lock" 2>/dev/null || fail "Another install is active (lock: $root/.install-lock)."
+if [ -n "$service_action" ]; then
+  # An atomic symlink publishes both lock ownership and PID, with no empty-lock
+  # crash window. Deployment installers still see EEXIST at the same lock path.
+  "$node" - "$root/.install-lock" "$$" <<'NODE' || fail "Another install is active (lock: $root/.install-lock)."
+const fs=require('node:fs'),path=require('node:path');const [file,pid]=process.argv.slice(2);fs.symlinkSync('service-group:'+pid,file);const fd=fs.openSync(path.dirname(file),fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
+NODE
+else
+  mkdir "$root/.install-lock" 2>/dev/null || fail "Another install is active (lock: $root/.install-lock)."
+fi
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
 work=$(mktemp -d "$root/.download.XXXXXX") || fail 'Cannot create installer scratch directory.'
@@ -786,6 +859,45 @@ if [ "$uninstall" = 1 ]; then
   printf '%s\n' 'AbeleNode uninstalled. State retained unless explicitly purged; provider credentials and original projects were not touched.'
   exit 0
 fi
+if [ -n "$service_action" ]; then
+  # Use the existing immutable runtime, never download, deploy or switch current.
+  if [ "$service_action" = disable ] && [ "$old_service" = 0 ]; then
+    printf '%s\n' 'Service already disabled; foreground mode.'
+    exit 0
+  fi
+  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && check_health "$old" 1; then
+    printf '%s\n' 'Service already enabled and running.'
+    exit 0
+  fi
+  preflight_stop || fail 'Cannot confirm ownership before service change; nothing changed.'
+  check_journal_capacity || fail 'Journal/backups are not writable or have insufficient free space; nothing was stopped.'
+  "$node" "$transition_helper" prepare "$root" "$work" "$backup" "$service_file" "$state" "$expected_state_identity" "$old_service" "$old" "$$" "$os" "$HOME" || fail 'Cannot preserve service transition snapshots; nothing was stopped.'
+  ABELE_SERVICE_TRANSITION=$(physical_path "$root/.service-transition")
+  export ABELE_SERVICE_TRANSITION
+  journal_recording=1
+  if [ "$old_service" = 1 ]; then
+    stop_service || fail 'Could not confirm daemon stop; service registration retained.'
+  else
+    assert_foreground_stopped
+  fi
+  if [ "$service_action" = disable ]; then
+    if [ "$os" = linux ]; then
+      journal_intent disabled-service "$service_file" "$old" || fail 'Cannot journal service disable.'
+      disabled_id=$journal_action_id
+      systemctl --user disable abele-node.service
+      journal_done "$disabled_id" || fail 'Cannot mark disable done.'
+    fi
+    verify_state_identity "$state" || fail 'State identity changed before service removal.'
+    journal_intent write-service "$service_file" "$old" || fail 'Cannot journal service removal.'
+    removed_id=$journal_action_id
+    rm -f "$service_file"
+    journal_done "$removed_id" || fail 'Cannot mark removal done.'
+    if [ "$os" = linux ]; then systemctl --user daemon-reload; fi
+  else
+    start_service "$old" || fail 'Service enable failed.'
+  fi
+  check_health "$old" "$service" || fail 'Service runtime failed status/doctor health checks.'
+else
 base=${ABELE_INSTALL_BASE_URL:-https://github.com/dudaanton/abele-node}
 api=${ABELE_INSTALL_API_URL:-https://api.github.com/repos/dudaanton/abele-node/releases/latest}
 if [ -z "$version" ]; then
@@ -831,6 +943,7 @@ switch_to "$version"
 journal_done "$current_id" || fail 'Cannot mark current switch done.'
 if [ "$service" = 1 ]; then start_service "$version" || fail 'Service installation failed.'; fi
 check_health "$version" "$service" || fail 'New runtime failed status/doctor health checks.'
+fi
 # Publish wrapper and configuration only after validation. No secrets are generated.
 verify_state_identity "$state" || fail 'Pinned state identity changed before recording installation.'
 if [ "$service" = 1 ]; then
@@ -846,6 +959,7 @@ const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model'
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
 fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
+if(process.env.ABELE_SERVICE_TRANSITION){const path=require('node:path'),dir=process.env.ABELE_SERVICE_TRANSITION;for(const [name,file] of [['wrapper',wrapper],['config',config]]){const stage=path.join(dir,'next-'+name);fs.copyFileSync(file,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}const fd=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi
 if [ -f "$config" ]; then cp -p "$config" "$work/published-config.previous"; fi
@@ -857,8 +971,14 @@ journal_intent published-config "$config" "$version" || fail 'Cannot persist con
 config_id=$journal_action_id
 mv "$work/config.json" "$config"
 journal_done "$config_id" || fail 'Cannot mark configuration publication done.'
+if [ -n "$service_action" ]; then "$node" "$transition_helper" commit "$root" || fail 'Cannot persist service transition completion.'; fi
 transaction=0
 journal_recording=0
+if [ -n "$service_action" ]; then
+  if [ "$service" = 1 ]; then printf '%s\n' 'Service enabled and running; health verified.'
+  else printf '%s\n' 'Service disabled and unregistered; state retained. Start in the foreground: abele-node start'; fi
+  exit 0
+fi
 case ":${PATH:-}:" in *":$prefix/bin:"*) ;; *) printf 'Add %s/bin to PATH before running abele-node.\n' "$prefix" ;; esac
 local_port=$("$node" -e 'const s=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); console.log(Number.isInteger(s.port) && s.port>0 && s.port<=65535 ? s.port : 7777)' "$work/status.json")
 printf '%s\n' 'AbeleNode installed.'

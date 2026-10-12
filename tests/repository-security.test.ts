@@ -500,12 +500,21 @@ it('bounds huge trees before publication, huge blobs before loading, and skips b
     ).join(''),
   })
   expect(tree.status, tree.stderr).toBe(0)
+  // Keep the output-ceiling guarantee with an explicitly small metadata budget.
+  // Normal browsing now admits this tree under the larger, still bounded ceiling.
   await expect(
-    s.request('repository.v1.tree', {
-      worktree_id: s.worktree_id,
-      revision: { kind: 'commit', commit: tree.stdout.trim() },
+    new GitRunner(15000, 512 * 1024, '/usr/bin/git', 512 * 1024).run(s.repo, {
+      kind: 'tree',
+      object: tree.stdout.trim(),
     })
   ).rejects.toThrow('output_limit')
+  const largePage = await s.request('repository.v1.tree', {
+    worktree_id: s.worktree_id,
+    revision: { kind: 'commit', commit: tree.stdout.trim() },
+  })
+  expect(largePage.entries.length).toBeGreaterThan(0)
+  expect(largePage.cursor).toBeTruthy()
+  expect(Buffer.byteLength(JSON.stringify(largePage))).toBeLessThanOrEqual(32768)
 })
 
 it('retains at most 1000 matches and returns byte-bounded pages with explicit truncation', async () => {

@@ -3,7 +3,8 @@ import { existsSync } from 'node:fs'
 import { systemProcessProbe } from '@abele/provider-claude'
 import type { ProcessIdentity } from '@abele/provider-contract'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { dirname } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { ChannelError } from '@abele/channel-protocol'
 
 /** Internal typed commands, never a client-supplied argv or shell string. */
@@ -25,6 +26,8 @@ export type GitCommand =
   | { kind: 'untracked' }
   | { kind: 'diff' }
   | { kind: 'filters' }
+  | { kind: 'config.origins' }
+  | { kind: 'config.excludes' }
   | {
       kind: 'view.diff'
       mode: 'staged' | 'unstaged' | 'head' | 'base' | 'commit'
@@ -84,7 +87,8 @@ export class GitRunner {
   constructor(
     readonly timeoutMs = 15000,
     readonly outputBytes = 512 * 1024,
-    private executable = '/usr/bin/git'
+    private executable = '/usr/bin/git',
+    readonly metadataOutputBytes = 64 * 1024 * 1024
   ) {}
   /** Only metadata effects are serialized; reads and agent work remain independent. */
   serialize<T>(repository: string, work: () => Promise<T>): Promise<T> {
@@ -103,7 +107,8 @@ export class GitRunner {
     command: GitCommand,
     beforeEffect?: () => void,
     deadlineMs?: number,
-    effect?: GitEffectLifecycle
+    effect?: GitEffectLifecycle,
+    record?: (row: string) => void
   ): Promise<Buffer> {
     if (
       ['tree', 'blob', 'blob.size'].includes(command.kind) &&
@@ -315,6 +320,20 @@ export class GitRunner {
           command.path,
         ]
         break
+      case 'config.origins':
+        args = ['config', '--includes', '--null', '--show-origin', '--list']
+        break
+      case 'config.excludes':
+        args = [
+          'config',
+          '--includes',
+          '--null',
+          '--show-origin',
+          '--path',
+          '--get-regexp',
+          '^(core\\.excludesfile|include\\.path|includeif\\..*\\.path)$',
+        ]
+        break
       case 'filters':
         args = [
           'config',
@@ -457,7 +476,8 @@ export class GitRunner {
       }
       const chunks: Buffer[] = []
       let bytes = 0,
-        failure: string | undefined
+        failure: string | undefined,
+        pending = Buffer.alloc(0)
       const limit =
         command.kind === 'diff'
           ? Math.min(this.outputBytes, 32768)
@@ -465,13 +485,33 @@ export class GitRunner {
             ? 16 * 1024 * 1024
             : ['view.diff', 'show', 'patch', 'blame'].includes(command.kind)
               ? 8 * 1024 * 1024
-              : this.outputBytes
+              : ['tracked', 'tree', 'untracked', 'visible.untracked', 'status'].includes(
+                    command.kind
+                  )
+                ? this.metadataOutputBytes
+                : this.outputBytes
       const collect = (chunk: Buffer, stdout: boolean) => {
         bytes += chunk.byteLength
         if (bytes > limit) {
           failure = 'output_limit'
           child.kill('SIGKILL')
-        } else if (stdout) chunks.push(chunk)
+        } else if (stdout) {
+          if (!record) chunks.push(chunk)
+          else {
+            pending = Buffer.concat([pending, chunk])
+            let end: number
+            while ((end = pending.indexOf(0)) !== -1) {
+              try {
+                record(decodeGit(pending.subarray(0, end)))
+              } catch (e) {
+                failure = e instanceof ChannelError ? e.code : 'git_failed'
+                child.kill('SIGKILL')
+                break
+              }
+              pending = pending.subarray(end + 1)
+            }
+          }
+        }
       }
       child.stdout!.on('data', (b: Buffer) => collect(b, true))
       child.stderr!.on('data', (b: Buffer) => collect(b, false))
@@ -501,12 +541,46 @@ export class GitRunner {
             failure = e instanceof ChannelError ? e.code : 'git_process_unconfirmed'
           }
         }
+        if (record && pending.length && !failure) failure = 'git_failed'
         if (failure) reject(new ChannelError(failure))
-        else if (code !== 0 && !(command.kind === 'filters' && code === 1))
+        else if (
+          code !== 0 &&
+          !(['filters', 'config.excludes'].includes(command.kind) && code === 1)
+        )
           reject(new ChannelError('git_failed'))
         else resolve(Buffer.concat(chunks))
       })
     })
+  }
+  /** Resolve exclude/config dependencies with the exact hardened Git configuration used by reads.
+   * Global/system Git config stays disabled; Git's default XDG ignore file remains effective.
+   */
+  async excludeSources(cwd: string) {
+    const configs = new Set<string>()
+    const origins = decodeGit(await this.run(cwd, { kind: 'config.origins' })).split('\0')
+    for (let i = 0; i + 1 < origins.length; i += 2)
+      if (origins[i]!.startsWith('file:')) configs.add(resolve(cwd, origins[i]!.slice(5)))
+    const fields = decodeGit(await this.run(cwd, { kind: 'config.excludes' })).split('\0')
+    let excludes: string | undefined
+    for (let i = 0; i + 1 < fields.length; i += 2) {
+      const origin = fields[i]!
+      const field = fields[i + 1]!
+      const split = field.indexOf('\n')
+      const key = field.slice(0, split).toLowerCase()
+      const value = field.slice(split + 1)
+      if (key === 'core.excludesfile') excludes = resolve(cwd, value)
+      else if (origin.startsWith('file:'))
+        configs.add(resolve(dirname(resolve(cwd, origin.slice(5))), value))
+    }
+    return {
+      configs: [...configs],
+      excludes:
+        excludes ?? join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'git/ignore'),
+    }
+  }
+  /** Consume NUL-delimited metadata incrementally, under a separate bounded scan ceiling. */
+  async records(cwd: string, command: GitCommand, consume: (row: string) => void) {
+    await this.run(cwd, command, undefined, undefined, undefined, consume)
   }
   async text(cwd: string, command: GitCommand) {
     return decodeGit(await this.run(cwd, command)).replace(/\n$/, '')

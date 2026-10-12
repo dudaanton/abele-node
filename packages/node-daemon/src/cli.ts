@@ -37,6 +37,15 @@ import { daemonProcessPresent, waitForLaunch } from './launch-wait.js'
 import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
 import { update } from './update.js'
+import {
+  changeService,
+  installedService,
+  serviceStatus,
+  installationMode,
+  stageServiceCandidate,
+  recoverServiceTransition,
+} from './service.js'
+import { cliHelp, requestedHelp } from './cli-help.js'
 import { doctorCodex } from '@abele/provider-codex'
 import {
   ClaudeProviderAdapter,
@@ -49,6 +58,11 @@ import {
 const json = process.argv.includes('--json')
 async function main() {
   const args = process.argv.slice(2).filter((arg) => arg !== '--json')
+  const help = requestedHelp(args)
+  if (help) {
+    console.log(help)
+    return
+  }
   function option(name: string, fallback: string) {
     const i = args.indexOf(name)
     if (i < 0) return fallback
@@ -62,6 +76,11 @@ async function main() {
   // A release installer can use its already deployed, immutable runtime directly.
   const configuredRuntime = option('--runtime-dir', '')
   const installerJournal = option('--installer-journal', '')
+  // Only the generated manager command bypasses the interactive start guard.
+  const serviceRunIndex = args.indexOf('--service-run')
+  const serviceRun = serviceRunIndex >= 0
+  if (serviceRun) args.splice(serviceRunIndex, 1)
+  const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   function completedInstallerAction(action: string, target: string) {
     if (!installerJournal) return
     if (resolve(installerJournal) !== installerJournal) throw new Error('invalid_installer_journal')
@@ -160,6 +179,27 @@ async function main() {
   const version = JSON.parse(
     readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')
   ).version as string
+  const commandOptions: Record<string, string[]> = {
+    update: ['--check', '--force', '--version'],
+    'approve-pair': ['--list', '--installation-id', '--fingerprint'],
+  }
+  for (const arg of args.slice(args[0] === '--version' ? 1 : 0)) {
+    if (
+      args[0] !== 'update' &&
+      arg.startsWith('-') &&
+      !(commandOptions[args[0] ?? ''] ?? []).includes(arg)
+    )
+      throw new Error(
+        `Unknown option: ${arg}. For background operation use abele-node service enable; run abele-node --help.`
+      )
+  }
+  if (
+    ['start', 'stop', 'status', 'doctor', 'install', 'version', '--version'].includes(
+      args[0] ?? ''
+    ) &&
+    args.length !== 1
+  )
+    throw new Error(cliHelp(args[0] === '--version' ? 'version' : args[0]))
   const output = (value: unknown) =>
     console.log(
       json
@@ -230,7 +270,23 @@ async function main() {
       process.exitCode = report.exit_code
       return
     }
+    case 'service': {
+      if (args.length !== 2 || !['enable', 'disable', 'status'].includes(args[1]!))
+        throw new Error('Usage: abele-node service enable|disable|status [--json]')
+      output(
+        args[1] === 'status'
+          ? serviceStatus(runtimeRoot, state)
+          : await changeService(runtimeRoot, state, args[1]!)
+      )
+      return
+    }
     case 'start': {
+      if (!serviceRun && installedService(runtimeRoot, state)?.service === 1) {
+        const report = await changeService(runtimeRoot, state, 'enable')
+        if (json) output(report)
+        else console.log(humanOutput(['service', 'status'], report))
+        return
+      }
       const daemon = await startDaemon(
         state,
         port,
@@ -261,6 +317,9 @@ async function main() {
       return
     }
     case 'stop': {
+      // The installer's journaled stop runs inside the live transition; public
+      // invocations recover an orphan first, before manager/process mutations.
+      if (!process.env.ABELE_SERVICE_TRANSITION) recoverServiceTransition(runtimeRoot)
       // Capture before bootout: launchd can remove the job before its daemon exits.
       let recordedPid: number | undefined
       let recordedEntry = fileURLToPath(import.meta.url)
@@ -359,6 +418,7 @@ async function main() {
       delete publicRuntime.node_name
       const report = {
         running: !!running,
+        mode: installationMode(runtimeRoot, state),
         ...publicRuntime,
         state_dir: state,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
@@ -604,6 +664,20 @@ async function main() {
       return
     }
     case 'install': {
+      // --runtime-dir is the installer's internal, journaled LaunchAgent writer.
+      if (!configuredRuntime && installedService(runtimeRoot, state)) {
+        console.error(
+          'abele-node install is deprecated for installer deployments; use abele-node service enable. Recorded provider settings are retained; use install.sh to change them.'
+        )
+        const report = await changeService(runtimeRoot, state, 'enable')
+        if (json) output(report)
+        else console.log(humanOutput(['service', 'enable'], report))
+        return
+      }
+      if (!configuredRuntime)
+        console.error(
+          'abele-node install is the legacy manual macOS setup. For installer deployments use abele-node service enable.'
+        )
       if (process.platform !== 'darwin') throw new Error('LaunchAgent requires macOS')
       if (port === 0) throw new Error('install_requires_fixed_port')
       if (readRuntime(state)) throw new Error('stop_before_install')
@@ -669,6 +743,7 @@ async function main() {
         '--json',
         '--state-dir',
         state,
+        '--service-run',
         '--port',
         String(port),
         ...(worktreeRoot ? ['--worktree-root', worktreeRoot] : []),
@@ -713,6 +788,7 @@ async function main() {
         } finally {
           closeSync(fd)
         }
+        stageServiceCandidate(runtimeRoot, candidate)
         renameSync(candidate, destination)
         completedInstallerAction('write-service', destination)
       } finally {
@@ -749,9 +825,7 @@ async function main() {
       return
     }
     default:
-      throw new Error(
-        'Usage: abele-node --version|version|install|start|stop|status|doctor|token create|list|revoke [--state-dir PATH] [--port PORT] [--worktree-root PATH]\n       abele-node update [--version X.Y.Z] [--check] [--force] [--json]\n       abele-node debugger install js [--state-dir PATH] [--json]\n       abele-node pair [--node-name NAME] [--json]\n       abele-node approve-pair [NAME] [--installation-id ID] | --list [--json]'
-      )
+      throw new Error(cliHelp())
   }
 }
 void main().catch((error) => {

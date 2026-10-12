@@ -32,6 +32,7 @@ import {
 import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
+import { WorktreeMonitor, pathMetadata, sourceMetadata } from './worktree-monitor.js'
 import { decodeGit, parseWorktrees, type GitCommand } from './git.js'
 
 const hash = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex')
@@ -83,6 +84,21 @@ interface Target {
   /** Ephemeral per-project access epoch, captured by a request, never persisted as identity. */
   readGeneration?: number
 }
+interface WorkingSnapshot {
+  head: string | null
+  files: TreeEntry[]
+  status: Status[]
+  fingerprint: string
+  signature: string
+  monitor: WorktreeMonitor
+  byPath: Map<string, TreeEntry>
+  children: Map<string, TreeEntry[]>
+  stamps: Map<string, string | null>
+  tracked: Map<string, string[]>
+  ignoreStamps: Map<string, string | null>
+  started: number
+  boundaries: string[]
+}
 interface Observation {
   target: string
   owner: string
@@ -92,6 +108,7 @@ interface Observation {
   status: Status[]
   expires: number
   includeIgnored: boolean
+  snapshot: WorkingSnapshot
 }
 interface TreeEntry {
   path: string
@@ -120,6 +137,7 @@ interface Continuation {
   expires: number
   extra: Record<string, unknown>
   omissions: string[]
+  scan?: { files: TreeEntry[]; next: number }
 }
 interface Comparison {
   owner: string
@@ -177,6 +195,10 @@ export class RepositoryService {
     this.cacheGeneration++
     this.objectCache.clear()
   }
+  private monitors = new Map<string, WorktreeMonitor>()
+  private snapshots = new Map<string, WorkingSnapshot>()
+  private retainedSizes = new WeakMap<object, number>()
+  private rowSnapshots = new WeakMap<object, WorkingSnapshot>()
   private observations = new Map<string, Observation>()
   private cursors = new Map<string, Continuation>()
   private comparisons = new Map<string, Comparison>()
@@ -230,6 +252,10 @@ export class RepositoryService {
   removed(id: string) {
     this.invalidateReads(id)
     this.clearObjectCache()
+    for (const row of this.r.core.db
+      .prepare('SELECT worktree_id FROM repository_targets WHERE project_id=?')
+      .all(id) as { worktree_id: string }[])
+      this.dropMonitor(row.worktree_id)
     this.r.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(id)
     this.r.core.db.prepare('UPDATE repository_targets SET active=0 WHERE project_id=?').run(id)
     this.r.core.db
@@ -284,6 +310,7 @@ export class RepositoryService {
         for (const [id, c] of this.comparisons)
           if (targets.has(c.target)) this.comparisons.delete(id)
         for (const id of targets) {
+          this.dropMonitor(id)
           core.db.prepare('DELETE FROM repository_contents WHERE worktree_id=?').run(id)
           core.db.prepare('DELETE FROM repository_edit_permissions WHERE worktree_id=?').run(id)
         }
@@ -548,22 +575,98 @@ export class RepositoryService {
     if (!row) throw new ChannelError('not_found')
     return { ...row, readGeneration: this.readGenerations.get(row.project_id) ?? 0 }
   }
-  private prune() {
+  private dropMonitor(id: string) {
+    this.monitors.get(id)?.close()
+    this.monitors.delete(id)
+    this.snapshots.delete(id + ':false')
+    this.snapshots.delete(id + ':true')
+  }
+  private leaseSize(value: object): number {
+    // Index-owned arrays are charged once to the separate working-index budget.
+    if (this.rowSnapshots.has(value)) return 0
+    const known = this.retainedSizes.get(value)
+    if (known !== undefined) return known
+    const bytes = Buffer.byteLength(
+      JSON.stringify(value, (key, v: unknown) =>
+        ['snapshot', 'rows', 'files', 'scan'].includes(key)
+          ? undefined
+          : v instanceof Map
+            ? [...v]
+            : v instanceof Set
+              ? [...v]
+              : v
+      )
+    )
+    const shared = value as { rows?: unknown[]; files?: TreeEntry[]; scan?: object }
+    const total =
+      bytes +
+      (shared.rows ? this.leaseSize(shared.rows) : 0) +
+      (shared.files ? this.leaseSize(shared.files) : 0) +
+      (shared.scan ? this.leaseSize(shared.scan) : 0)
+    this.retainedSizes.set(value, total)
+    return total
+  }
+  private restoreBaseline(monitor: WorktreeMonitor, preferred?: WorkingSnapshot) {
+    const retained =
+      preferred ??
+      [
+        ...this.snapshots.values(),
+        ...[...this.observations.values()].map((o) => o.snapshot),
+        ...[...this.cursors.values()].flatMap((c) => [
+          this.rowSnapshots.get(c.rows),
+          c.scan && this.rowSnapshots.get(c.scan.files),
+        ]),
+      ].find((s) => s?.monitor === monitor)
+    if (retained)
+      monitor.capture(retained.stamps, retained.started, retained.boundaries, retained.ignoreStamps)
+    else monitor.releaseBaseline()
+  }
+  private evictSnapshot(snapshot: WorkingSnapshot) {
+    for (const [key, state] of this.snapshots) if (state === snapshot) this.snapshots.delete(key)
+    for (const [id, observation] of this.observations)
+      if (observation.snapshot === snapshot) this.observations.delete(id)
+    for (const [id, cursor] of this.cursors)
+      if (
+        this.rowSnapshots.get(cursor.rows) === snapshot ||
+        (cursor.scan && this.rowSnapshots.get(cursor.scan.files) === snapshot)
+      )
+        this.cursors.delete(id)
+    if (snapshot.monitor.ownsBaseline(snapshot.stamps)) this.restoreBaseline(snapshot.monitor)
+  }
+  private pruneIndexes(keep?: WorkingSnapshot) {
+    // Count even old indexes retained only by a lease, once per shared snapshot.
+    const cached = new Set(this.snapshots.values())
+    const states = new Set(cached)
+    for (const observation of this.observations.values()) states.add(observation.snapshot)
+    for (const cursor of this.cursors.values()) {
+      const state = this.rowSnapshots.get(cursor.rows)
+      const scan = cursor.scan && this.rowSnapshots.get(cursor.scan.files)
+      if (state) states.add(state)
+      if (scan) states.add(scan)
+    }
+    let bytes = [...states].reduce((sum, state) => sum + this.retainedSizes.get(state)!, 0)
+    const oldest = [...states]
+      .filter((state) => state !== keep)
+      .sort((a, b) => Number(cached.has(a)) - Number(cached.has(b)))
+    for (const state of oldest) {
+      if (bytes <= 32 * 1024 * 1024) break
+      this.evictSnapshot(state)
+      bytes -= this.retainedSizes.get(state)!
+    }
+  }
+  private prune(keep?: WorkingSnapshot) {
+    for (const [id, monitor] of this.monitors)
+      if (monitor.touched + ttl < Date.now()) this.dropMonitor(id)
     for (const map of [this.observations, this.cursors, this.comparisons]) {
       for (const [key, value] of map) if (value.expires < Date.now()) map.delete(key)
-      const size = (value: unknown) =>
-        Buffer.byteLength(
-          JSON.stringify(value, (_key, v: unknown) =>
-            v instanceof Map ? [...v] : v instanceof Set ? [...v] : v
-          )
-        )
-      let bytes = [...map.values()].reduce((sum, value) => sum + size(value), 0)
+      let bytes = [...map.values()].reduce((sum, value) => sum + this.leaseSize(value), 0)
       while (map.size >= 128 || bytes > 8 * 1024 * 1024) {
         const key = map.keys().next().value!
-        bytes -= size(map.get(key))
+        bytes -= this.leaseSize(map.get(key)!)
         map.delete(key)
       }
     }
+    this.pruneIndexes(keep)
   }
   private key(method: string, p: Record<string, unknown>) {
     const { cursor: _c, limit: _l, ...query } = p
@@ -575,7 +678,8 @@ export class RepositoryService {
     p: Record<string, unknown>,
     rows: unknown[],
     extra: Record<string, unknown> = {},
-    omissions: string[] = []
+    omissions: string[] = [],
+    scan?: Continuation['scan']
   ) {
     this.prune()
     const target = String(p.worktree_id ?? p.project_id),
@@ -594,6 +698,7 @@ export class RepositoryService {
       offset = saved.offset
       extra = saved.extra
       omissions = saved.omissions
+      scan = saved.scan
     }
     const entries: unknown[] = []
     let bytes = Buffer.byteLength(JSON.stringify(extra)) + 1024
@@ -608,9 +713,9 @@ export class RepositoryService {
     }
     offset += entries.length
     let cursor: string | null = null
-    if (offset < rows.length) {
+    if (offset < rows.length || scan) {
       cursor = randomUUID()
-      this.cursors.set(cursor, {
+      const continuation = {
         owner: actor.installation_id,
         target,
         key,
@@ -619,7 +724,10 @@ export class RepositoryService {
         expires: Date.now() + ttl,
         extra,
         omissions,
-      })
+        scan,
+      }
+      if (this.leaseSize(continuation) > 8 * 1024 * 1024) throw new ChannelError('output_limit')
+      this.cursors.set(cursor, continuation)
       this.prune()
     }
     return { ...extra, entries, cursor, incomplete: omissions.length > 0, omissions }
@@ -1259,33 +1367,116 @@ export class RepositoryService {
     }
     return result
   }
-  private async workingState(target: Target, includeIgnored = false) {
+  private async monitor(target: Target) {
+    let monitor = this.monitors.get(target.worktree_id)
+    if (!monitor) {
+      const gitdir = await this.r.git.text(target.path, { kind: 'directory' })
+      monitor = this.monitors.get(target.worktree_id)
+      if (!monitor) {
+        while (this.monitors.size >= 8) {
+          const id = this.monitors.keys().next().value!
+          this.dropMonitor(id)
+        }
+        if (this.stopped) throw new ChannelError('resource_busy')
+        this.checkRead(target)
+        monitor = new WorktreeMonitor(
+          target.path,
+          gitdir,
+          this.r.projects.get(target.project_id).git_common_dir!
+        )
+        this.monitors.set(target.worktree_id, monitor)
+      }
+    }
+    monitor.touched = Date.now()
+    this.monitors.delete(target.worktree_id)
+    this.monitors.set(target.worktree_id, monitor)
+    return monitor
+  }
+  private async configureMonitor(target: Target, monitor: WorktreeMonitor) {
+    if (!monitor.needsConfiguration()) return
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const sources = await this.r.git.excludeSources(target.path)
+      monitor.configure(sources)
+      const confirmed = await this.r.git.excludeSources(target.path)
+      if (!monitor.needsConfiguration() && JSON.stringify(sources) === JSON.stringify(confirmed))
+        return
+      monitor.configurationStale()
+    }
+    throw new ChannelError('stale_revision')
+  }
+  private async workingState(
+    target: Target,
+    includeIgnored = false,
+    retries = 2
+  ): Promise<WorkingSnapshot> {
+    const monitor = await this.monitor(target)
+    await this.configureMonitor(target, monitor)
+    const signature = monitor.signature()
+    const started = Date.now()
+    const key = target.worktree_id + ':' + includeIgnored
+    const cached = this.snapshots.get(key)
+    if (monitor.reliable && cached?.signature === signature) {
+      // Explicitly creating a fresh repository observation reconciles its known
+      // metadata, including same-turn tracked edits before filesystem delivery.
+      // Item/page reads never enter this route or enumerate the shared index.
+      let membershipUnchanged = true
+      for (const [path, stamp] of cached.stamps)
+        if (pathMetadata(join(target.path, path)) !== stamp) {
+          membershipUnchanged = false
+          break
+        }
+      const ignoresUnchanged = [...cached.ignoreStamps].every(
+        ([path, stamp]) => sourceMetadata(path) === stamp
+      )
+      if (membershipUnchanged && ignoresUnchanged) return cached
+      monitor.generation++
+      return this.workingState(target, includeIgnored, retries)
+    }
     const head = await this.head(target),
       status = this.parseStatus(await this.r.git.run(target.path, { kind: 'status' }))
-    const tracked = decodeGit(await this.r.git.run(target.path, { kind: 'tracked' }))
-      .split('\0')
-      .filter(Boolean)
     const paths = new Map<string, { kind: TreeEntry['kind']; oid: string | null }>()
-    for (const f of tracked) {
+    const tracked = new Map<string, string[]>()
+    const untracked = new Set<string>()
+    await this.r.git.records(target.path, { kind: 'tracked' }, (f) => {
       const m = f.match(/^(\d+) ([a-f0-9]+) \d\t([\s\S]*)$/)
       if (!m) throw new ChannelError('git_failed')
-      if (safePath(m[3]!))
+      if (safePath(m[3]!)) {
+        const rows = tracked.get(m[3]!) ?? []
+        rows.push(f)
+        tracked.set(m[3]!, rows)
         paths.set(m[3]!, {
           kind: m[1] === '160000' ? 'submodule' : m[1] === '120000' ? 'symlink' : 'file',
           oid: m[2]!,
         })
-    }
-    for (const path of decodeGit(
-      await this.r.git.run(target.path, {
-        kind: includeIgnored ? 'untracked' : 'visible.untracked',
-      })
+      }
+      if (paths.size > 250000) throw new ChannelError('scan_limit')
+    })
+    await this.r.git.records(
+      target.path,
+      { kind: includeIgnored ? 'untracked' : 'visible.untracked' },
+      (path) => {
+        if (safePath(path)) {
+          untracked.add(path)
+          paths.set(path, { kind: 'file', oid: null })
+        }
+        if (paths.size > 250000) throw new ChannelError('scan_limit')
+      }
     )
-      .split('\0')
-      .filter(Boolean))
-      if (safePath(path)) paths.set(path, { kind: 'file', oid: null })
-    if (paths.size > 10000) throw new ChannelError('scan_limit')
+    if (paths.size > 250000) throw new ChannelError('scan_limit')
     const files: TreeEntry[] = [],
-      stamps: unknown[] = []
+      stamps = new Map<string, string | null>(),
+      byPath = new Map<string, TreeEntry>(),
+      children = new Map<string, TreeEntry[]>()
+    const add = (entry: TreeEntry) => {
+      byPath.set(entry.path, entry)
+      const parent = entry.path.includes('/')
+        ? entry.path.slice(0, entry.path.lastIndexOf('/'))
+        : ''
+      const rows = children.get(parent) ?? []
+      rows.push(entry)
+      children.set(parent, rows)
+    }
+    stamps.set('', pathMetadata(target.path))
     const submodules = [...paths].filter(([, d]) => d.kind === 'submodule').map(([path]) => path)
     for (const [path, data] of paths) {
       if (submodules.some((parent) => path.startsWith(parent + '/'))) continue
@@ -1294,37 +1485,122 @@ export class RepositoryService {
         this.checked(target, parent)
         const full = join(target.path, path),
           s = lstatSync(full)
-        stamps.push([path, metadata(full)])
-        files.push({
+        stamps.set(path, metadata(full))
+        let directory = ''
+        for (const part of parent.split('/').filter(Boolean)) {
+          directory = directory ? directory + '/' + part : part
+          if (!byPath.has(directory)) {
+            add({ path: directory, name: part, kind: 'directory', oid: null, size: null })
+            stamps.set(directory, pathMetadata(join(target.path, directory)))
+          }
+        }
+        const entry: TreeEntry = {
           path,
           name: path.split('/').at(-1)!,
           kind: s.isSymbolicLink() ? 'symlink' : data.kind,
           oid: data.oid,
           size: s.size,
-        })
+        }
+        files.push(entry)
+        add(entry)
       } catch {
-        stamps.push([path, null])
+        stamps.set(path, null)
       }
     }
-    const gitdir = await this.r.git.text(target.path, { kind: 'directory' })
-    const internal = ['HEAD', 'index'].map((name) => {
-      try {
-        return metadata(join(gitdir, name))
-      } catch {
-        return null
+    for (const row of status)
+      if (!stamps.has(row.path)) stamps.set(row.path, pathMetadata(join(target.path, row.path)))
+    for (const rows of children.values()) {
+      rows.sort((a, b) => a.path.localeCompare(b.path))
+      this.retainedSizes.set(rows, Buffer.byteLength(JSON.stringify(rows)))
+    }
+    this.retainedSizes.set(files, Buffer.byteLength(JSON.stringify(files)))
+    const ignoreDirectories = new Set(['', ...children.keys()])
+    for (const row of status) {
+      const parts = row.path.split('/')
+      parts.pop()
+      for (let i = 1; i <= parts.length; i++) ignoreDirectories.add(parts.slice(0, i).join('/'))
+    }
+    const ignoreStamps = new Map(
+      [...ignoreDirectories].map((directory) => {
+        const path = join(target.path, directory, '.gitignore')
+        return [path, sourceMetadata(path)] as const
+      })
+    )
+    // Ignore files may change before their first dependency stamp is discovered.
+    // Confirm the enumeration while those stamps are pinned; never cache a mixed
+    // old visible-path list with new rules (even if a filesystem hint is delayed).
+    const confirmedStatus = this.parseStatus(await this.r.git.run(target.path, { kind: 'status' }))
+    const confirmedUntracked = new Set<string>()
+    await this.r.git.records(
+      target.path,
+      { kind: includeIgnored ? 'untracked' : 'visible.untracked' },
+      (path) => {
+        if (safePath(path)) confirmedUntracked.add(path)
+        if (confirmedUntracked.size > 250000) throw new ChannelError('scan_limit')
       }
-    })
-    return {
+    )
+    if (
+      JSON.stringify(confirmedStatus) !== JSON.stringify(status) ||
+      confirmedUntracked.size !== untracked.size ||
+      [...untracked].some((path) => !confirmedUntracked.has(path)) ||
+      [...ignoreStamps].some(([path, stamp]) => sourceMetadata(path) !== stamp)
+    ) {
+      if (retries) return this.workingState(target, includeIgnored, retries - 1)
+      throw new ChannelError('stale_revision')
+    }
+    const boundaries = files
+      .filter((file) => file.kind === 'submodule' || file.kind === 'symlink')
+      .map((file) => file.path)
+    monitor.capture(stamps, started, boundaries, ignoreStamps)
+    if (monitor.reliable && monitor.signature() !== signature) {
+      if (retries) {
+        try {
+          return await this.workingState(target, includeIgnored, retries - 1)
+        } catch (error) {
+          this.restoreBaseline(monitor)
+          throw error
+        }
+      }
+      this.restoreBaseline(monitor)
+      throw new ChannelError('stale_revision')
+    }
+    const snapshot: WorkingSnapshot = {
       head,
       files,
       status,
-      fingerprint: hash(JSON.stringify([head, status, stamps, internal])),
+      signature,
+      monitor,
+      byPath,
+      children,
+      stamps,
+      tracked,
+      ignoreStamps,
+      started,
+      boundaries,
+      fingerprint: hash(JSON.stringify([head, status, [...stamps], [...ignoreStamps], signature])),
     }
+    const footprint =
+      this.retainedSizes.get(files)! +
+      Buffer.byteLength(JSON.stringify([...stamps])) +
+      Buffer.byteLength(JSON.stringify([...tracked])) +
+      Buffer.byteLength(JSON.stringify([...ignoreStamps])) +
+      Buffer.byteLength(JSON.stringify(status))
+    if (footprint > 32 * 1024 * 1024) {
+      this.restoreBaseline(monitor)
+      throw new ChannelError('scan_limit')
+    }
+    if (cached?.fingerprint === snapshot.fingerprint) {
+      this.restoreBaseline(monitor, cached)
+      return cached
+    }
+    this.retainedSizes.set(snapshot, footprint)
+    this.rowSnapshots.set(files, snapshot)
+    for (const rows of children.values()) this.rowSnapshots.set(rows, snapshot)
+    this.snapshots.set(key, snapshot)
+    this.pruneIndexes(snapshot)
+    return snapshot
   }
-  private async changeDetails(target: Target, rows: Status[]) {
-    const tracked = decodeGit(await this.r.git.run(target.path, { kind: 'tracked' }))
-      .split('\0')
-      .filter(Boolean)
+  private async changeDetails(target: Target, rows: Status[], tracked: Map<string, string[]>) {
     let bytes = 0
     const detailed: Status[] = []
     for (const row of rows) {
@@ -1367,13 +1643,7 @@ export class RepositoryService {
         if (e instanceof ChannelError && e.code === 'stale_revision') throw e
         content = null
       }
-      const fingerprint = hash(
-        JSON.stringify([
-          row,
-          tracked.filter((f) => f.slice(f.indexOf('\t') + 1) === row.path),
-          content,
-        ])
-      )
+      const fingerprint = hash(JSON.stringify([row, tracked.get(row.path) ?? [], content]))
       const old = this.r.core.db
         .prepare(
           'SELECT fingerprint,body FROM repository_change_stamps WHERE worktree_id=? AND path=?'
@@ -1461,9 +1731,34 @@ export class RepositoryService {
       JSON.stringify(o.revision) !== JSON.stringify(revision)
     )
       throw new ChannelError('stale_revision')
-    if ((await this.workingState(target, o.includeIgnored)).fingerprint !== o.fingerprint)
+    o.snapshot.monitor.touched = Date.now()
+    if (o.snapshot.monitor.closed) throw new ChannelError('stale_revision')
+    if (o.snapshot.monitor.reliable) {
+      if (o.snapshot.monitor.signature() !== o.snapshot.signature)
+        throw new ChannelError('stale_revision')
+    } else if ((await this.workingState(target, o.includeIgnored)).fingerprint !== o.fingerprint)
       throw new ChannelError('stale_revision')
     return o
+  }
+  private checkObservedPath(target: Target, snapshot: WorkingSnapshot, path: string) {
+    let directory = ''
+    const parents = ['']
+    const parts = path.split('/').filter(Boolean)
+    if (snapshot.byPath.get(path)?.kind !== 'directory') parts.pop()
+    for (const part of parts) {
+      directory = directory ? directory + '/' + part : part
+      parents.push(directory)
+    }
+    const ignoresUnchanged = parents.every((directory) => {
+      const source = join(target.path, directory, '.gitignore')
+      return sourceMetadata(source) === (snapshot.ignoreStamps.get(source) ?? null)
+    })
+    if (!ignoresUnchanged || pathMetadata(join(target.path, path)) !== snapshot.stamps.get(path)) {
+      // Fence the cache too: an immediate re-observe must not reuse the old state
+      // while a delayed filesystem hint is still in flight.
+      snapshot.monitor.generation++
+      throw new ChannelError('stale_revision')
+    }
   }
   private retain(target: Target, bytes: Buffer) {
     // A read completing after opt-out must neither retain nor publish old bytes, even
@@ -1577,9 +1872,11 @@ export class RepositoryService {
   ) {
     if (revision.kind === 'working') {
       const o = await this.observation(actor, target, revision)
-      const entry = o.files.find((e) => e.path === path)
+      const entry = o.snapshot.byPath.get(path)
       if (!entry || entry.kind !== 'file') throw new ChannelError('unsafe_path')
+      this.checkObservedPath(target, o.snapshot, path)
       const result = this.readFile(target, path, limit)
+      this.checkObservedPath(target, o.snapshot, path)
       await this.observation(actor, target, revision)
       return result
     }
@@ -1799,6 +2096,7 @@ export class RepositoryService {
         } else if (status.index === '?' && mode !== 'staged')
           rows.push({ path: status.path, status: 'A', index: '?', worktree: '?' })
       }
+      for (const row of rows) this.checkObservedPath(target, o.snapshot, row.path)
     }
     this.prune()
     const id = randomUUID()
@@ -1834,6 +2132,7 @@ export class RepositoryService {
     let bytes: Buffer
     if (comparison.head.kind === 'working') {
       const o = await this.observation(actor, target, comparison.head)
+      this.checkObservedPath(target, o.snapshot, path)
       if (o.status.some((s) => s.path === path && s.index === '?')) {
         const result = await this.blobBytes(actor, target, comparison.head, path, 1024 * 1024)
         if (!result.bytes || result.bytes.includes(0))
@@ -1852,6 +2151,7 @@ export class RepositoryService {
           unstaged: comparison.mode === 'unstaged',
           path,
         })
+      this.checkObservedPath(target, o.snapshot, path)
       await this.observation(actor, target, comparison.head)
     } else
       bytes = await this.r.git.run(target.path, {
@@ -1871,10 +2171,15 @@ export class RepositoryService {
     return capturedPatch
   }
   private async blame(actor: AuthorityContext, target: Target, p: Record<string, unknown>) {
-    const continued = this.continuation(actor, 'repository.v1.blame', p)
-    if (continued) return continued
     const revision = p.revision as RepositoryRevision,
       path = String(p.path)
+    if (p.cursor && revision.kind === 'working') {
+      const o = await this.observation(actor, target, revision)
+      this.checked(target, path)
+      this.checkObservedPath(target, o.snapshot, path)
+    }
+    const continued = this.continuation(actor, 'repository.v1.blame', p)
+    if (continued) return continued
     const result = await this.blobBytes(actor, target, revision, path, 1024 * 1024)
     if (!result.bytes) throw new ChannelError('input_limit')
     if (result.bytes.includes(0)) throw new ChannelError('unsupported_binary')
@@ -1937,14 +2242,24 @@ export class RepositoryService {
     method: string,
     p: Record<string, unknown>
   ): Promise<unknown> {
-    const continued = this.continuation(actor, method, p)
-    if (continued) return continued
+    const saved = p.cursor ? this.cursors.get(String(p.cursor)) : undefined
+    if (
+      p.cursor &&
+      (!saved ||
+        saved.owner !== actor.installation_id ||
+        saved.target !== target.worktree_id ||
+        saved.key !== this.key(method, p))
+    )
+      throw new ChannelError('stale_cursor')
+    if (saved && (saved.offset < saved.rows.length || !saved.scan))
+      return this.continuation(actor, method, p)
     const revision = p.revision as RepositoryRevision
     let files =
-      revision.kind === 'commit'
+      saved?.scan?.files ??
+      (revision.kind === 'commit'
         ? await this.commitTree(target, revision.commit, '', true)
-        : (await this.observation(actor, target, revision)).files
-    if (p.scope === 'changed') {
+        : (await this.observation(actor, target, revision)).files)
+    if (!saved && p.scope === 'changed') {
       let paths: Set<string>
       if (revision.kind === 'working')
         paths = new Set((await this.observation(actor, target, revision)).status.map((s) => s.path))
@@ -1971,8 +2286,19 @@ export class RepositoryService {
     const start = Date.now(),
       omissions = new Set<string>(),
       rows: unknown[] = []
-    let scanned = 0,
+    let next = saved?.scan?.next ?? 0,
       bytes = 0
+    const pageParams = { ...p, cursor: undefined }
+    const finish = () =>
+      this.page(
+        actor,
+        method,
+        pageParams,
+        rows,
+        {},
+        [...omissions],
+        next < files.length ? { files, next } : undefined
+      )
     // All regular expressions, including glob matching, run off the event loop in a killable worker.
     const worker = new Worker(searchWorker, {
       eval: true,
@@ -2003,7 +2329,7 @@ export class RepositoryService {
               void worker.terminate()
               reject(new ChannelError('search_deadline'))
             },
-            Math.max(1, 5000 - (Date.now() - start))
+            Math.max(1, 1000 - (Date.now() - start))
           )
           worker.once('message', message)
           worker.once('error', failure)
@@ -2018,20 +2344,16 @@ export class RepositoryService {
         path_glob: p.path_glob,
       })
       if (init.error) throw new ChannelError('unsupported_search_syntax')
-      if (p.path_glob) {
+      if (p.path_glob && !saved) {
         // Match in the terminable worker before consuming file/byte budgets or reading blobs.
         const filtered = await call({ filter_paths: files.map((file) => file.path) })
         files = files.filter((_file, index) => filtered.included[index])
       }
-      for (const file of files) {
+      for (; next < files.length; next++) {
+        const file = files[next]!
         if (file.kind !== 'file') continue
-        if (
-          ++scanned > 2048 ||
-          bytes >= 32 * 1024 * 1024 ||
-          Date.now() - start >= 5000 ||
-          rows.length >= 1000
-        ) {
-          omissions.add('scan limit; refine query to cover remaining files')
+        if (bytes >= 32 * 1024 * 1024 || Date.now() - start >= 750 || rows.length >= 1000) {
+          omissions.add('scan limit; continue with cursor to cover remaining files')
           break
         }
         if (file.size !== null && file.size > 1024 * 1024) {
@@ -2042,17 +2364,20 @@ export class RepositoryService {
           content_id: string | null = null
         if (p.mode !== 'filename') {
           if (file.size !== null && bytes + file.size > 32 * 1024 * 1024) {
-            omissions.add('scan limit; refine query to cover remaining files')
+            omissions.add('scan limit; continue with cursor to cover remaining files')
             break
           }
-          if (revision.kind === 'working')
+          if (revision.kind === 'working') {
+            const snapshot = (await this.observation(actor, target, revision)).snapshot
+            this.checkObservedPath(target, snapshot, file.path)
             content = this.readFile(target, file.path, 1024 * 1024).bytes
-          else
+            this.checkObservedPath(target, snapshot, file.path)
+          } else
             content = await this.r.git.run(
               target.path,
               { kind: 'blob', object: file.oid! },
               undefined,
-              Math.max(1, 5000 - (Date.now() - start))
+              Math.max(1, 1000 - (Date.now() - start))
             )
           if (!content) {
             omissions.add('files over 1 MiB skipped')
@@ -2081,14 +2406,14 @@ export class RepositoryService {
         if (found.truncated) omissions.add('matches or line text truncated')
       }
       if (revision.kind === 'working') await this.observation(actor, target, revision)
-      return this.page(actor, method, p, rows, {}, [...omissions])
+      return finish()
     } catch (e) {
       if (e instanceof ChannelError && ['search_deadline', 'git_timeout'].includes(e.code)) {
         // The outer read budget rechecks observation/authority after the worker budget expires.
-        return this.page(actor, method, p, rows, {}, [
-          ...omissions,
-          '5-second deadline; incomplete coverage',
-        ])
+        omissions.add(
+          'search execution deadline; incomplete coverage; refine query or continue with cursor'
+        )
+        return finish()
       }
       throw e
     } finally {
@@ -2105,9 +2430,11 @@ export class RepositoryService {
     this.subscriptions.delete(id)
   }
   private async watchFingerprint(target: Target) {
+    const monitor = await this.monitor(target)
+    await this.configureMonitor(target, monitor)
     return hash(
       JSON.stringify([
-        (await this.workingState(target)).fingerprint,
+        monitor.reliable ? monitor.signature() : (await this.workingState(target)).fingerprint,
         (await this.r.git.run(target.path, { kind: 'refs' })).toString('base64'),
         (await this.r.git.run(target.path, { kind: 'worktrees' })).toString('base64'),
       ])
@@ -2311,17 +2638,20 @@ export class RepositoryService {
               head: after.head,
               observed_at: new Date().toISOString(),
             }
-            this.observations.set(revision.observation_id, {
+            const observation: Observation = {
               target: target.worktree_id,
               owner: actor.installation_id,
               revision,
               fingerprint: after.fingerprint,
               files: after.files,
-              status: await this.changeDetails(target, after.status),
+              status: await this.changeDetails(target, after.status, after.tracked),
               expires: Date.now() + ttl,
               includeIgnored,
-            })
-            this.prune()
+              snapshot: after,
+            }
+            if (this.leaseSize(observation) > 8 * 1024 * 1024) throw new ChannelError('scan_limit')
+            this.observations.set(revision.observation_id, observation)
+            this.prune(after)
             result = { revision, atomic: false }
             break
           }
@@ -2354,43 +2684,21 @@ export class RepositoryService {
             if (revision!.kind === 'commit')
               entries = await this.commitTree(target, revision!.commit, String(p.path))
             else {
-              const o = await this.observation(actor, target, revision!),
-                prefix = p.path ? String(p.path) + '/' : '',
-                dirs = new Map<string, TreeEntry>()
-              if (p.path) {
-                if (
-                  o.files.some(
-                    (f) =>
-                      f.kind === 'submodule' &&
-                      (p.path === f.path || String(p.path).startsWith(f.path + '/'))
-                  )
-                )
-                  throw new ChannelError('unsafe_path')
-                this.checked(target, String(p.path))
-              }
-              entries = []
-              for (const f of o.files)
-                if (f.path.startsWith(prefix)) {
-                  const rest = f.path.slice(prefix.length)
-                  if (!rest.includes('/')) entries.push(f)
-                  else {
-                    const name = rest.split('/')[0]!
-                    dirs.set(name, {
-                      path: prefix + name,
-                      name,
-                      kind: 'directory',
-                      oid: null,
-                      size: null,
-                    })
-                  }
-                }
-              entries.push(...dirs.values())
+              const o = await this.observation(actor, target, revision!)
+              const path = String(p.path ?? '')
+              if (path && o.snapshot.byPath.get(path)?.kind !== 'directory')
+                throw new ChannelError('unsafe_path')
+              this.checked(target, path)
+              this.checkObservedPath(target, o.snapshot, path)
+              entries = o.snapshot.children.get(path) ?? []
             }
             result = this.page(
               actor,
               method,
               p,
-              entries.sort((a, b) => a.path.localeCompare(b.path))
+              revision!.kind === 'working'
+                ? entries
+                : entries.sort((a, b) => a.path.localeCompare(b.path))
             )
             break
           }
@@ -2441,7 +2749,23 @@ export class RepositoryService {
           default:
             throw new ChannelError('unsupported_method')
         }
-        if (revision?.kind === 'working') await this.observation(actor, target, revision)
+        if (revision?.kind === 'working') {
+          const o = await this.observation(actor, target, revision)
+          if (method === 'repository.v1.tree') {
+            const path = String(p.path ?? '')
+            this.checked(target, path)
+            this.checkObservedPath(target, o.snapshot, path)
+          }
+          if (method === 'repository.v1.blame') {
+            this.checked(target, String(p.path))
+            this.checkObservedPath(target, o.snapshot, String(p.path))
+          }
+          if (
+            ['repository.v1.tree', 'repository.v1.status', 'repository.v1.search'].includes(method)
+          )
+            for (const entry of (result as { entries: { path: string }[] }).entries)
+              this.checkObservedPath(target, o.snapshot, entry.path)
+        }
         await this.validate(target)
       }
       this.checkPublication(actor, p, result)
@@ -2462,6 +2786,9 @@ export class RepositoryService {
   }
   async stop() {
     this.stopped = true
+    for (const monitor of this.monitors.values()) monitor.close()
+    this.monitors.clear()
+    this.snapshots.clear()
     this.clearObjectCache()
     for (const id of this.subscriptions.keys()) this.unwatch(id)
     await Promise.all([...this.workers].map((w) => w.terminate()))
