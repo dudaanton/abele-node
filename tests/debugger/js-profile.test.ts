@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -49,19 +49,32 @@ const pin = (bytes: Buffer) => ({
 })
 
 describe('explicit JS adapter installation and gated native profile', () => {
-  it('has no audited pin and no experimental override or network download', async () => {
-    expect(JS_DEBUG_PIN).toBeNull()
-    expect(JS_DEBUG_AUDIT.candidate.version).toBe('1.140.0')
+  it('pins the approved 1.140.0, downloads only its URL and keeps nothing that fails the checksum', async () => {
+    // The owner accepted this release with its recorded advisories on 2026-10-14.
+    expect(JS_DEBUG_PIN).toEqual({
+      version: JS_DEBUG_AUDIT.candidate.version,
+      sha256: JS_DEBUG_AUDIT.candidate.sha256,
+      license: 'MIT',
+      url: 'https://github.com/microsoft/vscode-js-debug/releases/download/v1.140.0/js-debug-dap-v1.140.0.tar.gz',
+    })
     expect(JS_DEBUG_AUDIT.advisories).toContain('GHSA-pqg4-j6r4-53mv')
-    const download = vi.fn()
+    const dir = mkdtempSync(join(tmpdir(), 'adapter-download-'))
+    const download = vi.fn(async () => {
+      const response = new Response(archive())
+      Object.defineProperty(response, 'url', { value: JS_DEBUG_PIN!.url })
+      return response
+    })
     vi.stubGlobal('fetch', download)
     vi.stubEnv('ABELE_B0_ALLOW_AUDITED_RELEASE', '1')
     try {
-      await expect(installJsAdapter('unused')).rejects.toThrow('js_debug_no_audited_release')
-      expect(download).not.toHaveBeenCalled()
+      await expect(installJsAdapter(dir)).rejects.toThrow('adapter_checksum')
+      expect(download).toHaveBeenCalledTimes(1)
+      expect((download.mock.calls[0] as unknown[])[0]).toBe(JS_DEBUG_PIN!.url)
+      expect(existsSync(join(dir, 'debugger/adapters/js-debug/1.140.0'))).toBe(false)
     } finally {
       vi.unstubAllGlobals()
       vi.unstubAllEnvs()
+      rmSync(dir, { recursive: true, force: true })
     }
   })
   it('verifies archives before writing and records exact version, checksum, license and file hashes', async () => {
@@ -171,7 +184,7 @@ describe('explicit JS adapter installation and gated native profile', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
-  it('requires capability + explicit switch + an audited install, never exposes control RPC', async () => {
+  it('requires capability + explicit switch + an installed adapter, never exposes control RPC', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'js-profile-')),
       core = new NodeCore(dir, { debuggerEnabled: true })
     try {
@@ -181,9 +194,10 @@ describe('explicit JS adapter installation and gated native profile', () => {
         profile.attach({ port: 12345, address: '127.0.0.1', target_pid: 123 }, {} as any)
       ).rejects.toThrow('js_debug_disabled')
       const requested = new JsDebugProfile(core.debugger, { stateDirectory: dir, enabled: true })
+      expect(requested.profiles()).toEqual([])
       await expect(
-        requested.attach({ port: 12345, address: '127.0.0.1', target_pid: 123 }, {} as any)
-      ).rejects.toThrow('js_debug_no_audited_release')
+        requested.attach({ port: 12345, address: '127.0.0.1', target_pid: process.pid }, {} as any)
+      ).rejects.toThrow('js_debug_not_installed')
       for (const method of ['debugger.v1.launch', 'debugger.v1.attach', 'debugger.v1.terminate']) {
         const token = core.createToken('fixture')
         expect(() => core.request(core.authority.authenticate(token.token), method, {})).toThrow(
@@ -195,7 +209,7 @@ describe('explicit JS adapter installation and gated native profile', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
-  it('offers an explicit CLI install command that fails closed before creating state', () => {
+  it('offers an explicit CLI install command that takes no version or source of its own', () => {
     const dir = mkdtempSync(join(tmpdir(), 'js-cli-'))
     try {
       const result = spawnSync(
@@ -205,6 +219,7 @@ describe('explicit JS adapter installation and gated native profile', () => {
           'debugger',
           'install',
           'js',
+          '9.9.9',
           '--state-dir',
           join(dir, 'state'),
           '--json',
@@ -212,7 +227,8 @@ describe('explicit JS adapter installation and gated native profile', () => {
         { encoding: 'utf8' }
       )
       expect(result.status).toBe(1)
-      expect(result.stderr).toContain('js_debug_no_audited_release')
+      expect(result.stderr).toContain('Usage: abele-node debugger install js')
+      expect(existsSync(join(dir, 'state'))).toBe(false)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

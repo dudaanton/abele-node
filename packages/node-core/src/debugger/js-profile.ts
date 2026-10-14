@@ -6,7 +6,7 @@ import { DebuggerService } from './index.js'
 import { DapTransport } from './dap.js'
 import { DapSession, JsSessionTree } from './driver.js'
 import { OwnedDebugProcess, processStartIdentity } from './process.js'
-import { installedJsAdapter, requireJsPin } from './js-install.js'
+import { installedJsAdapter, jsAdapterInstalled, requireJsPin } from './js-install.js'
 
 export type JsLaunch = {
   cwd: string
@@ -114,6 +114,7 @@ export class JsDebugProfile {
     if (!this.service.enabled || !this.options.enabled) return []
     try {
       const pin = requireJsPin()
+      if (!jsAdapterInstalled(this.options.stateDirectory)) return []
       return [{ id: 'js-ts-native', version: pin.version, inspection: 'explicit-only' }]
     } catch {
       return []
@@ -126,8 +127,10 @@ export class JsDebugProfile {
     if (!['darwin', 'linux'].includes(process.platform))
       throw new Error('unsupported_debugger_host')
   }
-  private async sources(root?: string, program?: string) {
-    const sources = new Map(this.options.sources ?? (program ? [['program', program]] : []))
+  private async sources(root?: string, program?: string, chosen?: ReadonlyMap<string, string>) {
+    const sources = new Map(
+      chosen ?? this.options.sources ?? (program ? [['program', program]] : [])
+    )
     if (sources.size > 256) throw new Error('source_limit')
     if (sources.size && !root) throw new Error('debugger_workspace_required')
     const physical = root ? await realpath(root) : undefined
@@ -137,10 +140,14 @@ export class JsDebugProfile {
     }
     return sources
   }
-  async launch(raw: JsLaunch, target: DebuggerTarget): Promise<NativeJsRun> {
+  async launch(
+    raw: JsLaunch,
+    target: DebuggerTarget,
+    chosen?: ReadonlyMap<string, string>
+  ): Promise<NativeJsRun> {
     this.requireEnabled()
     const config = await validateJsLaunch(raw)
-    const sources = await this.sources(config.cwd, config.program)
+    const sources = await this.sources(config.cwd, config.program, chosen)
     this.service.assertEffectsAvailable()
     const owner = await OwnedDebugProcess.spawn(
       config.executable,
@@ -280,6 +287,33 @@ export class NativeJsRun {
     private readonly owner: OwnedDebugProcess | undefined,
     private readonly remove: () => void
   ) {}
+  get root() {
+    return this.tree.root
+  }
+  /** Every session of the run: the root at once, then each child as the adapter starts it. */
+  onSession(listener: (session: DapSession) => void) {
+    listener(this.tree.root)
+    for (const child of this.tree.children.values()) listener(child)
+    return this.tree.onChild(listener)
+  }
+  /** js-debug attaches to the program in a child of the root it was asked for: the first one. */
+  program(timeout = 10000): Promise<DapSession> {
+    const first = this.tree.children.values().next().value
+    if (first) return Promise.resolve(first)
+    if (this.root.dap.closed) return Promise.reject(new Error('debugger_program_ended'))
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error('debugger_program_not_attached')), timeout)
+      const finish = (error?: Error, session?: DapSession) => {
+        clearTimeout(timer)
+        off()
+        closed()
+        if (session) resolve(session)
+        else reject(error)
+      }
+      const off = this.tree.onChild((session) => finish(undefined, session))
+      const closed = this.root.dap.onClose(() => finish(new Error('debugger_program_ended')))
+    })
+  }
   async detach() {
     this.detached = true // Never fall back to killing after an uncertain detach.
     try {
@@ -295,6 +329,10 @@ export class NativeJsRun {
   async terminate() {
     if (!this.owner) throw new Error('process_not_owned')
     try {
+      // js-debug answers the root's disconnect only once its children are gone.
+      await Promise.allSettled(
+        [...this.tree.children.values()].filter((s) => !s.dap.closed).map((s) => s.detach())
+      )
       if (!this.tree.root.dap.closed) await this.tree.root.terminate()
     } finally {
       await this.close()

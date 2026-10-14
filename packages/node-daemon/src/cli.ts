@@ -121,7 +121,7 @@ async function main() {
   const claudeBudget = Number(option('--claude-budget', '0.35'))
   const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
-  // This enables authorized infrastructure only, never the audit-blocked JS profile.
+  // Authorized debugger infrastructure, and the JS profile once its pinned adapter is installed.
   const debuggerFlag = args.indexOf('--debugger')
   const debuggerEnabled = debuggerFlag >= 0
   if (debuggerEnabled) args.splice(debuggerFlag, 1)

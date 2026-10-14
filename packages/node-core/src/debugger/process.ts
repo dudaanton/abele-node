@@ -163,7 +163,15 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
   }
   private async signal(signal: NodeJS.Signals) {
     if (!this.alive) return
-    const current = await this.identity(this.pid)
+    let current: string
+    try {
+      current = await this.identity(this.pid)
+    } catch (error) {
+      // A program that ended by itself is gone from the OS a moment before its exit arrives here.
+      await this.waitForExit(1000).catch(() => {})
+      if (!this.alive) return
+      throw error
+    }
     // Check again after the asynchronous OS query, before issuing a signal.
     if (!this.alive) return
     if (current !== this.evidence.start_identity) throw new Error('pid_reused')

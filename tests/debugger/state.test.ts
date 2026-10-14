@@ -42,6 +42,42 @@ describe('debugger reducer, handles, replay and persistence', () => {
       expect(output.event_seq).toBe(stop.event_seq + 1)
       expect(output.breakpoint_revision).toBe(0)
     }, true))
+  it('certifies a stop on a known thread by a list of the same threads, leaving the stop as it was', () =>
+    withCore((core) => {
+      const d = core.debugger
+      const s = d.create(target)
+      d.observe(s.debug_session_id, s.incarnation, {
+        kind: 'thread',
+        thread_id: 7,
+        reason: 'started',
+      })
+      const stop = d.observe(s.debug_session_id, s.incarnation, {
+        ...stopped,
+        thread_id: 7,
+        hit_breakpoint_ids: [],
+      })
+      expect(stop.execution).toBe('unknown')
+      const listed = d.observe(s.debug_session_id, s.incarnation, {
+        kind: 'threads',
+        inventory_revision: stop.thread_inventory_revision,
+        threads: [{ id: 7, name: 'Main Thread' }],
+      })
+      expect(listed.execution).toBe('stopped')
+      expect(listed.thread_inventory).toBe('complete')
+      expect(listed.threads[0]?.name).toBe('Main Thread')
+      expect(listed.stop_epoch).toBe(stop.stop_epoch)
+      expect(listed.state_revision).toBe(stop.state_revision)
+      // A list that differs is a change of what runs, as before.
+      const more = d.observe(s.debug_session_id, s.incarnation, {
+        kind: 'threads',
+        inventory_revision: listed.thread_inventory_revision,
+        threads: [
+          { id: 7, name: 'Main Thread' },
+          { id: 8, name: 'worker' },
+        ],
+      })
+      expect(more.stop_epoch).toBeGreaterThan(listed.stop_epoch)
+    }, true))
   it('treats missing/unknown threads conservatively and clears resumed stop metadata', () =>
     withCore((core) => {
       const d = core.debugger

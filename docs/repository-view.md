@@ -22,6 +22,9 @@ External discovery/access defaults to **off** per registered project. Omitting
 no assumption that the default is `main` or `master`: an owner setting wins;
 otherwise exactly one distinct local `refs/remotes/*/HEAD` target is required.
 If neither exists, clients must ask the owner to select a branch.
+`NodeClient.getRepositorySettings(project_id)` (`project.repository_settings.get`)
+reads both back, so a client can show whether browsing is on; a node without this read
+answers `unsupported_method`, and `project.get` keeps its shape either way.
 
 `repository.v1.worktrees` runs hardened `git worktree list --porcelain -z` from
 the validated registered root/common directory. Root and managed workspace

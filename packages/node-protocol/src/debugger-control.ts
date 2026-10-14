@@ -72,10 +72,34 @@ export const DebuggerApprovalSchema = z
     decision: z.enum(['approve', 'deny']),
   })
   .strict()
+const relativePath = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((v) => !v.includes('\0') && !/^([\\/]|[A-Za-z]:)/.test(v), 'relative path')
+/** The owner starts a program of a chat's folder under the debugger: `program` and `sources` are
+ * paths inside that folder. Only the native JS profile starts anything, and only once installed. */
+export const DebuggerStartSchema = z
+  .object({
+    operation_id: id,
+    conversation_id: id,
+    program: relativePath,
+    argv: z.array(z.string().max(8192)).max(256).default([]),
+    sources: z.array(relativePath).max(255).default([]),
+  })
+  .strict()
+export const DebuggerStartResultSchema = z
+  .object({
+    debug_session_id: id,
+    sources: z.array(z.object({ source_id: id, path: z.string().max(4096) }).strict()).max(256),
+  })
+  .strict()
+export type DebuggerStartResult = z.infer<typeof DebuggerStartResultSchema>
 /** B3 exposes only authorized implemented methods. Profile startup, source,
  * tools, subscriptions and timers retain their later-stage gates. */
 export const DebuggerControlMethodSchemas = {
   'debugger.v1.profiles': DebuggerMethodSchemas['debugger.v1.profiles'],
+  'debugger.v1.start': DebuggerStartSchema,
   'debugger.v1.sessions': DebuggerMethodSchemas['debugger.v1.sessions'],
   'debugger.v1.status': DebuggerMethodSchemas['debugger.v1.status'],
   'debugger.v1.commandResult': DebuggerMethodSchemas['debugger.v1.commandResult'],

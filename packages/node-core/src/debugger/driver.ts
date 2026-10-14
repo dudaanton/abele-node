@@ -10,10 +10,25 @@ import { DebuggerService, DebuggerStateError } from './index.js'
 import { DapTransport, DAP_LIMITS } from './dap.js'
 import type { DebugProcessOwner } from './process.js'
 import { boundedText } from './storage.js'
+import {
+  CAPTURE_MAX_CHARS,
+  captureChunk,
+  captureEnd,
+  captureStart,
+  decode,
+  readChunk,
+  readLength,
+} from '../trace/capture.js'
 
 const nonnegative = (n: unknown): n is number =>
   typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
 const positive = (n: unknown): n is number => nonnegative(n) && n > 0
+/** DAP lets an adapter name a thread 0, and js-debug names a Node program's thread so; debugger.v1
+ * counts threads from 1. Thread 0 travels as the largest id, which no adapter may use itself. */
+const THREAD_ZERO = Number.MAX_SAFE_INTEGER
+const dapThread = (n: unknown): n is number => nonnegative(n) && n !== THREAD_ZERO
+const fromDap = (n: number) => (n === 0 ? THREAD_ZERO : n)
+const toDap = (n: number) => (n === THREAD_ZERO ? 0 : n)
 function list(value: unknown, limit = 256): any[] {
   if (
     !Array.isArray(value) ||
@@ -49,6 +64,11 @@ type Frame = {
 }
 type Scope = { name: string; handle: string | null; expensive: boolean }
 type Variable = { name: string; value: string; type?: string; handle: string | null }
+/** What a record point's stop gave: where the program stood and each value whole or why not. */
+export type RecordedStop = {
+  frames: { name: string; path?: string; line: number }[]
+  values: { name: string; text?: string; string?: boolean; error?: string }[]
+}
 
 /** Trusted internal driver, NOT an authority boundary or a public arbitrary-DAP
  * API. DapDebuggerBackend installs the coordinator's physical dispatch fence.
@@ -296,7 +316,7 @@ export class DapSession {
             )
               this.breakpointIds.delete(id)
           results.forEach((result, i) => {
-            if (positive(result.id))
+            if (nonnegative(result.id))
               this.breakpointIds.set(result.id, { id: requested[i]!.breakpoint_id, revision })
           })
         }
@@ -354,8 +374,8 @@ export class DapSession {
       kind: 'threads',
       inventory_revision: before.thread_inventory_revision,
       threads: list(body.threads).map((t) => {
-        if (!positive(t.id) || typeof t.name !== 'string') throw new Error('dap_invalid_body')
-        return { id: t.id, name: boundedText(t.name, 256) }
+        if (!dapThread(t.id) || typeof t.name !== 'string') throw new Error('dap_invalid_body')
+        return { id: fromDap(t.id), name: boundedText(t.name, 256) }
       }),
     })
     return this.snapshot
@@ -365,7 +385,7 @@ export class DapSession {
     byteLimit(maxBytes)
     const before = this.stopped(thread)
     const body = await this.request('stackTrace', {
-      threadId: thread,
+      threadId: toDap(thread),
       startFrame: start,
       levels: count,
     })
@@ -511,6 +531,63 @@ export class DapSession {
       source_identity: before.target.build_identity,
     }
   }
+  /** Trusted node-internal recording of a record point's stop, never routed to clients: the
+   * top frames and each take evaluated whole in the top frame, in chunks the transport can carry.
+   * The takes were approved when the point was set. No client handles are issued. Only what the
+   * point names is taken: with no takes nothing is read beyond the frames. */
+  async recordStop(
+    thread: number,
+    takes: { name: string; expression: string }[],
+    levels = 10
+  ): Promise<RecordedStop> {
+    const before = this.stopped(thread)
+    const body = await this.request('stackTrace', {
+      threadId: toDap(thread),
+      startFrame: 0,
+      levels,
+    })
+    this.fence(before)
+    const raw = list(body.stackFrames, 1024).slice(0, levels)
+    const frames = raw.map((f) => ({
+      name: boundedText(typeof f.name === 'string' ? f.name : '', 256),
+      ...(typeof f.source?.path === 'string' ? { path: boundedText(f.source.path, 4096) } : {}),
+      line: nonnegative(f.line) ? f.line : 0,
+    }))
+    const frameId = raw[0]?.id
+    if (!Number.isSafeInteger(frameId))
+      return { frames, values: takes.map((t) => ({ name: t.name, error: 'No frame to read' })) }
+    const context = this.capabilities.supportsClipboardContext ? 'clipboard' : 'repl'
+    const evaluate = async (expression: string) => {
+      const r = await this.request('evaluate', { frameId, expression, context })
+      // Someone else moved the session meanwhile: the frame is no longer the one recorded.
+      this.fence(before)
+      if (typeof r.result !== 'string') throw new Error('dap_invalid_body')
+      return r.result as string
+    }
+    const values: RecordedStop['values'] = []
+    for (const take of takes) {
+      const key = `k${Math.random().toString(36).slice(2, 10)}`
+      try {
+        const length = readLength(await evaluate(captureStart(take.expression, key)))
+        if (length > CAPTURE_MAX_CHARS) throw new Error(`Too large to take: ${length} characters`)
+        let text = ''
+        for (let at = 0; at < length;) {
+          const chunk = readChunk(await evaluate(captureChunk(key, at)), at)
+          text += chunk.text
+          at = chunk.end
+        }
+        values.push({ name: take.name, ...decode(text) })
+      } catch (error) {
+        values.push({
+          name: take.name,
+          error: boundedText(error instanceof Error ? error.message : String(error), 512),
+        })
+      } finally {
+        await evaluate(captureEnd(key)).catch(() => undefined)
+      }
+    }
+    return { frames, values }
+  }
   async setVariable(handle: string, name: string, value: string) {
     if (!this.capabilities.supportsSetVariable) throw new ChannelError('unsupported_operation')
     const variablesReference = this.service.resolveHandle(this.id, handle, 'object')
@@ -577,13 +654,13 @@ export class DapSession {
     this.admission?.advanceIntent()
     this.frameThreads.clear()
     this.objectThreads.clear()
-    await this.request(command, { threadId: thread, singleThread })
+    await this.request(command, { threadId: toDap(thread), singleThread })
     return this.snapshot
   }
   async pause(thread: number) {
     this.current()
     if (!positive(thread)) throw new Error('invalid_thread')
-    await this.request('pause', { threadId: thread })
+    await this.request('pause', { threadId: toDap(thread) })
     return this.snapshot
   }
   setOwner(owner: DebugProcessOwner) {
@@ -607,7 +684,10 @@ export class DapSession {
       try {
         await this.dap.request('disconnect', { terminateDebuggee: false, suspendDebuggee: false })
       } catch (error) {
-        disconnectError = error
+        // Closed while it was asked to let go: that is the detach. js-debug ends a run's root as
+        // its program's session goes, and the root closes the session before it answers.
+        const closed = this.dap.closed && error instanceof Error && error.message === 'dap_closed'
+        if (!(lifecycle === 'detached' && closed)) disconnectError = error
       }
       // Owned cleanup is independent of transport success and journal availability.
       if (lifecycle === 'terminated') await this.owner!.terminate()
@@ -631,7 +711,7 @@ export class DapSession {
       case 'stopped':
         this.observe({
           kind: 'stopped',
-          ...(positive(body.threadId) ? { thread_id: body.threadId } : {}),
+          ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
           all_threads_stopped: body.allThreadsStopped === true,
           reason: typeof body.reason === 'string' ? boundedText(body.reason, 256) : 'unknown',
           ...(typeof body.description === 'string'
@@ -647,14 +727,14 @@ export class DapSession {
       case 'continued':
         this.observe({
           kind: 'continued',
-          ...(positive(body.threadId) ? { thread_id: body.threadId } : {}),
+          ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
           all_threads_continued: body.allThreadsContinued === true,
         })
         break
       case 'thread':
-        if (!positive(body.threadId) || !['started', 'exited'].includes(body.reason))
+        if (!dapThread(body.threadId) || !['started', 'exited'].includes(body.reason))
           throw new Error('dap_invalid_body')
-        this.observe({ kind: 'thread', thread_id: body.threadId, reason: body.reason })
+        this.observe({ kind: 'thread', thread_id: fromDap(body.threadId), reason: body.reason })
         break
       case 'output':
         if (typeof body.output !== 'string') throw new Error('dap_invalid_body')
@@ -709,6 +789,12 @@ type ChildCoverage = {
  * grandchildren and unknown reverse requests remain denied. */
 export class JsSessionTree {
   readonly children = new Map<string, DapSession>()
+  private readonly childListeners = new Set<(child: DapSession) => void>()
+  /** Each child as the adapter starts it, before its first event. */
+  onChild(listener: (child: DapSession) => void) {
+    this.childListeners.add(listener)
+    return () => void this.childListeners.delete(listener)
+  }
   private readonly pendingIds = new Set<string>()
   private closed = false
   constructor(
@@ -740,13 +826,21 @@ export class JsSessionTree {
     )
       throw new Error('reverse_request_denied')
     const { __pendingTargetId: pending, ...config } = args.configuration
+    const keys = Object.keys(config)
     const equal =
-      Object.keys(config).length === Object.keys(coverage.configuration).length &&
-      Object.keys(config).every(
+      keys.length === Object.keys(coverage.configuration).length &&
+      keys.every(
         (key) => JSON.stringify(config[key]) === JSON.stringify(coverage.configuration[key])
       )
+    // The pinned js-debug names its child by the parent's type and a display name
+    // only, and resolves the rest from the pending target it already holds.
+    const named =
+      keys.length === 2 &&
+      config.type === coverage.configuration.type &&
+      typeof config.name === 'string' &&
+      config.name.length <= 128
     if (
-      !equal ||
+      !(equal || named) ||
       typeof pending !== 'string' ||
       !pending ||
       pending.length > 128 ||
@@ -768,6 +862,7 @@ export class JsSessionTree {
       })
       const child = new DapSession(this.service, state, dap, this.root.sources)
       this.children.set(child.id, child)
+      for (const listener of [...this.childListeners]) listener(child)
       await child.start(coverage.mode, { ...config, __pendingTargetId: pending }, signal)
       if (signal.aborted || this.closed) throw new Error('reverse_request_denied')
       return {}

@@ -22,7 +22,7 @@ export const DEBUGGER_LIMITS = Object.freeze({
 export const DEBUGGER_V1_CAPABILITY = Object.freeze({
   status: 'supported' as const,
   evidence:
-    'debugger.v1-contracts; bounded-state-and-history; bounded-dap; js-profile-audit-blocked; authorized-shared-control',
+    'debugger.v1-contracts; bounded-state-and-history; bounded-dap; js-profile-pinned; authorized-shared-control',
 })
 const id = z.string().min(1).max(128)
 const seq = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)

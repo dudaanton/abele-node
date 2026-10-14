@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
 import {
   mkdir,
@@ -14,7 +15,7 @@ import {
 import { join, dirname, resolve } from 'node:path'
 
 export type JsAdapterPin = { version: string; sha256: string; license: 'MIT'; url: string }
-/** Audit evidence, NOT an installable production pin. Never consult the B0 opt-in. */
+/** Audit evidence behind the pin below. Never consult the B0 opt-in. */
 export const JS_DEBUG_AUDIT = Object.freeze({
   checked_at: '2026-10-10',
   candidate: {
@@ -32,9 +33,15 @@ export const JS_DEBUG_AUDIT = Object.freeze({
     'GHSA-pqg4-j6r4-53mv',
   ],
 })
-// Deliberately empty: a new reviewed source pin + license/SBOM audit must land
-// before installation or native profile startup can become possible.
-export const JS_DEBUG_PIN: JsAdapterPin | null = null
+// The owner accepted 1.140.0 despite the advisories above, on 2026-10-14: the node
+// attaches over loopback with a fixed configuration and refuses terminal launches.
+// A new version is a new decision, never a substituted number.
+export const JS_DEBUG_PIN: JsAdapterPin | null = Object.freeze({
+  version: '1.140.0',
+  sha256: '27dab92937ec1ab35821ae955aac867544fe06a1b6307229049f2d789af10968',
+  license: 'MIT',
+  url: 'https://github.com/microsoft/vscode-js-debug/releases/download/v1.140.0/js-debug-dap-v1.140.0.tar.gz',
+})
 export function requireJsPin(): JsAdapterPin {
   if (!JS_DEBUG_PIN) throw new Error('js_debug_no_audited_release')
   return JS_DEBUG_PIN
@@ -184,15 +191,23 @@ export async function installJsAdapter(stateDirectory: string) {
   } finally {
     await reader.cancel()
   }
-  return unpackJsAdapter(
-    join(stateDirectory, 'debugger/adapters/js-debug', pin.version),
-    pin,
-    Buffer.concat(chunks)
-  )
+  return unpackJsAdapter(jsAdapterDirectory(stateDirectory), pin, Buffer.concat(chunks))
+}
+export function jsAdapterDirectory(stateDirectory: string) {
+  return join(stateDirectory, 'debugger/adapters/js-debug', requireJsPin().version)
+}
+/** Whether the pinned adapter was installed here; its bytes are verified on use. */
+export function jsAdapterInstalled(stateDirectory: string) {
+  try {
+    return existsSync(join(jsAdapterDirectory(stateDirectory), 'installation.json'))
+  } catch {
+    return false
+  }
 }
 export async function installedJsAdapter(stateDirectory: string) {
   const pin = requireJsPin()
-  return verifyJsInstallation(join(stateDirectory, 'debugger/adapters/js-debug', pin.version), pin)
+  if (!jsAdapterInstalled(stateDirectory)) throw new Error('js_debug_not_installed')
+  return verifyJsInstallation(jsAdapterDirectory(stateDirectory), pin)
 }
 export async function verifyJsInstallation(directory: string, pin: JsAdapterPin) {
   validPin(pin)

@@ -17,6 +17,7 @@ import { DebuggerPermissions, type DebuggerPrincipal, type DebuggerAction } from
 import { boundedPayload } from './storage.js'
 import { DebuggerHistoryStore } from './history.js'
 import { DebuggerWaits } from './wait.js'
+import { DapDebuggerBackend } from './dap-backend.js'
 
 export type { DebuggerPrincipal } from './permissions.js'
 type Params = Record<string, any>
@@ -144,8 +145,12 @@ export class DebuggerCoordinator {
     this.enabled()
     this.core.debugger.snapshot(session)
     this.backends.set(session, backend)
+    // A DAP session records a run whenever it has record points.
+    const recording =
+      backend instanceof DapDebuggerBackend ? this.core.trace.attach(backend.session) : undefined
     return () => {
       if (this.backends.get(session) === backend) this.backends.delete(session)
+      recording?.()
     }
   }
   createGrant(owner: AuthorityContext, raw: unknown) {
@@ -608,7 +613,7 @@ export class DebuggerCoordinator {
     if (method === 'profiles') {
       this.permissions.owner(principal.authority)
       if (principal.kind !== 'human') throw new ChannelError('unauthorized')
-      return this.core.debugger.profiles()
+      return this.core.debuggerLaunches.profiles()
     }
     if (method === 'sessions') {
       if (principal.kind !== 'human') throw new ChannelError('unauthorized')
@@ -776,6 +781,7 @@ export class DebuggerCoordinator {
     if (method === 'wait' || method === 'sleep') return this.wait(human, method, p, signal)
     if (method === 'cancelWait') return this.waits.cancel(human, p)
     if (method === 'approve') return this.approve(owner, p)
+    if (method === 'start') return this.core.debuggerLaunches.start(owner, p as any)
     if (method === 'approvals') {
       this.checkPublication(human, p.debug_session_id)
       const all = this.core.db
@@ -829,7 +835,10 @@ export class DebuggerCoordinator {
     this.permissions.owner(owner)
     const p = raw as Params
     const session =
-      p.debug_session_id ?? p.cursor?.debug_session_id ?? result?.snapshot?.debug_session_id
+      p.debug_session_id ??
+      p.cursor?.debug_session_id ??
+      result?.snapshot?.debug_session_id ??
+      (full === 'debugger.v1.start' ? result?.debug_session_id : undefined)
     if (session) this.checkPublication({ kind: 'human', authority: owner }, session)
     if (full === 'debugger.v1.sessions' && Array.isArray(result))
       for (const s of result)

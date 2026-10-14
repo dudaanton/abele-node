@@ -5,7 +5,12 @@ import type { DapSession } from './driver.js'
 /** Trusted host binding, registered only after reviewed profile admission. No
  * launch, attach, restart, source export or arbitrary adapter request surface. */
 export class DapDebuggerBackend implements DebuggerBackend {
-  constructor(private readonly session: DapSession) {}
+  /** `stop` ends the whole run the session belongs to, where the run owns the process and the
+   * session does not: the program's own session under the adapter's root. */
+  constructor(
+    readonly session: DapSession,
+    private readonly stopRun?: () => Promise<unknown>
+  ) {}
   supports(method: string) {
     const caps = this.session.snapshot.adapter_capabilities
     if (method === 'setVariable') return caps.includes('supportsSetVariable')
@@ -60,7 +65,9 @@ export class DapDebuggerBackend implements DebuggerBackend {
         case 'detach':
           return this.session.detach()
         case 'terminate':
-          return this.session.terminate()
+          if (!this.stopRun) return this.session.terminate()
+          await this.stopRun()
+          return this.session.snapshot
         default:
           throw new ChannelError('unsupported_operation')
       }

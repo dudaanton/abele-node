@@ -30,12 +30,18 @@ import {
 
 import { DebuggerService, migrateDebugger } from './debugger/index.js'
 import { DebuggerCoordinator } from './debugger/coordinator.js'
+import { DebuggerLaunches, type LaunchProfile } from './debugger/launch.js'
+import { JsDebugProfile as NativeJsProfile } from './debugger/js-profile.js'
+import { TraceService } from './trace/service.js'
 import { migrateDebuggerControl, migrateDebuggerModes } from './debugger/storage.js'
 export { DebuggerCoordinator } from './debugger/coordinator.js'
 export { DebuggerAgentBinding, debuggerToolDefinitions } from './debugger/agent.js'
 export { DebuggerRunBinding } from './debugger/run.js'
 export type { DebuggerRunContext } from './debugger/run.js'
 export { DapDebuggerBackend } from './debugger/dap-backend.js'
+export { TraceService } from './trace/service.js'
+export { TraceStore } from './trace/store.js'
+export { TracePoints, TraceRecorder } from './trace/recorder.js'
 export type {
   DebuggerPrincipal,
   DebuggerBackend,
@@ -45,6 +51,7 @@ export { DebuggerService, DebuggerStateError, reduceDebugger } from './debugger/
 export type { DebuggerObservation, DebuggerAdapterSink } from './debugger/index.js'
 export { installJsAdapter, JS_DEBUG_AUDIT, JS_DEBUG_PIN } from './debugger/js-install.js'
 export { JsDebugProfile } from './debugger/js-profile.js'
+export { DebuggerLaunches, type LaunchProfile, type LaunchedRun } from './debugger/launch.js'
 export type { JsLaunch, JsAttach } from './debugger/js-profile.js'
 import { canonicalStateDir } from './state.js'
 export { canonicalStateDir } from './state.js'
@@ -255,6 +262,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   readonly pairing: PairingService
   readonly debugger: DebuggerService
   readonly debuggerControl: DebuggerCoordinator
+  /** Programs the owner started under the debugger. */
+  readonly debuggerLaunches: DebuggerLaunches
+  readonly trace: TraceService
   readonly node_id: string
   readonly provider = new FakeProvider()
   readonly resources: ResourceServices
@@ -274,6 +284,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       /** Authorized control infrastructure, off by default. Native profiles
        * require a separate explicit switch and an audited adapter installation. */
       debuggerEnabled?: boolean
+      /** Trusted seam for tests: what starts a program under the debugger. The native JS profile,
+       * still refusing until an audited adapter is installed, otherwise. */
+      debuggerProfile?: (core: NodeCore) => LaunchProfile
       claude?: ProviderAdapter
       pi?: ProviderAdapter
       codex?: ProviderAdapter
@@ -413,11 +426,20 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     try {
       this.debugger = new DebuggerService(this, options.debuggerEnabled)
       this.debuggerControl = new DebuggerCoordinator(this)
+      this.trace = new TraceService(this)
       this.authority.subscribeInvalidation(() => {
         if (!this.closed) this.debuggerControl.notifyPermissions()
       })
       this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
       this.resources.mutations.recover()
+      this.debuggerLaunches = new DebuggerLaunches(
+        this,
+        options.debuggerProfile?.(this) ??
+          new NativeJsProfile(this.debugger, {
+            stateDirectory: stateDir,
+            enabled: !!options.debuggerEnabled,
+          })
+      )
     } catch (error) {
       this.db.close()
       throw error
@@ -458,6 +480,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   close() {
     if (!this.closed) {
+      this.trace.close()
+      void this.debuggerLaunches
+        ?.close()
+        .catch((error) => console.debug('[debugger] Closing started programs failed', error))
       this.debuggerControl.close()
       this.protectFiles()
       this.db.close()
@@ -571,6 +597,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       capabilities: {
         ...this.provider.capabilities().capabilities,
         ...this.debugger.capabilities(),
+        ...this.trace.capabilities(),
         expected_target: {
           status: 'supported',
           evidence: 'atomic-target-admission: session.send; delegation.send; review.submit',
@@ -675,6 +702,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.authority.check(actor, 'request')
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.request(actor, method, raw, operation, signal)
+    if (method.startsWith('trace.v1.')) return this.trace.request(actor, method, raw)
     if (method === 'pairing.list' || method === 'pairing.confirm') {
       if (actor.profile !== 'local-token-v1') throw new ChannelError('local_owner_required')
       const parsed = PairingMethodSchemas[method].safeParse(raw)
@@ -727,6 +755,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.authority.check(actor, 'publish')
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.checkRpcPublication(actor, method, raw, result)
+    // Owner-only views of the owner's own runs folder: nothing scoped beyond the installation.
+    if (method.startsWith('trace.v1.')) return
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
     this.authority.check(

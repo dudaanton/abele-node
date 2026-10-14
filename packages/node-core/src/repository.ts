@@ -347,6 +347,15 @@ export class RepositoryService {
       }
     })
   }
+  /** Whether the project's other worktrees are open to browsing, and its default branch. */
+  settingsOf(id: string) {
+    const config = this.config(id)
+    return {
+      project_id: id,
+      external_read: Boolean(config.external_read),
+      default_branch: config.default_branch,
+    }
+  }
   private config(id: string): {
     fingerprint: string
     external_read: number

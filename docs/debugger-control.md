@@ -1,8 +1,8 @@
 # Shared debugger control infrastructure (B3)
 
-B3 adds the authorization boundary and shared coordinator. This is still **gated
-infrastructure, not a usable debugger release**: no audited JS adapter pin, target
-startup RPC, renderer attachment or plugin UI is enabled. B5 subsequently adds
+B3 adds the authorization boundary and shared coordinator. It is **gated
+infrastructure**: target startup arrived later as the owner's `debugger.v1.start`
+(see [recorded runs](trace.md#starting-a-program)); renderer attachment is not enabled. B5 subsequently adds
 [gated provider tools, current-state delivery and timers](debugger-agent-tools.md).
 
 ## Availability and RPC boundary
@@ -10,7 +10,8 @@ startup RPC, renderer attachment or plugin UI is enabled. B5 subsequently adds
 `abele-node start --debugger` (or the daemon's explicit `debuggerOptions.enabled`)
 enables the infrastructure capability; it defaults to **off**. It does not enable
 or install a real profile. `profiles` remains empty while the JS audit is blocked.
-Neither launch/attach/create/restart nor source export or arbitrary DAP are routed.
+The owner's `start` is routed (see [recorded runs](trace.md#starting-a-program)); attach,
+create, restart, source export and arbitrary DAP are not.
 B5 extends the gated subset with wait/sleep and caller-scoped cancellation. There is no automatic target creation or adapter reconnect.
 
 `DebuggerControlMethodSchemas` is the implemented RPC subset; the full

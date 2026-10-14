@@ -5,6 +5,8 @@ import {
   DebuggerReplayResultSchema,
   DebuggerReceiptSchema,
   DebuggerWaitResultSchema,
+  DebuggerStartSchema,
+  DebuggerStartResultSchema,
   type DebuggerSnapshot,
 } from '@abele/node-protocol'
 
@@ -95,6 +97,12 @@ export class DebuggerClient {
     // Even a complete event page is not substituted for a current snapshot.
     await this.status(params.cursor.debug_session_id)
     return result
+  }
+  /** Starts a program of a chat's folder under the debugger; the owner's act, never resent. */
+  async start(params: (typeof DebuggerStartSchema)['_input']) {
+    return DebuggerStartResultSchema.parse(
+      await this.rpc('debugger.v1.start', DebuggerStartSchema.parse(params))
+    )
   }
   async command<M extends Command>(method: M, params: Input<`debugger.v1.${M}`>) {
     await this.status(params.debug_session_id)

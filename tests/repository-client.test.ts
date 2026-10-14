@@ -58,7 +58,16 @@ it('uses the real client/daemon boundary for browsing, retained bytes, live inva
   expect(
     ((await client.describe()) as any).capabilities.capabilities.repository_read_v1.status
   ).toBe('supported')
+  expect(await client.getRepositorySettings(project.project_id)).toEqual({
+    project_id: project.project_id,
+    external_read: false,
+    default_branch: null,
+  })
   await client.setRepositorySettings({ project_id: project.project_id, external_read: true })
+  expect((await client.getRepositorySettings(project.project_id)).external_read).toBe(true)
+  // The project's own answer keeps its shape: released clients parse it strictly.
+  const answer = await client.request('project.get', { project_id: project.project_id })
+  expect(Object.keys(answer as object)).not.toContain('external_read')
   const worktree_id = (await client.repository.worktrees({ project_id: project.project_id }))
     .entries[0]!.worktree_id
   const revision = await client.repository.resolve({ worktree_id, ref: 'HEAD' })

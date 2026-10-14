@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { NodeCore } from '../../packages/node-core/src/index.js'
 import { describe, expect, it, vi } from 'vitest'
 import { DapSession, JsSessionTree } from '../../packages/node-core/src/debugger/driver.js'
+import { DebuggerSnapshotSchema } from '@abele/node-protocol'
 import { wire } from './dap-wire.js'
 import { target } from './helpers.js'
 
@@ -574,6 +575,15 @@ describe('internal DAP session driver', () => {
       await detach
       expect(f.session.snapshot.lifecycle).toBe('detached')
     }))
+  it('reads a session the adapter closes while it is asked to detach as detached, not lost', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const detach = f.session.detach()
+      // js-debug ends the run's root as its program's session goes, and that closes this one.
+      f.session.dap.close()
+      await detach
+      expect(f.session.snapshot.lifecycle).toBe('detached')
+    }))
   it('does not label a disconnect acknowledgement as proof of process exit', async () =>
     fixture(async (f) => {
       await ready(f)
@@ -640,6 +650,108 @@ describe('internal DAP session driver', () => {
           )
         ).rejects.toThrow('reverse_request_denied')
       expect(tree.children.size).toBe(0)
+    }))
+  it("ties a hit to its point by js-debug's breakpoint 0, and a column it picks is no move", async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.core.debugger.patchBreakpoints(
+        f.session.id,
+        0,
+        [{ breakpoint_id: 'bp', source_id: 'source', line: 4 }],
+        []
+      )
+      const sync = f.session.syncBreakpoints()
+      const set = f.w.messages.find((m) => m.command === 'setBreakpoints')!
+      f.w.reply(set, { breakpoints: [{ id: 0, verified: true, line: 4, column: 17 }] })
+      await sync
+      expect(f.session.snapshot.breakpoints[0]).toMatchObject({
+        status: 'verified',
+        resolved_line: 4,
+        resolved_column: 17,
+      })
+      stopped(f.w, 1)
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: { threadId: 1, allThreadsStopped: true, reason: 'breakpoint', hitBreakpointIds: [0] },
+      })
+      await Promise.resolve()
+      expect(f.session.snapshot.threads[0]!.stop?.hit_breakpoint_ids).toEqual(['bp'])
+    }))
+  it('takes thread 0, the only thread the pinned js-debug reports for a Node program', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      // debugger.v1 counts threads from 1, so the adapter's 0 travels as the largest id.
+      const zero = Number.MAX_SAFE_INTEGER
+      f.w.send({ type: 'event', event: 'thread', body: { reason: 'started', threadId: 0 } })
+      stopped(f.w, 0)
+      await Promise.resolve()
+      expect(f.w.dap.closed).toBe(false)
+      expect(f.session.snapshot.selected_thread_id).toBe(zero)
+      expect(f.session.snapshot.threads.find((t) => t.thread_id === zero)?.status).toBe('stopped')
+      expect(DebuggerSnapshotSchema.parse(f.session.snapshot).selected_thread_id).toBe(zero)
+      const step = f.session.step(zero, 'over')
+      const next = f.w.messages.find((m) => m.command === 'next')!
+      expect(next.arguments).toMatchObject({ threadId: 0 })
+      f.w.reply(next)
+      await step
+      const pause = f.session.pause(zero)
+      const asked = f.w.messages.find((m) => m.command === 'pause')!
+      expect(asked.arguments).toEqual({ threadId: 0 })
+      f.w.reply(asked)
+      await pause
+      // An adapter may not take that id for a thread of its own.
+      f.w.send({ type: 'event', event: 'thread', body: { reason: 'started', threadId: zero } })
+      await Promise.resolve()
+      expect(f.w.dap.closed).toBe(true)
+    }))
+  it("takes the pinned js-debug's own child form: the parent's type and a name, nothing else", async () =>
+    fixture(async (f) => {
+      const childWire = wire(),
+        config = { type: 'pwa-node', port: 12345, address: '127.0.0.1' }
+      const tree = new JsSessionTree(f.core.debugger, f.session, async () => childWire.dap, {
+        mode: 'attach',
+        configuration: config,
+        maxChildren: 2,
+      })
+      const ask = (configuration: Record<string, unknown>, seq = 1) =>
+        tree.reverse(
+          {
+            seq,
+            type: 'request',
+            command: 'startDebugging',
+            arguments: { request: 'attach', configuration },
+          },
+          new AbortController().signal
+        )
+      for (const configuration of [
+        { type: 'pwa-chrome', name: 'Remote Process [0]', __pendingTargetId: 'a' },
+        { type: 'pwa-node', name: 'Remote Process [0]', port: 9999, __pendingTargetId: 'b' },
+        { type: 'pwa-node', name: 'x'.repeat(129), __pendingTargetId: 'c' },
+        { type: 'pwa-node', name: 7, __pendingTargetId: 'd' },
+        { type: 'pwa-node', __pendingTargetId: 'e' },
+      ])
+        await expect(ask(configuration)).rejects.toThrow('reverse_request_denied')
+      expect(tree.children.size).toBe(0)
+      const p = ask({ type: 'pwa-node', name: 'Remote Process [0]', __pendingTargetId: 'real' }, 2)
+      for (let i = 0; i < 15; i++) {
+        for (const m of childWire.messages.filter((m) => m.type === 'request' && !m.replied)) {
+          m.replied = true
+          childWire.reply(m)
+          if (m.command === 'initialize') childWire.send({ type: 'event', event: 'initialized' })
+        }
+        await Promise.resolve()
+      }
+      await p
+      expect(tree.children.size).toBe(1)
+      const attach = childWire.messages.find((m) => m.command === 'attach')!
+      expect(attach.arguments).toEqual({
+        request: 'attach',
+        type: 'pwa-node',
+        name: 'Remote Process [0]',
+        __pendingTargetId: 'real',
+      })
+      tree.close()
     }))
   it('creates only covered child sessions, with separate reducers and bounded cleanup', async () =>
     fixture(async (f) => {

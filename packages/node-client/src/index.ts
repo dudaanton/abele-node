@@ -9,6 +9,8 @@ import {
 import { LocalChannelConnector, RequestChannel, reconnect } from '@abele/channel-client'
 import { DebuggerClient } from './debugger.js'
 export { DebuggerClient } from './debugger.js'
+export { TraceClient } from './trace.js'
+import { TraceClient } from './trace.js'
 export type { DebuggerObservationState } from './debugger.js'
 import {
   SessionSchema,
@@ -154,6 +156,7 @@ export class NodeClient {
     (method, params, operation) => this.mutation(method, params, operation)
   )
   readonly debugger = new DebuggerClient((method, params) => this.request(method, params))
+  readonly trace = new TraceClient((method, params) => this.request(method, params))
   readonly repository = new RepositoryClient((method, params) => this.request(method, params), {
     mutation: (method, params) => this.mutation(method, params),
     save: async (method, params, operation) => {
@@ -512,6 +515,12 @@ export class NodeClient {
   ) {
     return RepositorySettingsSchema.parse(
       await this.mutation('project.repository_settings', params)
+    )
+  }
+  /** The project's browsing opt-in as it stands; a node older than this answers unsupported_method. */
+  async getRepositorySettings(project_id: string) {
+    return RepositorySettingsSchema.parse(
+      await this.request('project.repository_settings.get', { project_id })
     )
   }
   async getProject(project_id: string) {

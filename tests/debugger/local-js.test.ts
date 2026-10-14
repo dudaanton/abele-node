@@ -38,12 +38,11 @@ it.skipIf(process.env.ABELE_DEBUGGER_LOCAL_TEST !== '1' || !installed)(
           await new Promise((resolve) => setTimeout(resolve, 20))
         }
       }
-      await until(() =>
-        [...run.tree.children.values()].some((s) => s.snapshot.execution === 'stopped')
-      )
-      const session = [...run.tree.children.values()].find(
-        (s) => s.snapshot.execution === 'stopped'
-      )!
+      // js-debug runs the program in a child session and names only the thread that stopped.
+      const session = await run.program()
+      await until(() => session.snapshot.threads.some((t) => t.status === 'stopped'))
+      await session.threads()
+      expect(session.snapshot.execution).toBe('stopped')
       const thread = session.snapshot.selected_thread_id!
       const stack = await session.stack(thread, 0, 1)
       expect(stack.items[0]?.source_id).toBe('program')

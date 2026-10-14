@@ -38,6 +38,41 @@ describe('node-owned debugger processes', () => {
       await child.terminate()
     }
   })
+  it('takes a program that ended by itself as ended, though the OS forgot it before its exit arrived', async () => {
+    let ended = false
+    const child = await OwnedDebugProcess.spawn(
+      process.execPath,
+      ['-e', 'setTimeout(() => {}, 150)'],
+      {},
+      async (pid) => {
+        if (!ended) return processStartIdentity(pid)
+        throw new Error('process_identity_unavailable')
+      }
+    )
+    ended = true
+    await child.terminate()
+    expect(child.alive).toBe(false)
+  })
+  it('still refuses to signal what it cannot identify while it runs', async () => {
+    let lost = false
+    const child = await OwnedDebugProcess.spawn(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      {},
+      async (pid) => {
+        if (!lost) return processStartIdentity(pid)
+        throw new Error('process_identity_unavailable')
+      }
+    )
+    try {
+      lost = true
+      await expect(child.terminate()).rejects.toThrow('process_identity_unavailable')
+      expect(child.alive).toBe(true)
+    } finally {
+      lost = false
+      await child.terminate()
+    }
+  })
   it('uses argv/env without a shell; handles failed spawn and early exit without leftover processes', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dap-process-'))
     try {

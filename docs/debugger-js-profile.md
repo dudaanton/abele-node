@@ -8,10 +8,8 @@ without relaxing the profile audit/startup gate. References
 below to unavailable control RPC describe B2's original boundary, not a profile
 availability promise.
 
-B2 adds an internal node-owned DAP transport and driver. It is **not a usable,
-public debugger release**: no control RPC, provider tools or plugin UI is enabled.
-The real JS/TS profile is disabled, even with its configuration switch set, because
-no audited adapter release is available. B3 must add shared coordination and
+B2 adds an internal node-owned DAP transport and driver. The real JS/TS profile
+works only under `--debugger` and once the pinned adapter below is installed. B3 must add shared coordination and
 read/control authorization before any driver operation is routed to clients.
 
 ## Adapter decision and advisory check
@@ -19,12 +17,8 @@ read/control authorization before any driver operation is routed to clients.
 Checked on **2026-10-10** using the official
 [`microsoft/vscode-js-debug` releases API](https://api.github.com/repos/microsoft/vscode-js-debug/releases?per_page=10)
 and its `releases/latest` endpoint. Both identify **1.140.0** as the newest
-published release; no release newer than the probe pin was available. The
-candidate standalone artifact has SHA-256
+published release. The standalone artifact `js-debug-dap-v1.140.0.tar.gz` has SHA-256
 `27dab92937ec1ab35821ae955aac867544fe06a1b6307229049f2d789af10968` and is MIT-licensed.
-It is recorded as rejected audit evidence, **not an approved installation pin**.
-The standalone bundle has no verified complete SBOM or completed bundled-notice
-review here. B2 neither installs nor runs this rejected adapter.
 
 Audit the official release's `package.json` and `package-lock.json` using
 `npm audit --omit=dev --json`. This check reported **five affected production
@@ -39,24 +33,24 @@ packages: four high and one critical**. Advisory records included:
 | `brace-expansion`      | [GHSA-q2hr-2g5m-vwhr](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr), [GHSA-qhr7-859c-m2p7](https://github.com/advisories/GHSA-qhr7-859c-m2p7), [GHSA-6j4f-fj2g-mc7p](https://github.com/advisories/GHSA-6j4f-fj2g-mc7p) |
 
 An upstream lockfile finding does not establish exactly which vulnerable code is
-reachable in a standalone bundle. Without an audited new pin or verified
-build/SBOM, it also cannot be dismissed. A checksum or a clean AbeleNode audit is
-not a substitute for this adapter review.
+reachable in a standalone bundle. On **2026-10-14** the owner accepted 1.140.0 with
+these findings: the node starts the adapter with an empty environment, attaches to it
+over loopback with a fixed configuration, and refuses terminal launches and any
+reverse request other than the adapter's own child session, so the affected paths are
+not expected to be reachable. It is the same adapter VS Code ships.
 
-`JS_DEBUG_PIN` in `packages/node-core/src/debugger/js-install.ts` is therefore
-`null`. There is no production interpretation of the probe's experimental opt-in.
-Explicit installation is the only intended distribution path:
+`JS_DEBUG_PIN` in `packages/node-core/src/debugger/js-install.ts` holds that exact
+version, URL and SHA-256. A newer release is a new decision with its own audit, never a
+substituted version number. Explicit installation is the only distribution path:
 
 ```sh
 abele-node debugger install js
 ```
 
-Currently this fails with `js_debug_no_audited_release` **before downloading or
-creating state**. No adapter is bundled, silently downloaded on use, or accepted
-from an arbitrary user-supplied pin. Future enablement requires a source change
-with a reviewed release URL, exact version, SHA-256, license/notices and audit/SBOM
-evidence, followed by the local integration gate. Do not simply substitute a new
-version number or relax reverse-request validation to make it work.
+It downloads the pinned archive, refuses it unless the checksum matches, and installs
+it under the node's state. Nothing is bundled, silently downloaded on use, or taken from
+a user-supplied version or source. Until it is installed the profile lists nothing and
+`debugger.v1.start` answers `debugger_profile_unavailable`.
 
 The installer primitive is exercised only with synthetic archives. It bounds
 compressed/unpacked bytes, verifies the checksum before extraction, rejects
@@ -78,9 +72,10 @@ authority boundary. It requires all of:
 
 1. An enabled `debugger_v1` core (`debuggerEnabled`, false by default).
 2. The profile's separate `enabled: true` configuration switch, false by default.
-3. A reviewed source pin and verified explicit installation (currently impossible).
+3. The reviewed source pin and its verified explicit installation.
 
-There is deliberately no daemon control flag or RPC exposing this seam. Existing
+The owner's `debugger.v1.start` reaches it under `--debugger` (see
+[recorded runs](trace.md#starting-a-program)); it refuses until the adapter is installed. Existing
 clients remain compatible, and all `debugger.v1.*` RPC methods remain unsupported.
 
 Launch configurations use typed executable/program paths, argv and an explicit
@@ -164,10 +159,15 @@ in other sessions too. Cleanup deliberately bypasses that fence. B3 still has to
 serialize conflicting commands and journal durable receipts.
 
 Root and covered child connections own separate reducer sessions and handle spaces.
-Only an exact pre-covered `startDebugging` configuration plus a bounded pending-target
-ID is accepted. Uncovered children, grandchildren, `runInTerminal` and unknown
-reverse requests are denied. This intentionally narrow coverage has **not** been
-validated against a newly audited real adapter's generated child configuration.
+A `startDebugging` request is accepted with a bounded pending-target ID and either an
+exact copy of the covered configuration or js-debug's own child form: the parent's
+`type` and a display `name` of at most 128 characters, nothing else. Uncovered
+children, grandchildren, `runInTerminal` and unknown reverse requests are denied.
+js-debug runs a Node program in that child, numbers its only thread and its first
+breakpoint `0`, and reports a column for every breakpoint; none of these is an error
+or a moved breakpoint. As `debugger.v1` counts threads from 1, the adapter's thread 0
+travels as `Number.MAX_SAFE_INTEGER`, an id no adapter may use itself. Terminating a run detaches the children first, as js-debug
+answers the root's disconnect only once they are gone.
 Root connection loss closes child transports; child loss does not corrupt root state.
 
 Detach always requests `terminateDebuggee: false` and leaves attached targets alive.
@@ -188,13 +188,15 @@ isolated child sessions, reverse denial, early failures, audit failures, PID reu
 owned shutdown and detached-target survival. Ownership tests spawn only disposable
 synthetic Node programs, never an application or a model.
 
-The real-adapter check is opt-in and **skipped while the audited pin is absent**.
-Once a reviewed pin has landed, install explicitly into its disposable test state:
+The real-adapter checks are opt-in. Install explicitly into their disposable test state:
 
 ```sh
 abele-node debugger install js --state-dir .scratch/debugger-integration/state
-ABELE_DEBUGGER_LOCAL_TEST=1 npx vitest run tests/debugger/local-js.test.ts
+ABELE_DEBUGGER_LOCAL_TEST=1 npx vitest run tests/debugger/local-js.test.ts tests/trace/local-run.test.ts
 ```
+
+They stop, inspect and step a synthetic program, and record values at a record point of
+a JavaScript program and of a TypeScript program through its source map.
 
 The test never installs anything itself; ordinary CI skips it when the adapter is
 absent. It checks a tiny node-owned synthetic JS program, inspection, stepping and

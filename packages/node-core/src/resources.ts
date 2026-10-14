@@ -730,6 +730,8 @@ export class ResourceServices {
     if (method.startsWith('repository.v1.')) return this.repository.request(actor, method, p)
     if (method === 'project.repository_settings')
       return this.repository.settings(actor, p, operation)
+    if (method === 'project.repository_settings.get')
+      return this.repository.settingsOf(String(p.project_id))
     if (RESOURCE_MUTATIONS.includes(method as (typeof RESOURCE_MUTATIONS)[number])) {
       const previous = this.core.operationReceipt(actor, method, p, operation)
       if (previous) return previous.result

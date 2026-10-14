@@ -389,3 +389,16 @@ it.each([
     expect(humanError(new Error(code + suffix))).toBe(`${explanation}. (${code})`)
   }
 })
+
+it('says in one line which JavaScript debugger it installed, not every file it checked', () => {
+  const text = humanOutput(['debugger', 'install', 'js'], {
+    version: '1.140.0',
+    sha256: 'a'.repeat(64),
+    license: 'MIT',
+    url: 'https://example.invalid/adapter.tar.gz',
+    files: { 'src/dapDebugServer.js': 'b'.repeat(64), LICENSE: 'c'.repeat(64) },
+  })
+  expect(text).toBe(
+    'Installed the JavaScript debugger 1.140.0 (MIT, 2 files checked against its pinned archive).'
+  )
+})

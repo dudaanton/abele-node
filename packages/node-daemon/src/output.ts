@@ -104,6 +104,8 @@ export function humanOutput(
         (item) =>
           `${line(item.operation_id)} (${line(item.installation_id)}): ${line(item.reconciliation)} — ${line(item.reason)}${item.state === 'outcome_unknown' ? (item.reservation_retained === true ? '. Reservation retained; check again after the Git process/state is settled.' : '. No reservation confirmed; deletion unresolved. Check node state before proceeding.') : '. Observed without replaying removal.'}`
       )
+    case 'debugger':
+      return `Installed the JavaScript debugger ${line(r.version)} (${line(r.license)}, ${Object.keys(record(r.files)).length} files checked against its pinned archive).`
     case 'service':
       return [
         `Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`,

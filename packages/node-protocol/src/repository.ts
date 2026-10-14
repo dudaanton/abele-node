@@ -265,6 +265,8 @@ export const RepositoryMethodSchemas = {
       default_branch: ref.nullable().optional(),
     })
     .strict(),
+  // A read of its own: the project's answer stays the shape released clients parse strictly.
+  'project.repository_settings.get': z.object({ project_id: id }).strict(),
   'repository.v1.editing': RepositoryEditingSchema,
   'repository.v1.editing.get': z.object(target).strict(),
   'repository.v1.write': RepositoryWriteSchema,

@@ -5,9 +5,8 @@ enabled, authorized coordinator RPCs. B5 adds gated agent tools, cursor waits an
 current-state delivery; target startup and plugin UI remain unavailable. See
 [agent tools and timers](debugger-agent-tools.md) and
 [shared control and authorization](debugger-control.md). B2 added
-an internal bounded transport/driver and a native JS/TS profile that remains
-audit-blocked: there is no approved adapter pin, so no production adapter is
-installed or target started. See
+an internal bounded transport/driver and a native JS/TS profile, which runs programs
+once the owner-approved js-debug pin is explicitly installed. See
 [Native JS/TS infrastructure](debugger-js-profile.md) for the audit and host profile.
 `docs/debug-probe.md` describes separate experimental feasibility work; its adapter
 pins and experimental opt-in are not production dependencies.
@@ -23,8 +22,8 @@ not implicitly made into a managed workspace.
 
 The internal `NodeCore` constructor option `debuggerEnabled` defaults to false.
 Only an explicitly enabled core advertises `debugger_v1`, whose evidence states
-that this is bounded-state/DAP/shared-control infrastructure with an audit-blocked
-JS profile. `profiles()` returns an empty list while no approved adapter pin exists.
+that this is bounded-state/DAP/shared-control infrastructure with a pinned JS
+profile. `profiles()` returns an empty list until the pinned adapter is installed.
 The native profile also requires its separate explicit switch. There is no daemon
 flag enabling real profiles. B3's `--debugger` flag enables authorized infrastructure
 only. Declarations are deliberately **not** merged into ordinary routable/offline

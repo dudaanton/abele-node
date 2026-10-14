@@ -80,6 +80,15 @@ export function reduceDebugger(
       // Correlate against inventory at request time, not receipt time. A stale
       // reply cannot remove newly discovered threads or certify completeness.
       if (event.inventory_revision !== state.thread_inventory_revision) break
+      const known = state.threads.map((t) => t.thread_id)
+      if (ids.length === known.length && ids.every((id) => known.includes(id))) {
+        // The same threads, now certified complete: nothing ran or stopped, so a stop and its
+        // handles stay what they were.
+        for (const t of event.threads)
+          state.threads.find((x) => x.thread_id === t.id)!.name = t.name
+        state.thread_inventory = 'complete'
+        break
+      }
       state.threads = event.threads.map((t) => ({
         ...(state.threads.find((old) => old.thread_id === t.id) ?? {
           status: state.all_threads_status,
@@ -226,7 +235,9 @@ export function reduceDebugger(
         bp.status = !result.verified
           ? 'rejected'
           : (result.line !== undefined && result.line !== bp.line) ||
-              (result.column !== undefined && result.column !== bp.column)
+              (result.column !== undefined &&
+                bp.column !== undefined &&
+                result.column !== bp.column)
             ? 'relocated'
             : 'verified'
       }

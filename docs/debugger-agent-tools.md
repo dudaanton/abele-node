@@ -1,8 +1,8 @@
 # Debugger agent tools and current-state delivery (B5)
 
 B5 is **opt-in infrastructure**, not the completed debugger release. `--debugger`
-(or the trusted core option) must be enabled. Real profiles remain audit-blocked;
-there is no target startup, renderer attachment, arbitrary DAP, source export or
+(or the trusted core option) must be enabled. Programs are started only by the owner
+(`debugger.v1.start`, see [recorded runs](trace.md#starting-a-program)); there is no agent target startup, renderer attachment, arbitrary DAP, source export or
 plugin debugger UI here. See [shared authorization](debugger-control.md),
 [state contracts](debugger-v1.md) and [the native profile gate](debugger-js-profile.md).
 
