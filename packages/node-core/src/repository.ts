@@ -33,6 +33,7 @@ import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
 import { WorktreeMonitor, pathMetadata, sourceMetadata } from './worktree-monitor.js'
+import { ChangeStreams, baselineOf } from './repository-changes.js'
 import { decodeGit, parseWorktrees, type GitCommand } from './git.js'
 
 const hash = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex')
@@ -163,12 +164,18 @@ interface Subscription {
   owner: AuthorityContext
   target: Target
   fingerprint: string
+  /** What a reader sees: announced only when this moves, never on a hint alone. */
+  visible: string
   expires: number
   watchers: FSWatcher[]
   timer?: NodeJS.Timeout
   pending?: NodeJS.Timeout
   checking: boolean
   dirty?: 'filesystem' | 'reconciliation' | 'overflow'
+  /** A change-stream watcher: gets numbered batches instead of invalidations. */
+  changes: boolean
+  monitor?: WorktreeMonitor
+  detach?: () => void
 }
 
 /** Repository targets deliberately do not enter the managed-workspace/provider tables. */
@@ -203,6 +210,7 @@ export class RepositoryService {
   private cursors = new Map<string, Continuation>()
   private comparisons = new Map<string, Comparison>()
   private subscriptions = new Map<string, Subscription>()
+  readonly changes = new ChangeStreams(() => randomUUID())
   private workers = new Set<Worker>()
   private reconciliations = new Set<Promise<void>>()
   private active = 0
@@ -254,8 +262,10 @@ export class RepositoryService {
     this.clearObjectCache()
     for (const row of this.r.core.db
       .prepare('SELECT worktree_id FROM repository_targets WHERE project_id=?')
-      .all(id) as { worktree_id: string }[])
+      .all(id) as { worktree_id: string }[]) {
       this.dropMonitor(row.worktree_id)
+      this.changes.drop(row.worktree_id)
+    }
     this.r.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(id)
     this.r.core.db.prepare('UPDATE repository_targets SET active=0 WHERE project_id=?').run(id)
     this.r.core.db
@@ -311,6 +321,7 @@ export class RepositoryService {
           if (targets.has(c.target)) this.comparisons.delete(id)
         for (const id of targets) {
           this.dropMonitor(id)
+          this.changes.drop(id)
           core.db.prepare('DELETE FROM repository_contents WHERE worktree_id=?').run(id)
           core.db.prepare('DELETE FROM repository_edit_permissions WHERE worktree_id=?').run(id)
         }
@@ -1989,20 +2000,24 @@ export class RepositoryService {
       count = method.endsWith('.commit') ? 1 : Number(p.limit)
     let more = false,
       size = 1024
-    for (let i = 0; i <= count; i++) {
-      const f = decodeGit(
-        await this.r.git.run(target.path, {
-          kind: 'history',
-          commit,
-          offset: offset + i,
-          limit: 1,
-          ...(p.path ? { path: String(p.path) } : {}),
-        })
-      ).split('\0')
-      if (!f[0]?.trim()) break
-      if (f.length !== 8) throw new ChannelError('unsupported_commit_metadata')
+    // One Git process reads the whole page plus the row that says whether there is more.
+    const fields = decodeGit(
+      await this.r.git.run(target.path, {
+        kind: 'history',
+        commit,
+        offset,
+        limit: method.endsWith('.commit') ? 1 : count + 1,
+        ...(p.path ? { path: String(p.path) } : {}),
+      })
+    ).split('\0')
+    if (fields.length % 7 !== 1 || fields[fields.length - 1]!.trim())
+      throw new ChannelError('unsupported_commit_metadata')
+    for (let i = 0; i + 7 < fields.length; i += 7) {
+      const f = fields.slice(i, i + 7)
+      if (!/^[a-f0-9]{40,64}$/.test(f[0]!.trim()) || !/^(?:[a-f0-9]{40,64}(?: |$))*$/.test(f[1]!))
+        throw new ChannelError('unsupported_commit_metadata')
       const row = {
-        commit: f[0].trim(),
+        commit: f[0]!.trim(),
         parents: f[1]!.split(' ').filter(Boolean),
         author: f[2]!,
         email: f[3]!,
@@ -2427,20 +2442,72 @@ export class RepositoryService {
     if (s.timer) clearInterval(s.timer)
     if (s.pending) clearTimeout(s.pending)
     for (const w of s.watchers) w.close()
+    s.detach?.()
     this.subscriptions.delete(id)
+    if (
+      s.changes &&
+      ![...this.subscriptions.values()].some(
+        (other) => other.changes && other.target.worktree_id === s.target.worktree_id
+      )
+    )
+      this.changes.idle(s.target.worktree_id)
+  }
+  private async changeBaseline(target: Target) {
+    const snapshot = await this.workingState(target)
+    return baselineOf(snapshot, snapshot.monitor.gitdir)
   }
   private async watchFingerprint(target: Target) {
     const monitor = await this.monitor(target)
     await this.configureMonitor(target, monitor)
+    const refs = [
+      (await this.r.git.run(target.path, { kind: 'refs' })).toString('base64'),
+      (await this.r.git.run(target.path, { kind: 'worktrees' })).toString('base64'),
+    ]
+    return {
+      cheap: hash(
+        JSON.stringify([
+          monitor.reliable ? monitor.signature() : (await this.workingState(target)).fingerprint,
+          ...refs,
+        ])
+      ),
+      refs,
+    }
+  }
+  /**
+   * The monitor's signature moves on things no reader sees: an index rewritten by another
+   * tool's `git status`, ignored files, a directory's time after a temporary file came and
+   * went. Only HEAD, the visible files with their stamps, their states and the refs count.
+   */
+  private async watchVisible(target: Target, watched: { cheap: string; refs: string[] }) {
+    let snapshot: WorkingSnapshot
+    try {
+      snapshot = await this.workingState(target)
+    } catch (error) {
+      // Too large or too busy to enumerate: every hint counts, as before.
+      if (error instanceof ChannelError && ['scan_limit', 'stale_revision'].includes(error.code))
+        return watched.cheap
+      throw error
+    }
     return hash(
       JSON.stringify([
-        monitor.reliable ? monitor.signature() : (await this.workingState(target)).fingerprint,
-        (await this.r.git.run(target.path, { kind: 'refs' })).toString('base64'),
-        (await this.r.git.run(target.path, { kind: 'worktrees' })).toString('base64'),
+        snapshot.head,
+        snapshot.status,
+        snapshot.files.map((file) => [
+          file.path,
+          file.kind,
+          file.oid,
+          snapshot.stamps.get(file.path),
+        ]),
+        ...watched.refs,
       ])
     )
   }
-  private async subscribe(actor: AuthorityContext, target: Target) {
+  private async subscribe(
+    actor: AuthorityContext,
+    target: Target,
+    cursor?: { stream_id: string; revision: number } | null
+  ) {
+    const changes = cursor !== undefined
     for (const [key, s] of this.subscriptions)
       if (
         s.expires < Date.now() ||
@@ -2449,15 +2516,21 @@ export class RepositoryService {
       )
         this.unwatch(key)
     if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
+    const watched = await this.watchFingerprint(target)
     const id = randomUUID(),
       s: Subscription = {
         owner: actor,
         target,
-        fingerprint: await this.watchFingerprint(target),
+        fingerprint: watched.cheap,
+        visible: await this.watchVisible(target, watched),
         expires: Date.now() + 60000,
         watchers: [],
         checking: false,
+        changes,
       }
+    const stream = changes
+      ? await this.changes.open(target.worktree_id, () => this.changeBaseline(target))
+      : undefined
     // Initial fingerprinting yields to token revocation, opt-out and shutdown.
     // Recheck before allocating timers/handles, not just when publishing the first hint.
     if (this.stopped) throw new ChannelError('resource_busy')
@@ -2471,6 +2544,12 @@ export class RepositoryService {
         this.unwatch(key)
     if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
     this.subscriptions.set(id, s)
+    // Decided as the subscription takes over, so no batch falls between the answer and it.
+    const follows = changes
+      ? this.changes.follow(target.worktree_id, actor.installation_id, cursor ?? null)
+      : false
+    const position = changes ? this.changes.position(target.worktree_id) : undefined
+    if (changes) this.changes.watched(target.worktree_id)
     const notify = (reason: 'filesystem' | 'reconciliation' | 'reconnect' | 'overflow') => {
       this.r.core.authority.check(actor, 'publish', target.worktree_id)
       this.config(target.project_id)
@@ -2487,6 +2566,45 @@ export class RepositoryService {
           generation: randomUUID(),
         }
       )
+    }
+    const publish = async (reason: 'change' | 'overflow' | 'unavailable') => {
+      const batch = await this.changes.advance(
+        target.worktree_id,
+        () => this.changeBaseline(target),
+        reason
+      )
+      if (!batch) return
+      // One revision, sent to every change watcher of this worktree.
+      for (const [key, other] of this.subscriptions) {
+        if (!other.changes || other.target.worktree_id !== target.worktree_id) continue
+        try {
+          this.r.core.authority.check(other.owner, 'publish', target.worktree_id)
+          if (target.kind === 'external' && !this.config(target.project_id).external_read)
+            throw new ChannelError('unauthorized')
+          this.r.core.append(
+            'catalog',
+            'repository.changed',
+            { kind: 'installation', installation_id: other.owner.installation_id },
+            {
+              project_id: target.project_id,
+              worktree_id: target.worktree_id,
+              stream_id: batch.stream_id,
+              revision: batch.revision,
+              ...batch.body,
+            }
+          )
+          this.changes.sent(target.worktree_id, other.owner.installation_id, batch.revision)
+        } catch {
+          this.unwatch(key)
+        }
+      }
+    }
+    const attach = async () => {
+      const monitor = await this.monitor(target)
+      if (s.monitor === monitor || !this.subscriptions.has(id)) return
+      s.detach?.()
+      s.monitor = monitor
+      s.detach = monitor.listen((overflow) => (overflow ? run('overflow') : schedule()))
     }
     const reconcile = async (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
       if (this.stopped || !this.subscriptions.has(id)) return
@@ -2510,15 +2628,28 @@ export class RepositoryService {
         }
         this.r.core.authority.check(actor, 'resource', target.worktree_id)
         await this.validate(target)
-        const fingerprint = await this.watchFingerprint(target)
+        if (changes) await attach()
+        const watched = await this.watchFingerprint(target)
         if (this.stopped || !this.subscriptions.has(id)) return
         if (s.expires < Date.now()) {
           this.unwatch(id)
           return
         }
-        if (fingerprint !== s.fingerprint || reason === 'overflow' || reason === 'filesystem') {
-          s.fingerprint = fingerprint
-          notify(reason)
+        if (changes) {
+          // A stream watcher diffs what clients show, so any hint is worth a look; an unchanged
+          // view sends no batch.
+          if (watched.cheap !== s.fingerprint || reason === 'overflow' || reason === 'filesystem') {
+            s.fingerprint = watched.cheap
+            await publish(reason === 'overflow' ? 'overflow' : 'change')
+          }
+        } else if (watched.cheap !== s.fingerprint || reason === 'overflow') {
+          s.fingerprint = watched.cheap
+          const visible = await this.watchVisible(target, watched)
+          if (this.stopped || !this.subscriptions.has(id)) return
+          if (visible !== s.visible || reason === 'overflow') {
+            s.visible = visible
+            notify(reason)
+          }
         }
       } catch (error) {
         // A moved/missing directory is itself an invalidation. Do not silently abandon the UI.
@@ -2530,7 +2661,8 @@ export class RepositoryService {
           )
         ) {
           try {
-            notify(reason)
+            if (changes) await publish('unavailable')
+            else notify(reason)
           } catch {
             /* authorization may have disappeared too */
           }
@@ -2576,11 +2708,22 @@ export class RepositoryService {
     s.timer = setInterval(() => {
       run('reconciliation')
     }, 2000)
-    notify('reconnect')
+    if (!stream) {
+      notify('reconnect')
+      return {
+        subscription_id: id,
+        expires_at: new Date(s.expires).toISOString(),
+        refresh_required: true,
+      }
+    }
+    // Hear nested edits at once, and describe anything that happened while nobody watched.
+    await attach()
+    schedule()
     return {
       subscription_id: id,
       expires_at: new Date(s.expires).toISOString(),
-      refresh_required: true,
+      refresh_required: !follows,
+      changes: position ?? stream,
     }
   }
   request(actor: AuthorityContext, method: string, p: Record<string, unknown>): Promise<unknown> {
@@ -2735,7 +2878,11 @@ export class RepositoryService {
             result = await this.r.git.bounded(5000, () => this.search(actor, target, method, p))
             break
           case 'repository.v1.watch':
-            result = await this.subscribe(actor, target)
+            result = await this.subscribe(
+              actor,
+              target,
+              p.changes as { stream_id: string; revision: number } | null | undefined
+            )
             break
           case 'repository.v1.unwatch': {
             const s = this.subscriptions.get(String(p.subscription_id))
@@ -2794,6 +2941,7 @@ export class RepositoryService {
     this.snapshots.clear()
     this.clearObjectCache()
     for (const id of this.subscriptions.keys()) this.unwatch(id)
+    this.changes.clear()
     await Promise.all([...this.workers].map((w) => w.terminate()))
     await Promise.allSettled([...this.reconciliations])
     this.workers.clear()

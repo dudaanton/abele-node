@@ -147,3 +147,74 @@ it('uses the real client/daemon boundary for browsing, retained bytes, live inva
   )
   await client.repository.unwatch({ worktree_id, subscription_id: renewed.subscription_id })
 }, 30000)
+it('streams change batches through the real client and asks for a reread after a node restart', async () => {
+  mkdirSync('.scratch', { recursive: true })
+  const dir = mkdtempSync(resolve('.scratch/repository-client-changes-'))
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }))
+  const repo = join(dir, 'repo'),
+    state = join(dir, 'state')
+  mkdirSync(join(repo, 'nested'), { recursive: true })
+  const git = (...args: string[]) => {
+    const result = spawnSync('/usr/bin/git', args, { cwd: repo, encoding: 'utf8' })
+    expect(result.status, result.stderr).toBe(0)
+  }
+  git('init', '-b', 'trunk')
+  git('config', 'user.name', 'Fixture')
+  git('config', 'user.email', 'fixture@example.invalid')
+  writeFileSync(join(repo, 'nested', 'sample'), 'fixture\n')
+  git('add', '.')
+  git('commit', '-m', 'fixture')
+  const token = (await offlineToken(state, { action: 'create', value: 'fixture' })) as {
+    token: string
+  }
+  let daemon = await startDaemon(state, 0)
+  cleanup.push(() => daemon.stop())
+  const store = new MemoryClientStore()
+  const makeClient = () =>
+    new NodeClient(
+      {
+        url: `ws://127.0.0.1:${daemon.port}/channel`,
+        profile: 'local-token-v1',
+        token: token.token,
+      },
+      store
+    )
+  let client = makeClient()
+  cleanup.push(() => client.disconnect())
+  await client.connect()
+  const project = await client.registerProject(repo, 'untrusted')
+  expect(
+    ((await client.describe()) as any).capabilities.capabilities.repository_changes_v1.status
+  ).toBe('supported')
+  const worktree_id = (await client.repository.worktrees({ project_id: project.project_id }))
+    .entries[0]!.worktree_id
+  await client.subscribe('catalog')
+  const lease = await client.repository.watch({ worktree_id, changes: null })
+  expect(lease.changes).toEqual({ stream_id: expect.any(String), revision: 0 })
+  const cursor = await client.cursor('catalog')
+  writeFileSync(join(repo, 'nested', 'sample'), 'external edit\n')
+  await until(async () =>
+    (await client.history('catalog')).some((e) => e.seq > cursor && e.type === 'repository.changed')
+  )
+  const batch = (await client.history('catalog')).find((e) => e.type === 'repository.changed')!
+    .data as any
+  expect(batch).toMatchObject({
+    stream_id: lease.changes!.stream_id,
+    revision: 1,
+    complete: true,
+    entries: [{ change: 'modified', entry: { path: 'nested/sample', size: 14 } }],
+    git: { status: [{ path: 'nested/sample', entry: { index: ' ', worktree: 'M' } }] },
+  })
+  await client.disconnect()
+  await daemon.stop()
+  daemon = await startDaemon(state, 0)
+  client = makeClient()
+  await client.connect()
+  const renewed = await client.repository.watch({
+    worktree_id,
+    changes: { stream_id: lease.changes!.stream_id, revision: 1 },
+  })
+  expect(renewed.refresh_required).toBe(true)
+  expect(renewed.changes!.stream_id).not.toBe(lease.changes!.stream_id)
+  await client.repository.unwatch({ worktree_id, subscription_id: renewed.subscription_id })
+}, 30000)

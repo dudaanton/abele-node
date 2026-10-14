@@ -12,13 +12,18 @@ import {
   NodePathMethodSchemas,
   NODE_PATH_MUTATIONS,
   WorkspaceWatchInvalidationSchema,
+  WorkspaceChangeBatchSchema,
   ExecutionTargetSchema,
   SessionTargetChangedSchema,
 } from './node-path.js'
 export * from './node-path.js'
 import { ExpectedExecutionTargetSchema } from './turn.js'
 export * from './turn.js'
-import { RepositoryMethodSchemas, RepositoryInvalidationSchema } from './repository.js'
+import {
+  RepositoryMethodSchemas,
+  RepositoryInvalidationSchema,
+  RepositoryChangeBatchSchema,
+} from './repository.js'
 export * from './repository.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
 export * from './files.js'
@@ -156,7 +161,9 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
 ])
 const EventPayloads = {
   'repository.invalidated': RepositoryInvalidationSchema,
+  'repository.changed': RepositoryChangeBatchSchema,
   'workspace.invalidated': WorkspaceWatchInvalidationSchema,
+  'workspace.files_changed': WorkspaceChangeBatchSchema,
   'stream.redacted': z.object({ refresh_required: z.literal(true) }).strict(),
   'delegation.created': DelegationSchema,
   'delegation.progress': DelegationMessageSchema,

@@ -35,8 +35,9 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
 - Workspace browsing, file/content reads, Git history, retained immutable diffs
   and anchored review comments submitted as session inputs.
 - Opt-in external-worktree discovery and versioned repository reads: frozen trees,
-  working observations, comparisons, blame, bounded node-side search and change
-  notifications. See [repository API and bounds](docs/repository-view.md).
+  working observations, comparisons, blame, bounded node-side search, change
+  notifications and a numbered change stream that lets a client patch its file tree
+  in place instead of rereading it. See [repository API and bounds](docs/repository-view.md).
 - Bounded UTF-8 file editing/creation with content-version checks, durable save
   receipts, protected recovery copies and explicit restore. See [editing](docs/editing.md).
 - Per-installation tokens, revocation, status/doctor commands and macOS LaunchAgent

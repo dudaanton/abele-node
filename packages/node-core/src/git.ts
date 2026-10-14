@@ -483,7 +483,7 @@ export class GitRunner {
           ? Math.min(this.outputBytes, 32768)
           : command.kind === 'blob'
             ? 16 * 1024 * 1024
-            : ['view.diff', 'show', 'patch', 'blame'].includes(command.kind)
+            : ['view.diff', 'show', 'patch', 'blame', 'history'].includes(command.kind)
               ? 8 * 1024 * 1024
               : ['tracked', 'tree', 'untracked', 'visible.untracked', 'status'].includes(
                     command.kind

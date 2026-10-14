@@ -1,6 +1,10 @@
 import { z } from 'zod'
 import { CommitSchema, RelativePathSchema } from './files.js'
-import { RepositoryRefSchema } from './repository.js'
+import {
+  RepositoryChangesCursorSchema,
+  RepositoryRefSchema,
+  RepositoryTreeChangeSchema,
+} from './repository.js'
 import { TrustSchema } from './resources.js'
 const id = z.string().min(1).max(128)
 export const AbsolutePathSchema = z
@@ -150,7 +154,9 @@ export const NodePathMethodSchemas = {
       limit: z.number().int().min(1).max(100).default(100),
     })
     .strict(),
-  'workspace.watch': z.object({ workspace_id: id }).strict(),
+  'workspace.watch': z
+    .object({ workspace_id: id, changes: RepositoryChangesCursorSchema.nullable().optional() })
+    .strict(),
   'workspace.unwatch': z.object({ workspace_id: id, subscription_id: id }).strict(),
 } as const
 export const NODE_PATH_MUTATIONS = [
@@ -165,3 +171,30 @@ export const NODE_PATH_MUTATIONS = [
 ] as const
 export type NodePathMethod = keyof typeof NodePathMethodSchemas
 export type NodePathParams<M extends NodePathMethod> = z.input<(typeof NodePathMethodSchemas)[M]>
+
+const workspaceBatch = {
+  workspace_id: id,
+  stream_id: id,
+  revision: z.number().int().positive(),
+}
+/**
+ * `workspace.files_changed`: a plain folder's numbered batches, for a watcher that asked with
+ * `changes`. Revisions count up by one per stream; anything else is a gap.
+ */
+export const WorkspaceChangeBatchSchema = z.discriminatedUnion('complete', [
+  z
+    .object({
+      ...workspaceBatch,
+      complete: z.literal(true),
+      entries: z.array(RepositoryTreeChangeSchema).max(2048),
+    })
+    .strict(),
+  z
+    .object({
+      ...workspaceBatch,
+      complete: z.literal(false),
+      reason: z.enum(['overflow', 'limit', 'unavailable']),
+    })
+    .strict(),
+])
+export type WorkspaceChangeBatch = z.infer<typeof WorkspaceChangeBatchSchema>

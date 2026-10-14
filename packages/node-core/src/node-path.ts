@@ -11,6 +11,7 @@ import {
   mkdirSync,
   watch,
   type FSWatcher,
+  type Stats,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -24,6 +25,7 @@ import {
 } from '@abele/node-protocol'
 import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
+import type { ChangeBaseline } from './repository-changes.js'
 const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex')
 const identity = (path: string) => {
   const s = lstatSync(path)
@@ -53,7 +55,11 @@ interface Lease {
   timer: NodeJS.Timeout
   watcher?: FSWatcher
   pending?: NodeJS.Timeout
+  /** A change-stream watcher: gets numbered `workspace.files_changed` batches instead of hints. */
+  changes: boolean
 }
+/** Plain folders share the repository's numbered streams under their own keys. */
+const streamKey = (workspace: string) => 'workspace:' + workspace
 /** Owner picker handles are not agent filesystem authority. Effects never replay unknown intents. */
 export class NodePathService {
   fault?: () => void
@@ -212,6 +218,77 @@ export class NodePathService {
     walk(root, 0)
     return hash(records)
   }
+  /** The folder as a change stream describes it: rows, with an inode to recognise renames. */
+  private baseline(root: string, pin: string): ChangeBaseline {
+    // Rows are sent to the client, so the walk stays inside the pinned folder: a folder swapped
+    // for a link while it is read makes the batch unavailable rather than describing elsewhere.
+    if (identity(root) !== pin) throw new ChannelError('stale_resource')
+    const entries: ChangeBaseline['entries'] = new Map(),
+      walk = (path: string, prefix: string, depth: number, before?: Stats) => {
+        if (depth > 32 || entries.size >= 10000) throw new ChannelError('scan_limit')
+        const names = readdirSync(path).sort()
+        if (before) {
+          const after = lstatSync(path)
+          if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino)
+            throw new ChannelError('unsafe_path')
+        }
+        for (const name of names) {
+          if (name.toLowerCase() === '.git') continue
+          const full = join(path, name),
+            s = lstatSync(full),
+            relative = prefix ? prefix + '/' + name : name
+          const kind = s.isSymbolicLink() ? 'symlink' : s.isDirectory() ? 'directory' : 'file'
+          entries.set(relative, {
+            entry: { path: relative, name, kind, oid: null, size: kind === 'file' ? s.size : null },
+            identity: `${s.dev}:${s.ino}`,
+            // A folder's own timestamps move with every child; only its children describe it.
+            signature:
+              kind === 'directory'
+                ? 'directory'
+                : JSON.stringify([s.mode, s.size, s.mtimeMs, s.ctimeMs]),
+          })
+          if (kind === 'directory') walk(full, relative, depth + 1, s)
+          if (entries.size >= 10000) throw new ChannelError('scan_limit')
+        }
+      }
+    walk(root, '', 0)
+    if (identity(root) !== pin) throw new ChannelError('stale_resource')
+    return { entries, status: new Map(), head: null, branch: null, detached: false }
+  }
+  /** The next batch of a plain folder, sent once to every change watcher of it. */
+  private async publish(
+    workspace: string,
+    root: string,
+    pin: string,
+    reason: 'change' | 'overflow' | 'unavailable'
+  ) {
+    const streams = this.r.repository.changes,
+      key = streamKey(workspace)
+    const compute = async () => this.baseline(root, pin)
+    // A folder that could not be walked is announced, so no client keeps a stale tree.
+    const batch = await streams
+      .advance(key, compute, reason)
+      .catch(() => streams.advance(key, compute, 'unavailable'))
+    if (!batch) return
+    const body = batch.body.complete
+      ? { complete: true as const, entries: batch.body.entries }
+      : batch.body
+    for (const [id, l] of this.leases) {
+      if (!l.changes || l.workspace !== workspace) continue
+      try {
+        this.r.core.authority.check(l.owner, 'publish', workspace)
+        this.r.core.append(
+          'catalog',
+          'workspace.files_changed',
+          { kind: 'installation', installation_id: l.owner.installation_id },
+          { workspace_id: workspace, stream_id: batch.stream_id, revision: batch.revision, ...body }
+        )
+        streams.sent(key, l.owner.installation_id, batch.revision)
+      } catch {
+        this.unwatch(id)
+      }
+    }
+  }
   private unwatch(id: string) {
     const l = this.leases.get(id)
     if (!l) return
@@ -219,6 +296,11 @@ export class NodePathService {
     if (l.pending) clearTimeout(l.pending)
     l.watcher?.close()
     this.leases.delete(id)
+    if (
+      l.changes &&
+      ![...this.leases.values()].some((other) => other.changes && other.workspace === l.workspace)
+    )
+      this.r.repository.changes.idle(streamKey(l.workspace))
   }
   private notify(l: Lease, reason: 'filesystem' | 'reconciliation' | 'reconnect' | 'overflow') {
     this.r.core.authority.check(l.owner, 'publish', l.workspace)
@@ -231,7 +313,13 @@ export class NodePathService {
       { workspace_id: l.workspace, reason, generation: randomUUID() }
     )
   }
-  private subscribe(actor: AuthorityContext, workspace: string) {
+  private async subscribe(
+    actor: AuthorityContext,
+    workspace: string,
+    cursor?: { stream_id: string; revision: number } | null
+  ) {
+    const changes = cursor !== undefined,
+      streams = this.r.repository.changes
     for (const [id, l] of this.leases)
       if (
         l.expires < Date.now() ||
@@ -246,6 +334,24 @@ export class NodePathService {
     const id = randomUUID(),
       pin = identity(w.path),
       fingerprint = this.fingerprint(w.path)
+    if (changes) {
+      await streams.open(streamKey(workspace), async () => this.baseline(w.path, pin))
+      // Opening yields; a lease of this client may have been taken meanwhile.
+      if (this.stopped) throw new ChannelError('resource_busy')
+      for (const [other, l] of this.leases)
+        if (l.owner.installation_id === actor.installation_id && l.workspace === workspace)
+          this.unwatch(other)
+      if (this.leases.size >= 16) throw new ChannelError('resource_busy')
+    }
+    const hint = (l: Lease, reason: 'filesystem' | 'reconciliation' | 'overflow') => {
+      if (!l.changes) return this.notify(l, reason)
+      void this.publish(
+        workspace,
+        l.root,
+        l.identity,
+        reason === 'overflow' ? 'overflow' : 'change'
+      ).catch(() => {})
+    }
     const check = (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
       const l = this.leases.get(id)
       if (!l) return
@@ -256,18 +362,20 @@ export class NodePathService {
       try {
         this.r.core.authority.check(actor, 'resource', workspace)
         if (identity(l.root) !== l.identity) {
-          this.notify(l, 'overflow')
+          hint(l, 'overflow')
           this.unwatch(id)
           return
         }
         const current = this.fingerprint(l.root)
         if (current !== l.fingerprint || reason !== 'reconciliation') {
           l.fingerprint = current
-          this.notify(l, reason)
+          hint(l, reason)
         }
       } catch {
         try {
-          this.notify(l, 'overflow')
+          if (l.changes)
+            void this.publish(workspace, l.root, l.identity, 'unavailable').catch(() => {})
+          else this.notify(l, 'overflow')
         } catch {
           /* revoked */
         }
@@ -282,8 +390,15 @@ export class NodePathService {
       fingerprint,
       expires: Date.now() + 60000,
       timer: setInterval(() => check('reconciliation'), 2000),
+      changes,
     }
     this.leases.set(id, l)
+    // Decided as the lease takes over, so no batch falls between the answer and it.
+    const follows = changes
+      ? streams.follow(streamKey(workspace), actor.installation_id, cursor ?? null)
+      : false
+    const position = changes ? streams.position(streamKey(workspace)) : undefined
+    if (changes) streams.watched(streamKey(workspace))
     try {
       l.watcher = watch(w.path, () => {
         if (!l.pending)
@@ -296,11 +411,24 @@ export class NodePathService {
     } catch {
       /* bounded reconciliation remains authoritative */
     }
-    this.notify(l, 'reconnect')
+    if (!position) {
+      this.notify(l, 'reconnect')
+      return {
+        subscription_id: id,
+        expires_at: new Date(l.expires).toISOString(),
+        refresh_required: true,
+      }
+    }
+    // Describe anything that happened while nobody watched.
+    l.pending = setTimeout(() => {
+      l.pending = undefined
+      check('filesystem')
+    }, 100)
     return {
       subscription_id: id,
       expires_at: new Date(l.expires).toISOString(),
-      refresh_required: true,
+      refresh_required: !follows,
+      changes: position,
     }
   }
   async request(
@@ -449,7 +577,11 @@ export class NodePathService {
       case 'workspace.search':
         return this.r.search.request(actor, p)
       case 'workspace.watch':
-        return this.subscribe(actor, String(p.workspace_id))
+        return this.subscribe(
+          actor,
+          String(p.workspace_id),
+          p.changes as { stream_id: string; revision: number } | null | undefined
+        )
       case 'workspace.unwatch': {
         const l = this.leases.get(String(p.subscription_id))
         if (

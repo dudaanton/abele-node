@@ -177,13 +177,70 @@ export const RepositorySettingsSchema = z
   .object({ project_id: id, external_read: z.boolean(), default_branch: z.string().nullable() })
   .strict()
 export const RepositoryUnwatchSchema = z.object({ removed: z.literal(true) }).strict()
+/** Where a change-stream client stands: the node run's stream and the last batch applied. */
+export const RepositoryChangesCursorSchema = z
+  .object({ stream_id: id, revision: z.number().int().nonnegative() })
+  .strict()
+export type RepositoryChangesCursor = z.infer<typeof RepositoryChangesCursorSchema>
+/**
+ * A lease. Without `changes` in the request it is the legacy shape and the client rereads on
+ * every `repository.invalidated`. With it, `refresh_required: false` means the client's cursor
+ * continues the stream, so applying later `repository.changed` batches keeps its view current.
+ */
 export const RepositoryWatchSchema = z
   .object({
     subscription_id: id,
     expires_at: z.string().datetime(),
-    refresh_required: z.literal(true),
+    refresh_required: z.boolean(),
+    changes: RepositoryChangesCursorSchema.optional(),
   })
   .strict()
+const treeEntry = RepositoryTreeEntrySchema
+/** Applied in order. A renamed or removed folder carries everything under it; an added folder
+ * lists none of its contents, which are read when the folder is opened. */
+export const RepositoryTreeChangeSchema = z.discriminatedUnion('change', [
+  z.object({ change: z.literal('added'), entry: treeEntry }).strict(),
+  z.object({ change: z.literal('modified'), entry: treeEntry }).strict(),
+  z.object({ change: z.literal('renamed'), from: file, entry: treeEntry }).strict(),
+  z.object({ change: z.literal('deleted'), path: file, kind: treeEntry.shape.kind }).strict(),
+])
+export type RepositoryTreeChange = z.infer<typeof RepositoryTreeChangeSchema>
+/** HEAD, branch and the changed status rows; `entry: null` means the path is clean again. */
+export const RepositoryGitChangeSchema = z
+  .object({
+    head: CommitSchema.nullable(),
+    branch: z.string().nullable(),
+    detached: z.boolean(),
+    status: z
+      .array(z.object({ path: file, entry: StatusEntrySchema.nullable() }).strict())
+      .max(2048),
+  })
+  .strict()
+const batch = {
+  project_id: id,
+  worktree_id: id,
+  stream_id: id,
+  revision: z.number().int().positive(),
+}
+/** `repository.changed`. Revisions count up by one per stream; anything else is a gap. */
+export const RepositoryChangeBatchSchema = z.discriminatedUnion('complete', [
+  z
+    .object({
+      ...batch,
+      complete: z.literal(true),
+      entries: z.array(RepositoryTreeChangeSchema).max(2048),
+      git: RepositoryGitChangeSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      ...batch,
+      complete: z.literal(false),
+      reason: z.enum(['overflow', 'limit', 'unavailable']),
+    })
+    .strict(),
+])
+export type RepositoryChangeBatch = z.infer<typeof RepositoryChangeBatchSchema>
 const target = { worktree_id: id }
 export const RepositoryWriteSchema = FileWriteSchema.omit({ workspace_id: true })
   .extend(target)
@@ -283,7 +340,9 @@ export const RepositoryMethodSchemas = {
       limit: z.number().int().min(1).max(100).default(100),
     })
     .strict(),
-  'repository.v1.watch': z.object(target).strict(),
+  'repository.v1.watch': z
+    .object({ ...target, changes: RepositoryChangesCursorSchema.nullable().optional() })
+    .strict(),
   'repository.v1.unwatch': z.object({ ...target, subscription_id: id }).strict(),
 } as const
 export const RepositoryContentChunkSchema = ContentChunkSchema

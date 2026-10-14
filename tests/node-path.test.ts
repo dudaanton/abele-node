@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, renameSync, symlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { WorkspaceChangeBatchSchema } from '../packages/node-protocol/src/index.js'
 
 const dirs: string[] = [],
   cores: NodeCore[] = []
@@ -281,6 +282,68 @@ it('pushes plain folder invalidations on catalog, and stops leases on unwatch', 
     })
   ).toEqual({ removed: true })
 })
+
+it('streams numbered plain folder batches to a watcher that asks for them', async () => {
+  const s = setup()
+  mkdirSync(join(s.folder, 'src'))
+  writeFileSync(join(s.folder, 'src', 'kept.ts'), 'kept')
+  expect(s.core.discovery().supported_capabilities).toContain('workspace_changes_v1')
+  const project = await s.request('project.register', { path: s.folder, trust: 'untrusted' })
+  const workspace = (await s.request('workspace.list', { project_id: project.project_id }))[0]
+  const lease = await s.request('workspace.watch', {
+    workspace_id: workspace.workspace_id,
+    changes: null,
+  })
+  expect(lease).toMatchObject({
+    refresh_required: true,
+    changes: { stream_id: expect.any(String), revision: 0 },
+  })
+  const batches = (after: number) =>
+    s.core
+      .read('catalog', after)
+      .filter((e) => e.type === 'workspace.files_changed')
+      .map((e) => e.data as any)
+  const next = async (change: () => void) => {
+    const before = s.core.head('catalog')
+    change()
+    await expect.poll(() => batches(before).length, { timeout: 8000 }).toBeGreaterThan(0)
+    const [batch] = batches(before)
+    expect(WorkspaceChangeBatchSchema.parse(batch)).toEqual(batch)
+    return batch
+  }
+  let batch = await next(() => writeFileSync(join(s.folder, 'src', 'added.ts'), 'new'))
+  expect(batch).toMatchObject({
+    workspace_id: workspace.workspace_id,
+    stream_id: lease.changes.stream_id,
+    revision: 1,
+    complete: true,
+    entries: [
+      {
+        change: 'added',
+        entry: { path: 'src/added.ts', name: 'added.ts', kind: 'file', oid: null, size: 3 },
+      },
+    ],
+  })
+  batch = await next(() =>
+    renameSync(join(s.folder, 'src', 'added.ts'), join(s.folder, 'moved.ts'))
+  )
+  expect(batch.entries).toEqual([
+    {
+      change: 'renamed',
+      from: 'src/added.ts',
+      entry: expect.objectContaining({ path: 'moved.ts' }),
+    },
+  ])
+  batch = await next(() => rmSync(join(s.folder, 'moved.ts')))
+  expect(batch).toMatchObject({ revision: 3, entries: [{ change: 'deleted', path: 'moved.ts' }] })
+  // A stream watcher is not told to reread for ordinary edits.
+  expect(s.core.read('catalog', 0).filter((e) => e.type === 'workspace.invalidated')).toEqual([])
+  const renewed = await s.request('workspace.watch', {
+    workspace_id: workspace.workspace_id,
+    changes: { stream_id: lease.changes.stream_id, revision: 3 },
+  })
+  expect(renewed.refresh_required).toBe(false)
+}, 30000)
 
 it('expires picker handles and refuses durable unknown effects after restart instead of replaying', async () => {
   const s = setup()

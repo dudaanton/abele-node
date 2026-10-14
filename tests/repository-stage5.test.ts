@@ -317,6 +317,8 @@ it('coalesces rapid hints and reconciles index, HEAD, refs and catalogue changes
   const invalidations = (after: number) =>
     s.core.read('catalog', after).filter((e) => e.type === 'repository.invalidated')
   let before = s.core.head('catalog')
+  // A hint is announced only when something visible changed; twenty of them, one announcement.
+  writeFileSync(join(s.linked, 'file'), 'coalesced\n')
   for (let i = 0; i < 20; i++) subscription.watchers[0].emit('change', 'change', 'file')
   await wait(() => invalidations(before).length > 0)
   await new Promise((r) => setTimeout(r, 200))

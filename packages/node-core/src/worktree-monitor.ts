@@ -33,6 +33,7 @@ export class WorktreeMonitor {
   private configSources: string[] = []
   private excludeSource: string | null = null
   private configured: string | null = null
+  private listeners = new Set<(overflow: boolean) => void>()
   generation = 0
   reliable = true
   closed = false
@@ -48,6 +49,7 @@ export class WorktreeMonitor {
         watcher.on('error', () => {
           this.generation++
           this.reliable = false
+          for (const listener of this.listeners) listener(true)
         })
         this.watchers.push(watcher)
       } catch {
@@ -166,6 +168,14 @@ export class WorktreeMonitor {
       }
     }
     this.generation++
+    for (const listener of this.listeners) listener(false)
+  }
+  /** Hears every change that moves the signature; `overflow` when a watcher failed. */
+  listen(listener: (overflow: boolean) => void) {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
   }
   capture(
     stamps: Map<string, string | null>,
@@ -234,5 +244,6 @@ export class WorktreeMonitor {
     this.generation++
     for (const watcher of this.watchers) watcher.close()
     this.watchers = []
+    this.listeners.clear()
   }
 }

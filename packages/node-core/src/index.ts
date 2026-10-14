@@ -583,6 +583,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported',
           evidence: 'idle-only-catalog-removal; retained-journal; operation-receipts',
         },
+        repository_changes_v1: {
+          status: 'supported',
+          evidence:
+            'repository.v1.watch changes cursor; repository.changed numbered tree and git batches; explicit incomplete',
+        },
+        workspace_changes_v1: {
+          status: 'supported',
+          evidence:
+            'workspace.watch changes cursor; workspace.files_changed numbered plain folder batches; explicit incomplete',
+        },
         node_path_v2: {
           status: 'supported',
           evidence:
@@ -708,7 +718,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   canPublishEvent(actor: AuthorityContext, event: JournalEvent) {
     this.authority.check(actor, 'publish', event.stream_id)
     return (
-      event.type !== 'repository.invalidated' ||
+      !['repository.invalidated', 'repository.changed'].includes(event.type) ||
       this.resources.repository.canPublishInvalidation(event.data)
     )
   }

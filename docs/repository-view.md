@@ -5,8 +5,8 @@ limits, see [Repository view in the README](../README.md#repository-view).
 This page specifies the node/client API; it does not promise a particular plugin
 UI version or register repository endpoints as agent tools.
 
-The node advertises `repository_read_v1`, `repository_notifications_v1` and
-`repository_editing_v1` in `node.describe` and the channel welcome. Requests use `repository.v1.*`; protocol
+The node advertises `repository_read_v1`, `repository_notifications_v1`,
+`repository_changes_v1` and `repository_editing_v1` in `node.describe` and the channel welcome. Requests use `repository.v1.*`; protocol
 schemas live in `@abele/node-protocol`, and `NodeClient.repository` validates both
 requests and results. No repository endpoint takes shell text or arbitrary Git
 arguments. No Git mutations or provider execution are authorized by this feature.
@@ -82,7 +82,7 @@ without the `repository.v1.` prefix and an object argument.
 | `patch`         | Comparison identity and changed path; lazily retained per-file patch                                                                              |
 | `blame`         | Revision/path, starting line and count; content identity and paged attribution                                                                    |
 | `search`        | Explicit revision, query, literal/regex/filename mode, case sensitivity, path glob, repository/changed scope; retained match identities and pages |
-| `watch`         | Worktree; renewable 60-second invalidation lease, immediate refresh requirement                                                                   |
+| `watch`         | Worktree, optional `changes` cursor; renewable 60-second lease (see [change stream](#change-stream))                                              |
 | `unwatch`       | Worktree/subscription identity; releases the lease                                                                                                |
 | `editing.get`   | Worktree; effective `{ worktree_id, enabled }` editing status (registered roots/ready managed targets do not need external approval)              |
 | `editing`       | External worktree and `enabled`; durable owner approval/revocation, returns `{ worktree_id, enabled }`                                            |
@@ -222,27 +222,27 @@ admission was added here. Human Save is an explicit owner action.
 
 ## Bounds and incomplete coverage
 
-| Resource                                  | v1 bound                                                                                                                                                                                                                                                                 |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Ordinary result pages                     | 32 KiB serialized, with envelope headroom                                                                                                                                                                                                                                |
-| Trees, refs, catalogue, changes/status    | 256 entries/page, also byte-bounded                                                                                                                                                                                                                                      |
-| Catalogue enumeration                     | 512 KiB Git output, at most 1,024 worktree records; at most 64 dirty checks per catalogue read, remaining dirty states unknown                                                                                                                                           |
-| Tree/status/path enumeration              | 64 MiB Git stdout plus stderr; tracked/untracked paths consumed as NUL-delimited records; at most 250,000 working paths; limit errors are explicit                                                                                                                       |
-| Ref enumeration                           | 512 KiB Git output                                                                                                                                                                                                                                                       |
-| Working index cache                       | At most 8 monitored worktrees, 32 MiB estimated serialized snapshot footprint including indexes retained by leases; each shared index charged once, ten-minute idle expiry; eviction explicitly stales associated old observations/cursors                               |
-| Blob display                              | 1 MiB automatic, explicit larger load through 16 MiB                                                                                                                                                                                                                     |
-| Content transport                         | 128 KiB bytes/chunk in a channel record below 256 KiB                                                                                                                                                                                                                    |
-| Per-file patches                          | 8 MiB capture ceiling; untracked additions at most 1 MiB, binary additions explicitly unsupported                                                                                                                                                                        |
-| History                                   | 100 commits/page (default 50), 30 KiB maximum individual serialized metadata; a single multi-command read deadline                                                                                                                                                       |
-| Blame                                     | 400 lines default, at most 1,500/request, 1 MiB input, 5-second execution budget; byte-bounded continuations for the selected window                                                                                                                                     |
-| Search                                    | 100 matches/page, at most 1,000 retained matches per scan segment, 750 ms cooperative scan budget / 32 MiB scanned bytes per segment, skip content over 1 MiB and binary content; 1-second hard worker/Git segment budget, 5-second aggregate request budget             |
-| Search regex worker                       | Terminable worker, 32 MiB V8 old-generation heap / 2 MiB stack; terminated on deadline and shutdown                                                                                                                                                                      |
-| Concurrent repository jobs                | 4 total, including watcher reconciliation; excess requests get `resource_busy`                                                                                                                                                                                           |
-| Other Git-backed reads                    | 15-second aggregate multi-command execution budget, bounded subprocess stdout plus stderr                                                                                                                                                                                |
-| Observations/cursors/comparison manifests | Each collection below 128 entries and 8 MiB lease-owned serialized state (shared working arrays charged to the separate index budget), ten-minute leases; oversized admissions fail explicitly before returning an ID                                                    |
-| Retained content                          | 64 MiB global byte-bounded LRU store, at most 16 MiB/item, independent of legacy workspace contents                                                                                                                                                                      |
-| Immutable Git object cache                | 16 MiB / 512 entries byte-bounded memory LRU, at most 1 MiB per item; trees, blob sizes and displayed blobs only                                                                                                                                                         |
-| Watchers                                  | 16 notification leases, at most three handles per lease, 100 ms coalescing, two-second metadata reconciliation, 60-second expiry; working indexes also use up to three recursive watch roots per monitored worktree (OS implementations may use multiple native handles) |
+| Resource                                  | v1 bound                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ordinary result pages                     | 32 KiB serialized, with envelope headroom                                                                                                                                                                                                                                                                                                                                                                   |
+| Trees, refs, catalogue, changes/status    | 256 entries/page, also byte-bounded                                                                                                                                                                                                                                                                                                                                                                         |
+| Catalogue enumeration                     | 512 KiB Git output, at most 1,024 worktree records; at most 64 dirty checks per catalogue read, remaining dirty states unknown                                                                                                                                                                                                                                                                              |
+| Tree/status/path enumeration              | 64 MiB Git stdout plus stderr; tracked/untracked paths consumed as NUL-delimited records; at most 250,000 working paths; limit errors are explicit                                                                                                                                                                                                                                                          |
+| Ref enumeration                           | 512 KiB Git output                                                                                                                                                                                                                                                                                                                                                                                          |
+| Working index cache                       | At most 8 monitored worktrees, 32 MiB estimated serialized snapshot footprint including indexes retained by leases; each shared index charged once, ten-minute idle expiry; eviction explicitly stales associated old observations/cursors                                                                                                                                                                  |
+| Blob display                              | 1 MiB automatic, explicit larger load through 16 MiB                                                                                                                                                                                                                                                                                                                                                        |
+| Content transport                         | 128 KiB bytes/chunk in a channel record below 256 KiB                                                                                                                                                                                                                                                                                                                                                       |
+| Per-file patches                          | 8 MiB capture ceiling; untracked additions at most 1 MiB, binary additions explicitly unsupported                                                                                                                                                                                                                                                                                                           |
+| History                                   | 100 commits/page (default 50), 30 KiB maximum individual serialized metadata; a single multi-command read deadline                                                                                                                                                                                                                                                                                          |
+| Blame                                     | 400 lines default, at most 1,500/request, 1 MiB input, 5-second execution budget; byte-bounded continuations for the selected window                                                                                                                                                                                                                                                                        |
+| Search                                    | 100 matches/page, at most 1,000 retained matches per scan segment, 750 ms cooperative scan budget / 32 MiB scanned bytes per segment, skip content over 1 MiB and binary content; 1-second hard worker/Git segment budget, 5-second aggregate request budget                                                                                                                                                |
+| Search regex worker                       | Terminable worker, 32 MiB V8 old-generation heap / 2 MiB stack; terminated on deadline and shutdown                                                                                                                                                                                                                                                                                                         |
+| Concurrent repository jobs                | 4 total, including watcher reconciliation; excess requests get `resource_busy`                                                                                                                                                                                                                                                                                                                              |
+| Other Git-backed reads                    | 15-second aggregate multi-command execution budget, bounded subprocess stdout plus stderr                                                                                                                                                                                                                                                                                                                   |
+| Observations/cursors/comparison manifests | Each collection below 128 entries and 8 MiB lease-owned serialized state (shared working arrays charged to the separate index budget), ten-minute leases; oversized admissions fail explicitly before returning an ID                                                                                                                                                                                       |
+| Retained content                          | 64 MiB global byte-bounded LRU store, at most 16 MiB/item, independent of legacy workspace contents                                                                                                                                                                                                                                                                                                         |
+| Immutable Git object cache                | 16 MiB / 512 entries byte-bounded memory LRU, at most 1 MiB per item; trees, blob sizes and displayed blobs only                                                                                                                                                                                                                                                                                            |
+| Watchers                                  | 16 notification leases, at most three handles per lease, 100 ms coalescing, two-second metadata reconciliation, 60-second expiry; working indexes also use up to three recursive watch roots per monitored worktree (OS implementations may use multiple native handles); change streams: one per watched worktree, at most 32, idle ones dropped after ten minutes, batches of at most 1024 rows / 192 KiB |
 
 Search runs on the node, never downloads repository archives. Regular expressions
 are ECMAScript, line-oriented and case-configurable; invalid syntax returns
@@ -298,6 +298,86 @@ authorized mutable views, never as permission to recover the redacted content. R
 are drained and workers terminated on shutdown. Frozen commits and retained
 bytes never automatically follow invalidations. Client presentation must preserve
 drafts/selections and decide when to refresh; the plugin integration is separate.
+
+### Change stream
+
+A client of a node advertising `repository_changes_v1` can keep its own copy of a
+working tree and patch it instead of rereading. It asks for this by passing
+`changes` to `watch`: `null` the first time, then the cursor it holds when it
+renews the lease. Old clients omit the field and keep the invalidation contract
+above unchanged; the node never sends them batches.
+
+```ts
+// request
+{ worktree_id, changes: null | { stream_id, revision } }
+// result
+{ subscription_id, expires_at, refresh_required: boolean, changes: { stream_id, revision } }
+```
+
+Each worktree has one numbered stream per node run, shared by every change
+watcher of it. `refresh_required: false` means the cursor sent continues the
+stream: nothing was missed. Otherwise the client rereads the tree and status once
+and then applies batches whose `revision` is greater than the returned one (a
+batch may arrive before the `watch` result; keep it until then). A change watcher
+gets no `repository.invalidated` for filesystem edits or its own lease; it still
+gets them for editing-permission changes and its own saves, and should reread only
+for reasons other than `filesystem`.
+
+Batches arrive on `catalog` as `repository.changed`:
+
+```ts
+{
+  project_id, worktree_id, stream_id, revision,   // revision counts up by one
+  complete: true,
+  entries: (
+    | { change: 'added' | 'modified', entry: RepositoryTreeEntry }
+    | { change: 'renamed', from: path, entry: RepositoryTreeEntry }
+    | { change: 'deleted', path, kind }
+  )[],
+  git: null | {
+    head, branch, detached,                       // branch is the full ref, as in `worktrees`
+    status: { path, entry: StatusEntry | null }[] // null: the path is clean again
+  },
+}
+// or, when the node cannot describe what happened:
+{ project_id, worktree_id, stream_id, revision, complete: false,
+  reason: 'overflow' | 'limit' | 'unavailable' }
+```
+
+Entries are applied in order. A rename keeps the inode under a new name; a
+renamed folder carries everything under it, and `from` names where the client
+holds the row at that point of the batch. A deleted folder stands for its
+contents. An added folder lists none of its contents: read them when the folder
+is opened, through a fresh observation. Applying an entry the client already has
+(an add it saw in its reread) is a no-op, so rereading and then applying a batch
+that overlaps it is safe. `git` is present only when HEAD, the branch or a status
+row changed; a staged edit shows up both as a `modified` entry (its index object
+changed) and as a status row.
+
+Batches are not a replay of filesystem hints. The node diffs the working state
+against the state the previous batch described, so a delayed or merged hint
+delays a change but never loses it; rapid edits coalesce into one batch within
+about 100 ms. The client rereads once when it sees `complete: false`, a revision
+that is not exactly one more than the last it applied, a different `stream_id`
+(the node restarted, or the stream was idle for ten minutes and dropped), or a
+`stream.redacted` marker. A renewal from a cursor behind the stream still returns
+`refresh_required: false` when every batch after that cursor was already sent to
+the same client; it keeps its own cursor and applies them as they arrive. A batch
+made while that client held no lease (another client kept the stream moving)
+makes the renewal ask for a reread. `overflow` follows a watcher error; `limit` replaces a
+batch over 1024 rows or 192 KiB (a branch switch touching many files);
+`unavailable` follows a moved or unreadable worktree. After an incomplete batch
+later revisions continue from the state captured when it was sent. Batches carry
+path names, so they are fenced at publication like invalidations: opting out of
+external reading stops their delivery and redacts queued ones.
+
+A plain folder (a project without a repository) has the same stream behind
+`workspace_changes_v1`: `workspace.watch` takes `changes` the same way and answers
+with the same lease, and batches arrive on `catalog` as `workspace.files_changed`
+with `workspace_id` instead of `project_id`/`worktree_id` and no `git` part. Rows
+are described from a walk of the folder (skipping `.git`), renames by inode;
+`oid` is always null. A folder over the 10,000-entry watch limit gets an
+incomplete batch and its lease ends, as its invalidation did.
 
 Immutable cache keys include the validated common-directory repository identity,
 registration fingerprint, authority generation and Git object/query identity. Linked

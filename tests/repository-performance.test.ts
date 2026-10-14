@@ -8,7 +8,8 @@ import { GitRunner, NodeCore } from '../packages/node-core/src/index.js'
 // Shared macOS CI took up to 83s for the 75k case and over 10s for cleanup.
 // These are capacity/correctness tests, not benchmarks: allow >2x that worst case
 // for setup and reads separately, and give high-churn FSEvents teardown 60s.
-const largeFixtureTimeout = 180_000
+// Building the 75,000-path fixture takes minutes on slow hosted runners; only the setup gets this budget.
+const largeFixtureTimeout = 600_000
 const cleanupTimeout = 60_000
 // Capacity/invalidation assertions must not inherit the product's 15s Git budget
 // on shared Intel runners. Keep the real runner and all output/path ceilings.
