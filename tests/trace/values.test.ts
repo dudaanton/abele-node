@@ -144,6 +144,22 @@ describe('what changed between two values', () => {
     ])
     expect(diffValues('"2"', 'json', '2', 'json').summary).toBe('was "2" (string)')
     expect(diffValues('<total>2</total>', 'xml', '<total>5</total>', 'xml').summary).toBe('was "2"')
+    expect(diffValues('2', 'number', '5', 'number').summary).toBe('was 2')
+    expect(diffValues('abc', 'text', 'abd', 'text').summary).toBe('was "abc"')
+  })
+
+  it('says what a value with one field inside was rather than how much of it stayed', () => {
+    const d = diffValues('{"n":1}', 'json', '{"n":2}', 'json')
+    expect(d.summary).toBe('was 1')
+    expect(d.changes).toEqual([
+      expect.objectContaining({ path: '$.n', kind: 'value', before: '1', after: '2' }),
+    ])
+    expect(diffValues('[1]', 'json', '[2]', 'json').summary).toBe('was 1')
+    expect(diffValues('<a><b>1</b></a>', 'xml', '<a><b>2</b></a>', 'xml').summary).toBe('was "1"')
+  })
+
+  it('does not call a change it could not measure 0% the same', () => {
+    expect(diffValues('<a b="1"/>', 'xml', '<a b="2"/>', 'xml').summary).toBe('Changed')
   })
 
   it('says nothing changed when nothing did', () => {

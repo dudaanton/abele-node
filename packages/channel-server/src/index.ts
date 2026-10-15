@@ -182,6 +182,7 @@ export async function serveChannel(
             ...Object.keys(MethodSchemas),
             ...core.debuggerControl.methods(),
             ...core.trace.methods(),
+            ...core.http.methods(),
             ...(actor.profile === 'local-token-v1' ? Object.keys(PairingMethodSchemas) : []),
           ],
           limits: LIMITS,

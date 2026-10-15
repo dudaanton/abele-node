@@ -87,6 +87,13 @@ function remote(value: Report) {
   if (!paired.endpoint) return 'Paired/remote: disabled (local only)'
   return `Paired/remote: ${line(paired.endpoint)}; ${t.node_mapping === true ? 'Serve mapping active' : 'Serve mapping unavailable; run abele-node doctor'}`
 }
+function pairedListener(value: unknown) {
+  const p = record(value)
+  if (!p.config) return 'Remote access: no paired listener configured'
+  if (p.problem)
+    return `Remote access: paired configuration ${line(p.config)} is unusable: ${line(p.problem)}`
+  return `Remote access: paired listener at ${line(p.endpoint)} (${line(p.config)})`
+}
 function checklist(ok: boolean, name: string, detail: string, fix: string) {
   return `${ok ? 'OK' : 'PROBLEM'} ${name}: ${detail}${ok ? '' : `; fix: ${fix}`}`
 }
@@ -111,6 +118,7 @@ export function humanOutput(
         `Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`,
         `Service: ${r.enabled ? 'enabled' : 'disabled'}; daemon ${r.running ? 'running' : 'stopped'}`,
         ...(r.enabled ? [`Ownership: ${shown(r.ownership)}`] : []),
+        pairedListener(r.paired_listener),
         ...(!r.enabled ? ['Start in a terminal: abele-node start'] : []),
       ].join('\n')
     case 'status':

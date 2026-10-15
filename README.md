@@ -54,7 +54,8 @@ not a usable debugger release or plugin debugger UI. Separately,
 [gated debugger infrastructure](docs/debugger-v1.md) provides shared authorization,
 [agent tools and passive timers](docs/debugger-agent-tools.md); real profiles still
 require their audit/application gates. Over that infrastructure, [recorded runs](docs/trace.md) take values whole at record points and keep them as
-runs on disk. A worktree is isolation for Git state,
+runs on disk. [Saved requests](docs/http.md) are files in the project, sent from the node and
+kept with their answers, keys blanked. A worktree is isolation for Git state,
 not an OS sandbox for agent tools.
 
 ## Repository view

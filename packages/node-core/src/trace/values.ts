@@ -542,20 +542,15 @@ export function diffValues(
   const order = { added: 0, removed: 1, type: 2, value: 3 }
   changes.sort((x, y) => order[x.kind] - order[y.kind] || y.count - x.count)
   const count = (k: TraceChange['kind']) => changes.filter((c) => c.kind === k).length
-  // A single value has no structure to measure: say what it was.
+  // One value on each side, in the same place, has no structure to measure: say what it was.
   const [was, now] = [a[0], b[0]]
-  if (
-    a.length === 1 &&
-    was &&
-    now &&
-    b.length === 1 &&
-    was.path === now.path &&
-    /^(\$|text)$/.test(was.path)
-  )
+  if (a.length === 1 && b.length === 1 && was && now && was.path === now.path)
     return {
       summary: `was ${exampleOf(was.value)}${was.type === now.type ? '' : ` (${was.type})`}`,
       changes,
     }
+  // Nothing measurable on either side: the text differs, and that is all that is known.
+  if (!a.length && !b.length) return { summary: 'Changed', changes }
   const total = Math.max(a.length, b.length, 1)
   const parts = [`${Math.floor((same / total) * 100)}% the same`]
   if (count('added')) parts.push(`${count('added')} added`)

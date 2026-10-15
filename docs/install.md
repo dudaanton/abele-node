@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.10
+  sh -s -- --version 0.4.11
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -207,6 +207,11 @@ to service-mode transitions, not interrupted runtime upgrades.
 
 Later `abele-node update` preserves the selected mode. For manual installer reruns,
 continue passing `--no-service` while foreground mode is selected.
+
+`abele-node service enable --paired-config PATH` records a paired listener
+configuration for remote access and restarts the service with it;
+`--no-paired-config` removes it. Update and later enables keep it. See
+[remote access](remote-access.md).
 
 A running foreground daemon is not silently interrupted: enable refuses with the
 exact installed `stop` command. Wait for status to report stopped, then retry.
@@ -702,7 +707,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.10  # example; select an existing release
+   git checkout v0.4.11  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

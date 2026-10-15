@@ -43,6 +43,31 @@ and the manager will not write them. Certificates cover the full DNS name, not a
 IP or short hostname; names appear in public Certificate Transparency logs.
 Set `PAIRED_CONFIG` to the protected configuration file you created.
 
+For a one-command installer deployment (background service), record the file once;
+the service is rewritten and restarted with it:
+
+```sh
+abele-node service enable --paired-config "$PAIRED_CONFIG"
+abele-node service status        # Remote access: paired listener at HOST:PORT (PATH)
+abele-node service enable --no-paired-config   # remove it again
+```
+
+The installer config stores the file's physical path, and the generated
+LaunchAgent/systemd unit passes it as `--paired-config`; its recorded fingerprint is
+updated with it, so never hand-edit the service file. A plain `service enable`,
+`abele-node update` and installer reruns keep the recorded file; `sh install.sh
+--paired-config PATH` or `--no-paired-config` set or clear it during installation.
+`status`, `doctor`, `pair` and `pair routes` read the recorded file without repeating
+the flag. The file is refused, with nothing changed, unless it is a regular file (not
+a symlink) owned by you with owner-only permissions (`chmod 600`), in a directory
+nobody else can write, and valid for the paired listener. It is checked again on
+every update, so keep it at that stable, protected path; `service status` reports a
+recorded file that has become unusable, and `--no-paired-config` always removes it.
+Changing the file's contents takes effect on the next restart:
+`abele-node service disable && abele-node service enable`.
+
+For a source or foreground deployment, pass the file to `start`:
+
 ```sh
 node packages/node-daemon/dist/cli.js start --paired-config "$PAIRED_CONFIG"
 node packages/node-daemon/dist/cli.js doctor
@@ -57,9 +82,9 @@ All commands also accept `--state-dir`. Both node listeners stay on **127.0.0.1*
 The local listener accepts only local tokens; Serve must target the separate paired
 listener. The paired listener never accepts `local-token-v1`, even from loopback.
 Starting/stopping/restarting the daemon does **not** modify Serve. Disable its mapping
-before stopping if you want to remove reachability. Installation can persist
-`--paired-config`, but the configuration file must remain at its stable protected
-path; installing or redeploying a LaunchAgent is an owner-controlled operation.
+before stopping if you want to remove reachability. Installer deployments persist
+`--paired-config` with `service enable --paired-config` (above); the configuration
+file must remain at its stable protected path.
 
 `TailscaleServeManager` reads `serve status --json` before any write. It refuses
 foreign, duplicate, foreground or Funnel-enabled entries on its port, refuses any
@@ -196,6 +221,57 @@ The node still proves the original canonical endpoint and pinned key before rece
 the invitation secret/name over any accepted route. Changing the address never changes
 the key or grants a different principal. Only owner-trusted TLS termination is in scope;
 the application proof does not encrypt traffic independently of TLS.
+
+## Client Origins and a desktop + phone example
+
+The Abele plugin connects with the WebView's own `WebSocket`, so the Origin it sends
+is the origin of the Obsidian app page:
+
+| Client                                   | Origin                  |
+| ---------------------------------------- | ----------------------- |
+| Obsidian desktop (macOS, Windows, Linux) | `app://obsidian.md`     |
+| Obsidian for iOS and iPadOS              | `capacitor://localhost` |
+| Obsidian for Android                     | `http://localhost`      |
+
+The desktop value is the origin Obsidian's Electron window loads. The mobile values
+are those of the Capacitor shell Obsidian mobile is built on; automated tests do not
+run on a phone, so confirm them on your device before relying on them. A refused
+Origin shows as `policy_not_accepted` on the node's Address row; the daemon accepts
+only the exact strings listed. To measure, open the developer console on desktop
+(`Ctrl/Cmd+Shift+I`) or a Safari Web Inspector session for iOS, and read
+`location.origin`.
+
+Example for an owner with Obsidian on a Mac and an iPhone. Choose the paired port
+yourself: any free port other than 80/443 that no other Serve mapping uses, for
+example 8444, written into the endpoint as `:8444/channel`. Replace
+`YOUR_PAIRED_WSS_ENDPOINT` as described above.
+
+```json
+{
+  "endpoint": "YOUR_PAIRED_WSS_ENDPOINT",
+  "backend_port": 47124,
+  "accepted_routes": [],
+  "origins": ["app://obsidian.md", "capacitor://localhost"],
+  "allow_missing_origin": false,
+  "allow_null_origin": false
+}
+```
+
+Add `"http://localhost"` for an Android phone. Do not add an Origin you have not
+seen a supported client send. Keep the file in a private directory of your own
+(`chmod 700` on the directory, `chmod 600` on the file), set `PAIRED_CONFIG` to it,
+then:
+
+```sh
+abele-node service enable --paired-config "$PAIRED_CONFIG"
+abele-node doctor
+# Only after reviewing tailnet policy for the chosen port:
+abele-node serve enable --tailnet-policy-verified
+abele-node status
+abele-node pair
+```
+
+## Origin policy
 
 Path remains exactly `/channel`. Origins are an explicit
 allowlist, with no wildcard. Missing and `null` Origin each require their own explicit

@@ -11,9 +11,85 @@ import {
   fsyncSync,
   closeSync,
 } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readRuntime } from './index.js'
+import { PairedListenerSchema, type PairedListenerConfig } from './paired.js'
+
+/**
+ * A paired configuration a service will read on every start: a regular file, not a
+ * symlink, owned by this user with owner-only permissions, in a directory nobody
+ * else can write. Returns its physical path, which is what gets recorded.
+ */
+export function protectedPairedConfig(path: string): {
+  path: string
+  config: PairedListenerConfig
+} {
+  const requested = resolve(path)
+  let link
+  try {
+    link = lstatSync(requested)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      throw new Error(`Paired configuration not found: ${requested}; nothing changed.`)
+    throw error
+  }
+  if (link.isSymbolicLink())
+    throw new Error('Paired configuration is a symlink; point at the file itself. Nothing changed.')
+  const directory = realpathSync(dirname(requested)),
+    physical = join(directory, basename(requested))
+  const file = lstatSync(physical),
+    parent = statSync(directory)
+  if (!file.isFile())
+    throw new Error('Paired configuration is not a regular file; nothing changed.')
+  if (file.uid !== process.getuid!() || file.mode & 0o077)
+    throw new Error(
+      `Paired configuration must be owned by you and private (chmod 600 ${physical}); nothing changed.`
+    )
+  if (parent.uid !== process.getuid!() || parent.mode & 0o022)
+    throw new Error(
+      `Paired configuration directory must be owned by you and not writable by others (chmod go-w ${directory}); nothing changed.`
+    )
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(physical, 'utf8'))
+  } catch {
+    throw new Error('Paired configuration is not valid JSON; nothing changed.')
+  }
+  const result = PairedListenerSchema.safeParse(parsed)
+  if (!result.success)
+    throw new Error(
+      `Paired configuration is invalid (${result.error.issues.map((issue) => issue.path.join('.') || issue.message).join(', ')}); see docs/remote-access.md. Nothing changed.`
+    )
+  return { path: physical, config: result.data }
+}
+
+/** The installer's recorded paired configuration, if any, for the same state. */
+export function recordedPairedConfig(runtime: string, state: string): string | undefined {
+  const root = dirname(runtime),
+    file = join(root, 'config.json')
+  if (!existsSync(join(root, '.installer-owned')) || !existsSync(file)) return undefined
+  const config = JSON.parse(readFileSync(file, 'utf8')) as {
+    state?: string
+    paired_config?: string
+  }
+  return config.state === state && config.paired_config ? config.paired_config : undefined
+}
+
+/** Status shows where the paired listener answers, never its policy or secrets. */
+function pairedListener(path: string | undefined) {
+  if (!path) return null
+  try {
+    const endpoint = new URL(protectedPairedConfig(path).config.endpoint)
+    return { config: path, endpoint: endpoint.host, problem: null }
+  } catch (error) {
+    return {
+      config: path,
+      endpoint: null,
+      problem: (error as Error).message.replace(/[;.] [Nn]othing changed\.$/, ''),
+    }
+  }
+}
 
 export function recoverServiceTransition(runtime: string) {
   const root = dirname(runtime)
@@ -86,6 +162,7 @@ export function installedService(runtime: string, state: string) {
     service: number
     service_file?: string
     service_sha256?: string
+    paired_config?: string
   }
   if (
     !/^\d+\.\d+\.\d+$/.test(config.version) ||
@@ -149,12 +226,28 @@ export function serviceStatus(runtime: string, state: string) {
     ownership,
     service_file: config?.service_file ?? null,
     state_dir: state,
+    paired_listener: pairedListener(config?.paired_config || undefined),
   }
 }
 
-export async function changeService(runtime: string, state: string, action: string) {
+/** `undefined` keeps the recorded paired configuration, `null` removes it. */
+export async function changeService(
+  runtime: string,
+  state: string,
+  action: string,
+  paired?: string | null
+) {
   if (!['enable', 'disable'].includes(action))
     throw new Error('Usage: abele-node service enable|disable|status [--json]')
+  if (paired !== undefined && action !== 'enable')
+    throw new Error('--paired-config and --no-paired-config apply only to service enable.')
+  // Validate before the installer touches anything: a bad file must change nothing.
+  const pairedArgs =
+    paired === undefined
+      ? []
+      : paired === null
+        ? ['--no-paired-config']
+        : ['--paired-config', protectedPairedConfig(paired).path]
   const config = installedService(runtime, state)
   if (!config)
     throw new Error(
@@ -167,7 +260,7 @@ export async function changeService(runtime: string, state: string, action: stri
     )
   const child = spawn(
     '/bin/sh',
-    [installer, '--prefix', config.prefix, '--service-action', action],
+    [installer, '--prefix', config.prefix, '--service-action', action, ...pairedArgs],
     {
       detached: true, // Isolate the shell and mutation children from the caller's process group.
       // Services must use the same Node executable as this CLI, not shell discovery.

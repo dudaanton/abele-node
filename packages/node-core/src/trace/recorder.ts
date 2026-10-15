@@ -3,6 +3,7 @@
  * whole, writes a step and lets the program go on. A stop on any ordinary breakpoint stays a stop.
  * A session records whenever it has a record point: there is no separate record switch. */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { dirname, join, relative, isAbsolute } from 'node:path'
 import type { DebuggerSnapshot } from '@abele/node-protocol'
 import type { DebuggerService } from '../debugger/index.js'
@@ -93,6 +94,24 @@ interface Live {
   handled: Set<string>
   queue: Promise<void>
   off: () => void
+  /** Requests out now, sent into this run: what the points take meanwhile stands under them. */
+  chains: Map<string, { steps: number }>
+}
+
+/** A request sent into a recording while it is out: steps taken meanwhile go under it, and it
+ * writes itself into the run when its answer is in. */
+export interface TraceChain {
+  readonly id: string
+  readonly runId: string
+  /** Steps the record points took while it was out. */
+  readonly steps: number
+  /** Writes the request as a step at the time it went, heading the steps under it. */
+  close(step: {
+    label: string
+    status?: number
+    host?: string
+    values: { name: string; text?: string; failed?: string }[]
+  }): string | undefined
 }
 
 const terminal: Record<string, 'done' | 'cut' | undefined> = {
@@ -123,6 +142,7 @@ export class TraceRecorder {
       handled: new Set(),
       queue: Promise.resolve(),
       off: () => {},
+      chains: new Map(),
     }
     this.live.set(session.id, l)
     l.off = this.host.service.subscribe(session.id, () => this.observe(l))
@@ -141,6 +161,46 @@ export class TraceRecorder {
           started_at: new Date(l.writer.startedAt).toISOString(),
         }
       : undefined
+  }
+
+  /** Opens a request's chain in the run this session writes; none when nothing is recorded. */
+  chain(session: string): TraceChain | undefined {
+    const l = this.live.get(session)
+    const writer = l?.writer
+    if (!l || !writer) return undefined
+    const id = `h${randomBytes(6).toString('hex')}`
+    const entry = { steps: 0 }
+    l.chains.set(id, entry)
+    const at = this.now() - writer.startedAt
+    let closed = false
+    return {
+      id,
+      runId: writer.id,
+      get steps() {
+        return entry.steps
+      },
+      close: (step) => {
+        if (closed) return undefined
+        closed = true
+        l.chains.delete(id)
+        // The run may have ended while the request was out: it is written no more.
+        if (l.writer !== writer || this.live.get(session) !== l) return undefined
+        return writer.append({
+          kind: 'http',
+          at,
+          label: step.label,
+          ...(step.status !== undefined ? { status: step.status } : {}),
+          ...(step.host ? { host: step.host } : {}),
+          chain: id,
+          sent: true,
+          values: step.values.map((v) =>
+            v.text !== undefined
+              ? writer.value(v.name, v.text)
+              : writer.failed(v.name, v.failed ?? 'Not taken')
+          ),
+        }).id
+      },
+    }
   }
 
   /** Whether a run is being written now, in any session. */
@@ -284,9 +344,13 @@ export class TraceRecorder {
             : writer.value(v.name, v.text)
         )
       : [...takes.keys()].map((name) => writer.failed(name, failure ?? 'Not taken'))
+    // Under the request out now, the newest when several are: placed by time, not proven.
+    const chain = [...l.chains.entries()].pop()
+    if (chain) chain[1].steps++
     writer.append({
       kind: 'probe',
       at: stoppedAt - writer.startedAt,
+      ...(chain ? { chain: chain[0], by_time: true } : {}),
       ...(points[0] ? { point: points[0].breakpoint_id } : {}),
       label:
         points.map((p) => p.note).find(Boolean) ??

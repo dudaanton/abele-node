@@ -53,6 +53,10 @@ export interface TraceStoredStep {
   status?: number
   host?: string
   chain?: string
+  /** Under its request only because it ran while the request was out. */
+  by_time?: boolean
+  /** A request sent from the project's saved requests, not by a browser. */
+  sent?: boolean
   values: TraceStoredValue[]
 }
 

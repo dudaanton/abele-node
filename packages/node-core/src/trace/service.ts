@@ -225,7 +225,10 @@ export class TraceService {
     kinds?: string[]
   ): TraceRunResult {
     const store = this.store(project)
-    const { run, steps } = store.read(id)
+    const { run, steps: written } = store.read(id)
+    // A sent request is written when its answer is in, at the time it went: in time it heads the
+    // steps it caused. The sort is stable, so everything else keeps the order it was written in.
+    const steps = [...written].sort((a, b) => a.at - b.at)
     const marks = store.marks(id)
     const marked = new Set(marks.map((m) => m.step))
     const lastBy = new Map<string, string>()
@@ -439,6 +442,8 @@ function stepOut(s: TraceStoredStep, lastBy: Map<string, string>): TraceStep {
     ...(s.status !== undefined ? { status: s.status } : {}),
     ...(s.host ? { host: s.host } : {}),
     ...(s.chain ? { chain: s.chain } : {}),
+    ...(s.by_time ? { by_time: true } : {}),
+    ...(s.sent ? { sent: true } : {}),
     values,
   }
 }

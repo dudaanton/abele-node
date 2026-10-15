@@ -34,7 +34,14 @@ import {
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { daemonProcessPresent, waitForLaunch } from './launch-wait.js'
-import { startDaemon, readRuntime, offlineToken, control, PairedListenerSchema } from './index.js'
+import {
+  startDaemon,
+  readRuntime,
+  offlineToken,
+  control,
+  PairedListenerSchema,
+  type PairedListenerConfig,
+} from './index.js'
 import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
 import { update } from './update.js'
 import {
@@ -44,6 +51,8 @@ import {
   installationMode,
   stageServiceCandidate,
   recoverServiceTransition,
+  protectedPairedConfig,
+  recordedPairedConfig,
 } from './service.js'
 import { cliHelp, requestedHelp } from './cli-help.js'
 import { doctorCodex } from '@abele/provider-codex'
@@ -98,10 +107,41 @@ async function main() {
       closeSync(fd)
     }
   }
-  const pairedConfigPath = option('--paired-config', '')
-  const pairedConfig = pairedConfigPath
-    ? PairedListenerSchema.parse(JSON.parse(readFileSync(resolve(pairedConfigPath), 'utf8')))
-    : undefined
+  const explicitPairedConfig = option('--paired-config', '')
+  const noPairedFlag = args.indexOf('--no-paired-config')
+  const noPairedConfig = noPairedFlag >= 0
+  if (noPairedConfig) args.splice(noPairedFlag, 1)
+  if (noPairedConfig && explicitPairedConfig)
+    throw new Error('Choose either --paired-config PATH or --no-paired-config.')
+  // An installer deployment records its paired configuration; the service's own
+  // command line and the operator's commands both read that one file.
+  const recordedPaired =
+    explicitPairedConfig || noPairedConfig ? undefined : recordedPairedConfig(runtimeRoot, state)
+  let pairedLoaded: { value: PairedListenerConfig | undefined } | undefined
+  /**
+   * Parsed on first use. Diagnostics (`report`) tolerate a broken recorded file, so
+   * status, doctor and `service enable --no-paired-config` still work; serving
+   * and pairing refuse it.
+   */
+  const loadPairedConfig = (report = false): PairedListenerConfig | undefined => {
+    if (!pairedLoaded) {
+      if (explicitPairedConfig)
+        pairedLoaded = {
+          value: PairedListenerSchema.parse(
+            JSON.parse(readFileSync(resolve(explicitPairedConfig), 'utf8'))
+          ),
+        }
+      else if (recordedPaired) {
+        try {
+          pairedLoaded = { value: protectedPairedConfig(recordedPaired).config }
+        } catch (error) {
+          if (report) return undefined
+          throw error
+        }
+      } else pairedLoaded = { value: undefined }
+    }
+    return pairedLoaded.value
+  }
   const tailscalePath = option(
     '--tailscale-path',
     process.env.ABELE_TAILSCALE_PATH ?? '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
@@ -273,10 +313,13 @@ async function main() {
     case 'service': {
       if (args.length !== 2 || !['enable', 'disable', 'status'].includes(args[1]!))
         throw new Error('Usage: abele-node service enable|disable|status [--json]')
+      const paired = explicitPairedConfig || (noPairedConfig ? null : undefined)
+      if (args[1] === 'status' && paired !== undefined)
+        throw new Error('--paired-config and --no-paired-config apply only to service enable.')
       output(
         args[1] === 'status'
           ? serviceStatus(runtimeRoot, state)
-          : await changeService(runtimeRoot, state, args[1]!)
+          : await changeService(runtimeRoot, state, args[1]!, paired)
       )
       return
     }
@@ -292,7 +335,7 @@ async function main() {
         port,
         worktreeRoot,
         claudeOptions,
-        pairedConfig,
+        loadPairedConfig(),
         tailscalePath,
         piOptions,
         codexOptions,
@@ -412,7 +455,7 @@ async function main() {
     }
     case 'status': {
       const running = readRuntime(state)
-      const paired = running?.paired ?? pairedConfig
+      const paired = running?.paired ?? loadPairedConfig(true)
       // Discovery metadata is local-only; keep the existing status JSON field set stable.
       const publicRuntime = { ...running }
       delete publicRuntime.node_name
@@ -484,10 +527,10 @@ async function main() {
         runtime: running?.runtime ?? null,
         launch_agent: existsSync(join(homedir(), 'Library/LaunchAgents', label + '.plist')),
         profile: 'local-token-v1 (loopback only)',
-        paired: running?.paired ?? pairedConfig ?? null,
+        paired: running?.paired ?? loadPairedConfig(true) ?? null,
         tailscale: await tailscale.doctor(
-          (running?.paired ?? pairedConfig)?.endpoint,
-          (running?.paired ?? pairedConfig)?.backend_port,
+          (running?.paired ?? loadPairedConfig(true))?.endpoint,
+          (running?.paired ?? loadPairedConfig(true))?.backend_port,
           running?.port ?? port
         ),
         encrypted_at_rest: false,
@@ -512,7 +555,7 @@ async function main() {
       const action = args[1],
         installation_id = args[2]
       if (!action) {
-        const endpoint = (readRuntime(state)?.paired ?? pairedConfig)?.endpoint
+        const endpoint = (readRuntime(state)?.paired ?? loadPairedConfig())?.endpoint
         if (!endpoint)
           throw new Error(
             'paired_config_required: configure a paired WSS endpoint before issuing a code; run abele-node doctor'
@@ -535,11 +578,11 @@ async function main() {
         }
       } else if (action === 'routes') {
         if (args.length !== 2) throw new Error('Usage: pair routes [--json]')
-        const paired = readRuntime(state)?.paired ?? pairedConfig
+        const paired = readRuntime(state)?.paired ?? loadPairedConfig()
         if (!paired) throw new Error('paired_config_required')
         output({ endpoint: paired.endpoint, accepted_routes: paired.accepted_routes ?? [] })
       } else if (action === 'invite') {
-        const endpoint = (readRuntime(state)?.paired ?? pairedConfig)?.endpoint
+        const endpoint = (readRuntime(state)?.paired ?? loadPairedConfig())?.endpoint
         if (!endpoint) throw new Error('paired_config_required')
         output(
           await offlineToken(state, {
@@ -747,7 +790,8 @@ async function main() {
         '--port',
         String(port),
         ...(worktreeRoot ? ['--worktree-root', worktreeRoot] : []),
-        ...(pairedConfigPath ? ['--paired-config', resolve(pairedConfigPath)] : []),
+        // The installer always says which paired configuration the service gets.
+        ...(explicitPairedConfig ? ['--paired-config', resolve(explicitPairedConfig)] : []),
         '--tailscale-path',
         tailscalePath,
         '--claude-path',

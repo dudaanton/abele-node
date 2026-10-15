@@ -9,24 +9,29 @@ fail() { printf 'abele-node: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' 'Usage: sh install.sh [--version X.Y.Z] [--prefix PATH] [--state-dir PATH]' \
     '  [--claude-path PATH] [--codex-path PATH] [--codex-model MODEL_ID] [--codex-home PATH]' \
-    '  [--codex | --no-codex] [--no-service] [--uninstall]' \
+    '  [--codex | --no-codex] [--paired-config PATH | --no-paired-config]' \
+    '  [--no-service] [--uninstall]' \
     '  [--purge-state --confirm-purge-state ABSOLUTE_STATE_PATH]' \
     'Default prefix: ~/.local; Node 22.23.2 must already be installed.'
 }
 version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service=0 uninstall=0 purge=0 confirmation='' service_action=''
 codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABELE_CODEX_HOME:-} codex_enabled=''
+# Paired listener configuration: keep the recorded one unless set or cleared.
+paired_config='' paired_change=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action)
+    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action|--paired-config)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then fail "$1 requires a value"; fi
       case "$2" in --*) fail "$1 requires a value" ;; esac
       case "$1" in
         --version) version=${2#v} ;; --prefix) prefix=$2 ;; --state-dir) state=$2 ;;
         --claude-path) claude=$2 ;; --confirm-purge-state) confirmation=$2 ;; --service-action) service_action=$2 ;;
         --codex-path) codex=$2 ;; --codex-model) codex_model=$2 ;; --codex-home) codex_home=$2 ;;
+        --paired-config) [ -z "$paired_change" ] || fail 'Choose either --paired-config PATH or --no-paired-config.'; paired_config=$2; paired_change=set ;;
       esac
       shift 2 ;;
     --codex) codex_enabled=true; shift ;; --no-codex) codex_enabled=false; shift ;;
+    --no-paired-config) [ -z "$paired_change" ] || fail 'Choose either --paired-config PATH or --no-paired-config.'; paired_change=clear; shift ;;
     --no-service) no_service=1; shift ;; --uninstall) uninstall=1; shift ;;
     --purge-state) purge=1; shift ;; --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
@@ -37,6 +42,9 @@ if [ -n "$service_action" ]; then
   [ "$uninstall" = 0 ] && [ "$purge" = 0 ] && [ -z "$version" ] && [ "$no_service" = 0 ] || fail 'Service actions cannot be combined with deployment/removal options.'
 fi
 [ "$purge" = 0 ] || [ "$uninstall" = 1 ] || fail '--purge-state requires --uninstall'
+if [ -n "$paired_change" ]; then
+  [ "$uninstall" = 0 ] && [ "$service_action" != disable ] || fail '--paired-config/--no-paired-config apply only to installation or service enable.'
+fi
 [ -z "$confirmation" ] || [ "$purge" = 1 ] || fail '--confirm-purge-state requires --purge-state'
 [ "$(id -u)" != 0 ] || fail 'Refusing root. Run as your ordinary user, without sudo.'
 case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) fail 'Unsupported OS: use macOS or Linux.' ;; esac
@@ -149,7 +157,7 @@ if [ -d "$root/.service-transition" ] || [ -L "$root/.install-lock" ]; then
   "$node" "$transition_helper" recover "$root" || fail 'Interrupted service transition recovery failed; journal and state retained.'
 fi
 get_config() { "$node" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"))[process.argv[2]] ?? "")' "$config" "$1"; }
-old='' old_state='' old_claude='' old_service=0
+old='' old_state='' old_claude='' old_service=0 old_paired_config=''
 expected_state_identity=''
 state_path_pinned=0
 state_identity() {
@@ -205,6 +213,8 @@ if [ -f "$config" ]; then
   codex_model=${codex_model:-$(get_config codex_model)}
   codex_home=${codex_home:-$(get_config codex_home)}
   codex_enabled=${codex_enabled:-$(get_config codex_enabled)}
+  old_paired_config=$(get_config paired_config)
+  [ -n "$paired_change" ] || paired_config=$old_paired_config
   [ -L "$root/current" ] || fail 'Installed current pointer is missing; refusing to adopt an unknown deployment.'
   [ "$(readlink "$root/current")" = "$old" ] || fail 'Installed current pointer differs from the recorded version.'
   if [ "$old_service" = 0 ] && [ -z "$expected_state_identity" ]; then
@@ -313,12 +323,34 @@ fi
 if [ -n "$codex_home" ]; then
   valid_path "$codex_home" || fail 'Invalid codex-home: use an absolute normalized path.'
 fi
+# The service reads this file on every start, so it must stay where it is and
+# stay the owner's: a regular private file in a directory nobody else can write.
+# The selected runtime validates its contents (status --paired-config) before
+# anything is stopped.
+if [ "$uninstall" = 0 ] && [ -n "$paired_config" ]; then
+  paired_config=$("$node" - "$paired_config" <<'NODE'
+const fs=require('node:fs'),path=require('node:path');const requested=path.resolve(process.argv[2]),uid=process.getuid();
+const refuse=m=>{console.error(m);process.exit(1)};
+let link;try{link=fs.lstatSync(requested)}catch(e){if(e.code==='ENOENT')refuse('Paired configuration not found: '+requested);throw e}
+if(link.isSymbolicLink())refuse('Paired configuration is a symlink; point at the file itself.');
+const directory=fs.realpathSync(path.dirname(requested)),physical=path.join(directory,path.basename(requested));
+const file=fs.lstatSync(physical),parent=fs.statSync(directory);
+if(!file.isFile())refuse('Paired configuration is not a regular file.');
+if(file.uid!==uid || (file.mode&0o077))refuse('Paired configuration must be owned by you and private: chmod 600 '+physical);
+if(parent.uid!==uid || (parent.mode&0o022))refuse('Paired configuration directory must be owned by you and not writable by others: chmod go-w '+directory);
+try{JSON.parse(fs.readFileSync(physical,'utf8'))}catch{refuse('Paired configuration is not valid JSON.')}
+if(/[\x00-\x1f\x7f]/.test(physical))refuse('Paired configuration path contains control characters.');
+console.log(physical);
+NODE
+  ) || fail 'Unusable paired configuration; nothing changed. Fix it, or remove it with --no-paired-config (abele-node service enable --no-paired-config).'
+fi
 selected_cli() {
   selected_runtime=$1; shift
   [ -z "$codex_model" ] || set -- "$@" --codex-model "$codex_model"
   [ -z "$codex" ] || set -- "$@" --codex-path "$codex"
   [ -z "$codex_home" ] || set -- "$@" --codex-home "$codex_home"
   [ "$codex_enabled" = true ] || set -- "$@" --no-codex
+  [ -z "$paired_config" ] || set -- "$@" --paired-config "$paired_config"
   "$node" "$selected_runtime/packages/node-daemon/dist/cli.js" "$@"
 }
 # End provider discovery
@@ -606,9 +638,9 @@ start_service() {
     mkdir -p "$(dirname "$unit")" || return 1
     journal_intent write-service "$service_file" "$runtime" || return 1
     write_id=$journal_action_id
-    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" <<'NODE' || return 1
-const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled]=process.argv.slice(2);
-const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
+    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" <<'NODE' || return 1
+const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired]=process.argv.slice(2);
+const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[])];
 if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
@@ -892,9 +924,12 @@ if [ -n "$service_action" ]; then
     printf '%s\n' 'Service already disabled; foreground mode.'
     exit 0
   fi
-  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && check_health "$old" 1; then
+  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && [ "$paired_config" = "$old_paired_config" ] && check_health "$old" 1; then
     printf '%s\n' 'Service already enabled and running.'
     exit 0
+  fi
+  if [ -n "$paired_config" ]; then
+    selected_cli "$root/$old" status --json --state-dir "$state" --claude-path "$claude" > "$work/paired-preflight.json" || fail 'Paired configuration was refused by the installed runtime; nothing changed.'
   fi
   preflight_stop || fail 'Cannot confirm ownership before service change; nothing changed.'
   check_journal_capacity || fail 'Journal/backups are not writable or have insufficient free space; nothing was stopped.'
@@ -948,7 +983,7 @@ tar -xzf "$work/$asset" -C "$work/runtime"
 [ -f "$work/runtime/packages/node-daemon/dist/cli.js" ] || fail 'Archive has no built daemon.'
 "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version!==process.argv[2])process.exit(1)' "$work/runtime/package.json" "$version" || fail 'Archive version mismatch.'
 # Validate imports/diagnostics before disrupting the previous service.
-selected_cli "$work/runtime" status --json --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed; previous install retained (no rollback needed).'
+selected_cli "$work/runtime" status --json --state-dir "$state" --claude-path "$claude" > "$work/preflight.json" || fail 'Preflight status failed (including the paired configuration, if any); previous install retained (no rollback needed).'
 if [ "$service" = 0 ] || [ "$old_service" = 0 ]; then
   "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).running)process.exit(1)' "$work/preflight.json" || fail 'stop_before_install: stop the foreground/manual daemon before installation or conversion.'
 fi
@@ -977,8 +1012,8 @@ if [ "$service" = 1 ]; then
   installed_state=$(service_state) || fail 'Cannot read newly installed service state.'
   [ "$installed_state" = "$state" ] || fail 'Service state differs from the canonical installation state.'
 fi
-"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" <<'NODE'
-const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled]=process.argv.slice(2);
+"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" <<'NODE'
+const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled,paired]=process.argv.slice(2);
 const stateStat=fs.statSync(state,{bigint:true}),marker=state+'/.abele-state-identity',markerStat=fs.lstatSync(marker),state_identity='marker:'+stateStat.ino+':'+fs.readFileSync(marker,'utf8');
 if(!markerStat.isFile() || markerStat.isSymbolicLink())throw new Error('state_identity_changed_before_publication');
 if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathSync(state)!==state)throw new Error('state_identity_changed_before_publication');
@@ -986,7 +1021,7 @@ const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
-fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
+fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,service:Number(service),...ownership})+'\n',{mode:0o600});
 if(process.env.ABELE_SERVICE_TRANSITION){const path=require('node:path'),dir=process.env.ABELE_SERVICE_TRANSITION;for(const [name,file] of [['wrapper',wrapper],['config',config]]){const stage=path.join(dir,'next-'+name);fs.copyFileSync(file,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}const fd=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi

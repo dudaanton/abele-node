@@ -77,6 +77,10 @@ export const TraceStepSchema = z
     status: z.number().int().optional(),
     host: z.string().optional(),
     chain: z.string().optional(),
+    /** Under its request only because it ran while the request was out. */
+    by_time: z.boolean().optional(),
+    /** A request sent from the project's saved requests. */
+    sent: z.boolean().optional(),
     marked: z.boolean().optional(),
     values: z.array(TraceValueMetaSchema),
   })

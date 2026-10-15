@@ -174,6 +174,8 @@ let state=args[args.indexOf('--state-dir')+1] || process.env.HOME+'/.local/state
 const missing=[];while(!fs.existsSync(state)){missing.unshift(state.slice(state.lastIndexOf('/')+1));state=state.slice(0,state.lastIndexOf('/')) || '/'}
 state=fs.realpathSync(state)+(missing.length?'/'+missing.join('/'):'');
 const cliPath=fs.realpathSync(fileURLToPath(import.meta.url));
+const paired=args.includes('--paired-config')?args[args.indexOf('--paired-config')+1]:'';
+if(paired){let ok=false;try{ok=new URL(JSON.parse(fs.readFileSync(paired,'utf8')).endpoint).hostname.endsWith('.ts.net')}catch{}if(!ok){console.error('invalid paired configuration');process.exit(1)}}
 const lateDropin=process.env.HOME+'/dropin-on-preflight.json';
 if(args[0]==='status' && cliPath.includes('/.download.') && fs.existsSync(lateDropin)){
   const s=JSON.parse(fs.readFileSync(lateDropin,'utf8'));fs.mkdirSync(s.directory,{recursive:true});fs.writeFileSync(s.directory+'/10-late.conf','[Service]\\nEnvironment=LATE_OVERRIDE=yes\\n');fs.rmSync(lateDropin);
@@ -185,7 +187,7 @@ const completed=(action,target)=>{if(journal && !fs.existsSync(process.env.HOME+
 if(isMac && args[0]==='install'){
   if(fs.existsSync(marker) && JSON.parse(fs.readFileSync(marker,'utf8')).state===state){console.error('stop_before_install');process.exit(1)}
   fs.mkdirSync(state,{recursive:true,mode:0o700});fs.mkdirSync(process.env.HOME+'/Library/LaunchAgents',{recursive:true});
-  const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude'];
+  const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[])];
   const xml=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
   const text='<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>';
   if(process.env.ABELE_SERVICE_TRANSITION)fs.writeFileSync(process.env.ABELE_SERVICE_TRANSITION+'/next-service',text,{mode:0o600});
@@ -2505,6 +2507,7 @@ test(
         ownership: 'none',
         service_file: null,
         state_dir: join(await realpath(h), '.local/state/abele-node'),
+        paired_listener: null,
       })
       const help = await run(join(h, '.local/bin/abele-node'), ['service', '--help'], { HOME: h })
       assert.equal(help.code, 0, help.stderr)
@@ -2544,3 +2547,117 @@ test(
     }
   }
 )
+
+async function pairedConfigFile(h, endpoint = 'wss://node.example.ts.net:8444/channel') {
+  const directory = join(h, 'remote'),
+    file = join(directory, 'paired.json')
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  await chmod(directory, 0o700)
+  await writeFile(file, JSON.stringify({ endpoint, origins: ['app://obsidian.md'] }), {
+    mode: 0o600,
+  })
+  await chmod(file, 0o600)
+  return realpath(file)
+}
+for (const platform of ['mac', 'linux']) {
+  test(`service enable records, keeps and removes a paired configuration: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    assert.equal((await install(h, ['--version', '0.2.0', '--no-service'], env)).code, 0)
+    const configFile = join(h, '.local/share/abele-node/config.json'),
+      file = await pairedConfigFile(h)
+    const offline = {
+      ...env,
+      ABELE_INSTALL_BASE_URL: 'http://127.0.0.1:1',
+      ABELE_INSTALL_API_URL: 'http://127.0.0.1:1',
+    }
+    const recorded = async () => {
+      const config = JSON.parse(await readFile(configFile, 'utf8'))
+      const text = await readFile(config.service_file, 'utf8')
+      assert.equal(config.service_sha256, createHash('sha256').update(text).digest('hex'))
+      return { config, text }
+    }
+    const enable = await install(
+      h,
+      ['--service-action', 'enable', '--paired-config', file],
+      offline
+    )
+    assert.equal(enable.code, 0, enable.stderr)
+    let { config, text } = await recorded()
+    assert.equal(config.paired_config, file)
+    assert.ok(
+      platform === 'mac'
+        ? text.includes('<string>--paired-config</string><string>' + file + '</string>')
+        : text.includes('"--paired-config" "' + file + '"'),
+      text
+    )
+    // A running service is restarted onto the new command line, not left as it was.
+    const job =
+      platform === 'mac' ? JSON.parse(await readFile(join(h, '.fake-launch-job'), 'utf8')) : null
+    if (job) assert.deepEqual(job.arguments.slice(-2), ['--paired-config', file])
+    // Plain enable and upgrade keep the recorded configuration.
+    assert.equal((await install(h, ['--service-action', 'enable'], offline)).code, 0)
+    assert.equal((await recorded()).text, text)
+    const upgrade = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(upgrade.code, 0, upgrade.stderr)
+    ;({ config, text } = await recorded())
+    assert.equal(config.paired_config, file)
+    assert.equal(config.version, '0.2.3')
+    assert.ok(text.includes(file))
+    // Refusals change neither the record nor the service file.
+    const before = await readFile(configFile, 'utf8')
+    await chmod(file, 0o644)
+    const loose = await install(h, ['--service-action', 'enable', '--paired-config', file], offline)
+    assert.notEqual(loose.code, 0)
+    assert.match(loose.stderr, /chmod 600/)
+    await chmod(file, 0o600)
+    const other = await pairedConfigFile(join(h, 'remote'), 'wss://example.com:8444/channel')
+    const invalid = await install(
+      h,
+      ['--service-action', 'enable', '--paired-config', other],
+      offline
+    )
+    assert.notEqual(invalid.code, 0)
+    assert.match(invalid.stderr, /refused by the installed runtime/)
+    const alias = join(h, 'paired-link.json')
+    await symlink(file, alias)
+    const linked = await install(
+      h,
+      ['--service-action', 'enable', '--paired-config', alias],
+      offline
+    )
+    assert.notEqual(linked.code, 0)
+    assert.match(linked.stderr, /symlink/)
+    for (const args of [
+      ['--service-action', 'disable', '--no-paired-config'],
+      ['--uninstall', '--paired-config', file],
+      ['--paired-config', file, '--no-paired-config'],
+    ])
+      assert.notEqual((await install(h, args, offline)).code, 0, args.join(' '))
+    assert.equal(await readFile(configFile, 'utf8'), before)
+    assert.equal((await recorded()).text, text)
+    // Removal rewrites the service without it.
+    const removal = await install(h, ['--service-action', 'enable', '--no-paired-config'], offline)
+    assert.equal(removal.code, 0, removal.stderr)
+    ;({ config, text } = await recorded())
+    assert.equal(config.paired_config, '')
+    assert.doesNotMatch(text, /--paired-config/)
+  })
+}
+test('an installation records a paired configuration given at install time and refuses an unusable recorded one on upgrade', async () => {
+  const h = await home(),
+    file = await pairedConfigFile(h)
+  const first = await install(h, ['--version', '0.2.0', '--no-service', '--paired-config', file])
+  assert.equal(first.code, 0, first.stderr)
+  const configFile = join(h, '.local/share/abele-node/config.json')
+  assert.equal(JSON.parse(await readFile(configFile, 'utf8')).paired_config, file)
+  await chmod(join(h, 'remote'), 0o777)
+  const upgrade = await install(h, ['--version', '0.2.3', '--no-service'])
+  await chmod(join(h, 'remote'), 0o700)
+  assert.notEqual(upgrade.code, 0)
+  assert.match(upgrade.stderr, /chmod go-w[\s\S]*--no-paired-config/)
+  assert.equal(JSON.parse(await readFile(configFile, 'utf8')).version, '0.2.0')
+  const removed = await install(h, ['--version', '0.2.3', '--no-service', '--no-paired-config'])
+  assert.equal(removed.code, 0, removed.stderr)
+  assert.equal(JSON.parse(await readFile(configFile, 'utf8')).paired_config, '')
+})

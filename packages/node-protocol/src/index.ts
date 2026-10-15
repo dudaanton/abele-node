@@ -4,6 +4,7 @@ export * from './pairing.js'
 export * from './debugger.js'
 export * from './debugger-control.js'
 export * from './trace.js'
+export * from './http.js'
 export type NodeId = string
 export type SessionId = string
 export type StreamId = string

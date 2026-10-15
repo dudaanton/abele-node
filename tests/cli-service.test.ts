@@ -1,6 +1,7 @@
 import { afterEach, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -71,7 +72,7 @@ function fixture() {
   )
   writeFileSync(
     join(runtime, 'fake-installer.cjs'),
-    `const fs=require('node:fs');const file=${JSON.stringify(configFile)};const args=process.argv.slice(2);const action=args[args.indexOf('--service-action')+1];const c=JSON.parse(fs.readFileSync(file));fs.appendFileSync(${JSON.stringify(join(home, 'actions'))},action+'\\n');c.service=action==='enable'?1:0;fs.writeFileSync(file,JSON.stringify(c));`
+    `const fs=require('node:fs');const file=${JSON.stringify(configFile)};const args=process.argv.slice(2);const action=args[args.indexOf('--service-action')+1];const c=JSON.parse(fs.readFileSync(file));fs.appendFileSync(${JSON.stringify(join(home, 'actions'))},action+'\\n');fs.appendFileSync(${JSON.stringify(join(home, 'installer-args'))},JSON.stringify(args)+'\\n');c.service=action==='enable'?1:0;if(args.includes('--paired-config'))c.paired_config=args[args.indexOf('--paired-config')+1];if(args.includes('--no-paired-config'))c.paired_config='';fs.writeFileSync(file,JSON.stringify(c));`
   )
   return {
     entry: join(runtime, 'packages/node-daemon/dist/cli.js'),
@@ -240,4 +241,164 @@ it('source deployments have an explicit foreground status and safe enable refusa
   const result = run(cli, f.state, 'service', 'enable')
   expect(result.status).toBe(1)
   expect(result.stderr).toContain('one-command installer')
+})
+
+const pairedEndpoint = 'wss://node.example.ts.net:8444/channel'
+function pairedFile(
+  home: string,
+  body: unknown = { endpoint: pairedEndpoint, origins: ['app://obsidian.md'] }
+) {
+  const directory = join(home, 'remote')
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  chmodSync(directory, 0o700)
+  const file = join(directory, 'paired.json')
+  writeFileSync(file, JSON.stringify(body), { mode: 0o600 })
+  chmodSync(file, 0o600)
+  return file
+}
+function installerArgs(home: string): string[][] {
+  try {
+    return readFileSync(join(home, 'installer-args'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[])
+  } catch {
+    return []
+  }
+}
+it('service enable records a validated, protected paired configuration and status shows only its endpoint', () => {
+  const f = fixture(),
+    file = pairedFile(f.home)
+  const enable = run(f.entry, f.state, 'service', 'enable', '--paired-config', file)
+  expect(enable.status, enable.stderr).toBe(0)
+  const passed = installerArgs(f.home)[0]!
+  expect(passed.slice(passed.indexOf('--service-action'))).toEqual([
+    '--service-action',
+    'enable',
+    '--paired-config',
+    file,
+  ])
+  expect(JSON.parse(readFileSync(f.configFile, 'utf8')).paired_config).toBe(file)
+  const json = JSON.parse(run(f.entry, f.state, 'service', 'status', '--json').stdout)
+  expect(json.paired_listener).toEqual({
+    config: file,
+    endpoint: 'node.example.ts.net:8444',
+    problem: null,
+  })
+  const human = run(f.entry, f.state, 'service', 'status').stdout
+  expect(human).toContain('Remote access: paired listener at node.example.ts.net:8444')
+  expect(human).not.toContain('app://obsidian.md')
+  // Operator commands read the recorded file without repeating the flag.
+  expect(run(f.entry, f.state, 'status').stdout).toContain(`Paired/remote: ${pairedEndpoint}`)
+  const routes = run(f.entry, f.state, 'pair', 'routes', '--json')
+  expect(routes.status, routes.stderr).toBe(0)
+  expect(JSON.parse(routes.stdout).endpoint).toBe(pairedEndpoint)
+  // A plain enable keeps it; --no-paired-config removes it.
+  expect(run(f.entry, f.state, 'service', 'enable').status).toBe(0)
+  expect(installerArgs(f.home)[1]).not.toContain('--paired-config')
+  expect(JSON.parse(readFileSync(f.configFile, 'utf8')).paired_config).toBe(file)
+  expect(run(f.entry, f.state, 'service', 'enable', '--no-paired-config').status).toBe(0)
+  expect(installerArgs(f.home)[2]).toContain('--no-paired-config')
+  expect(
+    JSON.parse(run(f.entry, f.state, 'service', 'status', '--json').stdout).paired_listener
+  ).toBe(null)
+  expect(run(f.entry, f.state, 'service', 'status').stdout).toContain(
+    'Remote access: no paired listener configured'
+  )
+})
+it('service enable records the physical path of a configuration reached through a symlinked directory', () => {
+  const f = fixture(),
+    file = pairedFile(f.home),
+    alias = join(f.home, 'alias')
+  symlinkSync(join(f.home, 'remote'), alias)
+  const result = run(
+    f.entry,
+    f.state,
+    'service',
+    'enable',
+    '--paired-config',
+    join(alias, 'paired.json')
+  )
+  expect(result.status, result.stderr).toBe(0)
+  expect(JSON.parse(readFileSync(f.configFile, 'utf8')).paired_config).toBe(file)
+})
+it.each([
+  ['missing', (file: string) => rmSync(file), 'not found'],
+  ['group-readable', (file: string) => chmodSync(file, 0o640), 'chmod 600'],
+  ['world-writable', (file: string) => chmodSync(file, 0o602), 'chmod 600'],
+  [
+    'in a group-writable directory',
+    (file: string) => chmodSync(resolve(file, '..'), 0o770),
+    'chmod go-w',
+  ],
+  [
+    'a symlink',
+    (file: string) => {
+      const target = file + '.real'
+      writeFileSync(target, readFileSync(file), { mode: 0o600 })
+      rmSync(file)
+      symlinkSync(target, file)
+    },
+    'symlink',
+  ],
+  ['not JSON', (file: string) => writeFileSync(file, '{'), 'not valid JSON'],
+  [
+    'invalid for the paired listener',
+    (file: string) =>
+      writeFileSync(file, JSON.stringify({ endpoint: 'wss://example.com/channel' })),
+    'invalid (endpoint)',
+  ],
+  [
+    'carrying unknown fields',
+    (file: string) => writeFileSync(file, JSON.stringify({ endpoint: pairedEndpoint, token: 'x' })),
+    'invalid',
+  ],
+])(
+  'service enable refuses a paired configuration that is %s and changes nothing',
+  (_, spoil, message) => {
+    const f = fixture(),
+      file = pairedFile(f.home)
+    spoil(file)
+    const before = readFileSync(f.configFile, 'utf8')
+    const result = run(f.entry, f.state, 'service', 'enable', '--paired-config', file)
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(message)
+    expect(result.stderr).toContain('othing changed')
+    expect(installerArgs(f.home)).toEqual([])
+    expect(readFileSync(f.configFile, 'utf8')).toBe(before)
+    chmodSync(join(f.home, 'remote'), 0o700)
+  }
+)
+it('paired configuration flags are refused outside service enable and together', () => {
+  const f = fixture(),
+    file = pairedFile(f.home)
+  for (const args of [
+    ['service', 'disable', '--paired-config', file],
+    ['service', 'disable', '--no-paired-config'],
+    ['service', 'status', '--paired-config', file],
+    ['service', 'enable', '--paired-config', file, '--no-paired-config'],
+  ]) {
+    const result = run(f.entry, f.state, ...args)
+    expect(result.status, args.join(' ')).toBe(1)
+  }
+  expect(installerArgs(f.home)).toEqual([])
+})
+it('a recorded paired configuration that became unusable is reported, never blocks its removal', () => {
+  const f = fixture(),
+    file = pairedFile(f.home)
+  writeFileSync(f.configFile, JSON.stringify({ ...f.config, paired_config: file }))
+  chmodSync(file, 0o644)
+  const status = JSON.parse(run(f.entry, f.state, 'service', 'status', '--json').stdout)
+  expect(status.paired_listener.endpoint).toBe(null)
+  expect(status.paired_listener.problem).toContain('chmod 600')
+  expect(run(f.entry, f.state, 'service', 'status').stdout).toContain('is unusable')
+  expect(run(f.entry, f.state, 'status', '--json').status).toBe(0)
+  // Pairing must not run on a configuration that is no longer protected.
+  const pair = run(f.entry, f.state, 'pair', 'routes', '--json')
+  expect(pair.status).toBe(1)
+  expect(pair.stderr).toContain('chmod 600')
+  const removal = run(f.entry, f.state, 'service', 'enable', '--no-paired-config')
+  expect(removal.status, removal.stderr).toBe(0)
+  expect(JSON.parse(readFileSync(f.configFile, 'utf8')).paired_config).toBe('')
 })

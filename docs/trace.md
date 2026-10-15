@@ -106,5 +106,5 @@ The capability `trace_v1` is advertised only where the debugger is enabled.
 ## Not here yet
 
 Recording without stopping the program, browser requests over the DevTools protocol or from a HAR
-file, masking of headers, suggested links between steps, canvas, comparing runs and HTTP-client
-launches on the same timeline are later stages.
+file, masking of headers, canvas and comparing runs are later stages. A [saved request](http.md) can be
+sent into the run being recorded: it heads the steps taken while it was out, linked by time.
