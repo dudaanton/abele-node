@@ -664,6 +664,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported',
           evidence: 'durable-file-mutations; identity-bound-external-owner-approval',
         },
+        repository_git_write_v1: {
+          status: 'supported',
+          evidence:
+            'repository.v1.git stage/unstage/discard/commit/update(rebase)/continue/abort/push(force-with-lease)/fetch/create_branch/info; editing-permission; durable-receipts; unknown-outcomes',
+        },
         repository_notifications_v1: {
           status: 'supported',
           evidence: 'leased-watchers-and-reconciliation-v1',
@@ -810,7 +815,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       .prepare(
         `SELECT request_hash FROM file_mutations WHERE principal_id=?1 AND operation_id=?2
       UNION ALL SELECT request_hash FROM node_path_effects WHERE principal_id=?1 AND operation_id=?2
-      UNION ALL SELECT request_hash FROM repository_deletions WHERE principal_id=?1 AND operation_id=?2`
+      UNION ALL SELECT request_hash FROM repository_deletions WHERE principal_id=?1 AND operation_id=?2
+      UNION ALL SELECT request_hash FROM repository_git_effects WHERE principal_id=?1 AND operation_id=?2`
       )
       .all(principal, operation) as Row[]
   }

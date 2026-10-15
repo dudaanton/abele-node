@@ -74,6 +74,7 @@ interface DeletionResult {
   reservation_retained: boolean
 }
 type DeletionReceipt = DeletionResult | { worktree_id: string; state: 'deleted' }
+export type RepositoryTarget = Target
 interface Target {
   worktree_id: string
   project_id: string
@@ -464,6 +465,78 @@ export class RepositoryService {
     }
     return target.path
   }
+  /** Git writes need what saving a file there needs, after full Git validation. */
+  async writableTarget(actor: AuthorityContext, id: string) {
+    this.r.core.authority.check(actor, 'mutate', id)
+    const target = await this.validate(this.get(id))
+    this.fileRoot(id)
+    return target
+  }
+  async readableTarget(actor: AuthorityContext, id: string) {
+    this.r.core.authority.check(actor, 'resource', id)
+    return this.validate(this.get(id))
+  }
+  /** Rechecked immediately before a git effect and before its result is published. */
+  checkWritable(actor: AuthorityContext, id: string) {
+    this.r.core.authority.check(actor, 'mutate', id)
+    this.checkPublication(actor, { worktree_id: id })
+    this.fileRoot(id)
+  }
+  headOf(target: RepositoryTarget) {
+    return this.head(target)
+  }
+  async defaultBranchOf(actor: AuthorityContext, target: RepositoryTarget) {
+    return RepositoryRefsPageSchema.parse(
+      await this.refs(actor, target, 'repository.v1.refs', {
+        worktree_id: target.worktree_id,
+        limit: 256,
+      })
+    ).default_branch
+  }
+  /**
+   * The status rows of `paths` as the caller's observation showed them, provided each path, its
+   * index entry and HEAD are unchanged since. Other paths may change freely.
+   */
+  async observedChanges(
+    actor: AuthorityContext,
+    target: RepositoryTarget,
+    observation: string,
+    paths: string[]
+  ) {
+    this.prune()
+    const o = this.observations.get(observation)
+    if (!o || o.owner !== actor.installation_id || o.target !== target.worktree_id)
+      throw new ChannelError('stale_revision')
+    if ((await this.head(target)) !== o.revision.head) throw new ChannelError('stale_revision')
+    const current = new Map(
+      this.parseStatus(await this.r.git.run(target.path, { kind: 'status' })).map((row) => [
+        row.path,
+        row,
+      ])
+    )
+    return paths.map((path) => {
+      const seen = o.status.find((row) => row.path === path),
+        now = current.get(path)
+      if (!seen || !now || now.index !== seen.index || now.worktree !== seen.worktree)
+        throw new ChannelError('stale_revision')
+      this.checkObservedPath(target, o.snapshot, path)
+      return { path, index: now.index, worktree: now.worktree }
+    })
+  }
+  /** Tell every reader of this worktree to refresh after a git write. */
+  gitChanged(actor: AuthorityContext, target: RepositoryTarget) {
+    this.r.core.append(
+      'catalog',
+      'repository.invalidated',
+      { kind: 'installation', installation_id: actor.installation_id },
+      {
+        project_id: target.project_id,
+        worktree_id: target.worktree_id,
+        reason: 'reconciliation',
+        generation: randomUUID(),
+      }
+    )
+  }
   private checkEdit(target: Target) {
     if (!target.active) throw new ChannelError('stale_resource')
     const config = this.config(target.project_id)
@@ -576,7 +649,8 @@ export class RepositoryService {
       ['repository.v1.write', 'repository.v1.restore', 'repository.v1.recovery.read'].includes(
         method
       ) ||
-      method.startsWith('repository.v1.file.')
+      method.startsWith('repository.v1.file.') ||
+      (method.startsWith('repository.v1.git.') && method !== 'repository.v1.git.info')
     ) {
       this.checkPublication(actor, p)
       this.fileRoot(String(p.worktree_id))
@@ -2521,17 +2595,19 @@ export class RepositoryService {
     cursor?: { stream_id: string; revision: number } | null
   ) {
     const changes = cursor !== undefined
-    for (const [key, s] of this.subscriptions)
-      if (
-        s.expires < Date.now() ||
-        (s.owner.installation_id === actor.installation_id &&
-          s.target.worktree_id === target.worktree_id)
-      )
-        this.unwatch(key)
-    if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
-    const watched = await this.watchFingerprint(target)
-    const id = randomUUID(),
-      s: Subscription = {
+    const renewed = (other: Subscription) =>
+      other.owner.installation_id === actor.installation_id &&
+      other.target.worktree_id === target.worktree_id
+    for (const [key, s] of this.subscriptions) if (s.expires < Date.now()) this.unwatch(key)
+    // The lease being renewed keeps publishing until this one takes over: dropped now, a batch
+    // made while the new one is observed would reach nobody and force the client to reread.
+    if ([...this.subscriptions.values()].filter((other) => !renewed(other)).length >= 16)
+      throw new ChannelError('resource_busy')
+    let stream: { stream_id: string; revision: number } | undefined, id: string, s: Subscription
+    try {
+      const watched = await this.watchFingerprint(target)
+      id = randomUUID()
+      s = {
         owner: actor,
         target,
         fingerprint: watched.cheap,
@@ -2541,20 +2617,20 @@ export class RepositoryService {
         checking: false,
         changes,
       }
-    const stream = changes
-      ? await this.changes.open(target.worktree_id, () => this.changeBaseline(target))
-      : undefined
-    // Initial fingerprinting yields to token revocation, opt-out and shutdown.
-    // Recheck before allocating timers/handles, not just when publishing the first hint.
-    if (this.stopped) throw new ChannelError('resource_busy')
-    this.checkRead(target)
-    this.checkPublication(actor, { worktree_id: target.worktree_id })
-    for (const [key, current] of this.subscriptions)
-      if (
-        current.owner.installation_id === actor.installation_id &&
-        current.target.worktree_id === target.worktree_id
-      )
-        this.unwatch(key)
+      stream = changes
+        ? await this.changes.open(target.worktree_id, () => this.changeBaseline(target))
+        : undefined
+      // Initial fingerprinting yields to token revocation, opt-out and shutdown.
+      // Recheck before allocating timers/handles, not just when publishing the first hint.
+      if (this.stopped) throw new ChannelError('resource_busy')
+      this.checkRead(target)
+      this.checkPublication(actor, { worktree_id: target.worktree_id })
+    } catch (error) {
+      // A failed renewal ends the lease it was renewing, as it always has.
+      for (const [key, current] of this.subscriptions) if (renewed(current)) this.unwatch(key)
+      throw error
+    }
+    for (const [key, current] of this.subscriptions) if (renewed(current)) this.unwatch(key)
     if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
     this.subscriptions.set(id, s)
     // Decided as the subscription takes over, so no batch falls between the answer and it.
@@ -2692,7 +2768,7 @@ export class RepositoryService {
       }
     }
     const run = (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
-      const task = this.r.git.bounded(15000, () => reconcile(reason))
+      const task = this.r.git.detached(15000, () => reconcile(reason))
       this.reconciliations.add(task)
       void task.finally(() => this.reconciliations.delete(task)).catch(() => {})
     }

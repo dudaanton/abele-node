@@ -63,8 +63,10 @@ afterEach(async () => {
   }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
+// A batch follows a hint within one reconciliation, which a slow machine may stretch to its
+// whole 15 s git budget, plus the 2 s reconciliation tick; a lost batch still fails here.
 async function wait(predicate: () => boolean) {
-  const end = Date.now() + 10000
+  const end = Date.now() + 20000
   while (!predicate()) {
     if (Date.now() > end) throw new Error('change stream deadline')
     await new Promise((r) => setTimeout(r, 20))
@@ -266,7 +268,7 @@ it('advertises the change stream and streams in-place tree batches to a watcher'
       .read('catalog', 0)
       .filter((e) => e.type === 'repository.invalidated' && (e.data as any).worktree_id === s.root)
   ).toEqual([])
-}, 30000)
+}, 60000)
 
 it('continues a renewed lease without a reread and asks for one after a gap', async () => {
   const s = await setup()
@@ -299,7 +301,7 @@ it('continues a renewed lease without a reread and asks for one after a gap', as
     changes: { stream_id: 'a-previous-node-run', revision },
   })
   expect(restarted).toMatchObject({ refresh_required: true, changes: { revision } })
-}, 30000)
+}, 60000)
 
 it('asks for a reread when a batch was made while this client was not watching', async () => {
   const s = await setup()
@@ -324,20 +326,68 @@ it('asks for a reread when a batch was made while this client was not watching',
     changes: first.changes,
   })
   expect(renewed.refresh_required).toBe(true)
-}, 30000)
+}, 60000)
 it('keeps sending batches while a lease is renewed', async () => {
-  const s = await setup()
+  const s = await setup(),
+    repository = s.core.resources.repository as any
   const first = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
   const before = s.core.head('catalog')
-  let renewing: Promise<any> | undefined
-  // The renewal is underway while the edit is described.
+  // Hold the renewal after it has observed the tree and before it takes over, however long
+  // that takes on this machine: an edit in that window is the old lease's to send.
+  const open = repository.changes.open.bind(repository.changes)
+  let held!: () => void,
+    reached = false
+  const release = new Promise<void>((r) => (held = r))
+  vi.spyOn(repository.changes, 'open').mockImplementation(async (...args: any[]) => {
+    reached = true
+    await release
+    return open(...args)
+  })
+  const renewing = s.request('repository.v1.watch', {
+    worktree_id: s.root,
+    changes: first.changes,
+  })
+  await wait(() => reached)
   writeFileSync(join(s.repo, 'during'), 'x\n')
-  renewing = s.request('repository.v1.watch', { worktree_id: s.root, changes: first.changes })
   await wait(() => s.batches(before).length > 0)
+  held()
   const renewed = await renewing
   expect(renewed.refresh_required).toBe(false)
-  expect(s.batches(before).map((b) => b.revision)).toEqual([first.changes.revision + 1])
-}, 30000)
+  expect(renewed.changes).toEqual({
+    stream_id: first.changes.stream_id,
+    revision: first.changes.revision + 1,
+  })
+  // The renewed lease carries on from there.
+  writeFileSync(join(s.repo, 'after'), 'x\n')
+  await wait(() => s.batches(before).length > 1)
+  expect(s.batches(before).map((b) => b.revision)).toEqual([
+    first.changes.revision + 1,
+    first.changes.revision + 2,
+  ])
+  expect(s.batches(before)[0].entries).toEqual([
+    { change: 'added', entry: expect.objectContaining({ path: 'during' }) },
+  ])
+}, 60000)
+it('keeps a lease streaming after the request that opened it would have run out of time', async () => {
+  const s = await setup()
+  const repository = s.core.resources.repository as any
+  await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  // The watch request's own 15 s git budget is long over; the lease's 60 s is not. A
+  // reconciliation already under way would see its own budget pass too, so none is.
+  await wait(() => repository.reconciliations.size === 0)
+  const now = Date.now.bind(Date)
+  vi.spyOn(Date, 'now').mockImplementation(() => now() + 16000)
+  const before = s.core.head('catalog')
+  writeFileSync(join(s.repo, 'later'), 'x\n')
+  await wait(() => s.batches(before).length > 0)
+  expect(s.batches(before)).toEqual([
+    expect.objectContaining({
+      revision: 1,
+      complete: true,
+      entries: [{ change: 'added', entry: expect.objectContaining({ path: 'later' }) }],
+    }),
+  ])
+}, 60000)
 it('marks a batch incomplete after a watcher overflow and keeps counting', async () => {
   const s = await setup(),
     repository = s.core.resources.repository as any
@@ -358,7 +408,7 @@ it('marks a batch incomplete after a watcher overflow and keeps counting', async
   writeFileSync(join(s.repo, 'after-overflow'), 'x\n')
   await wait(() => s.batches(before).some((b) => b.complete))
   expect(s.batches(before).find((b) => b.complete)).toMatchObject({ revision: 2 })
-}, 30000)
+}, 60000)
 
 it('asks for a reread when one batch would be too large', async () => {
   const s = await setup(),
@@ -369,7 +419,7 @@ it('asks for a reread when one batch would be too large', async () => {
   for (let i = 0; i < 5; i++) writeFileSync(join(s.repo, `bulk-${i}`), 'x\n')
   await wait(() => s.batches(before).length > 0)
   expect(s.batches(before)[0]).toMatchObject({ complete: false, reason: 'limit' })
-}, 30000)
+}, 60000)
 
 it('keeps a legacy watcher on invalidations only', async () => {
   const s = await setup()
@@ -380,7 +430,7 @@ it('keeps a legacy watcher on invalidations only', async () => {
   writeFileSync(join(s.repo, 'legacy'), 'x\n')
   await wait(() => s.core.read('catalog', before).some((e) => e.type === 'repository.invalidated'))
   expect(s.batches(0)).toEqual([])
-}, 30000)
+}, 60000)
 
 it('fences change batches of an external worktree once external reading is revoked', async () => {
   const s = await setup()
@@ -395,4 +445,4 @@ it('fences change batches of an external worktree once external reading is revok
     external_read: false,
   })
   expect(s.core.canPublishEvent(s.actor, event)).toBe(false)
-}, 30000)
+}, 60000)

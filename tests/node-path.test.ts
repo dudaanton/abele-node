@@ -345,6 +345,50 @@ it('streams numbered plain folder batches to a watcher that asks for them', asyn
   expect(renewed.refresh_required).toBe(false)
 }, 30000)
 
+it('keeps sending plain folder batches while a lease is renewed', async () => {
+  const s = setup()
+  const project = await s.request('project.register', { path: s.folder, trust: 'untrusted' })
+  const workspace = (await s.request('workspace.list', { project_id: project.project_id }))[0]
+  const lease = await s.request('workspace.watch', {
+    workspace_id: workspace.workspace_id,
+    changes: null,
+  })
+  const batches = (after: number) =>
+    s.core
+      .read('catalog', after)
+      .filter((e) => e.type === 'workspace.files_changed')
+      .map((e) => e.data as any)
+  const before = s.core.head('catalog')
+  // Hold the renewal while its stream opens: an edit in that window is the old lease's to send.
+  const streams = (s.core.resources.repository as any).changes
+  const open = streams.open.bind(streams)
+  let held!: () => void,
+    reached = false
+  const release = new Promise<void>((r) => (held = r))
+  vi.spyOn(streams, 'open').mockImplementation(async (...args: any[]) => {
+    reached = true
+    await release
+    return open(...args)
+  })
+  const renewing = s.request('workspace.watch', {
+    workspace_id: workspace.workspace_id,
+    changes: lease.changes,
+  })
+  await expect.poll(() => reached, { timeout: 20000 }).toBe(true)
+  writeFileSync(join(s.folder, 'during'), 'x')
+  await expect.poll(() => batches(before).length, { timeout: 20000 }).toBeGreaterThan(0)
+  held()
+  const renewed = await renewing
+  expect(renewed.refresh_required).toBe(false)
+  expect(batches(before)).toEqual([
+    expect.objectContaining({
+      revision: 1,
+      complete: true,
+      entries: [{ change: 'added', entry: expect.objectContaining({ path: 'during' }) }],
+    }),
+  ])
+}, 60000)
+
 it('expires picker handles and refuses durable unknown effects after restart instead of replaying', async () => {
   const s = setup()
   const picker = await s.request('filesystem.v1.directories', { path: s.folder })

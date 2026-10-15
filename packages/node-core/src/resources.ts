@@ -31,6 +31,7 @@ import {
 import { GitRunner, decodeGit, parseWorktrees } from './git.js'
 import { FileMutationCoordinator } from './mutations.js'
 import { RepositoryService } from './repository.js'
+import { RepositoryGitService } from './repository-git.js'
 import { NodePathService } from './node-path.js'
 import { WorkspaceSearchService } from './workspace-search.js'
 import { ExecutionTargetService } from './execution-targets.js'
@@ -569,6 +570,7 @@ export class ResourceServices {
   readonly targets: ExecutionTargetService
   readonly git: GitRunner
   readonly repository: RepositoryService
+  readonly repositoryGit: RepositoryGitService
   readonly files = new WorkspaceFileService(this)
   readonly mutations = new FileMutationCoordinator(this)
   readonly views = new GitViewService(this)
@@ -586,6 +588,7 @@ export class ResourceServices {
   ) {
     this.git = git
     this.repository = new RepositoryService(this)
+    this.repositoryGit = new RepositoryGitService(this)
     this.nodePath = new NodePathService(this)
     this.targets = new ExecutionTargetService(this)
     const stored = core.db.prepare("SELECT value FROM meta WHERE key='worktree_root'").get() as
@@ -727,6 +730,8 @@ export class ResourceServices {
       ].includes(method)
     )
       return this.repository.mutation(actor, method, p, operation)
+    if (this.repositoryGit.handles(method))
+      return this.repositoryGit.request(actor, method, p, operation)
     if (method.startsWith('repository.v1.')) return this.repository.request(actor, method, p)
     if (method === 'project.repository_settings')
       return this.repository.settings(actor, p, operation)

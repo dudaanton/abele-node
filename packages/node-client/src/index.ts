@@ -158,7 +158,7 @@ export class NodeClient {
   readonly debugger = new DebuggerClient((method, params) => this.request(method, params))
   readonly trace = new TraceClient((method, params) => this.request(method, params))
   readonly repository = new RepositoryClient((method, params) => this.request(method, params), {
-    mutation: (method, params) => this.mutation(method, params),
+    mutation: (method, params, operation) => this.mutation(method, params, operation),
     save: async (method, params, operation) => {
       const operation_id = await this.enqueue(method, params, operation)
       if (this.connected) await this.flush().catch(() => {})

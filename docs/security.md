@@ -122,9 +122,12 @@ deadlines. Repository-v1 adds aggregate read budgets, killable regex workers,
 opaque external-worktree targets and per-project owner opt-in. External targets never acquire workspace lifecycle/provider or mutation authority
 from discovery. Durable file editing additionally requires explicit owner approval
 for that opaque worktree identity; project opt-out clears approvals. Replacements
-do not inherit them, and no Git-write operations are exposed.
+do not inherit them. Owner [git writes](repository-git.md) need that same editing
+permission; unlike reads, they run with the repository and user Git configuration
+(hooks, filters, credential helpers) because the owner asked for exactly that operation,
+still with typed argv, no shell, editor, pager or prompt, and limited transports.
 Root/common-directory and target identities are rechecked at access and owner
-permission is rechecked before publishing, including retained reads. Operations disable hooks, fsmonitor, pagers, signature display/signing,
+permission is rechecked before publishing, including retained reads. Read operations disable hooks, fsmonitor, pagers, signature display/signing,
 external diff/textconv and configured checkout/clean filters **even for trusted
 projects**. Invocations ignore system/global Git config and pin supported signature
 programs to `/usr/bin/false`; commit/log/blob views also disable signature display.

@@ -25,6 +25,8 @@ import {
   RepositoryChangeBatchSchema,
 } from './repository.js'
 export * from './repository.js'
+import { RepositoryGitMethodSchemas, REPOSITORY_GIT_MUTATIONS } from './repository-git.js'
+export * from './repository-git.js'
 import { FileMethodSchemas, WorkspaceInvalidationSchema } from './files.js'
 export * from './files.js'
 import { EventSchema } from '@abele/channel-protocol'
@@ -213,6 +215,7 @@ export const MethodSchemas = {
   ...NodePathMethodSchemas,
   ...ResourceMethodSchemas,
   ...RepositoryMethodSchemas,
+  ...RepositoryGitMethodSchemas,
   ...FileMethodSchemas,
   'session.detach': z.object(session).strict(),
   'node.describe': z.object({}).strict(),
@@ -296,6 +299,7 @@ export const MUTATIONS = new Set<Method>([
   ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,
   ...NODE_PATH_MUTATIONS,
+  ...REPOSITORY_GIT_MUTATIONS,
   'project.repository_settings',
   'review.submit',
   'workspace.write',

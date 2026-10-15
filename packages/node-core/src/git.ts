@@ -84,10 +84,17 @@ export class GitRunner {
       work
     )
   }
+  /**
+   * Work a timer or a watcher starts gets a budget of its own. Their callbacks inherit the
+   * context of the request that created them, whose budget ran out long ago.
+   */
+  detached<T>(milliseconds: number, work: () => Promise<T>): Promise<T> {
+    return this.deadlines.run(Date.now() + milliseconds, work)
+  }
   constructor(
     readonly timeoutMs = 15000,
     readonly outputBytes = 512 * 1024,
-    private executable = '/usr/bin/git',
+    readonly executable = '/usr/bin/git',
     readonly metadataOutputBytes = 64 * 1024 * 1024
   ) {}
   /** Only metadata effects are serialized; reads and agent work remain independent. */

@@ -320,29 +320,38 @@ export class NodePathService {
   ) {
     const changes = cursor !== undefined,
       streams = this.r.repository.changes
-    for (const [id, l] of this.leases)
-      if (
-        l.expires < Date.now() ||
-        (l.owner.installation_id === actor.installation_id && l.workspace === workspace)
-      )
-        this.unwatch(id)
-    if (this.leases.size >= 16) throw new ChannelError('resource_busy')
-    const w = this.r.workspaces.get(workspace),
-      project = this.r.projects.get(w.project_id)
-    if (project.repository_path || w.kind !== 'root') throw new ChannelError('invalid_params')
-    if (w.state !== 'ready') throw new ChannelError('resource_busy')
-    const id = randomUUID(),
-      pin = identity(w.path),
+    const renewed = (l: Lease) =>
+        l.owner.installation_id === actor.installation_id && l.workspace === workspace,
+      replace = () => {
+        for (const [other, l] of this.leases) if (renewed(l)) this.unwatch(other)
+      }
+    for (const [id, l] of this.leases) if (l.expires < Date.now()) this.unwatch(id)
+    // The lease being renewed keeps publishing until this one takes over, so a batch made
+    // while the stream opens still reaches this client.
+    if ([...this.leases.values()].filter((l) => !renewed(l)).length >= 16)
+      throw new ChannelError('resource_busy')
+    let w: ReturnType<typeof this.r.workspaces.get>, id: string, pin: string, fingerprint: string
+    try {
+      w = this.r.workspaces.get(workspace)
+      const project = this.r.projects.get(w.project_id)
+      if (project.repository_path || w.kind !== 'root') throw new ChannelError('invalid_params')
+      if (w.state !== 'ready') throw new ChannelError('resource_busy')
+      id = randomUUID()
+      pin = identity(w.path)
       fingerprint = this.fingerprint(w.path)
-    if (changes) {
-      await streams.open(streamKey(workspace), async () => this.baseline(w.path, pin))
-      // Opening yields; a lease of this client may have been taken meanwhile.
-      if (this.stopped) throw new ChannelError('resource_busy')
-      for (const [other, l] of this.leases)
-        if (l.owner.installation_id === actor.installation_id && l.workspace === workspace)
-          this.unwatch(other)
-      if (this.leases.size >= 16) throw new ChannelError('resource_busy')
+      if (changes) {
+        const path = w.path
+        await streams.open(streamKey(workspace), async () => this.baseline(path, pin))
+        // Opening yields; a lease of this client may have been taken meanwhile.
+        if (this.stopped) throw new ChannelError('resource_busy')
+      }
+    } catch (error) {
+      // A failed renewal ends the lease it was renewing, as it always has.
+      replace()
+      throw error
     }
+    replace()
+    if (this.leases.size >= 16) throw new ChannelError('resource_busy')
     const hint = (l: Lease, reason: 'filesystem' | 'reconciliation' | 'overflow') => {
       if (!l.changes) return this.notify(l, reason)
       void this.publish(

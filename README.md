@@ -40,6 +40,11 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
   in place instead of rereading it. See [repository API and bounds](docs/repository-view.md).
 - Bounded UTF-8 file editing/creation with content-version checks, durable save
   receipts, protected recovery copies and explicit restore. See [editing](docs/editing.md).
+- Owner git writes on a worktree that may be edited: stage, unstage, confirmed discard,
+  commit as the worktree's git identity, update from the base branch by rebase (conflicts
+  reported as data, abort/continue), push (with an explicit lease after a rebase), fetch,
+  branch creation, and branch/upstream/remote information. See
+  [git writes](docs/repository-git.md).
 - Per-installation tokens, revocation, status/doctor commands and macOS LaunchAgent
   installation. Offline tests use a non-executing fake provider and fake CLI fixtures.
 - Separately enabled paired WSS through Tailscale Serve, owner-confirmed device keys,
@@ -47,7 +52,7 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
   API and the plugin’s **Pair remote node** action are available. Real phone pairing
   remains unverified here.
 
-Git-mutation UI, live steering, AskUserQuestion, persistent always-allow,
+Git-mutation UI in the plugin depends on its version. Live steering, AskUserQuestion, persistent always-allow,
 exhaustive child history and readable thinking are **not supported**. An experimental
 [debugger probe](docs/debug-probe.md) exercises synthetic JS/TS/Python targets; it is
 not a usable debugger release or plugin debugger UI. Separately,
@@ -79,9 +84,10 @@ never transfers its approval to the replacement.
 Saving changes only the current working file, with an exact-content precondition
 and a durable operation ID. Historical versions are read-only. Conflicts require
 review; an `outcome_unknown` save must not be retried with a new operation ID.
-Recovery copies support explicit restore, subject to retention. Repository view
-provides **no stage/unstage, commit, checkout, fetch, push, merge or generic shell
-operation**.
+Recovery copies support explicit restore, subject to retention. Git writes (stage,
+commit, update from base, push and the rest in [git writes](docs/repository-git.md))
+need the same editing permission and run as explicit owner actions with durable receipts.
+There is **no checkout of existing branches, bare force push or generic shell operation**.
 
 Automatic file display stops at 1 MiB; an explicit larger load can read up to
 16 MiB. Search skips binary files and files over 1 MiB, and reports incomplete

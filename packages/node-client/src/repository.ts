@@ -21,13 +21,16 @@ import {
   type RepositoryMethod,
   type RepositoryParams,
 } from '@abele/node-protocol'
+import { RepositoryGitClient } from './repository-git.js'
+export { RepositoryGitClient } from './repository-git.js'
 
-/** Versioned repository surface. Durable file saves, but no shell, provider admission or Git writes. */
+/** Versioned repository surface: durable file saves and owner git writes (`git`); no shell. */
 export class RepositoryClient {
+  readonly git: RepositoryGitClient
   constructor(
     private request: (method: string, params: unknown) => Promise<unknown>,
     private durable?: {
-      mutation: (method: RepositoryMethod, params: unknown) => Promise<unknown>
+      mutation: (method: string, params: unknown, operation?: string) => Promise<unknown>
       save: (
         method: RepositoryMethod,
         params: unknown,
@@ -35,7 +38,9 @@ export class RepositoryClient {
       ) => Promise<{ operation_id: string }>
       result: (operation: string) => Promise<{ result?: unknown; error?: string } | undefined>
     }
-  ) {}
+  ) {
+    this.git = new RepositoryGitClient(request, durable?.mutation)
+  }
   private call<M extends RepositoryMethod>(method: M, params: RepositoryParams<M>) {
     return this.request(method, RepositoryMethodSchemas[method].parse(params))
   }
