@@ -27,9 +27,14 @@ const NEVER_ARRIVED = new Set([
   'ERR_INVALID_CHAR',
 ])
 
-/** Blanks every secret value wherever it shows, the longest first so a longer one is not split. */
+/** Blanks every secret value wherever it shows, the longest first so a longer one is not split;
+ * also as it reads in an address or a form, percent-encoded. */
 export function masker(secrets: string[]) {
-  const values = [...new Set(secrets.filter((s) => s.length >= 3))].sort(
+  const forms = secrets.flatMap((s) => {
+    const uri = encodeURIComponent(s)
+    return [s, uri, uri.replace(/%20/g, '+')]
+  })
+  const values = [...new Set(forms.filter((s) => s.length >= 3))].sort(
     (a, b) => b.length - a.length
   )
   return (text: string) => {
@@ -50,8 +55,10 @@ export interface SendInput {
 
 const REDIRECT = new Set([301, 302, 303, 307, 308])
 const MAX_HOPS = 10
-/** What a browser drops when a redirect leaves the origin. */
-const ORIGIN_BOUND = /^(authorization|proxy-authorization|cookie)$/i
+/** What a browser drops when a redirect leaves the origin, and headers named as keys. */
+const ORIGIN_BOUND = /^(authorization|proxy-authorization|cookie|x-api-key|api-key)$/i
+/** A send goes out over http or https only: `file:`, `data:` and the rest are not addresses here. */
+const SENDABLE = new Set(['http:', 'https:'])
 
 /** Follows redirects by hand. Within the origin it goes on as a browser would. Leaving it, a
  * request that carries a key stops there: the key was allowed for this origin only, so the
@@ -81,6 +88,7 @@ async function follow(input: SendInput, signal: AbortSignal): Promise<Response> 
     } catch {
       return response
     }
+    if (!SENDABLE.has(next.protocol)) return response
     const leaves = next.origin !== new URL(url).origin
     if (leaves && keyed) return response
     await response.body?.cancel().catch(() => {})
@@ -134,6 +142,17 @@ export async function sendRequest(input: SendInput, signal?: AbortSignal): Promi
   const elapsed = () => Math.round(performance.now() - started)
   const timer = AbortSignal.timeout(timeout)
   const aborted = signal ? AbortSignal.any([signal, timer]) : timer
+  let scheme = ''
+  try {
+    scheme = new URL(input.url).protocol
+  } catch {
+    // Said below, as for any address that cannot be sent to.
+  }
+  if (!SENDABLE.has(scheme))
+    return {
+      outcome: { state: 'failed', reason: 'Not an address that can be sent to.' },
+      ms: elapsed(),
+    }
   let response: Response
   try {
     response = await follow(input, aborted)

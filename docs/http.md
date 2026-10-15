@@ -15,7 +15,8 @@ Everything is under `.abele/requests/` in the project folder:
   kept but not sent), `# @body` when the body's format cannot be read off its `Content-Type`.
   A hand-written `.http` file with one request reads too; unknown comment lines are dropped when
   the request is saved.
-- `env/<name>.json` is one environment: `{ "vars": [{ "key", "value"?, "secret"?, "off"? }],
+- `env/<name>.json` is one environment (a name may not end in `.local`, and no request or
+  collection goes in `env/`, in any case of the word): `{ "vars": [{ "key", "value"?, "secret"?, "off"? }],
 "step_header"? }`. A variable marked `secret` (a token taken from an answer) is never written:
   its value lives in the plugin's memory and comes with each send.
 - `env/<name>.local.json` holds values for this machine only, `{ "vars": [{ "key", "value" }] }`.
@@ -33,8 +34,11 @@ puts the value in for one send and gives it to the node with the list of values 
 `http.v1.send` takes the request as it is to go: method, full address, headers, body, and
 `secrets`, the values to blank. It answers at once with a `send_id`; `http.v1.send.status`
 follows it, since a request may take longer than the channel waits for any answer. Before
-anything is written or answered, every secret is replaced by `••••` wherever it shows: in the
-address, the headers, the body, the answer's headers and body, and an error's words.
+anything is written or answered, every secret is replaced by `••••` wherever it shows, as written
+or percent-encoded: in the address, the headers, the body, the answer's headers and body, and an
+error's words. In a send with any key, `Authorization`, `Cookie`, `X-Api-Key` and the like are
+kept blanked whole when no key shows in them as written, since one may be there encoded (Basic).
+Only `http:` and `https:` addresses are sent to.
 
 Outcomes:
 
@@ -48,7 +52,10 @@ Outcomes:
 
 Redirects are followed within the origin as a browser follows them. A redirect to another origin
 is followed only when the send came with no key at all, in whatever form: a key is allowed for one
-origin, so a request that carries one stops at the redirect and that is the answer, its `Location` among its headers.
+origin, so a request that carries one stops at the redirect and that is the answer, its `Location`
+among its headers. Followed to another origin, a send leaves behind `Authorization`, `Cookie` and
+headers named as keys (`X-Api-Key`, `Api-Key`). A redirect to anything but `http:` or `https:` is
+not followed.
 Links inside `.abele/requests/` are never followed, neither when listing nor when reading or writing.
 
 At most 16 sends are out at once. A finished send stays answerable in memory for ten minutes and

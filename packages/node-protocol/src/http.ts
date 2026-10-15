@@ -15,11 +15,12 @@ const collection = z
   .string()
   .max(256)
   .regex(/^(?![./])(?!.*\/\.)(?!.*\.\.)[^\\:*?"<>|\0]*$/)
+/** Not `<name>.local`: that is the file of another environment's machine-only values. */
 const envName = z
   .string()
   .min(1)
   .max(64)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/)
+  .regex(/^(?!.*\.local$)[A-Za-z0-9][A-Za-z0-9 ._-]*$/i)
 const sendId = z.string().regex(/^s[0-9a-z]{6,40}$/)
 
 export const HTTP_VERSION = 1 as const

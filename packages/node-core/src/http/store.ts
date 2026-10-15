@@ -12,6 +12,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
@@ -31,16 +32,35 @@ const HISTORY = '.history'
 export const HISTORY_KEEP = 50
 /** The most of an answer's body kept on disk. */
 export const BODY_KEEP = 5 * 1024 * 1024
+/** The largest request file read; the list leaves out anything larger. */
+const REQUEST_MAX = 2 * 1024 * 1024
 const IGNORE = `# What was sent and machine-only values stay on this machine.\n${HISTORY}/\n${ENV}/*.local.json\n`
 
 const fail = (code: string): never => {
   throw new Error(code)
 }
 
+/** Whether a path in the folder is in the environments folder, in any case: on a file system that
+ * ignores case `Env/` is that folder too. */
+const inEnv = (rel: string) => rel.split(/[\\/]/)[0]!.toLowerCase() === ENV
+
+/** An environment's file. Its name is one name in `env/`, and never `<other>.local`, which is the
+ * file of another environment's machine-only values. */
+const envFile = (name: string, local = false) => {
+  if (!name || /[\\/]|^\.|\.local$/i.test(name)) fail('http_bad_path')
+  return `${ENV}/${name}${local ? '.local' : ''}.json`
+}
+
 function writeAtomic(path: string, text: string | Buffer) {
   const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
   writeFileSync(tmp, text, { mode: 0o600 })
   renameSync(tmp, path)
+}
+
+function sameFile(a: string, b: string) {
+  const x = statSync(a)
+  const y = statSync(b)
+  return x.ino === y.ino && x.dev === y.dev
 }
 
 function readJson<T>(path: string): T | undefined {
@@ -138,10 +158,10 @@ export class HttpStore {
         // A link is not followed: it could lead out of the project.
         if (stat.isSymbolicLink()) continue
         if (stat.isDirectory()) {
-          if (rel === ENV) continue
+          if (rel.toLowerCase() === ENV) continue
           if (!collections.has(rel)) collections.set(rel, [])
           walk(full)
-        } else if (name.endsWith('.http') && stat.size <= 2 * 1024 * 1024) {
+        } else if (name.endsWith('.http') && stat.size <= REQUEST_MAX) {
           const collection = dirname(rel) === '.' ? '' : dirname(rel)
           const doc = parseRequestFile(readFileSync(full, 'utf8'), name.slice(0, -5))
           if (!collections.has(collection)) collections.set(collection, [])
@@ -176,19 +196,25 @@ export class HttpStore {
   get(id: string): HttpRequestDoc {
     const file = this.inside(id)
     if (!existsSync(file)) fail('http_request_not_found')
+    if (statSync(file).size > REQUEST_MAX) fail('http_request_too_large')
     return parseRequestFile(readFileSync(file, 'utf8'), basename(id).slice(0, -5))
   }
 
   save(id: string, doc: HttpRequestDoc, options: { from?: string; create?: boolean } = {}) {
+    if (inEnv(id) || (options.from && inEnv(options.from))) fail('http_bad_path')
     this.ensure()
     const file = this.inside(id)
     const moving = options.from && options.from !== id
-    if ((options.create || moving) && existsSync(file)) fail('http_request_exists')
-    if (moving && !existsSync(this.inside(options.from!))) fail('http_request_not_found')
+    const from = moving ? this.inside(options.from!) : undefined
+    if (from && !existsSync(from)) fail('http_request_not_found')
+    // The same file by another case of its name, where the file system ignores case: a rename.
+    const recase = from !== undefined && existsSync(file) && sameFile(from, file)
+    if ((options.create || moving) && existsSync(file) && !recase) fail('http_request_exists')
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    if (recase) renameSync(from, file)
     writeAtomic(file, writeRequestFile(doc))
-    if (moving) {
-      rmSync(this.inside(options.from!), { force: true })
+    if (from) {
+      if (!recase) rmSync(from, { force: true })
       // Its history follows it.
       const was = this.historyDir(options.from)
       if (existsSync(was)) {
@@ -208,9 +234,9 @@ export class HttpStore {
   }
 
   createCollection(name: string) {
+    if (inEnv(name)) fail('http_bad_path')
     this.ensure()
     const dir = this.inside(name)
-    if (relative(this.root, dir).split(sep)[0] === ENV) fail('http_bad_path')
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     return { name }
   }
@@ -229,13 +255,12 @@ export class HttpStore {
   }
 
   environment(name: string): HttpEnvironmentDoc {
-    const file = this.inside(`${ENV}/${name}.json`)
+    const file = this.inside(envFile(name))
     if (!existsSync(file)) fail('http_environment_not_found')
     const saved = readJson<{ vars?: HttpVar[]; step_header?: boolean }>(file) ?? {}
     const local =
-      readJson<{ vars?: { key: string; value?: string }[] }>(
-        this.inside(`${ENV}/${name}.local.json`)
-      )?.vars ?? []
+      readJson<{ vars?: { key: string; value?: string }[] }>(this.inside(envFile(name, true)))
+        ?.vars ?? []
     const vars = (Array.isArray(saved.vars) ? saved.vars : [])
       .filter((v) => v && typeof v.key === 'string' && v.key)
       .map((v) => {
@@ -259,13 +284,14 @@ export class HttpStore {
 
   /** Writes an environment; a value kept in the local file stays there, a secret is never written. */
   saveEnvironment(env: Omit<HttpEnvironmentDoc, 'local'>) {
+    const savedFile = envFile(env.name)
     this.ensure()
     mkdirSync(this.inside(ENV), { recursive: true, mode: 0o700 })
-    const localFile = this.inside(`${ENV}/${env.name}.local.json`)
+    const localFile = this.inside(envFile(env.name, true))
     const local = readJson<{ vars?: { key: string; value?: string }[] }>(localFile)?.vars ?? []
     const isLocal = (key: string) => local.some((l) => l.key === key)
     writeAtomic(
-      this.inside(`${ENV}/${env.name}.json`),
+      this.inside(savedFile),
       `${JSON.stringify(
         {
           vars: env.vars.map((v) => ({
@@ -300,10 +326,10 @@ export class HttpStore {
   }
 
   deleteEnvironment(name: string) {
-    const file = this.inside(`${ENV}/${name}.json`)
+    const file = this.inside(envFile(name))
     if (!existsSync(file)) fail('http_environment_not_found')
     rmSync(file, { force: true })
-    rmSync(this.inside(`${ENV}/${name}.local.json`), { force: true })
+    rmSync(this.inside(envFile(name, true)), { force: true })
   }
 
   // ── History ──

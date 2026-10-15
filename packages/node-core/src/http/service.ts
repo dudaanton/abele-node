@@ -295,9 +295,11 @@ export class HttpService {
   }
 }
 
+/** A key header of a send with keys: blanked where a key shows in it, and whole where none does,
+ * since a key may be in it encoded (Basic, a signature). */
 function maskWhole(mask: (t: string) => string, value: string) {
   const masked = mask(value)
-  return masked === value ? value : masked.includes(MASK) ? masked : MASK
+  return masked.includes(MASK) ? masked : MASK
 }
 
 function maskOutcome(
