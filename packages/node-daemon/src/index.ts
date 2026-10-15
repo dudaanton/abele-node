@@ -228,6 +228,11 @@ async function tokenCommand(core: NodeCore, raw: unknown) {
       throw new Error('unknown_token_command')
   }
 }
+/** A command's own failure reaches the operator; malformed requests stay generic. */
+function controlError(error: unknown) {
+  const message = error instanceof Error && error.name === 'Error' ? error.message : ''
+  return /^[a-z][a-z0-9_]+(: [^\n]{1,300})?$/.test(message) ? message : 'invalid_control_command'
+}
 export async function control(dir: string, command: OwnerCommand): Promise<unknown> {
   dir = canonicalStateDir(dir)
   return new Promise((resolve, reject) => {
@@ -429,7 +434,8 @@ export async function startDaemon(
             const raw: unknown = JSON.parse(data)
             const preflight = CodexPreflightSchema.safeParse(raw)
             const serve = ServeControlSchema.safeParse(raw)
-            if (WorktreeRecoveryControlSchema.safeParse(raw).success)
+            // Serve runs several Tailscale commands; match the client's own deadline.
+            if (WorktreeRecoveryControlSchema.safeParse(raw).success || serve.success)
               socket.setTimeout(60000, () => socket.destroy())
             if (preflight.success) {
               socket.setTimeout(60000, () => socket.destroy())
@@ -457,8 +463,8 @@ export async function startDaemon(
                 throw new Error('paired_endpoint_mismatch')
               socket.end(JSON.stringify({ result: await tokenCommand(core!, raw) }))
             }
-          } catch {
-            socket.end(JSON.stringify({ error: 'invalid_control_command' }))
+          } catch (error) {
+            socket.end(JSON.stringify({ error: controlError(error) }))
           }
         })()
       })

@@ -448,3 +448,41 @@ it('never executes custom filters, textconv, diff or fsmonitor during new reads'
   })
   expect(existsSync(marker)).toBe(false)
 })
+
+it('compares the current files with an older branch that has files they no longer have', async () => {
+  const s = await setup(),
+    worktree_id = (await s.catalog()).entries[0].worktree_id
+  git(s.repo, 'branch', 'base')
+  git(s.repo, 'checkout', '-q', '-b', 'feature')
+  git(s.repo, 'rm', '-q', 'sample.txt')
+  writeFileSync(join(s.repo, 'committed.txt'), 'ahead\n')
+  git(s.repo, 'add', '.')
+  git(s.repo, 'commit', '-q', '-m', 'ahead')
+  git(s.repo, 'checkout', '-q', 'base')
+  mkdirSync(join(s.repo, 'later'))
+  writeFileSync(join(s.repo, 'later', 'only-on-base.txt'), 'base\n')
+  git(s.repo, 'add', '.')
+  git(s.repo, 'commit', '-q', '-m', 'base moved on')
+  git(s.repo, 'checkout', '-q', 'feature')
+  writeFileSync(join(s.repo, 'committed.txt'), 'ahead\nedited\n')
+  writeFileSync(join(s.repo, 'untracked.txt'), 'new\n')
+  const base = await s.request('repository.v1.resolve', { worktree_id, ref: 'base' })
+  const head = (await s.request('repository.v1.observe', { worktree_id })).revision
+  const comparison = await s.request('repository.v1.compare', { worktree_id, base, head })
+  expect(comparison.entries.map((e: any) => [e.path, e.status[0]]).sort()).toEqual([
+    ['committed.txt', 'A'],
+    ['later/only-on-base.txt', 'D'],
+    ['sample.txt', 'D'],
+    ['untracked.txt', 'A'],
+  ])
+  const patch = await s.request('repository.v1.patch', {
+    worktree_id,
+    comparison_id: comparison.comparison_id,
+    path: 'sample.txt',
+  })
+  expect(patch.content_id).toBeTruthy()
+  writeFileSync(join(s.repo, 'committed.txt'), 'changed again\n')
+  await expect(s.request('repository.v1.compare', { worktree_id, base, head })).rejects.toThrow(
+    'stale_revision'
+  )
+})

@@ -1,23 +1,45 @@
-import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { assertPairedEndpoint } from '@abele/channel-protocol'
 
 export const DEFAULT_TAILSCALE_CLI = '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
 export type TailscaleRunner = (args: string[]) => Promise<string>
+/** First meaningful line of what Tailscale printed, safe to show to the operator. */
+function firstLine(text: string) {
+  const found = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/[\x00-\x1f\x7f]/g, ' ').trim())
+    .find((l) => l.length > 0)
+  return found ? found.slice(0, 240) : ''
+}
 export function tailscaleRunner(
   executable = process.env.ABELE_TAILSCALE_PATH ?? DEFAULT_TAILSCALE_CLI
 ): TailscaleRunner {
-  return async (args) => {
-    const result = spawnSync(executable, args, {
-      encoding: 'utf8',
-      timeout: 10000,
-      maxBuffer: 1024 * 1024,
+  return (args) =>
+    new Promise((resolve, reject) => {
+      execFile(
+        executable,
+        args,
+        {
+          encoding: 'utf8',
+          timeout: 10000,
+          maxBuffer: 1024 * 1024,
+          // The macOS app bundle acts as a CLI only when asked to; from a background
+          // service it otherwise tries to start its GUI and prints that failure instead.
+          env: { ...process.env, TAILSCALE_BE_CLI: '1' },
+        },
+        (error, stdout, stderr) => {
+          if (!error) return resolve(stdout)
+          // Spawn failures (ENOENT, EACCES, output overflow) keep their own error.
+          if (typeof error.code === 'string') return reject(error)
+          const detail = error.killed
+            ? 'no answer within 10 seconds'
+            : firstLine(stderr) || firstLine(stdout) || `exit status ${String(error.code)}`
+          reject(new Error(`tailscale_command_failed: ${detail}`))
+        }
+      )
     })
-    if (result.error) throw result.error
-    if (result.status !== 0) throw new Error('tailscale_command_failed')
-    return result.stdout
-  }
 }
 type Mapping = { endpoint: string; backend_port: number; state: 'pending' | 'confirmed' }
 export interface ServeOwnershipStore {
@@ -127,7 +149,13 @@ export class TailscaleServeManager {
     else this.memory = mapping
   }
   private async config(): Promise<ServeConfig> {
-    const parsed: unknown = JSON.parse(await this.run(['serve', 'status', '--json']))
+    const output = await this.run(['serve', 'status', '--json'])
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(output)
+    } catch {
+      throw new Error(`tailscale_unexpected_output: ${firstLine(output) || 'empty answer'}`)
+    }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
       throw new Error('invalid_serve_status')
     return parsed as ServeConfig
@@ -200,15 +228,29 @@ export class TailscaleServeManager {
       }
       const config = await this.config()
       const dns = status.Self?.DNSName?.replace(/\.$/, '')
+      const node_mapping =
+        !!endpoint && !!backend_port && exactMapping(config, endpoint, backend_port)
+      let owned: Mapping | undefined
+      try {
+        owned = this.owned()
+      } catch {
+        owned = undefined
+      }
       return {
         present: true,
         logged_in: status.BackendState === 'Running',
         magicdns: status.CurrentTailnet?.MagicDNSEnabled === true,
         https: !!dns && (status.CertDomains ?? []).includes(dns),
         endpoint_matches: !!endpoint && new URL(endpoint).hostname === dns,
-        node_mapping: !!endpoint && !!backend_port && exactMapping(config, endpoint, backend_port),
+        node_mapping,
         local_token_unmapped: !targetsPort(config, local_port),
-        policy_verified: false,
+        // Ownership is confirmed only by `serve enable --tailnet-policy-verified`, so a
+        // confirmed record of exactly the live mapping carries the operator's attestation.
+        policy_verified:
+          node_mapping &&
+          owned?.state === 'confirmed' &&
+          owned.endpoint === endpoint &&
+          owned.backend_port === backend_port,
       }
     } catch (error) {
       return {

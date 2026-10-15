@@ -53,6 +53,22 @@ test('installer retains launcher symlinks across version-directory replacement',
   assert.ok(wrapper.includes(join(bin, 'claude')))
   assert.ok(wrapper.includes(join(bin, 'codex')))
 })
+test('downloads survive a transient 504 or 503 and never retry a 404', async () => {
+  const asset = `/releases/download/v0.2.3/abele-node-0.2.3-${platform}.tar.gz`,
+    sums = '/releases/download/v0.2.3/SHA256SUMS'
+  failures.set(asset, [504])
+  failures.set(sums, [503])
+  hits.clear()
+  const h = await home()
+  const ok = await install(h, ['--version', '0.2.3', '--no-service'])
+  assert.equal(ok.code, 0, ok.stderr)
+  assert.equal(hits.get(asset), 2)
+  assert.equal(hits.get(sums), 2)
+  const missing = '/releases/download/v0.9.9/abele-node-0.9.9-' + platform + '.tar.gz'
+  const refused = await install(await home(), ['--version', '0.9.9', '--no-service'])
+  assert.notEqual(refused.code, 0)
+  assert.equal(hits.get(missing), 1)
+})
 test('Claude discovery records normalized paths and probes with service PATH', async () => {
   const h = await home(),
     bin = join(h, 'custom-bin'),
@@ -136,6 +152,9 @@ test('missing Claude still installs and explains how to configure it later', asy
 const platform = `${process.platform}-${process.arch === 'x64' ? 'x64' : 'arm64'}`
 let scratch, server, base, archive
 const routes = new Map()
+// Statuses answered before the real body, one per request; every request is counted.
+const failures = new Map(),
+  hits = new Map()
 async function run(command, args, env = {}, input = '') {
   return new Promise((resolveResult, reject) => {
     const child = spawn(command, args, {
@@ -363,6 +382,12 @@ before(async () => {
   await release('0.3.3')
   routes.set('/latest', JSON.stringify({ tag_name: 'v0.2.0' }))
   server = createServer((req, res) => {
+    hits.set(req.url, (hits.get(req.url) ?? 0) + 1)
+    const failure = failures.get(req.url)?.shift()
+    if (failure) {
+      res.statusCode = failure
+      return res.end('temporarily unavailable')
+    }
     const body = routes.get(req.url)
     res.statusCode = body === undefined ? 404 : 200
     res.end(body ?? 'not found')

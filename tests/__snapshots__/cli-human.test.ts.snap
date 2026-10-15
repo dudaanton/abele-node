@@ -15,7 +15,7 @@ PROBLEM MagicDNS: unavailable or unverified; fix: enable MagicDNS in the Tailsca
 PROBLEM HTTPS: unavailable or unverified; fix: enable HTTPS certificates in the Tailscale admin console
 PROBLEM Paired endpoint: unavailable or unverified; fix: set the paired endpoint hostname to this node’s Tailscale DNS name
 PROBLEM Serve mapping: unavailable or unverified; fix: verify tailnet policy, then run abele-node serve enable --tailnet-policy-verified
-PROBLEM Tailnet policy: unavailable or unverified; fix: verify the tailnet ACLs manually before enabling Serve
+PROBLEM Tailnet policy: unavailable or unverified; fix: check the tailnet ACLs, then run abele-node serve enable --tailnet-policy-verified
 PROBLEM Local token port: mapping safety unverified; fix: inspect tailscale serve status and remove any mapping to the local token port
 UNKNOWN Disk encryption: could not be determined; check FileVault or your operating system’s disk-encryption settings"
 `;

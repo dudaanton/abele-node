@@ -18,6 +18,8 @@ import { DatabaseSync } from 'node:sqlite'
 let scratch: string, prefix: string, root: string, runtime: string, state: string
 let server: Server, base: string
 let routes: Map<string, string>, requests: string[]
+// Answers served before the real body, one per request: a status (with headers) or a dropped connection.
+let failures: Map<string, Array<{ status: number; headers?: Record<string, string> } | 'drop'>>
 const version = '0.3.2'
 const installer = `#!/bin/sh
 exec "$TEST_NODE" -e 'require("node:fs").writeFileSync(process.env.TEST_CAPTURE,JSON.stringify(process.argv.slice(1)));process.exit(Number(process.env.TEST_INSTALL_EXIT || 0))' -- "$@"
@@ -85,6 +87,7 @@ async function cli(
           ABELE_UPDATE_RAW_URL: `${base}/raw`,
           TEST_NODE: process.execPath,
           TEST_CAPTURE: join(scratch, 'invocation.json'),
+          ABELE_UPDATE_RETRY_DELAY_MS: '20',
           ...extra,
         },
       }
@@ -121,8 +124,15 @@ beforeEach(async () => {
   config()
   routes = new Map()
   requests = []
+  failures = new Map()
   server = createServer((req, res) => {
     requests.push(req.url!)
+    const failure = failures.get(req.url!)?.shift()
+    if (failure === 'drop') return req.socket.destroy()
+    if (failure) {
+      res.writeHead(failure.status, failure.headers)
+      return res.end('temporarily unavailable')
+    }
     const body = routes.get(req.url!)
     res.writeHead(body === undefined ? 404 : 200)
     res.end(body ?? 'not found')
@@ -251,6 +261,53 @@ it('does not hide a failed asset download with a raw fallback', async () => {
   expect(result.code).toBe(1)
   expect(result.stderr).toContain('404')
   expect(requests.some((path) => path.startsWith('/raw'))).toBe(false)
+})
+it('retries a GitHub 504, a 502, a dropped connection and a 429 with Retry-After, then installs', async () => {
+  failures.set('/releases/latest', [{ status: 504 }, 'drop'])
+  failures.set('/releases/download/v0.4.0/install.sh', [
+    { status: 429, headers: { 'Retry-After': '1' } },
+    { status: 502 },
+  ])
+  const started = Date.now()
+  const result = await cli(['update'])
+  expect(result.code, result.stderr).toBe(0)
+  expect(JSON.parse(readFileSync(join(scratch, 'invocation.json'), 'utf8'))).toContain('--version')
+  expect(requests.filter((path) => path === '/releases/latest')).toHaveLength(3)
+  expect(requests.filter((path) => path.endsWith('/install.sh'))).toHaveLength(3)
+  // Retry-After is honoured, not replaced by the much shorter backoff.
+  expect(Date.now() - started).toBeGreaterThanOrEqual(1000)
+})
+it('does not retry a 404 or 403 and keeps its status in the message', async () => {
+  failures.set('/releases/download/v0.4.0/install.sh', [{ status: 403 }])
+  const result = await cli(['update'])
+  expect(result.code).toBe(1)
+  expect(result.stderr).toContain('HTTP 403')
+  expect(requests.filter((path) => path.endsWith('/install.sh'))).toHaveLength(1)
+  expect(existsSync(join(scratch, 'invocation.json'))).toBe(false)
+})
+it('gives up on a persistent 503 after a bounded number of attempts with a plain message', async () => {
+  failures.set(
+    '/releases/download/v0.4.0/install.sh',
+    Array.from({ length: 20 }, () => ({ status: 503 }))
+  )
+  const result = await cli(['update'])
+  expect(result.code).toBe(1)
+  const attempts = requests.filter((path) => path.endsWith('/install.sh')).length
+  expect(attempts).toBeGreaterThan(1)
+  expect(attempts).toBeLessThanOrEqual(6)
+  expect(result.stderr).toContain('HTTP 503')
+  expect(result.stderr).toMatch(new RegExp(`${attempts} attempts`))
+  expect(result.stderr).toContain('try again in a few minutes')
+  expect(existsSync(join(scratch, 'invocation.json'))).toBe(false)
+})
+it('does not wait out a Retry-After longer than the retry budget', async () => {
+  failures.set('/releases/latest', [{ status: 429, headers: { 'Retry-After': '3600' } }])
+  const started = Date.now()
+  const result = await cli(['update'])
+  expect(result.code).toBe(1)
+  expect(Date.now() - started).toBeLessThan(15000)
+  expect(result.stderr).toContain('HTTP 429')
+  expect(requests).toEqual(['/releases/latest'])
 })
 it('refuses active runs, reports their IDs and does not fetch installer code', async () => {
   activeRun()

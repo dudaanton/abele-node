@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.12
+  sh -s -- --version 0.4.13
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -279,6 +279,10 @@ both the installer asset and its checksum. If a legacy release has no installer
 asset, the unpinned update refuses it. Explicit `--version X.Y.Z` allows that tag's
 raw installer over HTTPS, with a clear notice that it has no installer checksum.
 An installer asset published without `SHA256SUMS` also produces a warning.
+Downloads (by the updater and by the installer) try again after network errors,
+timeouts, `429` (honouring `Retry-After`) and `5xx` answers, a few times with growing
+pauses inside a bounded time, then fail with a plain message; any other `4xx` fails
+at once.
 The installer remains responsible for archive verification, service ownership,
 transactional deployment and rollback; updater failures preserve its diagnostics
 and exit status.
@@ -707,7 +711,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.12  # example; select an existing release
+   git checkout v0.4.13  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

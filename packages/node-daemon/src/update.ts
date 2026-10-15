@@ -10,6 +10,7 @@ import {
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
 import { acquireUpdateLock } from '@abele/node-core'
 import { recoverServiceTransition } from './service.js'
@@ -100,16 +101,75 @@ function endpoint(value: string): URL {
     throw new Error('Update downloads require HTTPS (except loopback test servers).')
   return url
 }
+// Network errors, timeouts, 5xx and 429 are worth another attempt; every other answer is final.
+class TransientDownloadError extends Error {
+  constructor(
+    message: string,
+    readonly waitMs?: number
+  ) {
+    super(message)
+  }
+}
+const RETRY_ATTEMPTS = 5
+const RETRY_BUDGET_MS = 90000
+function retryAfter(value: string | null): number | undefined {
+  if (!value) return undefined
+  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000
+  const at = Date.parse(value)
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now())
+}
+function reason(error: unknown) {
+  const cause = (error as { cause?: unknown }).cause
+  const message = error instanceof Error ? error.message : String(error)
+  return cause instanceof Error && cause.message ? `${message} (${cause.message})` : message
+}
 async function download(value: string, interrupted?: AbortSignal): Promise<Buffer> {
+  const started = Date.now()
+  const backoff = Number(process.env.ABELE_UPDATE_RETRY_DELAY_MS ?? 1000)
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await downloadOnce(value, interrupted)
+    } catch (error) {
+      if (interrupted?.aborted) throw interrupted.reason ?? error
+      if (!(error instanceof TransientDownloadError)) throw error
+      const wait = error.waitMs ?? backoff * 2 ** (attempt - 1)
+      const elapsed = Date.now() - started
+      if (attempt >= RETRY_ATTEMPTS || elapsed + wait > RETRY_BUDGET_MS)
+        throw new Error(
+          `${error.message}; gave up after ${attempt} ${attempt === 1 ? 'attempt' : 'attempts'} in ${Math.round(elapsed / 1000)} s${
+            error.waitMs !== undefined && attempt < RETRY_ATTEMPTS
+              ? ` (the server asked to wait ${Math.round(error.waitMs / 1000)} s)`
+              : ''
+          }. The download server may be temporarily unavailable; try again in a few minutes.`
+        )
+      try {
+        await sleep(wait, undefined, interrupted ? { signal: interrupted } : undefined)
+      } catch (abort) {
+        throw interrupted?.reason ?? abort
+      }
+    }
+  }
+}
+async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<Buffer> {
   let url = endpoint(value)
   const timeout = AbortSignal.timeout(30000)
   const signal = interrupted ? AbortSignal.any([timeout, interrupted]) : timeout
+  // Anything that breaks the connection itself, including our own timeout, is transient.
+  const network = (error: unknown) =>
+    interrupted?.aborted
+      ? error
+      : new TransientDownloadError(`Cannot download ${url}: ${reason(error)}`)
   for (let redirects = 0; redirects <= 5; redirects++) {
-    const response = await fetch(url, {
-      signal,
-      redirect: 'manual',
-      headers: { 'User-Agent': 'abele-node-update' },
-    })
+    let response: Response
+    try {
+      response = await fetch(url, {
+        signal,
+        redirect: 'manual',
+        headers: { 'User-Agent': 'abele-node-update' },
+      })
+    } catch (error) {
+      throw network(error)
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       await response.body?.cancel()
       const location = response.headers.get('location')
@@ -118,8 +178,11 @@ async function download(value: string, interrupted?: AbortSignal): Promise<Buffe
       continue
     }
     if (!response.ok) {
-      await response.body?.cancel()
-      throw new Error(`Cannot download ${url}: HTTP ${response.status}`)
+      await response.body?.cancel().catch(() => {})
+      const message = `Cannot download ${url}: HTTP ${response.status}`
+      if (response.status === 429 || response.status >= 500)
+        throw new TransientDownloadError(message, retryAfter(response.headers.get('retry-after')))
+      throw new Error(message)
     }
     const reader = response.body?.getReader()
     if (!reader) throw new Error(`Empty update download: ${url}`)
@@ -127,14 +190,19 @@ async function download(value: string, interrupted?: AbortSignal): Promise<Buffe
     let length = 0
     try {
       for (;;) {
-        const { done, value: chunk } = await reader.read()
-        if (done) return Buffer.concat(chunks)
-        length += chunk.length
+        let read: Awaited<ReturnType<typeof reader.read>>
+        try {
+          read = await reader.read()
+        } catch (error) {
+          throw network(error)
+        }
+        if (read.done) return Buffer.concat(chunks)
+        length += read.value.length
         if (length > 4 * 1024 * 1024) throw new Error('Update metadata/installer exceeds 4 MiB.')
-        chunks.push(Buffer.from(chunk))
+        chunks.push(Buffer.from(read.value))
       }
     } finally {
-      await reader.cancel()
+      await reader.cancel().catch(() => {})
     }
   }
   throw new Error('Too many update download redirects.')

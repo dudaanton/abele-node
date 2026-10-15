@@ -961,17 +961,19 @@ if [ -n "$service_action" ]; then
   check_health "$old" "$service" || fail 'Service runtime failed status/doctor health checks.'
 else
 base=${ABELE_INSTALL_BASE_URL:-https://github.com/dudaanton/abele-node}
+# curl retries timeouts, 408, 429 (honouring Retry-After) and 5xx; never other 4xx.
+retry='--retry 5 --retry-connrefused --retry-max-time 120 --connect-timeout 20'
 api=${ABELE_INSTALL_API_URL:-https://api.github.com/repos/dudaanton/abele-node/releases/latest}
 if [ -z "$version" ]; then
-  curl -fsSL --retry 3 "$api" -o "$work/latest.json" || fail 'Cannot resolve latest GitHub release; try --version X.Y.Z.'
+  curl -fsSL $retry "$api" -o "$work/latest.json" || fail 'Cannot resolve latest GitHub release; try --version X.Y.Z.'
   version=$("$node" -e 'const v=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).tag_name; if(typeof v!=="string")process.exit(1); console.log(v.replace(/^v/,""))' "$work/latest.json") || fail 'Invalid latest release response.'
   valid_version "$version" || fail 'Invalid release version; expected vX.Y.Z.'
 fi
 asset=abele-node-$version-$os-$arch.tar.gz
 url=$base/releases/download/v$version
 printf 'Downloading AbeleNode %s (%s-%s)...\n' "$version" "$os" "$arch"
-curl -fsSL --retry 3 "$url/$asset" -o "$work/$asset" || fail "Cannot download $asset. Select a release with native installer assets."
-curl -fsSL --retry 3 "$url/SHA256SUMS" -o "$work/SHA256SUMS" || fail 'Cannot download SHA256SUMS.'
+curl -fsSL $retry "$url/$asset" -o "$work/$asset" || fail "Cannot download $asset. If the download server is temporarily unavailable, try again in a few minutes; otherwise select a release with native installer assets."
+curl -fsSL $retry "$url/SHA256SUMS" -o "$work/SHA256SUMS" || fail 'Cannot download SHA256SUMS; try again in a few minutes.'
 expected=$("$node" -e 'const lines=require("node:fs").readFileSync(process.argv[1],"utf8").trim().split(/\r?\n/); const matches=lines.map(l=>l.match(/^([a-fA-F0-9]{64})\s+\*?(.+)$/)).filter(m=>m&&m[2]===process.argv[2]); if(matches.length!==1)process.exit(1); console.log(matches[0][1].toLowerCase())' "$work/SHA256SUMS" "$asset") || fail 'Invalid checksum manifest.'
 if [ "$checksum" = shasum ]; then actual=$(shasum -a 256 "$work/$asset"); else actual=$(sha256sum "$work/$asset"); fi
 actual=${actual%% *}

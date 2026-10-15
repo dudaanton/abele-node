@@ -112,3 +112,34 @@ it('uncertain removal does not retain deletion rights over a subsequently recrea
   )
   expect(f.writes.filter((args) => args.includes('off'))).toHaveLength(1)
 })
+it('doctor reports the tailnet policy verified only for the confirmed mapping enabled through serve', async () => {
+  const f = fixture()
+  // A mapping someone created by hand carries no policy attestation.
+  f.setConfig(mapping)
+  expect(
+    await new TailscaleServeManager(f.run, f.store).doctor(endpoint, 47124, 7777)
+  ).toMatchObject({ node_mapping: true, policy_verified: false })
+  f.setConfig({})
+  const manager = new TailscaleServeManager(f.run, f.store)
+  await manager.enable(endpoint, 47124, 7777)
+  // A fresh reader, as the CLI's doctor is, sees the recorded confirmation.
+  const reader = new TailscaleServeManager(f.run, new FileServeOwnershipStore(f.path))
+  expect(await reader.doctor(endpoint, 47124, 7777)).toMatchObject({
+    node_mapping: true,
+    policy_verified: true,
+  })
+  // Another backend, a vanished mapping or an unconfirmed record are not verified.
+  expect(await reader.doctor(endpoint, 47125, 7777)).toMatchObject({ policy_verified: false })
+  f.setConfig({})
+  expect(await reader.doctor(endpoint, 47124, 7777)).toMatchObject({ policy_verified: false })
+  f.setConfig(mapping)
+  writeFileSync(f.path, JSON.stringify({ endpoint, backend_port: 47124, state: 'pending' }))
+  expect(await reader.doctor(endpoint, 47124, 7777)).toMatchObject({ policy_verified: false })
+  // An unreadable record degrades to unverified rather than hiding every other check.
+  writeFileSync(f.path, 'not json')
+  expect(await reader.doctor(endpoint, 47124, 7777)).toMatchObject({
+    logged_in: true,
+    node_mapping: true,
+    policy_verified: false,
+  })
+})

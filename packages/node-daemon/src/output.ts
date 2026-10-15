@@ -196,7 +196,7 @@ export function humanOutput(
           [
             'policy_verified',
             'Tailnet policy',
-            'verify the tailnet ACLs manually before enabling Serve',
+            'check the tailnet ACLs, then run abele-node serve enable --tailnet-policy-verified',
           ],
         ])
           lines.push(
@@ -357,6 +357,26 @@ function list(value: unknown, empty: string, format: (item: Report) => string) {
     ? value.map((item) => format(record(item))).join('\n')
     : empty
 }
+const serveFailures: Record<string, string> = {
+  tailscale_command_failed: 'Tailscale refused the command',
+  tailscale_unexpected_output: 'Tailscale did not answer as expected',
+  tailscale_prerequisites_missing:
+    'Tailscale is not ready for Serve; run abele-node doctor and fix the Tailscale lines it reports',
+  paired_listener_required:
+    'The running daemon has no paired listener; enable the service with a paired configuration first',
+  serve_port_occupied: 'Another Tailscale Serve mapping already uses the paired endpoint port',
+  reserved_serve_port: 'The paired endpoint must not use port 443 or 80',
+  local_token_mapped:
+    'Tailscale Serve exposes the local token port; remove that mapping before enabling Serve',
+  local_token_backend_refused: 'The paired backend port must differ from the local port',
+  remove_owned_mapping_first:
+    'A different Serve mapping is recorded for this node; run abele-node serve disable first',
+  serve_mapping_unverified: 'Tailscale accepted the command but the mapping could not be verified',
+  serve_mapping_not_owned: 'This node did not create the current Serve mapping',
+  serve_ownership_uncertain:
+    'It is not certain this node created the current Serve mapping; inspect tailscale serve status',
+  serve_mapping_changed: 'The Serve mapping was changed outside AbeleNode; it was left untouched',
+}
 export function humanError(error: unknown) {
   const message = line(error instanceof Error ? error.message : error)
   const launchFailures: Record<string, string> = {
@@ -369,6 +389,10 @@ export function humanError(error: unknown) {
   const launchCode = message.split(':', 1)[0]!
   if (Object.hasOwn(launchFailures, launchCode))
     return `${launchFailures[launchCode]}. (${launchCode})`
+  if (Object.hasOwn(serveFailures, launchCode)) {
+    const detail = message.slice(launchCode.length + 1).trim()
+    return `${serveFailures[launchCode]}${detail ? `: ${detail.replace(/[.!]+$/, '')}` : ''}. (${launchCode})`
+  }
   if (message.startsWith('missing_--'))
     return `Provide a value for ${message.slice(8)}. (missing_option)`
   if (record(error).name === 'ZodError')

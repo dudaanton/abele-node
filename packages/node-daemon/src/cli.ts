@@ -42,7 +42,7 @@ import {
   PairedListenerSchema,
   type PairedListenerConfig,
 } from './index.js'
-import { TailscaleServeManager, tailscaleRunner } from './tailscale.js'
+import { FileServeOwnershipStore, TailscaleServeManager, tailscaleRunner } from './tailscale.js'
 import { update } from './update.js'
 import {
   changeService,
@@ -151,7 +151,11 @@ async function main() {
   const policyFlag = args.indexOf('--tailnet-policy-verified')
   const policyVerified = policyFlag >= 0
   if (policyVerified) args.splice(policyFlag, 1)
-  const tailscale = new TailscaleServeManager(tailscaleRunner(tailscalePath))
+  // Read-only here: doctor and status consult the daemon's ownership record.
+  const tailscale = new TailscaleServeManager(
+    tailscaleRunner(tailscalePath),
+    new FileServeOwnershipStore(join(state, 'serve-ownership.json'))
+  )
   const configuredWorktreeRoot = option('--worktree-root', '')
   const worktreeRoot = configuredWorktreeRoot ? resolve(configuredWorktreeRoot) : undefined
   const claudePath = resolve(

@@ -1773,7 +1773,11 @@ export class RepositoryService {
       const source = join(target.path, directory, '.gitignore')
       return sourceMetadata(source) === (snapshot.ignoreStamps.get(source) ?? null)
     })
-    if (!ignoresUnchanged || pathMetadata(join(target.path, path)) !== snapshot.stamps.get(path)) {
+    // A path the observation never saw (only the base has it) is unchanged while it stays absent.
+    if (
+      !ignoresUnchanged ||
+      pathMetadata(join(target.path, path)) !== (snapshot.stamps.get(path) ?? null)
+    ) {
       // Fence the cache too: an immediate re-observe must not reuse the old state
       // while a delayed filesystem hint is still in flight.
       snapshot.monitor.generation++

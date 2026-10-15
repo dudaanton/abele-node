@@ -18,6 +18,9 @@ unrelated service ports cannot be reached directly, over **both IPv4 and IPv6**.
 This is especially important with userspace netstack forwarding. The CLI cannot
 prove effective ACL policy; `--tailnet-policy-verified` is an explicit operator
 attestation, **not an automated security check**. Pairing is still mandatory.
+`abele-node doctor` reports the tailnet policy as verified while the live Serve
+mapping is exactly the one this node created with that attestation; a mapping made
+by hand, changed or removed shows it unverified again.
 
 Create a protected, stable configuration file. Replace `YOUR_PAIRED_WSS_ENDPOINT`
 with your full Tailscale WSS endpoint and `YOUR_VERIFIED_CLIENT_ORIGIN` with the exact
