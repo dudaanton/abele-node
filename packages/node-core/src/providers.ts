@@ -5,6 +5,10 @@ import type {
   ProviderRun,
   ProviderAction,
   Answer,
+  LiveSession,
+  LiveSessionContext,
+  LiveSessionSink,
+  LiveSessionSettings,
 } from '@abele/provider-contract'
 /** Both real adapters use one queue, journal, fenced worker and prompt-delivery service. */
 export interface ProviderAdapter {
@@ -24,4 +28,10 @@ export interface ProviderAdapter {
     }
   ): Promise<ProviderRun>
   reconcile(evidence: ProcessIdentity[], ipcDirectory?: string): Promise<void>
+  /** Long-lived owner sessions; absent or false means one process per message. */
+  readonly liveAvailable?: boolean
+  startSession?(context: LiveSessionContext, sink: LiveSessionSink): Promise<LiveSession>
+  sessionDefaults?(): LiveSessionSettings
+  /** Throws for a model, effort, mode or account name this node cannot launch. */
+  validateSettings?(settings: Partial<LiveSessionSettings>): void
 }

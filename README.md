@@ -27,6 +27,12 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
   durable provisioning/removal jobs and restart reconciliation.
 - Supervised Claude Code turns: streaming text/tool events, allow/deny/expiry
   approvals, interruption, process-group cleanup and explicit native-session resume.
+- Long-lived Claude sessions: one process per owner chat that keeps background tasks,
+  monitors and subagents across turns, per-session model, effort, account and
+  permission mode, interrupt and hard stop, compaction with continuation and a context
+  meter. They keep running through a node restart or update, and owner sessions can list
+  and write to each other through the node. See
+  [long-lived Claude sessions](docs/claude-sessions.md).
 - Supervised pi SDK turns using the same queue, journal, approvals and native-file
   resume flow; per-feature capability gates and local model configuration apply.
 - Node-side delegation with owner-approved controller grants, isolated child workspaces,

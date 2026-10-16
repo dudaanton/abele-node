@@ -13,6 +13,14 @@ const valueOptions = new Set([
   '--claude-budget',
   '--claude-deadline-ms',
   '--permission-ttl-ms',
+  '--claude-session-model',
+  '--claude-session-effort',
+  '--claude-session-permission-mode',
+  '--claude-session-permission-ttl-ms',
+  '--claude-account',
+  '--claude-idle-ms',
+  '--claude-max-live',
+  '--claude-detached-ms',
   '--codex-path',
   '--codex-model',
   '--codex-home',
@@ -34,6 +42,8 @@ const switches = new Set([
   '--debugger',
   '--codex',
   '--no-codex',
+  '--no-claude-live',
+  '--claude-allow-bypass',
   '--no-paired-config',
   '--check',
   '--force',
@@ -41,7 +51,7 @@ const switches = new Set([
 ])
 const usage: Record<string, string> = {
   start:
-    'start [--port PORT] [--worktree-root PATH]\nRuns in the foreground; Ctrl-C stops it. In a service deployment, starts/verifies the service instead.',
+    'start [--port PORT] [--worktree-root PATH]\nRuns in the foreground; Ctrl-C stops it. In a service deployment, starts/verifies the service instead.\nLong-lived Claude sessions: --claude-session-model MODEL, --claude-session-effort LEVEL, --claude-session-permission-mode MODE, --claude-session-permission-ttl-ms MS, --claude-account NAME=CONFIG_DIR (repeatable), --claude-idle-ms MS (0 keeps idle sessions), --claude-max-live N, --claude-detached-ms MS (how long sessions keep running while the node restarts or updates; 0 ends them with the node), --no-claude-live (one process per message), --claude-allow-bypass (owner sessions may choose bypassPermissions).',
   stop: 'stop\nStops the selected daemon. For managed background service removal, use service disable.',
   status: 'status\nShows daemon health, providers and foreground/background mode.',
   doctor:

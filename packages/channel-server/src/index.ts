@@ -87,6 +87,12 @@ export async function serveChannel(
     last = Date.now(),
     pumping = false
   const subscriptions = new Map<string, Subscription>()
+  // A followed session stream keeps its long-lived process from idling out.
+  const watches = new Map<string, () => void>()
+  const unwatch = (stream: string) => {
+    watches.get(stream)?.()
+    watches.delete(stream)
+  }
   const connection = new AbortController()
   const timerRequests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
@@ -217,6 +223,7 @@ export async function serveChannel(
               const after = Number(p.after_seq)
               if (after > core.head(p.stream_id)) throw new ChannelError('resync_required')
               subscriptions.set(p.stream_id, { cursor: after, ack: after, bytes: 0, sent: [] })
+              if (!watches.has(p.stream_id)) watches.set(p.stream_id, core.watch(p.stream_id))
               result = { head_seq: core.head(p.stream_id) }
             } else if ('seq' in p) {
               const seq = Number(p.seq)
@@ -227,6 +234,7 @@ export async function serveChannel(
               result = { seq }
             } else {
               subscriptions.delete(p.stream_id)
+              unwatch(p.stream_id)
               result = { unsubscribed: true }
             }
           } else
@@ -286,6 +294,7 @@ export async function serveChannel(
     clearTimeout(authDeadline)
     clearInterval(heartbeat)
     clearInterval(pump)
+    for (const stream of [...watches.keys()]) unwatch(stream)
     await close('channel_closed')
     await Promise.allSettled(timerRequests)
   }

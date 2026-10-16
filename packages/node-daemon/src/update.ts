@@ -41,7 +41,13 @@ export type UpdateReport = {
   state_dir: string | null
   claude_path: string | null
   service: boolean | null
-  agents: { admission_paused: boolean; admission_resumed: boolean; active_runs: ActiveRun[] }
+  agents: {
+    admission_paused: boolean
+    admission_resumed: boolean
+    active_runs: ActiveRun[]
+    /** Long-lived sessions that keep running while the node restarts. */
+    kept_sessions?: ActiveRun[]
+  }
   warnings: string[]
   installer: {
     exit_code: number
@@ -207,23 +213,41 @@ async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<B
   }
   throw new Error('Too many update download redirects.')
 }
-function activeRuns(state: string): { run_id: string; session_id: string }[] {
+function activeRuns(state: string): {
+  runs: { run_id: string; session_id: string }[]
+  kept: { run_id: string; session_id: string }[]
+} {
   const file = join(state, 'node.sqlite')
-  if (!existsSync(file)) return [] // Fresh foreground installs may have no database yet.
+  if (!existsSync(file)) return { runs: [], kept: [] } // Fresh foreground installs may have no database yet.
   // Do not instantiate NodeCore: inspecting a live owner's state must not migrate
   // the schema, reconcile processes, or take a second write owner.
   const db = new DatabaseSync(file, { readOnly: true })
   try {
-    return db
-      .prepare("SELECT run_id, session_id FROM provider_runs WHERE state='active' ORDER BY run_id")
-      .all() as { run_id: string; session_id: string }[]
+    // Long-lived sessions keep running through the restart; an older schema has none.
+    const live = (db.prepare('PRAGMA table_info(provider_runs)').all() as { name: string }[]).some(
+      (c) => c.name === 'live'
+    )
+    const rows = db
+      .prepare(
+        `SELECT run_id, session_id, ${live ? 'live IS NOT NULL' : '0'} AS kept FROM provider_runs WHERE state='active' ORDER BY run_id`
+      )
+      .all() as { run_id: string; session_id: string; kept: number }[]
+    const strip = ({ run_id, session_id }: { run_id: string; session_id: string }) => ({
+      run_id,
+      session_id,
+    })
+    return {
+      runs: rows.filter((r) => !r.kept).map(strip),
+      kept: rows.filter((r) => r.kept).map(strip),
+    }
   } finally {
     db.close()
   }
 }
 function checkRuns(state: string, force: boolean, report: UpdateReport) {
-  const runs = activeRuns(state)
+  const { runs, kept } = activeRuns(state)
   report.agents.active_runs = runs
+  report.agents.kept_sessions = kept
   if (!runs.length) return
   const detail = runs.map((run) => `${run.run_id} (session ${run.session_id})`).join(', ')
   if (!force)

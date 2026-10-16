@@ -5,6 +5,8 @@ import {
   DebuggerReplayResultSchema,
   DebuggerReceiptSchema,
   DebuggerWaitResultSchema,
+  DebuggerAttachProgramSchema,
+  DebuggerProgramsResultSchema,
   DebuggerStartSchema,
   DebuggerStartResultSchema,
   type DebuggerSnapshot,
@@ -102,6 +104,18 @@ export class DebuggerClient {
   async start(params: (typeof DebuggerStartSchema)['_input']) {
     return DebuggerStartResultSchema.parse(
       await this.rpc('debugger.v1.start', DebuggerStartSchema.parse(params))
+    )
+  }
+  /** Node.js programs on the node's machine waiting for a debugger on loopback, for a chat. */
+  async programs(conversation_id: string) {
+    return DebuggerProgramsResultSchema.parse(
+      await this.rpc('debugger.v1.programs', { conversation_id })
+    )
+  }
+  /** Attaches to one of them; the owner's act, never resent. Detaching leaves it running. */
+  async attach(params: (typeof DebuggerAttachProgramSchema)['_input']) {
+    return DebuggerStartResultSchema.parse(
+      await this.rpc('debugger.v1.attachProgram', DebuggerAttachProgramSchema.parse(params))
     )
   }
   async command<M extends Command>(method: M, params: Input<`debugger.v1.${M}`>) {

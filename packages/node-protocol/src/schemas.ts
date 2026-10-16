@@ -18,6 +18,13 @@ import {
 } from './node-path.js'
 export * from './node-path.js'
 import { ExpectedExecutionTargetSchema } from './turn.js'
+import {
+  LiveMethodSchemas,
+  LIVE_MUTATIONS,
+  LiveEventPayloads,
+  SessionSettingsSchema,
+} from './live.js'
+export * from './live.js'
 export * from './turn.js'
 import {
   RepositoryMethodSchemas,
@@ -102,6 +109,8 @@ export const SessionSchema = z
     native_session_file: z.string().min(1).max(4096).optional(),
     created_at: z.string().datetime(),
     workspace_id: id.nullable().optional(),
+    /** The owner's choices for a long-lived session; absent means the node's defaults. */
+    settings: SessionSettingsSchema.optional(),
   })
   .strict()
   .refine(
@@ -185,6 +194,7 @@ const EventPayloads = {
   'prompt.resolved': PromptSchema,
   'prompt.expired': PromptSchema,
   'prompt.invalidated': PromptSchema,
+  ...LiveEventPayloads,
   'content.delta': z
     .object({
       run_id: id,
@@ -217,6 +227,7 @@ export const MethodSchemas = {
   ...RepositoryMethodSchemas,
   ...RepositoryGitMethodSchemas,
   ...FileMethodSchemas,
+  ...LiveMethodSchemas,
   'session.detach': z.object(session).strict(),
   'node.describe': z.object({}).strict(),
   'session.list': z
@@ -228,6 +239,7 @@ export const MethodSchemas = {
       provider: z.enum(['fake', 'claude', 'pi', 'codex']).default('fake'),
       workspace_id: id.optional(),
       target: ExecutionTargetSchema.optional(),
+      settings: SessionSettingsSchema.optional(),
     })
     .strict()
     .refine((p) => !(p.workspace_id && p.target)),
@@ -300,6 +312,7 @@ export const MUTATIONS = new Set<Method>([
   ...RESOURCE_MUTATIONS,
   ...NODE_PATH_MUTATIONS,
   ...REPOSITORY_GIT_MUTATIONS,
+  ...LIVE_MUTATIONS,
   'project.repository_settings',
   'review.submit',
   'workspace.write',

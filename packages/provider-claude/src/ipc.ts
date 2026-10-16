@@ -21,13 +21,35 @@ export function createRunIpc() {
     throw error
   }
 }
-export function cleanupRunIpc(dir: string) {
-  if (
-    dirname(dir) !== ipcRoot() ||
-    !/^abele-p-[A-Za-z0-9]{6}$/.test(basename(dir)) ||
-    Buffer.byteLength(join(dir, 'p.sock')) > 100
+/** The version of the protocol between a node and a session host it started or adopts. */
+export const HOST_PROTOCOL = 1
+/** A per-run directory this provider creates, by name; says nothing about its contents. */
+export function isRunIpc(dir: string) {
+  return (
+    dirname(dir) === ipcRoot() &&
+    /^abele-p-[A-Za-z0-9]{6}$/.test(basename(dir)) &&
+    Buffer.byteLength(join(dir, 'p.sock')) <= 100
   )
-    throw new Error('unmanaged_ipc_directory')
+}
+/** Before trusting what is in a directory a previous node left: ours, private, and real. */
+export function verifyRunIpc(dir: string, socket?: string) {
+  if (!isRunIpc(dir)) throw new Error('unmanaged_ipc_directory')
+  const stat = lstatSync(dir)
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    realpathSync(dir) !== dir ||
+    stat.uid !== process.getuid!() ||
+    (stat.mode & 0o777) !== 0o700
+  )
+    throw new Error('unsafe_ipc_directory')
+  if (socket) {
+    const entry = lstatSync(socket)
+    if (!entry.isSocket() || entry.uid !== process.getuid!()) throw new Error('unsafe_ipc_socket')
+  }
+}
+export function cleanupRunIpc(dir: string) {
+  if (!isRunIpc(dir)) throw new Error('unmanaged_ipc_directory')
   try {
     const stat = lstatSync(dir)
     if (

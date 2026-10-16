@@ -32,6 +32,33 @@ that stopped, the node reads the full thread list whenever a thread starts or go
 reads as paused. The run of a session ends with its connection: when the program exits or is
 stopped. A retried operation answers with the program already started.
 
+## Attaching to a running program
+
+A program already running with its inspector open on loopback (`node --inspect app.js`,
+`--inspect-brk`, `--inspect-wait`) is attached to instead of started.
+
+`debugger.v1.programs({ conversation_id })` lists the Node.js programs of the node's user whose
+inspector listens on `127.0.0.1`, read from the OS without a shell: `lsof` and `ps` on macOS,
+`/proc` on Linux. A port counts only when it answers as Node's inspector, so a program's own
+server is not listed, and an inspector bound to any other address is never listed. The node's own
+processes (its adapter, programs it started) are left out. Each entry gives the PID, the port, the
+command line cut to a line, the working folder, the file it runs when the command line names one,
+the registered project folder it runs from, and `in_chat_folder` when that is the chat's folder.
+
+`debugger.v1.attachProgram({ operation_id, conversation_id, pid, port, sources?, outside_folder? })`
+is the owner's act, under the same folder trust and execution grant as `start`. The node reads
+the listeners again and refuses (`debugger_program_not_found`) unless that process holds that
+port and it answers as an inspector. A program whose file and folder are both outside the chat's
+folder needs `outside_folder: true`, the owner's explicit confirmation, or the call is refused
+with `debugger_attach_outside_folder`. The answer has the shape of `start`'s: the program's own
+file is `s1` when it lies in the chat's folder, and `sources` adds files of that folder by the same
+rules. Its lines take breakpoints only while the file is unchanged since the process started.
+
+The session is `external`: stopping it is refused, and detaching (`debugger.v1.detach`) lets go
+of the program, which runs on and waits for a debugger again. If the node shuts down while
+attached, the program is let go the same way. Record points record runs as they do for a started
+program. A retried operation answers with the session already attached.
+
 ## Taking a value whole
 
 An adapter cuts long strings and opens objects a level at a time, and one DAP frame is bounded

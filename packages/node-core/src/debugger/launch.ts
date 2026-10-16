@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile, stat } from 'node:fs/promises'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
-import type { DebuggerStartResult, DebuggerTarget } from '@abele/node-protocol'
+import type { DebuggerProgram, DebuggerStartResult, DebuggerTarget } from '@abele/node-protocol'
 import type { NodeCore } from '../index.js'
 import { DapDebuggerBackend } from './dap-backend.js'
 import type { DapSession } from './driver.js'
-import type { JsLaunch } from './js-profile.js'
+import type { JsAttach, JsLaunch } from './js-profile.js'
+import { inspectorPrograms, processStartedAt } from './programs.js'
 
 /** What starts a program under a debugger. The native JS profile in production; a scripted one
  * in tests. It refuses while no audited adapter is installed. */
@@ -16,6 +17,13 @@ export interface LaunchProfile {
     config: JsLaunch,
     target: DebuggerTarget,
     sources: ReadonlyMap<string, string>
+  ): Promise<LaunchedRun>
+  /** Attaches to a program already running with its inspector on loopback; never owns it. */
+  attach?(
+    config: JsAttach,
+    target: DebuggerTarget,
+    sources: ReadonlyMap<string, string>,
+    root: string
   ): Promise<LaunchedRun>
 }
 export interface LaunchedRun {
@@ -37,7 +45,23 @@ type StartParams = {
   sources: string[]
 }
 
+type AttachParams = {
+  operation_id: string
+  conversation_id: string
+  pid: number
+  port: number
+  sources: string[]
+  outside_folder: boolean
+}
+
 const RETAINED_OPERATIONS = 128
+
+/** Whether `path` is `root` or under it. */
+function within(root: string, path: string | null) {
+  if (!path) return false
+  const rel = relative(root, path)
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel))
+}
 
 /** Starts a program of a chat's folder for its owner and puts every session of it under the shared
  * coordinator, which is also what records a run while a session has record points. The program
@@ -56,10 +80,23 @@ export class DebuggerLaunches {
 
   /** A retried operation answers with the program it already started, never a second one. */
   start(owner: AuthorityContext, p: StartParams): Promise<DebuggerStartResult> {
-    const key = JSON.stringify([owner.installation_id, p.operation_id])
+    return this.once(owner, p.operation_id, () => this.launch(p))
+  }
+
+  /** Attaches to a running program: the same retry rule, a session under the same coordinator. */
+  attach(owner: AuthorityContext, p: AttachParams): Promise<DebuggerStartResult> {
+    return this.once(owner, p.operation_id, () => this.attachTo(p))
+  }
+
+  private once(
+    owner: AuthorityContext,
+    operation: string,
+    run: () => Promise<DebuggerStartResult>
+  ): Promise<DebuggerStartResult> {
+    const key = JSON.stringify([owner.installation_id, operation])
     const known = this.operations.get(key)
     if (known) return known
-    const work = this.launch(p)
+    const work = run()
     this.operations.set(key, work)
     work.catch(() => this.operations.delete(key))
     while (this.operations.size > RETAINED_OPERATIONS)
@@ -75,20 +112,36 @@ export class DebuggerLaunches {
     return full
   }
 
-  private async launch(p: StartParams): Promise<DebuggerStartResult> {
-    if (!this.profile.profiles().length) throw new ChannelError('debugger_profile_unavailable')
+  /** The chat's folder and where it sits, once the chat may execute there. */
+  private chatFolder(conversation_id: string) {
     const targets = this.core.resources.targets
-    const root = targets.pathForSession(p.conversation_id)
+    const root = targets.pathForSession(conversation_id)
     if (!root) throw new ChannelError('workspace_required')
     // Running a program in a folder is executing there: the same trust and grant an agent needs.
-    targets.checkSession(p.conversation_id)
-    const bound = targets.bound(p.conversation_id)
-    const current = targets.currentTarget(p.conversation_id)
+    targets.checkSession(conversation_id)
+    const bound = targets.bound(conversation_id)
+    const current = targets.currentTarget(conversation_id)
     if (!current) throw new ChannelError('workspace_required')
     const project_id =
       bound?.project_id ??
-      this.core.resources.workspaces.get(this.core.session(p.conversation_id).workspace_id!)
+      this.core.resources.workspaces.get(this.core.session(conversation_id).workspace_id!)
         .project_id
+    const place = {
+      node_id: this.core.node_id,
+      project_id,
+      workspace_id: current.target.kind === 'workspace' ? current.target.workspace_id : null,
+      worktree_id:
+        current.target.kind === 'worktree'
+          ? current.target.worktree_id
+          : current.target.workspace_id,
+      conversation_id,
+    }
+    return { root, place }
+  }
+
+  private async launch(p: StartParams): Promise<DebuggerStartResult> {
+    if (!this.profile.profiles().length) throw new ChannelError('debugger_profile_unavailable')
+    const { root, place } = this.chatFolder(p.conversation_id)
     const program = this.inside(root, p.program)
     const sources = new Map<string, string>([['s1', program]])
     const asked = p.sources.map((path) => this.inside(root, path))
@@ -98,14 +151,7 @@ export class DebuggerLaunches {
       if (!unproven.has(full) && ![...sources.values()].includes(full))
         sources.set(`s${sources.size + 1}`, full)
     const target: DebuggerTarget = {
-      node_id: this.core.node_id,
-      project_id,
-      workspace_id: current.target.kind === 'workspace' ? current.target.workspace_id : null,
-      worktree_id:
-        current.target.kind === 'worktree'
-          ? current.target.worktree_id
-          : current.target.workspace_id,
-      conversation_id: p.conversation_id,
+      ...place,
       target_id: randomUUID(),
       adapter_profile: 'js-ts-native',
       adapter_version: 'unknown',
@@ -120,13 +166,88 @@ export class DebuggerLaunches {
       target,
       sources
     )
+    return this.adopt(run, root, sources, true)
+  }
+
+  /** The Node.js programs waiting for a debugger on this machine, as seen from a chat: which of
+   * them run from its folder, and which registered project folder each of the others is in. */
+  async programs(conversation_id: string): Promise<{ programs: DebuggerProgram[] }> {
+    const root = this.core.resources.targets.pathForSession(conversation_id) ?? null
+    const projects = this.core.db
+      .prepare('SELECT project_id, root_path FROM projects WHERE registered=1')
+      .all()
+      .map((r) => ({ project_id: String(r.project_id), path: String(r.root_path) }))
+      // The deepest folder first: a project inside another one is the closer answer.
+      .sort((a, b) => b.path.length - a.path.length)
+    const found = await inspectorPrograms()
+    return {
+      programs: found.slice(0, 256).map((x) => ({
+        ...x,
+        command: x.command.slice(0, 256),
+        project: projects.find((f) => within(f.path, x.script) || within(f.path, x.cwd)) ?? null,
+        in_chat_folder: !!root && (within(root, x.script) || within(root, x.cwd)),
+      })),
+    }
+  }
+
+  private async attachTo(p: AttachParams): Promise<DebuggerStartResult> {
+    if (!this.profile.attach || !this.profile.profiles().length)
+      throw new ChannelError('debugger_profile_unavailable')
+    const { root, place } = this.chatFolder(p.conversation_id)
+    // Only what is listening on loopback right now, as the OS says, under this very process: a
+    // port named by the caller alone is never trusted to be the program it says.
+    const program = (await inspectorPrograms()).find((x) => x.pid === p.pid && x.port === p.port)
+    if (!program) throw new ChannelError('debugger_program_not_found')
+    const inside = within(root, program.script) || within(root, program.cwd)
+    // A program of another folder is the owner's to name: the chat's own trust does not reach it.
+    if (!inside && !p.outside_folder) throw new ChannelError('debugger_attach_outside_folder')
+    const sources = new Map<string, string>()
+    if (program.script && within(root, program.script) && program.script !== root)
+      sources.set('s1', program.script)
+    const asked = p.sources.map((path) => this.inside(root, path))
+    const unproven = await unbuilt(program.script ?? join(root, 'program.js'), asked)
+    for (const full of asked)
+      if (!unproven.has(full) && ![...sources.values()].includes(full))
+        sources.set(`s${sources.size + 1}`, full)
+    const target: DebuggerTarget = {
+      ...place,
+      target_id: randomUUID(),
+      adapter_profile: 'js-ts-native',
+      adapter_version: 'unknown',
+      launch_configuration_id: `${basename(program.script ?? 'node')} · pid ${program.pid}`.slice(
+        -128
+      ),
+      process_ownership: 'external',
+      build_identity: (await loadedAsIs(program.pid, sources.get('s1'))) ? 'matched' : 'unknown',
+    }
+    const run = await this.profile.attach(
+      { address: '127.0.0.1', port: program.port, target_pid: program.pid },
+      target,
+      sources,
+      root
+    )
+    console.debug('[debugger] Attached', program.pid, program.port)
+    return this.adopt(run, root, sources, false)
+  }
+
+  /** Puts every session of a run under the coordinator until its root connection ends. A run the
+   * node does not own is never stopped from here: ending its session detaches. */
+  private async adopt(
+    run: LaunchedRun,
+    root: string,
+    sources: ReadonlyMap<string, string>,
+    owned: boolean
+  ): Promise<DebuggerStartResult> {
     this.runs.add(run)
     const unregister: (() => void)[] = []
     const off = run.onSession((session) => {
       unregister.push(
         this.core.debuggerControl.registerBackend(
           session.id,
-          new DapDebuggerBackend(session, run.terminate && (() => run.terminate!()))
+          new DapDebuggerBackend(
+            session,
+            owned && run.terminate ? () => run.terminate!() : undefined
+          )
         ),
         this.keepThreads(session)
       )
@@ -186,6 +307,18 @@ export class DebuggerLaunches {
     const failure = outcomes.find((o) => o.status === 'rejected')
     if (failure?.status === 'rejected') throw failure.reason
   }
+}
+
+/** Whether the program's own file is what it runs: JavaScript not changed since the process
+ * started. A file edited after that is not the code in memory, and its lines would lie. */
+async function loadedAsIs(pid: number, script: string | undefined) {
+  if (!script || !/\.[cm]?js$/.test(script)) return false
+  const [started, info] = await Promise.all([
+    processStartedAt(pid),
+    stat(script).catch(() => undefined),
+  ])
+  // The start is known to the second only: a file changed within that second does not count.
+  return !!started && !!info && Math.floor(info.mtimeMs / 1000) * 1000 < started
 }
 
 const MAP_SCAN = { entries: 4096, depth: 8, bytes: 8 * 1024 * 1024 }

@@ -103,7 +103,7 @@ type ProfileOptions = {
 }
 
 /** Native node-host profile, off by default AND hard-blocked by the source audit
- * pin. This class is internal infrastructure; not wired to daemon RPC or tools. */
+ * pin. Reached only through the owner's start and attach (DebuggerLaunches), never tools. */
 export class JsDebugProfile {
   private readonly runs = new Set<NativeJsRun>()
   constructor(
@@ -177,13 +177,18 @@ export class JsDebugProfile {
       throw error
     }
   }
-  async attach(raw: JsAttach, target: DebuggerTarget): Promise<NativeJsRun> {
+  async attach(
+    raw: JsAttach,
+    target: DebuggerTarget,
+    chosen?: ReadonlyMap<string, string>,
+    root?: string
+  ): Promise<NativeJsRun> {
     this.requireEnabled()
     const config = validateJsAttach(raw)
-    // Explicit loopback endpoint selection + OS liveness. This is NOT proof of
-    // endpoint-to-PID or build identity; B4 adds reviewed discovery/identity checks.
+    // Explicit loopback endpoint selection + OS liveness. The endpoint-to-PID match is the
+    // caller's (DebuggerLaunches reads the listening sockets from the OS); build identity is not.
     await processStartIdentity(config.target_pid)
-    const sources = await this.sources(this.options.workspaceRoot)
+    const sources = await this.sources(root ?? this.options.workspaceRoot, undefined, chosen)
     return this.open(
       {
         type: 'pwa-node',
@@ -197,7 +202,8 @@ export class JsDebugProfile {
         ...target,
         process_ownership: 'external',
         process_evidence: undefined,
-        build_identity: 'unknown',
+        // Matched only where the caller proved the file unchanged since the process started.
+        build_identity: target.build_identity === 'matched' ? 'matched' : 'unknown',
       },
       sources
     )

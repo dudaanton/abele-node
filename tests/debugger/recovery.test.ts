@@ -107,7 +107,7 @@ describe('debugger conservative state and migration regressions', () => {
       db.close()
       const next = new NodeCore(dir)
       try {
-        expect(Number(next.db.prepare('PRAGMA user_version').get()?.user_version)).toBe(16)
+        expect(Number(next.db.prepare('PRAGMA user_version').get()?.user_version)).toBe(18)
         expect(
           next.request(actor, 'session.create', { title: 'compatibility' }, 'chat-op')
         ).toEqual(before)

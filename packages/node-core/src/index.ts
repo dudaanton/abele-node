@@ -26,6 +26,7 @@ import {
   type FakeStep,
   type ExpectedExecutionTarget,
   type TurnAdmissionResult,
+  type SessionSettings,
 } from '@abele/node-protocol'
 
 import { DebuggerService, migrateDebugger } from './debugger/index.js'
@@ -58,6 +59,7 @@ export { DebuggerLaunches, type LaunchProfile, type LaunchedRun } from './debugg
 export type { JsLaunch, JsAttach } from './debugger/js-profile.js'
 import { canonicalStateDir } from './state.js'
 export { canonicalStateDir } from './state.js'
+export { LiveSessions, DEFAULT_CONTINUATION, type LiveOptions } from './live-sessions.js'
 export { acquireUpdateLock } from './update-lock.js'
 import { ResourceServices } from './resources.js'
 import type { GitRunner } from './git.js'
@@ -67,6 +69,7 @@ export { DelegationService, DelegationMailbox, WorkerReporter } from './delegati
 import { PairingService } from './pairing.js'
 export { PairingService, IdentityStore } from './pairing.js'
 import { ProviderSessions } from './claude.js'
+import type { LiveOptions } from './live-sessions.js'
 import type { ProviderAdapter } from './providers.js'
 export type { ProviderAdapter } from './providers.js'
 export { CodexProviderAdapter } from '@abele/provider-codex'
@@ -295,6 +298,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       claude?: ProviderAdapter
       pi?: ProviderAdapter
       codex?: ProviderAdapter
+      /** Policy for long-lived owner sessions. */
+      live?: LiveOptions
     } = {}
   ) {
     stateDir = this.stateDir = canonicalStateDir(stateDir)
@@ -305,7 +310,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 16) {
+    if (version > 18) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -421,6 +426,21 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.db.exec(`BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS deleted_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id));
       PRAGMA user_version=16; COMMIT;`)
+    if (version < 17)
+      this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS claude_native_accounts(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), account TEXT NOT NULL);
+      PRAGMA user_version=17; COMMIT;`)
+    if (version < 18) {
+      // What another node needs to take over a long-lived process this one left running.
+      const columns = new Set(
+        (this.db.prepare('PRAGMA table_info(provider_runs)').all() as Row[]).map((c) => c.name)
+      )
+      this.db.exec(`BEGIN IMMEDIATE;
+      ${columns.has('live') ? '' : 'ALTER TABLE provider_runs ADD COLUMN live TEXT;'}
+      ${columns.has('live_state') ? '' : 'ALTER TABLE provider_runs ADD COLUMN live_state TEXT;'}
+      ${columns.has('stream_offset') ? '' : 'ALTER TABLE provider_runs ADD COLUMN stream_offset INTEGER NOT NULL DEFAULT 0;'}
+      PRAGMA user_version=18; COMMIT;`)
+    }
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -452,8 +472,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     this.transaction(() => {
       this.delegations.repairLeases()
+      // A long-lived process the last node left running keeps its inputs; adoption decides.
       const active = this.db
-        .prepare("SELECT * FROM inputs WHERE state IN ('dispatching','delivered')")
+        .prepare(
+          "SELECT * FROM inputs WHERE state IN ('dispatching','delivered') AND (run_id IS NULL OR run_id NOT IN (SELECT run_id FROM provider_runs WHERE state='active' AND live IS NOT NULL))"
+        )
         .all() as Row[]
       for (const input of active) {
         this.transition(input, 'delivery_unknown')
@@ -475,10 +498,34 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         Object.entries({ claude: options.claude, pi: options.pi, codex: options.codex }).filter(
           (entry): entry is [string, ProviderAdapter] => entry[1] !== undefined
         )
-      )
+      ),
+      options.live
     )
     this.claude = this.execution
     this.protectFiles()
+  }
+  private watchers = new Map<string, number>()
+  private unwatched = new Map<string, number>()
+  /** A client follows this stream live. Long-lived sessions stay up while someone watches. */
+  watch(stream: string) {
+    this.watchers.set(stream, (this.watchers.get(stream) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const left = (this.watchers.get(stream) ?? 1) - 1
+      if (left > 0) this.watchers.set(stream, left)
+      else {
+        this.watchers.delete(stream)
+        this.unwatched.set(stream, Date.now())
+      }
+    }
+  }
+  watching(stream: string) {
+    return this.watchers.get(stream) ?? 0
+  }
+  unwatchedAt(stream: string) {
+    return this.unwatched.get(stream) ?? 0
   }
   protectFiles() {
     for (const file of readdirSync(this.stateDir))
@@ -618,6 +665,26 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported',
           evidence: 'idle-only-catalog-removal; retained-journal; operation-receipts',
         },
+        long_lived_sessions: this.claude.adapterFor('claude')?.liveAvailable
+          ? {
+              status: 'supported',
+              evidence:
+                'session.configure; session.compact; session.stop; session.state; turn.*; session.process',
+            }
+          : { status: 'unsupported', reason: 'Claude CLI without streamed input, or turned off' },
+        session_survives_restart: this.claude.adapterFor('claude')?.liveAvailable
+          ? {
+              status: 'supported',
+              evidence: 'detached session host; adoption on start; session.process reattached',
+            }
+          : { status: 'unsupported', reason: 'Claude CLI without streamed input, or turned off' },
+        session_messages: this.claude.adapterFor('claude')?.liveAvailable
+          ? {
+              status: 'supported',
+              evidence:
+                'agent tools node_sessions, node_session_send; input.accepted from_session; session.message.sent; settings.messaging',
+            }
+          : { status: 'unsupported', reason: 'Claude CLI without streamed input, or turned off' },
         repository_changes_v1: {
           status: 'supported',
           evidence:
@@ -901,6 +968,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         ).map((r) => SessionSchema.parse(JSON.parse(String(r.body))))
       case 'session.get':
         return this.session(String(p.session_id))
+      case 'session.state':
+        return this.claude.live.state(this.session(String(p.session_id)).session_id)
       case 'prompt.list': {
         this.head(String(p.session_id))
         const rows = this.db
@@ -964,12 +1033,21 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       if (!this.claude.isAvailable(String(p.provider)))
         throw new ChannelError('provider_unavailable')
     }
+    if (p.settings && (p.provider !== 'claude' || !this.claude.adapterFor('claude')?.liveAvailable))
+      throw new ChannelError('invalid_params')
+    if (p.settings)
+      try {
+        this.claude.adapterFor('claude')?.validateSettings?.(p.settings as SessionSettings)
+      } catch {
+        throw new ChannelError('invalid_params')
+      }
     const session = SessionSchema.parse({
       session_id: randomUUID(),
       title: p.title,
       provider: p.provider,
       created_at: new Date().toISOString(),
       ...(p.workspace_id ? { workspace_id: p.workspace_id } : {}),
+      ...(p.settings ? { settings: p.settings } : {}),
     })
     this.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(session.session_id)
     this.db
@@ -1046,6 +1124,43 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.append('catalog', 'session.updated', installationActor, updated)
       return updated
     }
+    if (method === 'session.configure') {
+      if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
+      // Choosing how a session's tools are authorized is execution authority, not display.
+      this.authority.check(actor, 'execute', session)
+      const settings = p.settings as SessionSettings
+      this.claude.live.validate(session, settings)
+      const before = this.claude.live.effective(session)
+      const updated = SessionSchema.parse({
+        ...currentSession,
+        settings: { ...(currentSession.settings ?? {}), ...settings },
+      })
+      this.db
+        .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+        .run(JSON.stringify(updated), session)
+      this.append(session, 'session.updated', installationActor, updated)
+      this.append('catalog', 'session.updated', installationActor, updated)
+      const after = this.claude.live.effective(session)
+      queueMicrotask(() => this.claude.live.applied(session, before, after))
+      return updated
+    }
+    if (method === 'session.stop') {
+      if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
+      this.append(session, 'session.stop_requested', installationActor, { session_id: session })
+      return this.claude.live.stopRequested(session)
+    }
+    if (method === 'session.compact') {
+      if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
+      const focus = typeof p.focus === 'string' ? p.focus.trim() : ''
+      return this.mutate(actor, 'session.send', {
+        session_id: session,
+        text: focus ? `/compact ${focus}` : '/compact',
+        observed_seq: this.head(session),
+        script: [{ kind: 'echo' }],
+        compact: true,
+        ...(typeof p.continue === 'boolean' ? { continue: p.continue } : {}),
+      })
+    }
     if (method === 'session.send') {
       const refusal = this.resources.targets.refusal(
         session,
@@ -1069,6 +1184,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         input_id,
         text: p.text,
         observed_seq: p.observed_seq,
+        // Written by another owner session through the node's own tool, never by a client.
+        ...(p.from_session ? { from_session: p.from_session } : {}),
       })
       this.db
         .prepare(
@@ -1125,6 +1242,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return { input_id: p.input_id, state: 'cancelled' }
     }
     if (method === 'session.interrupt') {
+      if (this.claude.live.interruptRequested(session, String(p.run_id)))
+        return { run_id: p.run_id, state: 'interrupting' }
       const input = this.db
         .prepare(
           "SELECT * FROM inputs WHERE session_id=? AND run_id=? AND state IN ('dispatching','delivered')"

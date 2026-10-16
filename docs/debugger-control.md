@@ -10,8 +10,9 @@ infrastructure**: target startup arrived later as the owner's `debugger.v1.start
 `abele-node start --debugger` (or the daemon's explicit `debuggerOptions.enabled`)
 enables the infrastructure capability; it defaults to **off**. It does not enable
 or install a real profile. `profiles` remains empty while the JS audit is blocked.
-The owner's `start` is routed (see [recorded runs](trace.md#starting-a-program)); attach,
-create, restart, source export and arbitrary DAP are not.
+The owner's `start`, `programs` and `attachProgram` are routed (see
+[recorded runs](trace.md#starting-a-program)); create, restart, source export and arbitrary DAP
+are not.
 B5 extends the gated subset with wait/sleep and caller-scoped cancellation. There is no automatic target creation or adapter reconnect.
 
 `DebuggerControlMethodSchemas` is the implemented RPC subset; the full

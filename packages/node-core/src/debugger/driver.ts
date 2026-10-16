@@ -857,7 +857,9 @@ export class JsSessionTree {
       const state = this.service.create({
         ...this.root.snapshot.target,
         target_id: this.root.snapshot.target.target_id + ':child:' + this.pendingIds.size,
-        process_ownership: 'unknown',
+        // A child of a run attached to someone else's program is that program: still not ours.
+        process_ownership:
+          this.root.snapshot.target.process_ownership === 'external' ? 'external' : 'unknown',
         process_evidence: undefined,
       })
       const child = new DapSession(this.service, state, dap, this.root.sources)

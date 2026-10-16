@@ -60,6 +60,13 @@ function activeRun() {
   )
   db.close()
 }
+function liveSession() {
+  const db = new DatabaseSync(join(state, 'node.sqlite'))
+  db.exec(
+    "CREATE TABLE provider_runs(run_id TEXT, session_id TEXT, state TEXT, live TEXT); INSERT INTO provider_runs VALUES('run-live','session-live','active','{}')"
+  )
+  db.close()
+}
 async function cli(
   args: string[],
   source = false,
@@ -586,6 +593,17 @@ it('JSON reports active runs and refuses them without printing human progress', 
   })
   expect(result.stderr).toBe('')
   expect(requests).toEqual(['/releases/latest'])
+})
+it('lets long-lived sessions run through an update instead of refusing it', async () => {
+  liveSession()
+  const result = await cli(['update', '--json'])
+  const report = JSON.parse(result.stdout)
+  expect(report.agents).toMatchObject({
+    active_runs: [],
+    kept_sessions: [{ run_id: 'run-live', session_id: 'session-live' }],
+  })
+  expect(String(report.error ?? '')).not.toContain('--force')
+  expect(requests.length).toBeGreaterThan(1)
 })
 it('force update explains that running agents must be stopped by the installer', async () => {
   config(1)

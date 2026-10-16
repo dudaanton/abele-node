@@ -53,6 +53,9 @@ import {
   type ExpectedExecutionTarget,
   type TurnAdmissionResult,
   TurnAdmissionResultSchema,
+  TurnAcceptedSchema,
+  LiveSessionStateSchema,
+  type SessionSettings,
 } from '@abele/node-protocol'
 import { NodePathClient } from './node-path.js'
 export * from './node-path.js'
@@ -309,15 +312,48 @@ export class NodeClient {
   async createSession(
     title: string,
     workspace_id?: string,
-    provider: 'fake' | 'claude' | 'pi' = 'fake'
+    provider: 'fake' | 'claude' | 'pi' = 'fake',
+    settings?: SessionSettings
   ) {
     return SessionSchema.parse(
       await this.mutation('session.create', {
         title,
         provider,
         ...(workspace_id ? { workspace_id } : {}),
+        ...(settings ? { settings } : {}),
       })
     )
+  }
+  /** Model and permission mode switch the running process; effort and account restart it when idle. */
+  async configureSession(session_id: string, settings: SessionSettings, operation?: string) {
+    return SessionSchema.parse(
+      await this.mutation(
+        'session.configure',
+        MethodSchemas['session.configure'].parse({ session_id, settings }),
+        operation
+      )
+    )
+  }
+  /** Queued like a message; the session continues afterwards unless continue is false. */
+  async compactSession(
+    session_id: string,
+    options: { focus?: string; continue?: boolean } = {},
+    operation?: string
+  ) {
+    return TurnAcceptedSchema.parse(
+      await this.mutation(
+        'session.compact',
+        MethodSchemas['session.compact'].parse({ session_id, ...options }),
+        operation
+      )
+    )
+  }
+  /** Ends the session's process and everything it started; queued messages are cancelled. */
+  stopSession(session_id: string, operation?: string) {
+    return this.mutation('session.stop', { session_id }, operation)
+  }
+  async sessionState(session_id: string) {
+    return LiveSessionStateSchema.parse(await this.request('session.state', { session_id }))
   }
   /** Rename a chat's display title without altering provider-native identity. */
   async renameSession(session_id: string, title: string, operation?: string) {

@@ -81,3 +81,69 @@ export interface ProviderRun {
   done: Promise<{ result?: Record<string, any>; reason?: string }>
   interrupt(): Promise<void>
 }
+/** Per-session choices for a long-lived provider process. Names, never paths or secrets. */
+export interface LiveSessionSettings {
+  model: string
+  effort: string
+  /** A named Claude configuration known to the node; 'default' inherits the node's own. */
+  account: string
+  permission_mode: string
+}
+export interface LiveSessionContext {
+  session_id: string
+  run_id: string
+  cwd: string
+  native_session_id?: string
+  /** Copy the native transcript from this account's configuration before resuming. */
+  previous_account?: string
+  use_repository_claude_permissions?: boolean
+  settings: LiveSessionSettings
+  /** How long a permission question waits for the owner before it is denied. */
+  permission_ttl_ms: number
+  /** Re-attach to a process an earlier node left running instead of starting one. */
+  adopt?: LiveAdoption
+}
+/** What the node journaled of a process it left running, so another node can take it over. */
+export interface LiveAdoption {
+  /** The provider's own record, as it last reported it through `attachment`. */
+  record: Record<string, unknown>
+  /** Stream position up to which everything was journaled. */
+  offset: number
+  /** A turn was running when the earlier node stopped reading. */
+  running: boolean
+  /** Inputs the running turn already took. */
+  delivered: string[]
+  /** Inputs written into the process that it had not taken yet. */
+  dispatching: LiveInput[]
+}
+export interface LiveInput {
+  input_id: string
+  /** Plain text or provider content blocks, written as one user message. */
+  content: string | Record<string, unknown>[]
+}
+export interface LiveSessionSink {
+  debugger?: DebuggerToolBridge
+  event(event: ProviderEvent): void
+  processes(evidence: ProcessIdentity[]): void
+  ipc?(directory: string): void
+  permission(action: ProviderAction, signal: AbortSignal): Promise<Answer>
+  /** A record another node needs to re-attach to this process; replaces the previous one. */
+  attachment?(record: Record<string, unknown>): void
+  /** Everything up to this stream position has been reported. */
+  checkpoint?(offset: number): void
+}
+/** One provider process that outlives turns. Turns are reported as events, not as calls. */
+export interface LiveSession {
+  /** Settles when the process is gone and its cleanup is confirmed (or not). */
+  done: Promise<{ reason?: string; exit_code?: number | null; signal?: string | null }>
+  /** Writes one user message into the running process; the CLI queues it. */
+  send(input: LiveInput): void
+  /** Stops the current turn and keeps the process. */
+  interrupt(): Promise<void>
+  /** A provider control request answered on the same stream. */
+  control(subtype: string, params?: Record<string, unknown>): Promise<Record<string, any>>
+  /** Ends the process and every process it started. */
+  stop(reason?: string): Promise<void>
+  /** Stops reading and leaves the process running for a later node to adopt. */
+  detach?(): Promise<void>
+}

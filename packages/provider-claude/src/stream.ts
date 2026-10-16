@@ -57,6 +57,58 @@ export class ClaudeEventMapper {
     if (r.type === 'system' && r.subtype === 'init')
       return [{ type: 'claude.init', data: { ...base, configuration: r } }]
     if (r.type === 'result') return [{ type: 'claude.result', data: { ...base, result: r } }]
+    if (r.type === 'system' && r.subtype === 'status')
+      return [
+        {
+          type: 'claude.status',
+          data: {
+            ...base,
+            status: typeof r.status === 'string' ? r.status : null,
+            ...(typeof r.permissionMode === 'string' ? { permission_mode: r.permissionMode } : {}),
+            ...(typeof r.compact_result === 'string' ? { compact_result: r.compact_result } : {}),
+            ...(typeof r.compact_error === 'string' ? { compact_error: r.compact_error } : {}),
+          },
+        },
+      ]
+    if (r.type === 'system' && r.subtype === 'compact_boundary') {
+      const m = r.compact_metadata ?? {}
+      const number = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+      return [
+        {
+          type: 'claude.compact.boundary',
+          data: {
+            ...base,
+            trigger: typeof m.trigger === 'string' ? m.trigger : null,
+            pre_tokens: number(m.pre_tokens),
+            post_tokens: number(m.post_tokens),
+            duration_ms: number(m.duration_ms),
+          },
+        },
+      ]
+    }
+    if (
+      r.type === 'system' &&
+      ['task_started', 'task_updated', 'task_progress', 'task_notification'].includes(r.subtype)
+    ) {
+      const { type: _type, subtype, uuid: _uuid, session_id: _session, ...rest } = r
+      return [{ type: 'claude.task', data: { ...base, ...rest, subtype } }]
+    }
+    if (r.type === 'system' && r.subtype === 'background_tasks_changed')
+      return [
+        {
+          type: 'claude.tasks',
+          data: { ...base, tasks: Array.isArray(r.tasks) ? r.tasks : [] },
+        },
+      ]
+    if (r.type === 'command_lifecycle')
+      return [
+        {
+          type: 'claude.command',
+          data: { ...base, state: typeof r.state === 'string' ? r.state : null },
+        },
+      ]
+    if (r.type === 'rate_limit_event')
+      return [{ type: 'claude.rate_limit', data: { ...base, info: r.rate_limit_info ?? null } }]
     if (r.type === 'stream_event' && r.event && typeof r.event.type === 'string') {
       const e = r.event
       const key = parent ?? 'root'

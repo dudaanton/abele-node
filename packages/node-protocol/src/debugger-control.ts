@@ -95,11 +95,46 @@ export const DebuggerStartResultSchema = z
   })
   .strict()
 export type DebuggerStartResult = z.infer<typeof DebuggerStartResultSchema>
+/** The Node.js programs on the node's machine whose inspector listens on loopback, for a chat. */
+export const DebuggerProgramsSchema = z.object({ conversation_id: id }).strict()
+const absolute = z.string().min(1).max(4096)
+export const DebuggerProgramSchema = z
+  .object({
+    pid: z.number().int().positive(),
+    port: z.number().int().min(1).max(65535),
+    command: z.string().max(256),
+    cwd: absolute.nullable(),
+    script: absolute.nullable(),
+    /** The registered project folder the program runs from, if any. */
+    project: z.object({ project_id: id, path: absolute }).strict().nullable(),
+    /** Runs from the chat's own folder: attaching needs no further confirmation. */
+    in_chat_folder: z.boolean(),
+  })
+  .strict()
+export type DebuggerProgram = z.infer<typeof DebuggerProgramSchema>
+export const DebuggerProgramsResultSchema = z
+  .object({ programs: z.array(DebuggerProgramSchema).max(256) })
+  .strict()
+/** The owner attaches the debugger to one of those programs, by its process and inspector port.
+ * A program outside the chat's folder takes `outside_folder: true`, the owner's own confirmation;
+ * `sources` are files of the chat's folder that take breakpoints. Detaching leaves it running. */
+export const DebuggerAttachProgramSchema = z
+  .object({
+    operation_id: id,
+    conversation_id: id,
+    pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    port: z.number().int().min(1).max(65535),
+    sources: z.array(relativePath).max(255).default([]),
+    outside_folder: z.boolean().default(false),
+  })
+  .strict()
 /** B3 exposes only authorized implemented methods. Profile startup, source,
  * tools, subscriptions and timers retain their later-stage gates. */
 export const DebuggerControlMethodSchemas = {
   'debugger.v1.profiles': DebuggerMethodSchemas['debugger.v1.profiles'],
   'debugger.v1.start': DebuggerStartSchema,
+  'debugger.v1.programs': DebuggerProgramsSchema,
+  'debugger.v1.attachProgram': DebuggerAttachProgramSchema,
   'debugger.v1.sessions': DebuggerMethodSchemas['debugger.v1.sessions'],
   'debugger.v1.status': DebuggerMethodSchemas['debugger.v1.status'],
   'debugger.v1.commandResult': DebuggerMethodSchemas['debugger.v1.commandResult'],

@@ -96,11 +96,15 @@ and OS start identity before each TERM/KILL signal and requires observed exit; a
 PID mismatch fails closed. It never signals a process group or adopts adapter-created
 children. This is not an OS sandbox or a general process-tree supervisor.
 
-External attach requires an explicitly selected loopback endpoint and PID. OS
-liveness is checked, but endpoint-to-PID and loaded-build identity are **unknown**:
-B2 does not pretend that an adapter response proves either. Attached processes are
-never eligible for owned termination. Reviewed target discovery/build identity
-belongs to later gates, including B4's separate Electron profile.
+External attach (the owner's `debugger.v1.attachProgram`, see
+[recorded runs](trace.md#attaching-to-a-running-program)) takes a PID and a loopback port the
+node itself just read from the OS: the port must be a TCP listener on `127.0.0.1` held by that
+very process and answer as Node's inspector. OS liveness and start identity are checked again
+before the adapter connects. Loaded-build identity is `matched` only when the program's own
+JavaScript file is unchanged since the process started; otherwise it is **unknown** and
+breakpoints are refused. Attached processes are never eligible for owned termination, and a
+child session of an attached run is `external` too. Electron/renderer discovery remains a
+separate later gate.
 
 ## Driver behavior and bounds
 

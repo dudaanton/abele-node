@@ -324,11 +324,17 @@ function humanUpdate(r: Report): string {
           return `${line(value.run_id)} (session ${line(value.session_id)})`
         })
         .join(', ')
-      return runs.length
-        ? `Agent turns paused; waiting for the installer to stop running agents (--force): ${detail}.`
-        : r.service
-          ? 'Agent turns paused; waiting for installer verification and service stop/restart.'
-          : 'Agent turns paused; waiting for installer verification and deployment.'
+      const kept = Array.isArray(agents.kept_sessions) ? agents.kept_sessions.length : 0
+      const keeping = kept
+        ? ` ${kept} long-lived ${kept === 1 ? 'session keeps' : 'sessions keep'} running through the restart.`
+        : ''
+      return (
+        (runs.length
+          ? `Agent turns paused; waiting for the installer to stop running agents (--force): ${detail}.`
+          : r.service
+            ? 'Agent turns paused; waiting for installer verification and service stop/restart.'
+            : 'Agent turns paused; waiting for installer verification and deployment.') + keeping
+      )
     }
     case 'warning':
       return `Warning: ${Array.isArray(r.warnings) ? line(r.warnings.at(-1)) : 'installer verification unavailable'}`

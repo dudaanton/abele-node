@@ -40,9 +40,13 @@ export async function fetchRemote(
   const prefix = `refs/remotes/${remote}/`
   const before = await refsUnder(git, target, prefix)
   await effect()
-  const r = await git.git(target, ['fetch', p.prune ? '--prune' : '--no-prune', remote], {
-    timeoutMs: 120000,
-  })
+  const r = await git.git(
+    target,
+    ['fetch', '--no-recurse-submodules', p.prune ? '--prune' : '--no-prune', remote],
+    {
+      timeoutMs: 120000,
+    }
+  )
   if (r.code !== 0) {
     if (AUTH.test(r.output)) return fail('auth_failed', r.output)
     if (UNREACHABLE.test(r.output)) return fail('remote_unreachable', r.output)

@@ -21,6 +21,7 @@ import {
   PiProviderAdapter,
   CodexProviderAdapter,
   canonicalStateDir,
+  type LiveOptions,
 } from '@abele/node-core'
 import type { CodexOptions } from '@abele/provider-codex'
 import type { PiOptions } from '@abele/provider-pi'
@@ -295,7 +296,8 @@ export async function startDaemon(
   tailscalePath?: string,
   piOptions: Omit<PiOptions, 'stateDir'> = {},
   codexOptions: Omit<CodexOptions, 'stateDir'> = {},
-  debuggerOptions: { enabled?: boolean } = {}
+  debuggerOptions: { enabled?: boolean } = {},
+  liveOptions: LiveOptions = {}
 ) {
   dir = canonicalStateDir(dir)
   const paired = pairedConfig ? PairedListenerSchema.parse(pairedConfig) : undefined
@@ -322,7 +324,8 @@ export async function startDaemon(
     for (const socket of sockets) socket.terminate()
     await Promise.all([app.close(), pairedApp.close()])
     await Promise.allSettled([...channels])
-    await core?.execution.stop()
+    // A restart or an update leaves long-lived sessions running; the next node adopts them.
+    await core?.execution.stop({ keepLive: claudeOptions.detachedMs !== 0 })
     await execution
     await core?.resources.stop()
     if (ipc) await new Promise<void>((r) => ipc!.close(() => r()))
@@ -339,6 +342,7 @@ export async function startDaemon(
       claude: new ClaudeProviderAdapter(claudeOptions),
       pi: new PiProviderAdapter({ ...piOptions, stateDir: dir }),
       codex,
+      live: liveOptions,
     })
     await core.resources.ready
     await core.execution.reconcile()

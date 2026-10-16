@@ -125,7 +125,18 @@ actions and run git as the owner would in a terminal: the repository and user co
 apply, including hooks, clean/smudge filters and credential helpers. They still use a fixed
 argument list without a shell, no editor, pager or terminal prompt, a session without a
 controlling terminal, bounded output and deadlines, the daemon's own `GIT_*` variables and
-`$EMAIL` removed, and only the file, git, http(s) and ssh transports.
+`$EMAIL` removed, and only the file, git, http(s) and ssh transports. They never enter
+submodules: fetch and push pass `--no-recurse-submodules` and `submodule.recurse` is off, because
+a submodule's git directory is named by a `.git` file inside the worktree, which anyone who can
+write worktree files could point at a configuration of their own.
+
+The checks a write makes first (status, staged changes, conflicted paths, refs, upstream) and
+`info` run as probes: no hooks, fsmonitor or clean/smudge filters, no transport or lazy fetch,
+and no index write. A file only a filter would show as unchanged is reported changed, as in the
+node's own status.
+
+Every git message a result carries, and so every receipt, has user names, passwords, query
+strings and fragments removed from the URLs it quotes; remote URLs in `info` likewise.
 
 Tests: `tests/repository-git-write.test.ts` uses disposable repositories, bare remotes and
 linked worktrees.

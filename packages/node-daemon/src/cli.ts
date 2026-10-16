@@ -165,6 +165,40 @@ async function main() {
   const claudeBudget = Number(option('--claude-budget', '0.35'))
   const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
+  const sessionModel = option('--claude-session-model', '')
+  const sessionEffort = option('--claude-session-effort', '')
+  const sessionPermissionMode = option('--claude-session-permission-mode', '')
+  const sessionPermissionTtl = option('--claude-session-permission-ttl-ms', '')
+  const claudeIdle = option('--claude-idle-ms', '')
+  const claudeMaxLive = option('--claude-max-live', '')
+  const claudeDetached = option('--claude-detached-ms', '')
+  const bypassFlag = args.indexOf('--claude-allow-bypass')
+  const allowBypass = bypassFlag >= 0
+  if (allowBypass) args.splice(bypassFlag, 1)
+  const noLiveFlag = args.indexOf('--no-claude-live')
+  const noLive = noLiveFlag >= 0
+  if (noLive) args.splice(noLiveFlag, 1)
+  const accountArgs: string[] = []
+  for (let value = option('--claude-account', ''); value; value = option('--claude-account', ''))
+    accountArgs.push(value)
+  const claudeAccounts: Record<string, string> = {}
+  for (const entry of accountArgs) {
+    const at = entry.indexOf('=')
+    if (at < 1) throw new Error('invalid_claude_account: use NAME=CONFIG_DIR')
+    claudeAccounts[entry.slice(0, at)] = resolve(entry.slice(at + 1))
+  }
+  const liveOptions = {
+    ...(claudeIdle ? { idleMs: Number(claudeIdle) } : {}),
+    ...(claudeMaxLive ? { maxLive: Number(claudeMaxLive) } : {}),
+  }
+  if (
+    (claudeIdle && (!Number.isSafeInteger(Number(claudeIdle)) || Number(claudeIdle) < 0)) ||
+    (claudeMaxLive &&
+      (!Number.isSafeInteger(Number(claudeMaxLive)) ||
+        Number(claudeMaxLive) < 1 ||
+        Number(claudeMaxLive) > 64))
+  )
+    throw new Error('invalid_claude_configuration')
   // Authorized debugger infrastructure, and the JS profile once its pinned adapter is installed.
   const debuggerFlag = args.indexOf('--debugger')
   const debuggerEnabled = debuggerFlag >= 0
@@ -218,6 +252,14 @@ async function main() {
     budgetUsd: claudeBudget,
     deadlineMs: claudeDeadline,
     permissionTtlMs: permissionTtl,
+    live: !noLive,
+    allowBypass,
+    accounts: claudeAccounts,
+    ...(sessionModel ? { sessionModel } : {}),
+    ...(sessionEffort ? { sessionEffort } : {}),
+    ...(sessionPermissionMode ? { sessionPermissionMode } : {}),
+    ...(sessionPermissionTtl ? { sessionPermissionTtlMs: Number(sessionPermissionTtl) } : {}),
+    ...(claudeDetached ? { detachedMs: Number(claudeDetached) } : {}),
   }
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port')
   const version = JSON.parse(
@@ -343,7 +385,8 @@ async function main() {
         tailscalePath,
         piOptions,
         codexOptions,
-        { enabled: debuggerEnabled }
+        { enabled: debuggerEnabled },
+        liveOptions
       )
       output({
         type: 'listening',
@@ -808,6 +851,23 @@ async function main() {
         String(claudeDeadline),
         '--permission-ttl-ms',
         String(permissionTtl),
+        ...(sessionModel ? ['--claude-session-model', sessionModel] : []),
+        ...(sessionEffort ? ['--claude-session-effort', sessionEffort] : []),
+        ...(sessionPermissionMode
+          ? ['--claude-session-permission-mode', sessionPermissionMode]
+          : []),
+        ...(sessionPermissionTtl
+          ? ['--claude-session-permission-ttl-ms', sessionPermissionTtl]
+          : []),
+        ...Object.entries(claudeAccounts).flatMap(([name, dir]) => [
+          '--claude-account',
+          `${name}=${dir}`,
+        ]),
+        ...(claudeIdle ? ['--claude-idle-ms', claudeIdle] : []),
+        ...(claudeMaxLive ? ['--claude-max-live', claudeMaxLive] : []),
+        ...(claudeDetached ? ['--claude-detached-ms', claudeDetached] : []),
+        ...(noLive ? ['--no-claude-live'] : []),
+        ...(allowBypass ? ['--claude-allow-bypass'] : []),
         ...(debuggerEnabled ? ['--debugger'] : []),
         ...(!codexOptions.enabled ? ['--no-codex'] : []),
         ...(codexPath ? ['--codex-path', codexPath] : []),

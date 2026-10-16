@@ -19,6 +19,7 @@ import type { ProviderAdapter } from './providers.js'
 import { updateInProgress, tryRunAdmission } from './update-lock.js'
 import { DebuggerRunBinding } from './debugger/run.js'
 import { RunTargetTools } from './run-target-tools.js'
+import { LiveSessions, type LiveOptions } from './live-sessions.js'
 
 type Input = Record<string, string | number | null>
 const actor = { kind: 'node' } as const
@@ -34,11 +35,20 @@ type ActiveRun = {
 export class ProviderSessions {
   private active = new Map<string, ActiveRun>()
   private stopping = false
+  /** Long-lived processes for owner sessions; delegated work stays one process per message. */
+  readonly live: LiveSessions
   constructor(
     private core: NodeCore,
-    private adapters: ReadonlyMap<string, ProviderAdapter> = new Map()
-  ) {}
-  private adapterFor(provider: string) {
+    private adapters: ReadonlyMap<string, ProviderAdapter> = new Map(),
+    liveOptions: LiveOptions = {}
+  ) {
+    this.live = new LiveSessions(core, this, liveOptions)
+  }
+  /** An unconfirmed cleanup stops new work until the node is inspected and restarted. */
+  fence() {
+    this.stopping = true
+  }
+  adapterFor(provider: string) {
     return this.adapters.get(provider)
   }
   isAvailable(provider: string) {
@@ -56,14 +66,21 @@ export class ProviderSessions {
       }
     )
   }
-  async reconcile() {
+  /** At boot: take over long-lived processes an earlier node left running, clean up the rest.
+   * When the node stops and leaves them running (`keepLive`), their records are kept as they are. */
+  async reconcile(options: { keepLive?: boolean } = {}) {
     const rows = this.core.db.prepare("SELECT * FROM provider_runs WHERE state='active'").all() as {
       run_id: string
       session_id: string
       processes: string
       ipc_path: string | null
+      live: string | null
+      live_state: string | null
+      stream_offset: number
     }[]
     for (const row of rows) {
+      if (row.live && options.keepLive) continue
+      if (this.live.adoptable(row) && !this.stopping && (await this.live.adopt(row))) continue
       const adapter = this.adapterFor(this.core.session(row.session_id).provider)
       if (!adapter) throw new Error('provider_reconciliation_required')
       this.core.debuggerControl.settleRun(row.run_id)
@@ -73,11 +90,16 @@ export class ProviderSessions {
           .prepare("UPDATE provider_runs SET state='unknown' WHERE run_id=?")
           .run(row.run_id)
         this.core.resources.targets.settle(row.session_id, row.run_id)
+        // A long-lived process did not survive the node: say so where its chat is read.
+        if (row.live || this.live.handles(row.session_id)) this.live.lost(row)
       })
     }
   }
-  async stop() {
+  /** `keepLive`: long-lived sessions keep running for the next node to adopt (a restart, an update). */
+  async stop(options: { keepLive?: boolean } = {}) {
     this.stopping = true
+    if (options.keepLive) await this.live.detachAll()
+    else await this.live.stopAll()
     while (this.active.size) {
       const ready = [...this.active].filter(([, slot]) => !slot.starting)
       const attempts = await Promise.allSettled(
@@ -90,7 +112,7 @@ export class ProviderSessions {
       if (this.active.size) await delay(20)
     }
     // Durable orphan records are also obligations, never a successful empty-map stop.
-    await this.reconcile()
+    await this.reconcile(options)
   }
   private async retryCleanup(session: string, slot: ActiveRun) {
     if (slot.run) {
@@ -143,6 +165,7 @@ export class ProviderSessions {
       if (!['dispatching', 'delivered'].includes(String(input.state)))
         await this.retryCleanup(session, active)
     }
+    await this.live.drain(this.stopping)
     if (this.stopping || updateInProgress(this.core.stateDir)) return
     const rows = this.core.db
       .prepare("SELECT * FROM inputs WHERE state IN ('accepted','queued') ORDER BY ordinal")
@@ -151,7 +174,12 @@ export class ProviderSessions {
       if (this.stopping || updateInProgress(this.core.stateDir) || this.active.size >= 4) break
       const session = this.core.session(String(input.session_id))
       const adapter = this.adapterFor(session.provider)
-      if (session.provider === 'fake' || !adapter?.available || this.active.has(session.session_id))
+      if (
+        session.provider === 'fake' ||
+        !adapter?.available ||
+        this.active.has(session.session_id) ||
+        this.live.handles(session.session_id)
+      )
         continue
       if (
         (!session.workspace_id && !this.core.resources.targets.bound(session.session_id)) ||
@@ -429,7 +457,7 @@ export class ProviderSessions {
     if (!binding) throw new Error('codex_native_binding_missing')
     return binding
   }
-  private persistProcesses(run_id: string, evidence: ProcessIdentity[]) {
+  persistProcesses(run_id: string, evidence: ProcessIdentity[]) {
     if (
       !evidence.every(
         (p) =>
@@ -563,37 +591,41 @@ export class ProviderSessions {
       )
         this.core.transition(current, 'delivered')
       if (!late) this.core.delegations.observe(session_id, run_id, event)
-      let data: Record<string, unknown> = {
-        ...event.data,
-        ...(event.data.run_id !== undefined && event.data.run_id !== run_id
-          ? { provider_run_id: event.data.run_id }
-          : {}),
-        run_id,
-        ...(late ? { late: true } : {}),
-      }
-      const bytes = Buffer.from(JSON.stringify(event.data))
-      if (event.type === 'claude.raw' || bytes.length > 8192) {
-        const artifact_id = randomUUID()
-        this.core.db
-          .prepare('INSERT INTO artifacts VALUES(?,?,?)')
-          .run(artifact_id, session_id, bytes)
-        data = {
-          run_id,
-          artifact_id,
-          size: bytes.length,
-          ...(late ? { late: true } : {}),
-          ...(event.type === 'claude.raw' ? { channel: event.data.channel } : {}),
-        }
-      }
-      this.core.append(
-        session_id,
-        event.type,
-        { kind: 'provider', provider: this.core.session(session_id).provider, session_id },
-        data
-      )
+      this.appendProviderEvent(session_id, run_id, event, late)
     })
   }
-  private invalidate(run_id: string) {
+  /** Inside a transaction. Large and raw records go to artifacts; the journal keeps a reference. */
+  appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
+    let data: Record<string, unknown> = {
+      ...event.data,
+      ...(event.data.run_id !== undefined && event.data.run_id !== run_id
+        ? { provider_run_id: event.data.run_id }
+        : {}),
+      run_id,
+      ...(late ? { late: true } : {}),
+    }
+    const bytes = Buffer.from(JSON.stringify(event.data))
+    if (event.type === 'claude.raw' || bytes.length > 8192) {
+      const artifact_id = randomUUID()
+      this.core.db
+        .prepare('INSERT INTO artifacts VALUES(?,?,?)')
+        .run(artifact_id, session_id, bytes)
+      data = {
+        run_id,
+        artifact_id,
+        size: bytes.length,
+        ...(late ? { late: true } : {}),
+        ...(event.type === 'claude.raw' ? { channel: event.data.channel } : {}),
+      }
+    }
+    return this.core.append(
+      session_id,
+      event.type,
+      { kind: 'provider', provider: this.core.session(session_id).provider, session_id },
+      data
+    )
+  }
+  invalidate(run_id: string) {
     // Called within input transactions. Cancel/settle outside that synchronous
     // commit, before another queued turn can be admitted. Active-run predicates
     // already reject publication once the input is no longer active.
@@ -613,13 +645,43 @@ export class ProviderSessions {
       if (p.state === 'pending') this.core.resolvePrompt(p, 'invalidated', 'deny', null)
     }
   }
-  private async permission(
+  private permission(
     input: Input,
     action: PermissionAction & Partial<PiAction>,
     signal: AbortSignal
   ) {
-    const session_id = String(input.session_id),
-      run_id = String(input.run_id)
+    const active = () => {
+      const current = this.core.db
+        .prepare('SELECT state FROM inputs WHERE input_id=?')
+        .get(String(input.input_id)) as { state: string }
+      return ['dispatching', 'delivered'].includes(current.state)
+    }
+    return this.ask(
+      {
+        session_id: String(input.session_id),
+        run_id: String(input.run_id),
+        principal: String(input.principal_id),
+        active,
+      },
+      action,
+      signal
+    )
+  }
+  /** One durable prompt per exact action, answered by the first device; delivery is confirmed once. */
+  async ask(
+    owner: {
+      session_id: string
+      run_id: string
+      principal: string
+      active(): boolean
+      /** Replaces the adapter's prompt lifetime (long-lived owner sessions wait minutes). */
+      ttl_ms?: number
+      evidence?: string
+    },
+    action: PermissionAction & Partial<PiAction>,
+    signal: AbortSignal
+  ) {
+    const { session_id, run_id } = owner
     const action_digest = createHash('sha256')
       .update(canonical({ run_id, ...action }))
       .digest('hex')
@@ -627,19 +689,20 @@ export class ProviderSessions {
     const reservation_id = randomUUID()
     let reserved = false
     this.core.transaction(() => {
-      const current = this.core.db
-        .prepare('SELECT state FROM inputs WHERE input_id=?')
-        .get(String(input.input_id)) as { state: string }
-      if (!['dispatching', 'delivered'].includes(current.state))
-        throw new ChannelError('stale_revision')
-      this.core.checkExecution(String(input.principal_id), session_id)
+      if (!owner.active()) throw new ChannelError('stale_revision')
+      this.core.checkExecution(owner.principal, session_id)
       const previous = this.core.db
         .prepare(
-          "SELECT body FROM prompts WHERE session_id=? AND run_id=? AND json_extract(body,'$.action_digest')=?"
+          "SELECT body FROM prompts WHERE session_id=? AND run_id=? AND json_extract(body,'$.action_digest')=? ORDER BY rowid DESC"
         )
         .get(session_id, run_id, action_digest) as { body: string } | undefined
+      const earlier = previous ? PromptSchema.parse(JSON.parse(previous.body)) : undefined
+      // A long-lived process asks again what a node restart invalidated: a new question.
       prompt =
-        (previous ? PromptSchema.parse(JSON.parse(previous.body)) : undefined) ??
+        (earlier &&
+        !(owner.evidence === 'stdio_control_response' && earlier.state === 'invalidated')
+          ? earlier
+          : undefined) ??
         PromptSchema.parse({
           prompt_id: randomUUID(),
           session_id,
@@ -648,13 +711,14 @@ export class ProviderSessions {
           action_digest,
           expires_at:
             Date.now() +
-            Math.min(
-              Number(
-                this.adapterFor(this.core.session(session_id).provider)!.configuration
-                  .permission_ttl_ms
-              ),
-              action.ttl_ms ?? 3600000
-            ),
+            (owner.ttl_ms ??
+              Math.min(
+                Number(
+                  this.adapterFor(this.core.session(session_id).provider)!.configuration
+                    .permission_ttl_ms
+                ),
+                action.ttl_ms ?? 3600000
+              )),
           state: 'pending',
           choice: null,
           installation_id: null,
@@ -689,7 +753,7 @@ export class ProviderSessions {
         this.core.transaction(() => {
           prompt = this.core.resolvePrompt(prompt, 'expired', 'deny', null)
         })
-      else await delay(20)
+      else await delay(owner.ttl_ms ? 100 : 20)
     }
     const choice =
       !signal.aborted &&
@@ -705,12 +769,9 @@ export class ProviderSessions {
         : {}),
       delivered: () =>
         this.core.transaction(() => {
-          const current = this.core.db
-            .prepare('SELECT state FROM inputs WHERE input_id=?')
-            .get(String(input.input_id)) as { state: string }
-          if (!['dispatching', 'delivered'].includes(current.state)) return false
+          if (!owner.active()) return false
           const latest = this.core.prompt(prompt.prompt_id)
-          this.core.checkExecution(String(input.principal_id), session_id)
+          this.core.checkExecution(owner.principal, session_id)
           if (latest.installation_id)
             this.core.authority.check(
               { installation_id: latest.installation_id },
@@ -734,11 +795,12 @@ export class ProviderSessions {
             run_id,
             choice,
             evidence:
-              this.core.session(session_id).provider === 'codex'
+              owner.evidence ??
+              (this.core.session(session_id).provider === 'codex'
                 ? 'codex_rpc_dispatch_authorized'
                 : this.core.session(session_id).provider === 'pi'
                   ? 'sdk_worker_ipc_ack'
-                  : 'bridge_ipc_ack',
+                  : 'bridge_ipc_ack'),
           })
           return true
         }),

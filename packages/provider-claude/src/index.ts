@@ -1,6 +1,15 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer, type Socket } from 'node:net'
-import { chmodSync, writeFileSync, realpathSync } from 'node:fs'
+import {
+  chmodSync,
+  writeFileSync,
+  realpathSync,
+  readdirSync,
+  existsSync,
+  mkdirSync,
+  cpSync,
+} from 'node:fs'
+import { startLiveSession } from './live.js'
 import { createRunIpc, cleanupRunIpc } from './ipc.js'
 import { isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -24,6 +33,63 @@ export interface ClaudeOptions {
   deadlineMs?: number
   permissionTtlMs?: number
   processProbe?: ProcessProbe
+  /** Long-lived owner sessions when the CLI supports them. */
+  live?: boolean
+  /** Named Claude configuration directories besides the inherited 'default'. */
+  accounts?: Record<string, string>
+  /** Defaults for a new owner session; each session may change them. */
+  sessionModel?: string
+  sessionEffort?: string
+  sessionPermissionMode?: string
+  /** How long an owner session's permission question waits. */
+  sessionPermissionTtlMs?: number
+  /** Operator opt-in: owner sessions may choose bypassPermissions. Off by default. */
+  allowBypass?: boolean
+  /** How long an owner session keeps running while no node reads it (a restart, an update). */
+  detachedMs?: number
+}
+export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export const CLAUDE_PERMISSION_MODES = [
+  'manual',
+  'acceptEdits',
+  'auto',
+  'plan',
+  'dontAsk',
+  'bypassPermissions',
+] as const
+const validModel = (m: unknown): m is string =>
+  typeof m === 'string' && /^[A-Za-z0-9_.[\]-]{1,128}$/.test(m) && !m.startsWith('-')
+const validAccountName = (n: string) => /^[a-z0-9][a-z0-9_-]{0,31}$/.test(n)
+/** Where a configuration keeps its transcripts. 'default' is the node's own environment. */
+function configDirectory(accounts: Record<string, string>, name: string) {
+  if (name === 'default') return process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+  const dir = accounts[name]
+  if (!dir) throw new Error('unknown_claude_account')
+  return dir
+}
+/** Resuming under another account needs that account to have the transcript. Copy, never move. */
+export function carryTranscript(from: string, to: string, nativeSessionId: string) {
+  if (!/^[0-9a-f-]{36}$/.test(nativeSessionId) || from === to) return false
+  const projects = join(from, 'projects')
+  let slugs: string[] = []
+  try {
+    slugs = readdirSync(projects)
+  } catch {
+    return false
+  }
+  for (const slug of slugs) {
+    const file = join(projects, slug, nativeSessionId + '.jsonl')
+    if (!existsSync(file)) continue
+    const target = join(to, 'projects', slug)
+    mkdirSync(target, { recursive: true, mode: 0o700 })
+    if (!existsSync(join(target, nativeSessionId + '.jsonl')))
+      cpSync(file, join(target, nativeSessionId + '.jsonl'))
+    const sidecar = join(projects, slug, nativeSessionId)
+    if (existsSync(sidecar) && !existsSync(join(target, nativeSessionId)))
+      cpSync(sidecar, join(target, nativeSessionId), { recursive: true })
+    return true
+  }
+  return false
 }
 import { recoverProviderLauncher } from '@abele/provider-contract'
 import type {
@@ -31,6 +97,10 @@ import type {
   TurnContext,
   ProviderEventSink,
   ProviderRun,
+  LiveSession,
+  LiveSessionContext,
+  LiveSessionSink,
+  LiveSessionSettings,
 } from '@abele/provider-contract'
 export type {
   PermissionAction,
@@ -56,6 +126,8 @@ export class ClaudeProviderAdapter {
   readonly available: boolean
   readonly diagnostic: string
   readonly configuration: Record<string, unknown>
+  /** The CLI keeps one process across turns: stream-json input, replayed inputs, stdio prompts. */
+  readonly liveAvailable: boolean
   private options: Required<Omit<ClaudeOptions, 'executable' | 'processProbe'>>
   private probe: ProcessProbe
   private readonly checkedExecutable: string
@@ -78,6 +150,14 @@ export class ClaudeProviderAdapter {
       budgetUsd: options.budgetUsd ?? 0.35,
       deadlineMs: options.deadlineMs ?? 120000,
       permissionTtlMs: options.permissionTtlMs ?? 60000,
+      live: options.live ?? true,
+      accounts: { ...(options.accounts ?? {}) },
+      sessionModel: options.sessionModel ?? options.model ?? 'haiku',
+      sessionEffort: options.sessionEffort ?? 'high',
+      sessionPermissionMode: options.sessionPermissionMode ?? 'manual',
+      sessionPermissionTtlMs: options.sessionPermissionTtlMs ?? 1800000,
+      allowBypass: options.allowBypass ?? false,
+      detachedMs: options.detachedMs ?? 10 * 60000,
     }
     if (
       !isAbsolute(this.executable) ||
@@ -92,7 +172,21 @@ export class ClaudeProviderAdapter {
       this.options.deadlineMs > 1800000 ||
       !Number.isSafeInteger(this.options.permissionTtlMs) ||
       this.options.permissionTtlMs < 1 ||
-      this.options.permissionTtlMs > 3600000
+      this.options.permissionTtlMs > 3600000 ||
+      !validModel(this.options.sessionModel) ||
+      !(CLAUDE_EFFORTS as readonly string[]).includes(this.options.sessionEffort) ||
+      !(CLAUDE_PERMISSION_MODES as readonly string[]).includes(
+        this.options.sessionPermissionMode
+      ) ||
+      !Number.isSafeInteger(this.options.sessionPermissionTtlMs) ||
+      this.options.sessionPermissionTtlMs < 1000 ||
+      this.options.sessionPermissionTtlMs > 24 * 3600000 ||
+      !Number.isSafeInteger(this.options.detachedMs) ||
+      this.options.detachedMs < 0 ||
+      this.options.detachedMs > 24 * 3600000 ||
+      Object.entries(this.options.accounts).some(
+        ([name, dir]) => name === 'default' || !validAccountName(name) || !isAbsolute(dir)
+      )
     )
       throw new Error('invalid_claude_configuration')
     const v = spawnSync(executable, ['--version'], {
@@ -149,6 +243,14 @@ export class ClaudeProviderAdapter {
                     ? `missing flag ${missingFlag}`
                     : undefined
     this.available = failure === undefined
+    const advertised = (f: string) =>
+      new RegExp(`(?:^|[\\s,])${f}(?=[\\s,=]|$)`, 'm').test(help.stdout ?? '')
+    this.liveAvailable =
+      this.available &&
+      this.options.live &&
+      ['--input-format', '--replay-user-messages', '--allow-dangerously-skip-permissions'].every(
+        advertised
+      )
     const repair =
       parts && parts[0] >= 3
         ? 'npm install -g @anthropic-ai/claude-code@2, then '
@@ -185,7 +287,45 @@ export class ClaudeProviderAdapter {
       max_budget_usd: this.options.budgetUsd,
       deadline_ms: this.options.deadlineMs,
       permission_ttl_ms: this.options.permissionTtlMs,
+      live_sessions: this.liveAvailable,
+      accounts: ['default', ...Object.keys(this.options.accounts)],
+      session_defaults: this.sessionDefaults(),
+      session_permission_ttl_ms: this.options.sessionPermissionTtlMs,
+      efforts: [...CLAUDE_EFFORTS],
+      permission_modes: CLAUDE_PERMISSION_MODES.filter(
+        (m) => m !== 'bypassPermissions' || this.options.allowBypass
+      ),
     }
+  }
+  sessionDefaults(): LiveSessionSettings {
+    return {
+      model: this.options.sessionModel,
+      effort: this.options.sessionEffort,
+      account: 'default',
+      permission_mode: this.options.sessionPermissionMode,
+    }
+  }
+  /** Rejects a choice this node cannot launch. Names only; directories stay in the daemon. */
+  validateSettings(settings: Partial<LiveSessionSettings>) {
+    if (settings.model !== undefined && !validModel(settings.model))
+      throw new Error('invalid_session_settings')
+    if (
+      settings.effort !== undefined &&
+      !(CLAUDE_EFFORTS as readonly string[]).includes(settings.effort)
+    )
+      throw new Error('invalid_session_settings')
+    if (
+      settings.permission_mode !== undefined &&
+      (!(CLAUDE_PERMISSION_MODES as readonly string[]).includes(settings.permission_mode) ||
+        (settings.permission_mode === 'bypassPermissions' && !this.options.allowBypass))
+    )
+      throw new Error('invalid_session_settings')
+    if (
+      settings.account !== undefined &&
+      settings.account !== 'default' &&
+      !Object.hasOwn(this.options.accounts, settings.account)
+    )
+      throw new Error('invalid_session_settings')
   }
   configurationForTurn(turn: Pick<TurnContext, 'use_repository_claude_permissions'>) {
     const sources =
@@ -254,14 +394,98 @@ export class ClaudeProviderAdapter {
           status: 'unsupported',
           reason: 'No question-response bridge; denied explicitly',
         },
-        steering: { status: 'unsupported', reason: 'Serialized followups only' },
-        compaction: { status: 'unverified', reason: 'Raw records retained; no control API' },
+        steering: this.liveAvailable
+          ? { status: 'supported', evidence: 'long-lived-stdin-taken-at-tool-boundary' }
+          : { status: 'unsupported', reason: 'Serialized followups only' },
+        compaction: this.liveAvailable
+          ? { status: 'supported', evidence: 'session.compact; compact_boundary; context usage' }
+          : { status: 'unverified', reason: 'Raw records retained; no control API' },
+        long_lived_sessions: this.liveAvailable
+          ? {
+              status: 'supported',
+              evidence: 'stream-json-input; replayed-inputs; stdio-permissions; live-2.1.301',
+            }
+          : {
+              status: 'unsupported',
+              reason: this.available
+                ? 'CLI lacks streamed input flags or the node turned it off'
+                : this.diagnostic,
+            },
       },
     }
   }
   async reconcile(evidence: ProcessIdentity[], ipcDirectory?: string) {
     await ProcessSupervisor.cleanup(evidence, 500, this.probe)
     if (ipcDirectory) cleanupRunIpc(ipcDirectory)
+  }
+  async startSession(context: LiveSessionContext, sink: LiveSessionSink): Promise<LiveSession> {
+    const checked = new ClaudeProviderAdapter({
+      ...this.options,
+      executable: this.executable,
+      processProbe: this.probe,
+    })
+    if (!checked.liveAvailable) throw new Error(checked.diagnostic)
+    const settings = context.settings
+    this.validateSettings(settings)
+    const configuration = checked.configurationForTurn(context)
+    const accountDirectory =
+      settings.account === 'default'
+        ? undefined
+        : configDirectory(this.options.accounts, settings.account)
+    if (
+      context.native_session_id &&
+      context.previous_account &&
+      context.previous_account !== settings.account
+    )
+      carryTranscript(
+        configDirectory(this.options.accounts, context.previous_account),
+        configDirectory(this.options.accounts, settings.account),
+        context.native_session_id
+      )
+    const args = [
+      '-p',
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      '--forward-subagent-text',
+      '--replay-user-messages',
+      '--model',
+      settings.model,
+      '--effort',
+      settings.effort,
+      '--permission-mode',
+      settings.permission_mode,
+      '--permission-prompts',
+      'host',
+      '--permission-prompt-tool',
+      'stdio',
+      '--setting-sources',
+      (configuration.settings_sources as string[]).join(','),
+    ]
+    // Only with the operator's opt-in: it makes bypass reachable, the session's mode decides.
+    if (this.options.allowBypass) args.push('--allow-dangerously-skip-permissions')
+    if (this.options.profile === 'isolated')
+      args.push(
+        '--strict-mcp-config',
+        '--disable-slash-commands',
+        '--settings',
+        JSON.stringify({ disableAllHooks: true })
+      )
+    if (context.native_session_id) args.push('--resume', context.native_session_id)
+    return startLiveSession(
+      {
+        executable: checked.checkedExecutable,
+        args,
+        probe: this.probe,
+        detachedMs: this.options.detachedMs,
+        ...(accountDirectory ? { env: { CLAUDE_CONFIG_DIR: accountDirectory } } : {}),
+      },
+      context,
+      sink
+    )
   }
   async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
     const checked = new ClaudeProviderAdapter({

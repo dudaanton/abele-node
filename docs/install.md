@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.14
+  sh -s -- --version 0.4.15
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -586,6 +586,7 @@ UMask=0077
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 
@@ -593,6 +594,8 @@ StandardError=journal
 WantedBy=default.target
 ```
 
+`KillMode=process` lets long-lived Claude sessions keep running while the node
+restarts or updates; the next node takes them over (see `claude-sessions.md`).
 Replace the Node and Claude paths with existing absolute executables. `%h` is
 systemd's home-directory specifier, not shell expansion. Run as your user, not a
 system-wide root service:
@@ -711,7 +714,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.14  # example; select an existing release
+   git checkout v0.4.15  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

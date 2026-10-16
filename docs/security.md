@@ -125,7 +125,12 @@ for that opaque worktree identity; project opt-out clears approvals. Replacement
 do not inherit them. Owner [git writes](repository-git.md) need that same editing
 permission; unlike reads, they run with the repository and user Git configuration
 (hooks, filters, credential helpers) because the owner asked for exactly that operation,
-still with typed argv, no shell, editor, pager or prompt, and limited transports.
+still with typed argv, no shell, editor, pager or prompt, and limited transports. They
+never recurse into submodules, whose git directories a worktree file names, and the checks
+around a write run with the read profile. The node's file methods refuse every `.git` path
+segment; a Codex workspace keeps its `.git` read-only. Git control that lives in tracked content
+the owner pointed configuration at (a `core.hooksPath` or `include.path` inside the worktree)
+stays the owner's choice and applies to writes.
 Root/common-directory and target identities are rechecked at access and owner
 permission is rechecked before publishing, including retained reads. Read operations disable hooks, fsmonitor, pagers, signature display/signing,
 external diff/textconv and configured checkout/clean filters **even for trusted
@@ -245,6 +250,50 @@ sandbox or a guarantee against malicious group escapes/reparenting**. Agent tool
 still run as the daemon user, can access that user's other files/credentials and
 can make network requests. A container restricts what is mounted, not what an
 agent can do with granted mounts, credentials or network access.
+
+### Long-lived owner sessions
+
+Owner chats on a CLI with streamed input run as [long-lived sessions](claude-sessions.md).
+The bounded-run guarantees above describe delegated work and per-message mode; for
+long-lived sessions they change as follows:
+
+- **Background processes survive turns.** Background commands, monitors and subagents
+  the agent starts keep running until they finish, the owner stops the session, or the node
+  ends an idle session with nothing running. Hard stop still cleans up the whole fenced
+  process group.
+- **Sessions outlive the node for a bounded time.** A stopping node leaves each session's
+  process group running under its own host, which ends it after `--claude-detached-ms`
+  (10 minutes by default; `0` ends sessions with the node) unless a node takes it over.
+  While no node runs, nobody can answer a permission question or press stop; tools that
+  need no question (bypass mode, allow rules) keep running and are journaled once the next
+  node adopts the process. The host's socket and the run directory are private to the
+  node's user and token-checked; adoption re-checks the owner's execution authority and the
+  project's trust.
+- **Permission questions come from the CLI over stdio** (`can_use_tool`), not the MCP
+  bridge. The same durable, single-use prompt records apply; they wait the session
+  lifetime (`--claude-session-permission-ttl-ms`). Answers are bound to the process that
+  asked; an interrupt or stop invalidates open questions.
+- **The permission mode is the owner's choice per session.** `bypassPermissions` is
+  available only when the operator starts the node with `--claude-allow-bypass`; only then
+  is the process launched with `--allow-dangerously-skip-permissions`, so the mode can be
+  switched without a restart. The launch flag alone grants nothing. Changing settings
+  requires execution authority on the session. Bypass means tools run without asking;
+  every call, its input and its result are still journaled and streamed, and interrupt
+  and hard stop remain available. Only an authenticated installation can change the
+  mode; agents cannot.
+- **No spending limit or deadline** applies to owner sessions. Delegated work keeps both.
+- The node's own agent tools (debugger, target switching, session messages) act with the
+  authority of the installation whose message started the process. Every message is checked against its
+  own installation when it is written into the process, and the process is ended when any
+  of those installations loses execution authority.
+- Repository CLAUDE.md files and `.claude/` settings load only with the per-project
+  opt-in, as above.
+- **Sessions can write to each other** (`node_session_send`) when both have the
+  `messaging` setting on (the default). A message becomes an input of the receiving session
+  under the sender's installation, checked for execution authority on the receiver, and is
+  marked as coming from another session in the text the receiving model reads. Delegated
+  work can neither send nor receive. A session in bypass mode can thereby start work in
+  another session; turn `messaging` off for sessions that must not.
 
 Only CLI versions 2.1.285/2.1.291 with required flags are enabled. Compatibility
 checks run bounded version/help commands; they do not verify login or quota. New

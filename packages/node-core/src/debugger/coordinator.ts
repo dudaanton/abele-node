@@ -782,6 +782,9 @@ export class DebuggerCoordinator {
     if (method === 'cancelWait') return this.waits.cancel(human, p)
     if (method === 'approve') return this.approve(owner, p)
     if (method === 'start') return this.core.debuggerLaunches.start(owner, p as any)
+    if (method === 'attachProgram') return this.core.debuggerLaunches.attach(owner, p as any)
+    // Listing what runs on the machine is the owner's (checked above), as attaching is.
+    if (method === 'programs') return this.core.debuggerLaunches.programs(p.conversation_id)
     if (method === 'approvals') {
       this.checkPublication(human, p.debug_session_id)
       const all = this.core.db
@@ -838,7 +841,9 @@ export class DebuggerCoordinator {
       p.debug_session_id ??
       p.cursor?.debug_session_id ??
       result?.snapshot?.debug_session_id ??
-      (full === 'debugger.v1.start' ? result?.debug_session_id : undefined)
+      (full === 'debugger.v1.start' || full === 'debugger.v1.attachProgram'
+        ? result?.debug_session_id
+        : undefined)
     if (session) this.checkPublication({ kind: 'human', authority: owner }, session)
     if (full === 'debugger.v1.sessions' && Array.isArray(result))
       for (const s of result)

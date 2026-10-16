@@ -10,6 +10,9 @@ export type ProcessEvidence = {
   start_identity: string
   executable_sha256: string
 }
+/** Processes the debugger started and still holds: its adapters and the programs it runs. Not
+ * offered for attaching, as they are already under it. */
+export const ownedDebugPids = new Set<number>()
 export interface DebugProcessOwner {
   readonly evidence: ProcessEvidence
   terminate(): Promise<void>
@@ -63,7 +66,11 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
         this.text = (this.text + chunk.toString('utf8')).slice(-16384)
         this.emit('text')
       })
-    child.on('exit', () => this.emit('exit'))
+    ownedDebugPids.add(evidence.pid)
+    child.on('exit', () => {
+      ownedDebugPids.delete(evidence.pid)
+      this.emit('exit')
+    })
     child.on('error', () => this.emit('exit'))
   }
   static async spawn(
@@ -178,6 +185,8 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
     if (!this.child.kill(signal)) throw new Error('debugger_signal_failed')
   }
   release() {
+    // Let go, it is a program of its own again: one that may be attached to later.
+    ownedDebugPids.delete(this.pid)
     this.child.unref()
     // Continue draining bounded private startup output while the host is alive,
     // but an explicitly detached target must not keep the node event loop alive.

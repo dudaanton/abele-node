@@ -213,8 +213,8 @@ export class RepositoryGitService {
   git(target: RepositoryTarget, args: string[], options?: Parameters<OwnerGit['run']>[2]) {
     return this.owner.run(target.path, args, { timeoutMs: 15000, ...options })
   }
-  async text(target: RepositoryTarget, args: string[]) {
-    const r = await this.git(target, args, { probe: true })
+  async text(target: RepositoryTarget, args: string[], probe = true) {
+    const r = await this.git(target, args, { probe })
     return r.code === 0 ? r.stdout.toString('utf8').trim() : null
   }
   async expectHead(target: RepositoryTarget, expected: unknown) {
@@ -234,12 +234,16 @@ export class RepositoryGitService {
     if (existsSync(join(dir, 'REVERT_HEAD'))) return 'revert'
     return null
   }
+  /** Unmerged index entries; the index alone, so nothing in the worktree is read. */
   async conflicted(target: RepositoryTarget) {
-    const r = await this.git(target, ['diff', '--name-only', '--diff-filter=U', '-z'], {
-      probe: true,
-    })
+    const r = await this.git(target, ['ls-files', '--unmerged', '-z'], { probe: true })
     if (r.code !== 0) throw new ChannelError('git_failed')
-    return [...new Set(r.stdout.toString('utf8').split('\0').filter(Boolean))].slice(0, 1000)
+    const paths = r.stdout
+      .toString('utf8')
+      .split('\0')
+      .map((row) => row.slice(row.indexOf('\t') + 1))
+      .filter(Boolean)
+    return [...new Set(paths)].slice(0, 1000)
   }
   private async author(target: RepositoryTarget) {
     const ident = await this.text(target, ['var', 'GIT_AUTHOR_IDENT'])
@@ -299,12 +303,17 @@ export class RepositoryGitService {
     return { ...tracked, commit, ahead, behind }
   }
   private async hasHook(target: RepositoryTarget, names: string[]) {
-    const configured = await this.text(target, ['config', '--get', 'core.hooksPath'])
+    // Where the write's hooks are: the owner's setting, which a probe pins away. Neither runs one.
+    const configured = await this.text(target, ['config', '--get', 'core.hooksPath'], false)
     const hooks = configured
       ? isAbsolute(configured)
         ? configured
         : join(target.path, configured)
-      : await this.text(target, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks'])
+      : await this.text(
+          target,
+          ['rev-parse', '--path-format=absolute', '--git-path', 'hooks'],
+          false
+        )
     if (!hooks) return false
     return names.some((name) => {
       try {
@@ -422,12 +431,11 @@ export class RepositoryGitService {
     const parent = await this.expectHead(target, p.expected_head)
     if (await this.operation(target)) return fail('operation_in_progress')
     if ((await this.conflicted(target)).length) return fail('conflicted')
-    const staged = await this.git(target, [
-      'diff',
-      '--cached',
-      '--quiet',
-      '--ignore-submodules=none',
-    ])
+    const staged = await this.git(
+      target,
+      ['diff', '--cached', '--quiet', '--ignore-submodules=none'],
+      { probe: true }
+    )
     if (staged.code === 0) return fail('nothing_staged')
     if (staged.code !== 1) return fail('git_failed', staged.output)
     const author = await this.author(target)
@@ -452,13 +460,11 @@ export class RepositoryGitService {
     const previous = await this.expectHead(target, p.expected_head)
     if (await this.operation(target)) return fail('operation_in_progress')
     if (!(await this.branch(target))) return fail('detached_head')
-    const dirty = await this.git(target, [
-      'status',
-      '--porcelain',
-      '-z',
-      '--untracked-files=no',
-      '--ignore-submodules=all',
-    ])
+    const dirty = await this.git(
+      target,
+      ['status', '--porcelain', '-z', '--untracked-files=no', '--ignore-submodules=all'],
+      { probe: true }
+    )
     if (dirty.code !== 0) return fail('git_failed', dirty.output)
     if (dirty.stdout.length) return fail('workspace_dirty')
     const base =
@@ -467,13 +473,11 @@ export class RepositoryGitService {
     const remotes = await this.remotes(target)
     const exists = async (ref: string) =>
       (
-        await this.git(target, [
-          'rev-parse',
-          '--verify',
-          '--quiet',
-          '--end-of-options',
-          ref + '^{commit}',
-        ])
+        await this.git(
+          target,
+          ['rev-parse', '--verify', '--quiet', '--end-of-options', ref + '^{commit}'],
+          { probe: true }
+        )
       ).code === 0
     const candidates = base.startsWith('refs/')
       ? [base]
@@ -509,6 +513,7 @@ export class RepositoryGitService {
           target,
           [
             'fetch',
+            '--no-recurse-submodules',
             '--no-tags',
             '--no-write-fetch-head',
             remote.name,
@@ -621,6 +626,7 @@ export class RepositoryGitService {
       [
         'push',
         '--porcelain',
+        '--no-recurse-submodules',
         ...(upstream ? [] : ['--set-upstream']),
         // Never a bare force: the remote branch is replaced only if it is still the commit
         // the client saw.

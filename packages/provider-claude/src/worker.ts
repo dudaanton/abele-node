@@ -56,11 +56,16 @@ process.on('message', (raw: any) => {
   ) {
     const configIndex = raw.args.indexOf('--mcp-config')
     if (configIndex >= 0) ipcDirectory = dirname(raw.args[configIndex + 1])
+    // Only the named configuration directory may differ from the daemon's environment.
+    const configDirectory =
+      typeof raw.env?.CLAUDE_CONFIG_DIR === 'string' ? raw.env.CLAUDE_CONFIG_DIR : undefined
     child = spawn(raw.executable, raw.args, {
       cwd: raw.cwd,
       detached: false,
       stdio: ['pipe', 'pipe', 'pipe'],
+      ...(configDirectory ? { env: { ...process.env, CLAUDE_CONFIG_DIR: configDirectory } } : {}),
     })
+    child.stdin.on('error', () => {})
     child.once('error', () => {
       send({ kind: 'exit', code: null, reason: 'spawn_failed' })
       void stop()
@@ -109,6 +114,11 @@ process.on('message', (raw: any) => {
   } else if (raw?.kind === 'deliver' && child && typeof raw.text === 'string') {
     // Single input only; EOF makes this one invocation, never an interactive queue.
     child.stdin.end(raw.text)
+  } else if (raw?.kind === 'write' && child && typeof raw.line === 'string') {
+    // A long-lived session: one JSON record per line, stdin stays open between turns.
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.write(raw.line + '\n')
+  } else if (raw?.kind === 'close_input' && child) {
+    child.stdin.end()
   } else if (raw?.kind === 'output_ack') child?.stdout.resume()
   else if (raw?.kind === 'stop') void stop()
 })
