@@ -169,61 +169,74 @@ it('frames UTF-8 bytes, handles server requests and cancels pending work', async
   abort.abort()
   await expect(pending).rejects.toThrow('cancelled')
 })
-it('shares processes, merges source-tagged diagnostics, confines definitions and stops idle', async () => {
-  const root = temp(),
-    log = join(root, 'frames')
-  writeFileSync(join(root, 'a.ts'), 'const a = 1')
-  mkdirSync(join(root, 'node_modules/eslint'), { recursive: true })
-  writeFileSync(join(root, 'node_modules/eslint/package.json'), '{}')
-  symlinkSync('/etc/passwd', join(root, 'escape.ts'))
-  const service = new LspService(root, {
-    trusted: () => true,
-    idleMs: 150,
-    command: (language) =>
-      ['typescript', 'eslint'].includes(language)
-        ? { command: process.execPath, args: [fixture, language, log] }
-        : null,
-    check: (base, path) => {
-      if (!path || path.split('/').some((p) => p === '..' || p === '.') || path.startsWith('/'))
-        throw new Error('unsafe_path')
-      const file = join(base, path)
-      if (lstatSync(file).isSymbolicLink() || realpathSync(file) !== file)
-        throw new Error('unsafe_path')
-      return file
-    },
-  })
-  cleanups.push(() => service.stop())
-  expect((await service.open(root, 'a.ts')).servers).toEqual(['typescript', 'eslint'])
-  await until(() => readFileSync(log, 'utf8').includes('textDocument/didOpen'))
-  let merged: string[] = []
-  for (let i = 0; i < 100; i++) {
-    merged =
-      (await service.query(root, 'a.ts', 'diagnostics')).diagnostics?.map((d) => d.source) ?? []
-    if (merged.length === 2) break
-    await new Promise((r) => setTimeout(r, 10))
+it.each(['direct', 'symlinked'] as const)(
+  'shares processes, merges source-tagged diagnostics, confines definitions and stops idle (%s root)',
+  async (kind) => {
+    const dir = temp()
+    const realRoot = join(dir, 'project')
+    mkdirSync(realRoot)
+    const root = kind === 'symlinked' ? join(dir, 'project-alias') : realRoot
+    if (kind === 'symlinked') symlinkSync(realRoot, root)
+    const log = join(dir, 'frames')
+    writeFileSync(join(root, 'a.ts'), 'const a = 1')
+    mkdirSync(join(root, 'node_modules/eslint'), { recursive: true })
+    writeFileSync(join(root, 'node_modules/eslint/package.json'), '{}')
+    symlinkSync('/etc/passwd', join(root, 'escape.ts'))
+    const outside = join(dir, 'project-outside')
+    mkdirSync(outside)
+    writeFileSync(join(outside, 'secret.ts'), 'secret')
+    symlinkSync(outside, join(root, 'escape-dir'))
+    const service = new LspService(root, {
+      trusted: () => true,
+      idleMs: 150,
+      command: (language) =>
+        ['typescript', 'eslint'].includes(language)
+          ? { command: process.execPath, args: [fixture, language, log] }
+          : null,
+      check: (base, path) => {
+        if (!path || path.split('/').some((p) => p === '..' || p === '.') || path.startsWith('/'))
+          throw new Error('unsafe_path')
+        const file = join(base, path)
+        if (lstatSync(file).isSymbolicLink() || realpathSync(file) !== file)
+          throw new Error('unsafe_path')
+        return file
+      },
+    })
+    cleanups.push(() => service.stop())
+    expect((await service.open(root, 'a.ts')).servers).toEqual(['typescript', 'eslint'])
+    await until(() => readFileSync(log, 'utf8').includes('textDocument/didOpen'))
+    let merged: string[] = []
+    for (let i = 0; i < 100; i++) {
+      merged =
+        (await service.query(root, 'a.ts', 'diagnostics')).diagnostics?.map((d) => d.source) ?? []
+      if (merged.length === 2) break
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    const diagnostics = await service.query(root, 'a.ts', 'diagnostics')
+    expect(diagnostics.diagnostics?.map((d) => d.source).sort()).toEqual(['eslint', 'typescript'])
+    const result = await service.query(root, 'a.ts', 'definition', { line: 0, character: 1 })
+    expect(result.locations).toEqual([
+      { path: 'a.ts', range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } } },
+    ])
+    // Both spellings must address the same processes and document versions.
+    await service.open(realpathSync(root), 'a.ts', 'const a = 2')
+    expect(
+      readFileSync(log, 'utf8')
+        .split('\n')
+        .filter((line) => line === 'initialize').length
+    ).toBe(2)
+    await expect(service.open(root, '../secret.ts')).rejects.toThrow('unsafe_path')
+    await expect(service.open(root, 'escape.ts')).rejects.toThrow('unsafe_path')
+    await expect(service.open(root, 'escape-dir/secret.ts')).rejects.toThrow('unsafe_path')
+    await new Promise((r) => setTimeout(r, 300))
+    await service.open(root, 'a.ts')
+    expect(
+      readFileSync(log, 'utf8')
+        .split('\n')
+        .filter((line) => line === 'initialize').length
+    ).toBe(4)
   }
-  const diagnostics = await service.query(root, 'a.ts', 'diagnostics')
-  expect(diagnostics.diagnostics?.map((d) => d.source).sort()).toEqual(['eslint', 'typescript'])
-  const result = await service.query(root, 'a.ts', 'definition', { line: 0, character: 1 })
-  expect(result.locations).toEqual([
-    { path: 'a.ts', range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } } },
-  ])
-  await service.open(root, 'a.ts', 'const a = 2')
-  expect(
-    readFileSync(log, 'utf8')
-      .split('\n')
-      .filter((line) => line === 'initialize').length
-  ).toBe(2)
-  await expect(service.open(root, '../secret.ts')).rejects.toThrow('unsafe_path')
-  await expect(service.open(root, 'escape.ts')).rejects.toThrow('unsafe_path')
-  await new Promise((r) => setTimeout(r, 300))
-  await service.open(root, 'a.ts')
-  expect(
-    readFileSync(log, 'utf8')
-      .split('\n')
-      .filter((line) => line === 'initialize').length
-  ).toBe(4)
-})
+)
 it('restarts once after a crash and reports a repeated crash', async () => {
   const root = temp(),
     log = join(root, 'frames'),

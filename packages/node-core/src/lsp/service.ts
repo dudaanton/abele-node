@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { extname, relative, isAbsolute, resolve, join } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
@@ -66,6 +66,14 @@ export class LspService {
     return !projectCodeServers.has(language) || this.options.trusted?.(root) === true
   }
   async enforceTrust(root: string) {
+    // Preserve cleanup of an already-open canonical root even if it disappeared.
+    if (![...this.slots.values()].some((slot) => slot.root === root)) {
+      try {
+        root = realpathSync(root)
+      } catch {
+        return
+      }
+    }
     await Promise.all(
       [...this.slots.values()]
         .filter((slot) => slot.root === root && !this.allowed(root, slot.language))
@@ -73,6 +81,7 @@ export class LspService {
     )
   }
   canRefresh(root: string) {
+    root = realpathSync(root)
     return (
       [...this.slots.values()].some(
         (slot) => slot.root === root && this.allowed(root, slot.language)
@@ -271,6 +280,8 @@ export class LspService {
     }
   }
   async open(root: string, path: string, text?: string, version?: number, signal?: AbortSignal) {
+    // Only the root alias is resolved. check() still refuses symlinks below it.
+    root = realpathSync(root)
     return this.active(root, () => this.openDocument(root, path, text, version, signal))
   }
   private async openDocument(
@@ -354,6 +365,7 @@ export class LspService {
     return { servers: opened }
   }
   closeDocument(root: string, path: string) {
+    root = realpathSync(root)
     this.options.check(root, path)
     for (const slot of this.slots.values())
       if (slot.root === root && slot.docs.delete(path)) {
@@ -376,6 +388,7 @@ export class LspService {
     position?: unknown,
     signal?: AbortSignal
   ) {
+    root = realpathSync(root)
     return this.active(root, () => this.queryDocument(root, path, method, position, signal))
   }
   private async queryDocument(
@@ -464,6 +477,7 @@ export class LspService {
     return { symbols }
   }
   async refresh(root: string, skip = new Set<string>()) {
+    root = realpathSync(root)
     await this.enforceTrust(root)
     const paths = new Set(
       [...this.slots.values()].filter((s) => s.root === root).flatMap((s) => [...s.docs.keys()])
