@@ -1,3 +1,4 @@
+import { LspTools } from './lsp/tools.js'
 import { randomUUID, createHash } from 'node:crypto'
 import { ChannelError } from '@abele/channel-protocol'
 import {
@@ -5,6 +6,7 @@ import {
   SessionSchema,
   type Prompt,
   type ExpectedExecutionTarget,
+  providerSessionUpdates,
 } from '@abele/node-protocol'
 import type {
   ProviderRun,
@@ -257,6 +259,7 @@ export class ProviderSessions {
         )
           throw new Error('codex_native_binding_missing')
         const body = JSON.parse(String(input.body)) as { text: string }
+
         if (this.core.debugger.enabled && ['claude', 'pi'].includes(session.provider)) {
           slot.debugger = new DebuggerRunBinding(this.core, {
             authority: this.core.authority.forInstallation(String(input.principal_id)),
@@ -295,6 +298,19 @@ export class ProviderSessions {
             slot.debugger
           )
         }
+        if (session.provider !== 'claude')
+          slot.debugger = new LspTools(
+            this.core,
+            session.session_id,
+            String(input.principal_id),
+            () =>
+              !this.stopping &&
+              !!this.core.db
+                .prepare("SELECT 1 FROM provider_runs WHERE run_id=? AND state='active'")
+                .get(run_id),
+            slot.debugger
+          )
+
         slot.run = await adapter.startTurn(
           {
             session_id: session.session_id,
@@ -378,6 +394,7 @@ export class ProviderSessions {
                   }
                 )
               }
+              void this.core.resources.lsp.afterEdit(session.session_id)
               this.invalidate(run_id)
               if (result.reason === 'process_cleanup_unconfirmed') this.stopping = true
               else
@@ -447,7 +464,37 @@ export class ProviderSessions {
       }
     }
   }
-  private codexBinding(session_id: string) {
+  /** Inside a transaction: the exact thread, workspace, policy and model a Codex session runs under. */
+  recordCodexBinding(session_id: string, thread_id: string, binding: Record<string, any>) {
+    const session = this.core.session(session_id)
+    if (
+      session.provider !== 'codex' ||
+      this.core.resources.targets.pathForSession(session_id) !== binding.workspace_path ||
+      !/^[a-f0-9]{64}$/.test(binding.policy_fingerprint) ||
+      typeof binding.model !== 'string' ||
+      !/^[A-Za-z0-9_.:-]{1,128}$/.test(binding.model) ||
+      (this.adapterFor('codex')?.configuration.model &&
+        binding.model !== this.adapterFor('codex')?.configuration.model)
+    )
+      throw new Error('codex_native_binding_mismatch')
+    const previous = this.core.db
+      .prepare('SELECT * FROM codex_thread_bindings WHERE session_id=?')
+      .get(session_id)
+    if (
+      previous &&
+      (previous.thread_id !== thread_id ||
+        previous.workspace_path !== binding.workspace_path ||
+        previous.policy_fingerprint !== binding.policy_fingerprint ||
+        previous.model !== binding.model)
+    )
+      throw new Error('codex_native_binding_mismatch')
+    this.core.db
+      .prepare(
+        'INSERT INTO codex_thread_bindings(session_id,thread_id,workspace_path,policy_fingerprint,model) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING'
+      )
+      .run(session_id, thread_id, binding.workspace_path, binding.policy_fingerprint, binding.model)
+  }
+  codexBinding(session_id: string) {
     const binding = this.core.db
       .prepare(
         'SELECT workspace_path,policy_fingerprint,model FROM codex_thread_bindings WHERE session_id=?'
@@ -539,41 +586,8 @@ export class ProviderSessions {
               "INSERT INTO provider_native_sessions(session_id,provider,native_session_id,session_file) VALUES(?,'pi',?,?) ON CONFLICT(session_id) DO UPDATE SET native_session_id=excluded.native_session_id,session_file=excluded.session_file"
             )
             .run(session_id, updated.native_session_id!, updated.native_session_file!)
-        if (event.type === 'codex.session.bound') {
-          const binding = event.data
-          if (
-            session.provider !== 'codex' ||
-            this.core.resources.targets.pathForSession(session_id) !== binding.workspace_path ||
-            !/^[a-f0-9]{64}$/.test(binding.policy_fingerprint) ||
-            typeof binding.model !== 'string' ||
-            !/^[A-Za-z0-9_.:-]{1,128}$/.test(binding.model) ||
-            (this.adapterFor('codex')?.configuration.model &&
-              binding.model !== this.adapterFor('codex')?.configuration.model)
-          )
-            throw new Error('codex_native_binding_mismatch')
-          const previous = this.core.db
-            .prepare('SELECT * FROM codex_thread_bindings WHERE session_id=?')
-            .get(session_id)
-          if (
-            previous &&
-            (previous.thread_id !== updated.native_session_id ||
-              previous.workspace_path !== binding.workspace_path ||
-              previous.policy_fingerprint !== binding.policy_fingerprint ||
-              previous.model !== binding.model)
-          )
-            throw new Error('codex_native_binding_mismatch')
-          this.core.db
-            .prepare(
-              'INSERT INTO codex_thread_bindings(session_id,thread_id,workspace_path,policy_fingerprint,model) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING'
-            )
-            .run(
-              session_id,
-              updated.native_session_id!,
-              binding.workspace_path,
-              binding.policy_fingerprint,
-              binding.model
-            )
-        }
+        if (event.type === 'codex.session.bound')
+          this.recordCodexBinding(session_id, updated.native_session_id!, event.data)
         this.core.db
           .prepare('UPDATE sessions SET body=? WHERE session_id=?')
           .run(JSON.stringify(updated), session_id)
@@ -596,6 +610,10 @@ export class ProviderSessions {
   }
   /** Inside a transaction. Large and raw records go to artifacts; the journal keeps a reference. */
   appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
+    const provider = this.core.session(session_id).provider
+    // Mapped from the whole record, before a large one is moved to an artifact.
+    const updates = providerSessionUpdates(provider, event.type, event.data)
+    const mapped = updates.length ? { mapped: true } : {}
     let data: Record<string, unknown> = {
       ...event.data,
       ...(event.data.run_id !== undefined && event.data.run_id !== run_id
@@ -603,6 +621,7 @@ export class ProviderSessions {
         : {}),
       run_id,
       ...(late ? { late: true } : {}),
+      ...mapped,
     }
     const bytes = Buffer.from(JSON.stringify(event.data))
     if (event.type === 'claude.raw' || bytes.length > 8192) {
@@ -616,14 +635,14 @@ export class ProviderSessions {
         size: bytes.length,
         ...(late ? { late: true } : {}),
         ...(event.type === 'claude.raw' ? { channel: event.data.channel } : {}),
+        ...mapped,
       }
     }
-    return this.core.append(
-      session_id,
-      event.type,
-      { kind: 'provider', provider: this.core.session(session_id).provider, session_id },
-      data
-    )
+    const author = { kind: 'provider', provider, session_id } as const
+    const appended = this.core.append(session_id, event.type, author, data)
+    for (const update of updates)
+      this.core.append(session_id, 'session.update', author, { run_id, update })
+    return appended
   }
   invalidate(run_id: string) {
     // Called within input transactions. Cancel/settle outside that synchronous

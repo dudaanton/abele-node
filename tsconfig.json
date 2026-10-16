@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/provider-contract" },
     { "path": "packages/provider-codex" },
+    { "path": "packages/provider-acp" },
     {
       "path": "packages/node-protocol"
     },

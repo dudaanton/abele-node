@@ -30,6 +30,8 @@ export interface ProviderAdapter {
   reconcile(evidence: ProcessIdentity[], ipcDirectory?: string): Promise<void>
   /** Long-lived owner sessions; absent or false means one process per message. */
   readonly liveAvailable?: boolean
+  /** Providers that host several agents: whether this one can be started here. */
+  agentAvailable?(agent: string): boolean
   startSession?(context: LiveSessionContext, sink: LiveSessionSink): Promise<LiveSession>
   sessionDefaults?(): LiveSessionSettings
   /** Throws for a model, effort, mode or account name this node cannot launch. */

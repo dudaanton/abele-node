@@ -35,6 +35,7 @@ import { RepositoryGitService } from './repository-git.js'
 import { NodePathService } from './node-path.js'
 import { WorkspaceSearchService } from './workspace-search.js'
 import { ExecutionTargetService } from './execution-targets.js'
+import { NodeLsp } from './lsp/node.js'
 
 type Params = Record<string, unknown>
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
@@ -563,6 +564,7 @@ export class JobService {
 }
 
 export class ResourceServices {
+  readonly lsp: NodeLsp
   readonly ready: Promise<unknown>
   readonly search = new WorkspaceSearchService(this)
   readonly nodePath: NodePathService
@@ -586,6 +588,7 @@ export class ResourceServices {
     git = new GitRunner()
   ) {
     this.git = git
+    this.lsp = new NodeLsp(this)
     this.repository = new RepositoryService(this)
     this.repositoryGit = new RepositoryGitService(this)
     this.nodePath = new NodePathService(this)
@@ -628,6 +631,7 @@ export class ResourceServices {
       : Promise.resolve([])
   }
   async stop() {
+    await this.lsp.stop()
     this.nodePath.stop()
     await this.ready
     await this.search.stop()

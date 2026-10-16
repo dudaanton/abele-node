@@ -35,7 +35,8 @@ it('uses the existing client flow for allow/deny/expiry, extension answers, queu
       { permissionTtlMs: 600, deadlineMs: 15000 },
       undefined,
       undefined,
-      { profile: 'isolated', permissionTtlMs: 600, deadlineMs: 15000 }
+      // The per-message flow, as delegated sessions and --no-pi-live run it.
+      { profile: 'isolated', permissionTtlMs: 600, deadlineMs: 15000, live: false }
     )
     client = new NodeClient(
       {

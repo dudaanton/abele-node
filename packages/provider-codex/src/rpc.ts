@@ -19,7 +19,10 @@ const METHODS = new Set([
   'thread/resume',
   'thread/read',
   'turn/start',
+  'turn/steer',
   'turn/interrupt',
+  'thread/compact/start',
+  'skills/list',
 ])
 export class ServerRequestRejected extends Error {
   constructor(
@@ -103,6 +106,8 @@ export interface RpcOptions {
   probe?: ProcessProbe
   marker?: string
   timeoutMs?: number
+  /** Bytes the whole stream may carry; a long-lived session has no total, only a frame limit. */
+  streamLimit?: number
   /** Node-local request deadline seam; does not replace process cleanup timers. */
   timers?: DeadlineTimers
 }
@@ -172,7 +177,7 @@ export class RpcPeer {
       this.child.once('close', () => r())
       this.child.once('error', () => r())
     })
-    const decoder = new JsonlDecoder()
+    const decoder = new JsonlDecoder(undefined, options.streamLimit)
     let stderrBytes = 0
     this.child.stderr.on('data', (b) => {
       if ((stderrBytes += b.length) > 1024 * 1024) this.fail('codex_diagnostic_limit')

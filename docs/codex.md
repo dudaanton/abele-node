@@ -16,6 +16,10 @@ version/help output, fingerprints the canonical executable, and verifies the
 app-server protocol schemas. It never installs or upgrades Codex automatically.
 Official npm installations are resolved to their bundled/platform native executable
 without executing the JavaScript launcher. Other opaque launchers are rejected.
+Codex runs its tools through a helper, `codex-code-mode-host`, which it looks for
+beside its own executable. An installation without it is refused
+(`codex_code_mode_host_missing`): otherwise every tool call would fail inside the
+turn while the model still answered as if it had worked.
 
 - `--codex-path /absolute/codex` selects the executable explicitly.
 - `ABELE_CODEX_PATH` supplies the executable when `--codex-path` is omitted.
@@ -186,7 +190,7 @@ Web search, tool-network access, shell environment inheritance and login shells
 are off by default. The worker environment is allowlisted, and no Codex network
 listener is requested.
 
-Each active run has one supervised stdio app-server. Its permission profile
+Each active run or live owner chat has one supervised stdio app-server. Its permission profile
 grants writes to the canonical workspace and minimum runtime reads, with explicit
 denials for node state, sibling workspaces, host-temp locations and protected Git
 and policy paths. Effective values are checked before user input. Project or
@@ -211,6 +215,27 @@ to dispatch, not proof that an operation executed.
 Delegated children use node-owned isolated workspaces and explicit provider
 grants. Existing grants and default grant lists do not automatically acquire
 Codex authority; see [delegation](delegation.md).
+
+## Owner chats are live sessions
+
+An owner chat keeps one app-server and its Codex thread for as long as it is in use,
+like a Claude chat. Delegated work keeps one bounded process per message.
+
+- A message written while Codex works is steered into the running turn. Between turns
+  it starts the next one; messages that queued up meanwhile go into that turn together.
+- A turn has no deadline. Stop interrupts the current turn and keeps the process.
+- `/compact` (or the compact button) asks Codex to compact the thread. Automatic
+  compaction inside a turn is reported the same way, and the context meter follows
+  Codex's token usage.
+- The session's `/` commands are `/compact` plus every enabled Codex skill;
+  `/<skill> text` runs that skill with the rest as its input.
+- Effort can be low, medium, high or xhigh. The model is fixed per thread, and there
+  is one permission mode: workspace operations run without prompts and everything
+  else asks, as described below.
+- When the node stops, the process stops with it. The next message starts a new
+  app-server that resumes the recorded thread; a turn that was running is reported
+  as interrupted.
+- An idle process with nobody watching ends after the node's idle time, like Claude's.
 
 ## Resume and interruption
 

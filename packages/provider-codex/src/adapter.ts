@@ -3,6 +3,10 @@ import type {
   ProviderRun,
   TurnContext,
   ProcessIdentity,
+  LiveSession,
+  LiveSessionContext,
+  LiveSessionSettings,
+  LiveSessionSink,
 } from '@abele/provider-contract'
 import { ProcessSupervisor, systemProcessProbe } from '@abele/provider-claude'
 import { discoverCodex, requireManagedFile, type CodexExecutable } from './discovery.js'
@@ -11,6 +15,8 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join, isAbsolute, resolve } from 'node:path'
 import { generateAndVerifySchemas, doctorCodex, type CodexDoctorReport } from './doctor.js'
 import { startCodexTurn } from './worker.js'
+import { startCodexLiveSession } from './live.js'
+import type { NativeBinding } from './thread.js'
 import {
   ensureCodexState,
   prepareCodexHome,
@@ -34,6 +40,10 @@ export class CodexProviderAdapter {
   private ready = false
   private preflightReport?: CodexDoctorReport
   get available() {
+    return this.ready
+  }
+  /** Owner sessions keep one app-server and its thread between messages. */
+  get liveAvailable() {
     return this.ready
   }
   readonly configuration: Record<string, any>
@@ -73,6 +83,9 @@ export class CodexProviderAdapter {
       deadline_ms: deadline,
       permission_ttl_ms: ttl,
       diagnostic,
+      accounts: ['default'],
+      efforts: ['low', 'medium', 'high', 'xhigh'],
+      permission_modes: ['manual'],
       approval_policy:
         'Workspace-contained operations run without prompts; only single-action answers are supported. Permission expansion and session grants are denied.',
     }
@@ -110,6 +123,26 @@ export class CodexProviderAdapter {
     }
     return this.available
   }
+  sessionDefaults(): LiveSessionSettings {
+    // The model is Codex's own selection unless the node overrides it; a thread keeps it.
+    return {
+      model: this.options.model ?? 'default',
+      effort: 'low',
+      account: 'default',
+      permission_mode: 'manual',
+    }
+  }
+  validateSettings(settings: Partial<LiveSessionSettings>) {
+    const defaults = this.sessionDefaults()
+    if (
+      (settings.model !== undefined && settings.model !== defaults.model) ||
+      (settings.effort !== undefined &&
+        !['low', 'medium', 'high', 'xhigh'].includes(settings.effort)) ||
+      (settings.account !== undefined && settings.account !== 'default') ||
+      (settings.permission_mode !== undefined && settings.permission_mode !== 'manual')
+    )
+      throw new Error('codex_setting_unsupported')
+  }
   configurationForTurn(_turn: unknown) {
     return this.configuration
   }
@@ -132,6 +165,15 @@ export class CodexProviderAdapter {
       configuration: this.configuration,
       gates: codexExecutionGates(),
       capabilities: {
+        long_lived_sessions: this.available
+          ? { status: 'supported', evidence: 'app-server-thread; turn-steer; thread-compact' }
+          : { status: 'unsupported', reason: this.configuration.diagnostic },
+        ...(this.available
+          ? {
+              steering: { status: 'supported', evidence: 'turn/steer' },
+              compaction: { status: 'supported', evidence: 'thread/compact/start; token usage' },
+            }
+          : {}),
         execution: {
           status: this.available ? 'supported' : 'unverified',
           evidence: this.available
@@ -154,15 +196,16 @@ export class CodexProviderAdapter {
     inventory.add(evidence)
     await inventory.cleanup()
   }
-  async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
+  /** Every launch: fresh preflight, gates, layout and schema checks, then the policy paths. */
+  private async launchPaths(cwd: string) {
     await this.prepare()
     requireManagedFile()
     const gateError = codexExecutionError()
     if (gateError) throw new Error(gateError)
     if (!this.available || !this.executable) throw new Error(this.configuration.diagnostic)
     const state = realpathSync(this.options.stateDir),
-      workspace = realpathSync(turn.cwd)
-    if (state !== this.options.stateDir || workspace !== turn.cwd)
+      workspace = realpathSync(cwd)
+    if (state !== this.options.stateDir || workspace !== cwd)
       throw new Error('codex_state_workspace_overlap')
     assertCodexLayout(state, workspace)
     ensureCodexState(state)
@@ -196,14 +239,29 @@ export class CodexProviderAdapter {
       sibling: dirname(workspace),
       repository: realpathSync(resolve(workspace, common.stdout.trim())),
     }
+    return paths
+  }
+  async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
+    const paths = await this.launchPaths(turn.cwd)
     return startCodexTurn(
       {
-        executable: this.executable,
+        executable: this.executable!,
         paths,
         model: this.options.model,
         deadlineMs: this.configuration.deadline_ms,
         turn,
       },
+      sink
+    )
+  }
+  async startSession(
+    context: LiveSessionContext & { native_binding?: NativeBinding },
+    sink: LiveSessionSink
+  ): Promise<LiveSession> {
+    this.validateSettings(context.settings)
+    const paths = await this.launchPaths(context.cwd)
+    return startCodexLiveSession(
+      { executable: this.executable!, paths, model: this.options.model, context },
       sink
     )
   }

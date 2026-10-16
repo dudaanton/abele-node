@@ -40,6 +40,8 @@ it.each(['healthy', 'evidence-save', 'absence-check', 'record-removal', 'release
     const adapter = new PiProviderAdapter({
       stateDir,
       profile: 'isolated',
+      // Exercise bounded worker admission/release, including startTurn's real SQL sink.
+      live: false,
       deadlineMs: 10000,
       permissionTtlMs: 10000,
       processProbe: {
@@ -59,6 +61,7 @@ it.each(['healthy', 'evidence-save', 'absence-check', 'record-removal', 'release
         },
       },
     })
+    expect(adapter.liveAvailable).toBe(false)
     const core = new NodeCore(stateDir, { pi: adapter }),
       actor = core.authority.authenticate(core.createToken('test').token)
     const request = (method: string, params: unknown) =>

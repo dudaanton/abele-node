@@ -75,7 +75,19 @@ const notify = (method, params) => send({ method, params })
 let thread,
   turn,
   waiting = false
+const said = (input) =>
+  input.map((i) => (i.type === 'skill' ? `[skill ${i.name}]` : i.text)).join(' + ')
 const complete = (status = 'completed', text = 'fake response') => {
+  if (mode === 'live' && status === 'completed')
+    notify('thread/tokenUsage/updated', {
+      threadId: thread.id,
+      turnId: turn.id,
+      tokenUsage: {
+        total: { totalTokens: 4000 },
+        last: { totalTokens: 2500 },
+        modelContextWindow: 10000,
+      },
+    })
   if (text)
     notify('item/completed', {
       threadId: thread.id,
@@ -83,6 +95,7 @@ const complete = (status = 'completed', text = 'fake response') => {
       item: { id: 'message', type: 'agentMessage', text },
     })
   notify('turn/completed', { threadId: thread.id, turn: { ...turn, status, error: null } })
+  turn.status = status
 }
 for await (const line of createInterface({ input: process.stdin })) {
   const msg = JSON.parse(line),
@@ -226,7 +239,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       !thread ||
       p.threadId !== thread.id ||
       p.permissions !== 'abele' ||
-      p.effort !== 'low' ||
+      !['low', 'medium', 'high', 'xhigh'].includes(p.effort) ||
       (p.model !== undefined && p.model !== 'fixture-small' && p.model !== 'fixture-user-default')
     )
       process.exit(70)
@@ -237,6 +250,12 @@ for await (const line of createInterface({ input: process.stdin })) {
     notify('turn/started', { threadId: thread.id, turn })
     if (mode === 'crash-after-dispatch') process.exit(17)
     if (mode === 'hang') continue
+    // A live session holds a turn open until it is steered or interrupted.
+    if (mode === 'live' && said(p.input).includes('hold')) continue
+    if (mode === 'live') {
+      complete('completed', `heard: ${said(p.input)}`)
+      continue
+    }
     if (mode === 'approval' || mode === 'approval-crash') {
       notify('item/started', {
         threadId: thread.id,
@@ -266,6 +285,52 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue
     }
     complete()
+  } else if (msg.method === 'turn/steer') {
+    if (!turn || turn.status !== 'inProgress' || p.expectedTurnId !== turn.id) {
+      send({ id: msg.id, error: { code: -32000 } })
+      continue
+    }
+    appendFileSync(join(home, 'steer-log.jsonl'), JSON.stringify(p) + '\n', { mode: 0o600 })
+    reply(msg.id, { turnId: turn.id })
+    if (!said(p.input).includes('hold')) {
+      complete('completed', `steered: ${said(p.input)}`)
+    }
+  } else if (msg.method === 'thread/compact/start') {
+    if (!thread || p.threadId !== thread.id) process.exit(70)
+    reply(msg.id, {})
+    turn = { id: `turn-${randomUUID()}`, status: 'inProgress' }
+    notify('turn/started', { threadId: thread.id, turn })
+    const item = { id: `compaction-${turn.id}`, type: 'contextCompaction' }
+    notify('item/started', { threadId: thread.id, turnId: turn.id, item })
+    notify('item/completed', { threadId: thread.id, turnId: turn.id, item })
+    notify('turn/completed', { threadId: thread.id, turn: { ...turn, status: 'completed' } })
+  } else if (msg.method === 'skills/list') {
+    reply(msg.id, {
+      data: [
+        {
+          cwd: p.cwds?.[0] ?? '',
+          skills: [
+            {
+              name: 'fixture-skill',
+              description: 'A skill the fixture offers',
+              path: join(home, 'skills', 'fixture-skill', 'SKILL.md'),
+              scope: 'user',
+              enabled: true,
+              pluginId: null,
+            },
+            {
+              name: 'off-skill',
+              description: 'Disabled',
+              path: join(home, 'skills', 'off-skill', 'SKILL.md'),
+              scope: 'user',
+              enabled: false,
+              pluginId: null,
+            },
+          ],
+          errors: [],
+        },
+      ],
+    })
   } else if (msg.method === 'turn/interrupt') {
     reply(msg.id, {})
     if (turn) complete('interrupted', '')

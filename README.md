@@ -19,6 +19,9 @@ or disable with `--no-codex`. Codex execution
 on Linux and Windows is unavailable. Windows deployment is untested. See
 [remote access, pairing and revocation](docs/remote-access.md).
 
+Language intelligence (definition, diagnostics, and private server installation) is available
+through the node API; see [language servers](docs/lsp.md).
+
 ## What works today
 
 - Durable sessions, event history, queued follow-ups, reconnect/replay and
@@ -33,6 +36,9 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
   meter. They keep running through a node restart or update, and owner sessions can list
   and write to each other through the node. See
   [long-lived Claude sessions](docs/claude-sessions.md).
+- One transcript vocabulary for every agent, shaped after ACP `session/update` (messages,
+  thoughts, tool calls with diffs, plan, mode, usage, compaction) and a per-session list of
+  the agent's "/" commands. See [session updates](docs/session-updates.md).
 - Supervised pi SDK turns using the same queue, journal, approvals and native-file
   resume flow; per-feature capability gates and local model configuration apply.
 - Node-side delegation with owner-approved controller grants, isolated child workspaces,

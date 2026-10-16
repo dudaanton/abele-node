@@ -27,8 +27,11 @@ it('fails the durable turn after a successful prompt when SDK dispose swallows a
     stateDir,
     hostModule: resolve('tests/fixtures/pi-shutdown-host.mjs'),
     profile: 'isolated',
+    // A bounded turn disposes its SDK before completion. Live turns keep it open.
+    live: false,
     deadlineMs: 10000,
   })
+  expect(adapter.liveAvailable).toBe(false)
   const core = new NodeCore(stateDir, { pi: adapter }),
     actor = core.authority.authenticate(core.createToken('test').token)
   const request = (method: string, params: unknown) =>

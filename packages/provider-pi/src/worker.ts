@@ -1,98 +1,14 @@
 import { pathToFileURL } from 'node:url'
-import { randomUUID } from 'node:crypto'
-import {
-  systemProcessProbe,
-  descendants,
-  ProcessSupervisor,
-  type ProcessIdentity,
-} from '@abele/provider-claude'
+import { systemProcessProbe, descendants } from '@abele/provider-claude'
 import { ParentMessageSchema } from './wire.js'
-import type { Ask, Answer, PiEvent, PiTurnResult } from './host.js'
+import type { PiEvent, PiTurnResult } from './host.js'
 import { managedBashOperations } from './processes.js'
+import { createWorkerCore } from './worker-core.js'
 process.umask(0o077)
 const abort = new AbortController()
-// Local obligations survive loss of the daemon and its SQLite owner.
-const owned = new Map<number, ProcessIdentity>()
-const registrations = new Map<string, { resolve(): void; reject(error: Error): void }>()
-let groupClaims = 0
-async function register(kind: 'process_claim' | 'group_reaped', evidence: ProcessIdentity) {
-  if (abort.signal.aborted || !process.connected) throw new Error('pi_parent_lost')
-  const id = randomUUID()
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      registrations.delete(id)
-      reject(new Error('process_registration_deadline'))
-    }, 5000)
-    registrations.set(id, {
-      resolve: () => {
-        clearTimeout(timer)
-        resolve()
-      },
-      reject: (error) => {
-        clearTimeout(timer)
-        reject(error)
-      },
-    })
-    send({ kind, id, evidence })
-  })
-}
-const groups = {
-  claim: async (evidence: ProcessIdentity) => {
-    if (++groupClaims > 256) throw new Error('pi_process_limit')
-    // Register locally BEFORE awaiting the durable daemon acknowledgement.
-    owned.set(evidence.pid, evidence)
-    await register('process_claim', evidence)
-  },
-  reaped: async (evidence: ProcessIdentity) => {
-    if (!abort.signal.aborted) await register('group_reaped', evidence)
-    for (const [pid, member] of owned) if (member.group === evidence.group) owned.delete(pid)
-  },
-}
+const core = createWorkerCore(send, abort.signal, () => !!process.connected)
+const { owned, groups, ask, debuggerCall } = core
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-async function cleanupOwned() {
-  await ProcessSupervisor.cleanup([...owned.values()], 100)
-}
-// Bounded by the supervisor's per-turn question limit; late answers to cancelled
-// dialogs are ignored, never retargeted to a newer question or granted.
-const cancelled = new Set<string>()
-const debuggerPending = new Map<
-  string,
-  { started: number; resolve(result: any): void; cleanup(): void }
->()
-function debuggerCall(name: string, args: unknown, signal?: AbortSignal): Promise<any> {
-  return new Promise((resolve) => {
-    const id = randomUUID(),
-      started = Date.now()
-    const lost = () => {
-      debuggerPending.delete(id)
-      signal?.removeEventListener('abort', lost)
-      if (process.connected && !abort.signal.aborted) send({ kind: 'debugger_cancel', id })
-      resolve({
-        reason: 'cancelled',
-        elapsed_ms: Math.max(0, Date.now() - started),
-        snapshot: null,
-        observation: 'unknown',
-      })
-    }
-    if (signal?.aborted || abort.signal.aborted || debuggerPending.size >= 64) return lost()
-    debuggerPending.set(id, {
-      started,
-      resolve,
-      cleanup: () => signal?.removeEventListener('abort', lost),
-    })
-    signal?.addEventListener('abort', lost, { once: true })
-    send({ kind: 'debugger_call', id, name, args })
-  })
-}
-const pending = new Map<
-  string,
-  {
-    resolve: (a: Answer) => void
-    answer?: { choice: 'allow' | 'deny'; value?: string }
-    lost: () => void
-    signal: AbortSignal
-  }
->()
 let host:
   | {
       prompt(text: string): Promise<PiTurnResult>
@@ -104,7 +20,7 @@ let host:
 let started = false,
   output = 0,
   unacked = 0
-function send(message: any) {
+function send(message: any): void {
   if (!process.connected) throw new Error('pi_parent_lost')
   process.send!(message, (error) => {
     if (error) void stop()
@@ -121,44 +37,12 @@ function emit(event: PiEvent) {
   }
   send(message)
 }
-const ask: Ask = (action, signal) =>
-  new Promise((resolve) => {
-    const id = randomUUID()
-    const lost = () => {
-      const existed = pending.delete(id)
-      signal.removeEventListener('abort', lost)
-      if (existed && process.connected && !abort.signal.aborted) {
-        cancelled.add(id)
-        send({ kind: 'question_cancel', id })
-      }
-      resolve({ choice: 'deny', delivered: () => false })
-    }
-    if (signal.aborted || abort.signal.aborted || pending.size >= 64) return lost()
-    pending.set(id, { resolve, signal, lost })
-    signal.addEventListener('abort', lost, { once: true })
-    send({ kind: 'question', id, action })
-  })
 let stopping = false
 async function stop() {
   if (stopping) return
   stopping = true
   abort.abort()
-  for (const p of debuggerPending.values()) {
-    p.cleanup()
-    p.resolve({
-      reason: 'connection_lost',
-      elapsed_ms: Math.max(0, Date.now() - p.started),
-      snapshot: null,
-      observation: 'unknown',
-    })
-  }
-  debuggerPending.clear()
-  for (const r of registrations.values()) r.reject(new Error('pi_parent_lost'))
-  registrations.clear()
-  for (const p of pending.values()) {
-    p.signal.removeEventListener('abort', p.lost)
-    p.lost()
-  }
+  core.release()
   clearInterval(inventory)
   // A hung SDK abort must not prevent independent group cleanup. Never exit
   // merely because a timer fired: that would abandon live descendants.
@@ -173,7 +57,7 @@ async function stop() {
   ])
   for (;;) {
     try {
-      await cleanupOwned()
+      await core.cleanupOwned()
       break
     } catch {
       await delay(1000)
@@ -203,51 +87,11 @@ process.on('message', (raw) => {
   void (async () => {
     const m = ParentMessageSchema.parse(raw)
     if (m.kind === 'stop') return stop()
-    if (m.kind === 'debugger_result') {
-      const p = debuggerPending.get(m.id)
-      if (p) {
-        debuggerPending.delete(m.id)
-        p.cleanup()
-        p.resolve(m.result)
-      }
-      return
-    }
     if (m.kind === 'ack') {
       unacked = Math.max(0, unacked - m.bytes)
       return
     }
-    if (m.kind === 'registered') {
-      const registration = registrations.get(m.id)
-      if (!registration) {
-        if (stopping) return
-        throw new Error('invalid_process_registration')
-      }
-      registrations.delete(m.id)
-      if (m.confirmed) registration.resolve()
-      else registration.reject(new Error('process_registration_failed'))
-      return
-    }
-    if (m.kind === 'answer') {
-      const p = pending.get(m.id)
-      if (!p && cancelled.has(m.id)) return
-      if (!p || p.answer) throw new Error('invalid_approval_delivery')
-      p.answer = { choice: m.choice, ...(m.value !== undefined ? { value: m.value } : {}) }
-      send({ kind: 'consume', id: m.id })
-      return
-    }
-    if (m.kind === 'confirmed') {
-      const p = pending.get(m.id)
-      if (!p && cancelled.has(m.id)) return
-      if (!p?.answer) throw new Error('invalid_approval_confirmation')
-      pending.delete(m.id)
-      p.signal.removeEventListener('abort', p.lost)
-      p.resolve(
-        m.confirmed && !abort.signal.aborted && !p.signal.aborted
-          ? { ...p.answer, delivered: () => true }
-          : { choice: 'deny', delivered: () => false }
-      )
-      return
-    }
+    if (core.handle(m, stopping) || m.kind !== 'start') return
     if (started) throw new Error('duplicate_pi_start')
     started = true
     let result: any, reason: string | undefined
@@ -278,7 +122,7 @@ process.on('message', (raw) => {
     }
     clearInterval(inventory)
     try {
-      await cleanupOwned()
+      await core.cleanupOwned()
     } catch {
       return stop()
     }

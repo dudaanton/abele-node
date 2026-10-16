@@ -104,3 +104,16 @@ it('requires an administrator-owned regular requirements file and directory', ()
   ])
     expect(() => checkManagedRequirements(bad, parent)).toThrow('unsafe_managed_requirements')
 })
+it('refuses a native Codex without the tool helper beside it', () => {
+  const dir = mkdtempSync(resolve('.scratch/codex-helper-')),
+    executable = join(dir, 'codex')
+  try {
+    copyFileSync('/usr/bin/true', executable)
+    expect(() => discoverCodex({ executable })).toThrow('codex_code_mode_host_missing')
+    copyFileSync('/usr/bin/true', join(dir, 'codex-code-mode-host'))
+    // With the helper present it gets as far as the version pin.
+    expect(() => discoverCodex({ executable })).toThrow('codex_version_unsupported')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

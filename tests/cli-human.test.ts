@@ -187,6 +187,7 @@ it('stopped status is human by default, read-only, and JSON adds the deployment 
   })
   const doctor = JSON.parse(command(state, 'doctor', '--json').stdout)
   expect(Object.keys(doctor).sort()).toEqual([
+    'acp',
     'claude',
     'codex',
     'encrypted_at_rest',

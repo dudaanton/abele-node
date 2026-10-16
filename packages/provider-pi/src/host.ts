@@ -26,6 +26,8 @@ const canonical = (v: any): string =>
  * Trusted extensions are executable local code, not sandboxed by this policy. */
 export class PiApprovalPolicy {
   private claimed = new Set<string>()
+  /** The owner chose to run this session without asking; every action is still journaled. */
+  bypass = false
   constructor(
     private ask: Ask,
     private signal: AbortSignal
@@ -42,6 +44,7 @@ export class PiApprovalPolicy {
     } as const
     const key = `${action.native_session_id ?? ''}:${action.tool_use_id}`
     if (signal.aborted || this.claimed.has(key)) return deny
+    if (this.bypass) return undefined
     this.claimed.add(key)
     const before = canonical(action)
     try {
@@ -155,6 +158,8 @@ function safe(v: any): any {
 /** Never serialize SDK runtime/model/auth objects or HTTP request/response diagnostics. */
 export class PiEventMapper {
   private message = 0
+  // Counters restart with every worker; the prefix keeps message ids apart across a session.
+  private prefix = randomUUID().slice(0, 8)
   map(raw: any): PiEvent {
     if (!raw || typeof raw.type !== 'string') throw new Error('invalid_pi_event')
     if (raw.type === 'message_update') {
@@ -176,7 +181,7 @@ export class PiEventMapper {
       return {
         type: 'pi.message.delta',
         data: {
-          message_id: String(this.message),
+          message_id: `${this.prefix}-${this.message}`,
           delta,
           usage: safe(raw.usage ?? update.partial?.usage),
         },
@@ -193,7 +198,7 @@ export class PiEventMapper {
       return {
         type: raw.type === 'message_end' ? 'pi.message.final' : 'pi.message.start',
         data: {
-          message_id: String(this.message),
+          message_id: `${this.prefix}-${this.message}`,
           message: e.message,
           replaces_partials: raw.type === 'message_end',
           ...(raw.message?.stopReason === 'error' &&

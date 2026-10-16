@@ -10,6 +10,7 @@ import {
   existsSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { NodeClient, MemoryClientStore } from '../packages/node-client/dist/index.js'
@@ -46,7 +47,7 @@ if (live)
     JSON.stringify({ at: new Date().toISOString(), branch, revision, max_turns: 6 }),
     { flag: 'wx', mode: 0o600 }
   )
-const root = mkdtempSync('/tmp/abele-node-pi-'),
+const root = mkdtempSync(join(tmpdir(), 'abele-node-pi-')),
   repo = join(root, 'repo'),
   state = join(root, 'state')
 const reportFile = join(evidenceRoot, 'pi-' + (live ? 'live' : 'fake') + '-' + Date.now() + '.json')
@@ -112,6 +113,9 @@ const start = async () => {
       '0',
       '--pi-profile',
       'isolated',
+      // This acceptance checks bounded worker disposal, expiry and exact-file reopen.
+      // Long-lived owner sessions have their own acceptance in pi-live.test.ts.
+      '--no-pi-live',
       '--pi-max-tokens',
       '1024',
       '--pi-deadline-ms',
@@ -157,6 +161,7 @@ const start = async () => {
     command(process.execPath, [cli, '--json', 'doctor', '--state-dir', state])
   )
   assert.equal(report.doctor.pi.configuration.profile, 'isolated')
+  assert.equal(report.doctor.pi.configuration.live_sessions, false)
 }
 const stop = async () => {
   await client?.disconnect()

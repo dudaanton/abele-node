@@ -94,6 +94,12 @@ export interface LiveSessionContext {
   run_id: string
   cwd: string
   native_session_id?: string
+  /** The exact native session file to reopen, for providers that keep one (pi). */
+  native_session_file?: string
+  /** Which configured agent a provider that hosts several (ACP) starts. */
+  agent?: string
+  /** What a recorded Codex thread was bound under; resuming it anywhere else is refused. */
+  native_binding?: { workspace_path: string; policy_fingerprint: string; model: string }
   /** Copy the native transcript from this account's configuration before resuming. */
   previous_account?: string
   use_repository_claude_permissions?: boolean

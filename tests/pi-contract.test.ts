@@ -73,7 +73,12 @@ it('advertises only accepted SDK features while retaining unverified extension/c
   expect(report.capabilities.extension_prompts.status).toBe('unverified')
   expect(report.capabilities.compaction.status).toBe('unverified')
   expect(report.capabilities.exhaustive_children.status).toBe('unverified')
-  expect(report.capabilities.steering.status).toBe('unsupported')
+  // Owner sessions steer into a running turn; one process per message cannot.
+  expect(report.capabilities.steering.status).toBe('supported')
+  expect(report.capabilities.long_lived_sessions.status).toBe('supported')
+  const bounded = new PiProviderAdapter({ stateDir: process.cwd(), live: false }).capabilities()
+  expect(bounded.capabilities.steering.status).toBe('unsupported')
+  expect(bounded.capabilities.long_lived_sessions.status).toBe('unsupported')
 })
 it('uses the patched transitive package on disk, not only a clean-looking lockfile', () => {
   const sdk = createRequire(

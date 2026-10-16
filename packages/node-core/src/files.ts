@@ -33,7 +33,7 @@ const same = (
 export class WorkspaceFileService {
   beforeOpen?: () => void
   constructor(private r: ResourceServices) {}
-  private root(id: string, repository = false) {
+  root(id: string, repository = false) {
     if (repository) return this.r.repository.fileRoot(id)
     const w = this.r.workspaces.get(id)
     this.r.projects.get(w.project_id)

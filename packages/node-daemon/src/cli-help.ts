@@ -34,6 +34,7 @@ const valueOptions = new Set([
   '--fingerprint',
 ])
 const switches = new Set([
+  '--popular',
   '--help',
   '-h',
   '--json',
@@ -43,6 +44,7 @@ const switches = new Set([
   '--codex',
   '--no-codex',
   '--no-claude-live',
+  '--no-pi-live',
   '--claude-allow-bypass',
   '--no-paired-config',
   '--check',
@@ -51,7 +53,7 @@ const switches = new Set([
 ])
 const usage: Record<string, string> = {
   start:
-    'start [--port PORT] [--worktree-root PATH]\nRuns in the foreground; Ctrl-C stops it. In a service deployment, starts/verifies the service instead.\nLong-lived Claude sessions: --claude-session-model MODEL, --claude-session-effort LEVEL, --claude-session-permission-mode MODE, --claude-session-permission-ttl-ms MS, --claude-account NAME=CONFIG_DIR (repeatable), --claude-idle-ms MS (0 keeps idle sessions), --claude-max-live N, --claude-detached-ms MS (how long sessions keep running while the node restarts or updates; 0 ends them with the node), --no-claude-live (one process per message), --claude-allow-bypass (owner sessions may choose bypassPermissions).',
+    'start [--port PORT] [--worktree-root PATH]\nRuns in the foreground; Ctrl-C stops it. In a service deployment, starts/verifies the service instead.\nLong-lived Claude sessions: --claude-session-model MODEL, --claude-session-effort LEVEL, --claude-session-permission-mode MODE, --claude-session-permission-ttl-ms MS, --claude-account NAME=CONFIG_DIR (repeatable), --claude-idle-ms MS (0 keeps idle sessions), --claude-max-live N, --claude-detached-ms MS (how long sessions keep running while the node restarts or updates; 0 ends them with the node), --no-claude-live (one process per message), --claude-allow-bypass (owner sessions may choose bypassPermissions). pi owner sessions are long-lived too and follow the permission TTL, detached time and bypass choices above; --no-pi-live runs them one process per message.',
   stop: 'stop\nStops the selected daemon. For managed background service removal, use service disable.',
   status: 'status\nShows daemon health, providers and foreground/background mode.',
   doctor:
@@ -68,6 +70,7 @@ const usage: Record<string, string> = {
   'approve-pair': 'approve-pair [NAME] [--installation-id ID] [--fingerprint FULL] | --list',
   serve: 'serve enable --tailnet-policy-verified | disable',
   debugger: 'debugger install js',
+  lsp: 'lsp status [--json] | install [LANG… | --popular]\nLanguages: typescript (includes JavaScript), eslint, python, rust, go, json, yaml, css, html, bash. Installs privately into node state; ESLint uses each project’s own installation and config.',
   'recover-worktree-deletion': 'recover-worktree-deletion [OPERATION_ID] [INSTALLATION_ID]',
 }
 export function cliHelp(command?: string): string {
@@ -76,7 +79,7 @@ export function cliHelp(command?: string): string {
   return [
     detail
       ? `Usage: abele-node ${detail}`
-      : 'Usage: abele-node COMMAND [OPTIONS]\nCommands: start, stop, status, doctor, service, install, update, version, token, pair, approve-pair, serve, debugger, recover-worktree-deletion',
+      : 'Usage: abele-node COMMAND [OPTIONS]\nCommands: start, stop, status, doctor, service, install, update, version, token, pair, approve-pair, serve, debugger, lsp, recover-worktree-deletion',
     'Background: abele-node service enable | service disable | service status',
     'Common options: --state-dir PATH, --json; use abele-node COMMAND --help for details.',
     'Provider/start options: --claude-path PATH, --codex-path PATH, --codex-model MODEL, --codex-home PATH, --no-codex, --pi-provider ID, --pi-model ID, --paired-config PATH.',

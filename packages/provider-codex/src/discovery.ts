@@ -108,6 +108,15 @@ function inspectExecutable(requested: string, options: CodexDiscoveryOptions) {
       timeout: 5000,
       maxBuffer: 256 * 1024,
     })
+  // Codex runs its tools through this helper and looks for it beside itself; without it every
+  // tool call fails inside the turn while the model still answers.
+  if (!interpreter) {
+    try {
+      accessSync(join(dirname(executable), 'codex-code-mode-host'), constants.X_OK)
+    } catch {
+      throw new Error('codex_code_mode_host_missing')
+    }
+  }
   const version = run(['--version']),
     help = run(['app-server', '--help'])
   if (version.status !== 0 || version.stdout.trim() !== 'codex-cli 0.160.1')

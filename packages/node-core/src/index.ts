@@ -12,6 +12,8 @@ import {
   validateParams,
   PairingMethodSchemas,
   NodeEventSchema,
+  SessionCommandsSchema,
+  SESSION_UPDATE_VERSION,
   MUTATIONS,
   type Method,
   SessionSchema,
@@ -75,6 +77,7 @@ export type { ProviderAdapter } from './providers.js'
 export { CodexProviderAdapter } from '@abele/provider-codex'
 export { PiProviderAdapter } from '@abele/provider-pi'
 export { ClaudeProviderAdapter } from '@abele/provider-claude'
+export { AcpProviderAdapter } from '@abele/provider-acp'
 export {
   ResourceServices,
   ProjectService,
@@ -298,6 +301,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       claude?: ProviderAdapter
       pi?: ProviderAdapter
       codex?: ProviderAdapter
+      /** Agents that speak ACP. */
+      acp?: ProviderAdapter
       /** Policy for long-lived owner sessions. */
       live?: LiveOptions
     } = {}
@@ -441,6 +446,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       ${columns.has('stream_offset') ? '' : 'ALTER TABLE provider_runs ADD COLUMN stream_offset INTEGER NOT NULL DEFAULT 0;'}
       PRAGMA user_version=18; COMMIT;`)
     }
+    // The agent's latest "/" list per session, so a client opening at the tail need not scan back.
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS session_commands(session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, body TEXT NOT NULL)'
+    )
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -495,9 +504,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.execution = new ProviderSessions(
       this,
       new Map(
-        Object.entries({ claude: options.claude, pi: options.pi, codex: options.codex }).filter(
-          (entry): entry is [string, ProviderAdapter] => entry[1] !== undefined
-        )
+        Object.entries({
+          claude: options.claude,
+          pi: options.pi,
+          codex: options.codex,
+          acp: options.acp,
+        }).filter((entry): entry is [string, ProviderAdapter] => entry[1] !== undefined)
       ),
       options.live
     )
@@ -533,6 +545,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   close() {
     if (!this.closed) {
+      void this.resources?.lsp.stop()
       this.trace.close()
       this.http.close()
       void this.debuggerLaunches
@@ -610,6 +623,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.db
       .prepare('INSERT INTO events VALUES(?,?,?)')
       .run(stream, event.seq, JSON.stringify(event))
+    if (type === 'session.update') {
+      const update = (event.data as { update: { kind: string; commands?: unknown } }).update
+      if (update.kind === 'available_commands_update')
+        this.db
+          .prepare(
+            'INSERT INTO session_commands VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq, body=excluded.body'
+          )
+          .run(stream, event.seq, JSON.stringify(update.commands))
+    }
+    this.resources?.lsp.observe(stream, type, data)
     return event
   }
   head(stream: string): number {
@@ -647,7 +670,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       ...this.provider.capabilities(),
       provider: 'node',
       provider_version: '5',
-      providers: [this.provider.capabilities(), claude, this.claude.capabilities('pi')],
+      providers: [
+        this.provider.capabilities(),
+        claude,
+        this.claude.capabilities('pi'),
+        this.claude.capabilities('acp'),
+      ],
       capabilities: {
         ...this.provider.capabilities().capabilities,
         ...this.debugger.capabilities(),
@@ -664,6 +692,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         'session.delete': {
           status: 'supported',
           evidence: 'idle-only-catalog-removal; retained-journal; operation-receipts',
+        },
+        lsp_v1: {
+          status: 'supported',
+          evidence: 'lsp.v1; confined-stdio; definition; merged-diagnostics; private-installs',
+        },
+        session_updates: {
+          status: 'supported',
+          evidence: `session-update-v${SESSION_UPDATE_VERSION}; session.commands`,
         },
         long_lived_sessions: this.claude.adapterFor('claude')?.liveAvailable
           ? {
@@ -780,6 +816,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     signal?: AbortSignal
   ): unknown {
     this.authority.check(actor, 'request')
+    if (method.startsWith('lsp.v1.')) return this.resources.lsp.request(actor, method, raw, signal)
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.request(actor, method, raw, operation, signal)
     if (method.startsWith('trace.v1.')) return this.trace.request(actor, method, raw)
@@ -956,6 +993,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
             this.provider.capabilities(),
             this.claude.capabilities(),
             this.claude.capabilities('pi'),
+            this.claude.capabilities('acp'),
           ],
         }
       case 'session.list':
@@ -968,6 +1006,17 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         ).map((r) => SessionSchema.parse(JSON.parse(String(r.body))))
       case 'session.get':
         return this.session(String(p.session_id))
+      case 'session.commands': {
+        const session_id = this.session(String(p.session_id)).session_id
+        const row = this.db
+          .prepare('SELECT seq, body FROM session_commands WHERE session_id=?')
+          .get(session_id) as Row | undefined
+        return SessionCommandsSchema.parse({
+          session_id,
+          commands: row ? JSON.parse(String(row.body)) : [],
+          seq: row ? Number(row.seq) : 0,
+        })
+      }
       case 'session.state':
         return this.claude.live.state(this.session(String(p.session_id)).session_id)
       case 'prompt.list': {
@@ -1034,12 +1083,19 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       } else this.resources.targets.check(executionTarget)
       if (!this.claude.isAvailable(String(p.provider)))
         throw new ChannelError('provider_unavailable')
+      const hosts = this.claude.adapterFor(String(p.provider))?.agentAvailable
+      if (hosts && !this.claude.adapterFor(String(p.provider))!.agentAvailable!(String(p.agent)))
+        throw new ChannelError('provider_unavailable')
     }
-    if (p.settings && (p.provider !== 'claude' || !this.claude.adapterFor('claude')?.liveAvailable))
+    const liveAdapter = this.claude.adapterFor(String(p.provider))
+    if (
+      p.settings &&
+      (!['claude', 'pi', 'acp'].includes(String(p.provider)) || !liveAdapter?.liveAvailable)
+    )
       throw new ChannelError('invalid_params')
     if (p.settings)
       try {
-        this.claude.adapterFor('claude')?.validateSettings?.(p.settings as SessionSettings)
+        liveAdapter?.validateSettings?.(p.settings as SessionSettings)
       } catch {
         throw new ChannelError('invalid_params')
       }
@@ -1050,6 +1106,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       created_at: new Date().toISOString(),
       ...(p.workspace_id ? { workspace_id: p.workspace_id } : {}),
       ...(p.settings ? { settings: p.settings } : {}),
+      ...(p.agent ? { agent: p.agent } : {}),
     })
     this.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(session.session_id)
     this.db
@@ -1494,3 +1551,5 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     })
   }
 }
+
+export { install as installLsp, status as lspStatus, popular as popularLsp } from './lsp/servers.js'

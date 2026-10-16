@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { LspMethodSchemas, LspDiagnosticsSchema } from './lsp.js'
 import {
   DelegationMethodSchemas,
   DelegationCreateSchema,
@@ -25,6 +26,8 @@ import {
   SessionSettingsSchema,
 } from './live.js'
 export * from './live.js'
+import { SessionUpdateEventSchema } from './session-update.js'
+export * from './session-update.js'
 export * from './turn.js'
 import {
   RepositoryMethodSchemas,
@@ -47,6 +50,7 @@ import {
 export * from './resources.js'
 export { RecordSchema, EventSchema, RequestSchema, ErrorSchema } from '@abele/channel-protocol'
 const id = z.string().min(1).max(128)
+export const AgentIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,31}$/)
 export const SeqSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export const FakeStepSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('echo') }).strict(),
@@ -99,7 +103,7 @@ export const SessionSchema = z
   .object({
     session_id: id,
     title: z.string().max(256),
-    provider: z.enum(['fake', 'claude', 'pi', 'codex']),
+    provider: z.enum(['fake', 'claude', 'pi', 'codex', 'acp']),
     native_session_id: z
       .string()
       .min(1)
@@ -107,6 +111,8 @@ export const SessionSchema = z
       .regex(/^[A-Za-z0-9_:-]+$/)
       .optional(),
     native_session_file: z.string().min(1).max(4096).optional(),
+    /** The ACP agent a session of provider `acp` runs, by its configured name. */
+    agent: AgentIdSchema.optional(),
     created_at: z.string().datetime(),
     workspace_id: id.nullable().optional(),
     /** The owner's choices for a long-lived session; absent means the node's defaults. */
@@ -116,10 +122,15 @@ export const SessionSchema = z
   .refine(
     (s) =>
       s.provider === 'codex' ||
+      s.provider === 'acp' ||
       s.native_session_id === undefined ||
       z.string().uuid().safeParse(s.native_session_id).success,
     { message: 'Native ID must be a UUID for this provider', path: ['native_session_id'] }
   )
+  .refine((s) => (s.provider === 'acp') === (s.agent !== undefined), {
+    message: 'An ACP session names its agent, and only an ACP session does',
+    path: ['agent'],
+  })
 export const SessionDeletedSchema = z.object({ session_id: id, deleted: z.literal(true) }).strict()
 export const CapabilitySchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('supported'), evidence: z.string() }),
@@ -171,6 +182,7 @@ export const TokenCommandSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('revoke'), value: id }).strict(),
 ])
 const EventPayloads = {
+  'lsp.diagnostics': LspDiagnosticsSchema,
   'repository.invalidated': RepositoryInvalidationSchema,
   'repository.changed': RepositoryChangeBatchSchema,
   'workspace.invalidated': WorkspaceWatchInvalidationSchema,
@@ -195,6 +207,7 @@ const EventPayloads = {
   'prompt.expired': PromptSchema,
   'prompt.invalidated': PromptSchema,
   ...LiveEventPayloads,
+  'session.update': SessionUpdateEventSchema,
   'content.delta': z
     .object({
       run_id: id,
@@ -214,6 +227,7 @@ export const NodeEventSchema = EventSchema.superRefine((event, ctx) => {
 })
 const session = { session_id: id }
 export const MethodSchemas = {
+  ...LspMethodSchemas,
   ...DelegationMethodSchemas,
   'delegation.create': DelegationCreateSchema.extend({
     script: z
@@ -236,14 +250,18 @@ export const MethodSchemas = {
   'session.create': z
     .object({
       title: z.string().max(256).default('Fake session'),
-      provider: z.enum(['fake', 'claude', 'pi', 'codex']).default('fake'),
+      provider: z.enum(['fake', 'claude', 'pi', 'codex', 'acp']).default('fake'),
       workspace_id: id.optional(),
       target: ExecutionTargetSchema.optional(),
       settings: SessionSettingsSchema.optional(),
+      agent: AgentIdSchema.optional(),
     })
     .strict()
-    .refine((p) => !(p.workspace_id && p.target)),
+    .refine((p) => !(p.workspace_id && p.target))
+    .refine((p) => (p.provider === 'acp') === (p.agent !== undefined)),
   'session.get': z.object(session).strict(),
+  /** The agent's "/" commands, as its latest `available_commands_update` listed them. */
+  'session.commands': z.object(session).strict(),
   'session.rename': z.object({ ...session, title: z.string().max(256) }).strict(),
   'session.delete': z.object(session).strict(),
   'session.send': z

@@ -60,7 +60,11 @@ import {
   ClaudeProviderAdapter,
   PiProviderAdapter,
   CodexProviderAdapter,
+  AcpProviderAdapter,
   canonicalStateDir,
+  installLsp,
+  lspStatus,
+  popularLsp,
   installJsAdapter,
 } from '@abele/node-core'
 
@@ -81,6 +85,31 @@ async function main() {
     return value
   }
   const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
+  if (args[0] === 'lsp') {
+    if (args[1] === 'status') {
+      const rows = await lspStatus(state, process.cwd())
+      console.log(
+        json
+          ? JSON.stringify(rows)
+          : rows
+              .map(
+                (row) =>
+                  `${row.language}: ${row.found ? `${row.server} (${row.version})` : 'missing'}${row.project_eslint ? `; project ESLint: ${row.project_eslint}` : ''}`
+              )
+              .join('\n')
+      )
+    } else if (args[1] === 'install') {
+      const languages = args.includes('--popular') ? popularLsp : args.slice(2)
+      if (!languages.length) throw new Error('usage: abele-node lsp install [lang…|--popular]')
+      const rows = await installLsp(state, languages)
+      console.log(
+        json
+          ? JSON.stringify(rows)
+          : rows.map((row) => `${row.language}: ${row.message}`).join('\n')
+      )
+    } else throw new Error('usage: abele-node lsp status [--json] | install [lang…|--popular]')
+    return
+  }
   const port = Number(option('--port', '7777'))
   // A release installer can use its already deployed, immutable runtime directly.
   const configuredRuntime = option('--runtime-dir', '')
@@ -178,6 +207,9 @@ async function main() {
   const noLiveFlag = args.indexOf('--no-claude-live')
   const noLive = noLiveFlag >= 0
   if (noLive) args.splice(noLiveFlag, 1)
+  const noPiLiveFlag = args.indexOf('--no-pi-live')
+  const noPiLive = noPiLiveFlag >= 0
+  if (noPiLive) args.splice(noPiLiveFlag, 1)
   const accountArgs: string[] = []
   for (let value = option('--claude-account', ''); value; value = option('--claude-account', ''))
     accountArgs.push(value)
@@ -232,6 +264,11 @@ async function main() {
     maxTokens: piMaxTokens,
     deadlineMs: piDeadline,
     permissionTtlMs: permissionTtl,
+    // Owner sessions share the operator's long-lived session choices with Claude's.
+    live: !noPiLive,
+    allowBypass,
+    ...(sessionPermissionTtl ? { sessionPermissionTtlMs: Number(sessionPermissionTtl) } : {}),
+    ...(claudeDetached ? { detachedMs: Number(claudeDetached) } : {}),
   }
   if (
     !['inherited', 'isolated'].includes(claudeProfile) ||
@@ -595,6 +632,7 @@ async function main() {
                 ...(codexHome ? { home: resolve(codexHome) } : {}),
               })
           : new CodexProviderAdapter({ ...codexOptions, stateDir: state }).capabilities(),
+        acp: new AcpProviderAdapter({ stateDir: state }).capabilities(),
       })
       return
     }
@@ -867,6 +905,7 @@ async function main() {
         ...(claudeMaxLive ? ['--claude-max-live', claudeMaxLive] : []),
         ...(claudeDetached ? ['--claude-detached-ms', claudeDetached] : []),
         ...(noLive ? ['--no-claude-live'] : []),
+        ...(noPiLive ? ['--no-pi-live'] : []),
         ...(allowBypass ? ['--claude-allow-bypass'] : []),
         ...(debuggerEnabled ? ['--debugger'] : []),
         ...(!codexOptions.enabled ? ['--no-codex'] : []),

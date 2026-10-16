@@ -1,3 +1,4 @@
+import { LspTools } from './lsp/tools.js'
 import { randomUUID } from 'node:crypto'
 import { ChannelError } from '@abele/channel-protocol'
 import {
@@ -39,6 +40,22 @@ const SAVED_ON = new Set([
   'claude.compact.boundary',
   'claude.tool.call',
 ])
+/** pi and ACP agents report the same lifecycle under their own names; `live.*` is the
+ * provider-neutral spelling a new provider uses. */
+const LIFECYCLE: Record<string, string> = {
+  'live.input.delivered': 'claude.input.delivered',
+  'live.turn.started': 'claude.turn.started',
+  'live.turn.completed': 'claude.turn.completed',
+  'live.context': 'claude.context',
+  'live.status': 'claude.status',
+  'live.compact.boundary': 'claude.compact.boundary',
+  'pi.input.delivered': 'claude.input.delivered',
+  'pi.turn.started': 'claude.turn.started',
+  'pi.turn.completed': 'claude.turn.completed',
+  'pi.context': 'claude.context',
+  'pi.compact.boundary': 'claude.compact.boundary',
+  'pi.compact.summary': 'claude.compact.summary',
+}
 export interface LiveOptions {
   /** Idle time after the last watcher left before a process with nothing running is ended; 0 never. */
   idleMs?: number
@@ -127,7 +144,7 @@ export class LiveSessions {
     }
     const adapter = this.adapter(session.provider)
     return (
-      session.provider === 'claude' &&
+      ['claude', 'pi', 'acp', 'codex'].includes(session.provider) &&
       !!adapter?.liveAvailable &&
       !!adapter.startSession &&
       !this.core.db.prepare('SELECT 1 FROM delegations WHERE session_id=?').get(session_id)
@@ -301,6 +318,10 @@ export class LiveSessions {
           run_id,
           cwd: slot.cwd,
           ...(session.native_session_id ? { native_session_id: session.native_session_id } : {}),
+          ...(session.native_session_file
+            ? { native_session_file: session.native_session_file }
+            : {}),
+          ...(session.agent ? { agent: session.agent } : {}),
           settings: slot.settings,
           permission_ttl_ms: Number(adapter.configuration.session_permission_ttl_ms ?? 30 * 60000),
           adopt: {
@@ -413,6 +434,8 @@ export class LiveSessions {
         alive,
         slot.debugger
       )
+    if (this.core.session(session_id).provider !== 'claude')
+      slot.debugger = new LspTools(this.core, session_id, slot.principal, alive, slot.debugger)
     return alive
   }
   private sink(slot: Slot, alive: () => boolean): LiveSessionSink {
@@ -445,7 +468,10 @@ export class LiveSessions {
             principal: slot.principal,
             active: alive,
             ttl_ms: action.ttl_ms,
-            evidence: 'stdio_control_response',
+            evidence:
+              this.core.session(session_id).provider === 'codex'
+                ? 'codex_rpc_dispatch_authorized'
+                : 'stdio_control_response',
           },
           action,
           signal
@@ -699,7 +725,14 @@ export class LiveSessions {
           run_id,
           cwd: target.path,
           ...(session.native_session_id ? { native_session_id: session.native_session_id } : {}),
+          ...(session.native_session_file
+            ? { native_session_file: session.native_session_file }
+            : {}),
+          ...(session.agent ? { agent: session.agent } : {}),
           ...(previous_account ? { previous_account } : {}),
+          ...(session.provider === 'codex' && session.native_session_id
+            ? { native_binding: this.owner.codexBinding(session_id) }
+            : {}),
           use_repository_claude_permissions: useRepositoryPermissions,
           settings: slot.settings,
           permission_ttl_ms: Number(adapter.configuration.session_permission_ttl_ms ?? 30 * 60000),
@@ -827,16 +860,80 @@ export class LiveSessions {
   private record(slot: Slot, event: ProviderEvent) {
     this.core.transaction(() => {
       this.apply(slot, event)
-      if (SAVED_ON.has(event.type)) this.save(slot)
+      if (SAVED_ON.has(LIFECYCLE[event.type] ?? event.type)) this.save(slot)
     })
   }
   private apply(slot: Slot, event: ProviderEvent) {
     const { session_id, run_id } = slot
     const d = event.data
     {
-      switch (event.type) {
+      switch (LIFECYCLE[event.type] ?? event.type) {
+        case 'pi.session.bound': {
+          const native = d.native_session_id,
+            file = d.native_session_file
+          const session = this.core.session(session_id)
+          if (typeof native !== 'string' || typeof file !== 'string')
+            throw new Error('invalid_pi_session_mapping')
+          if (native === session.native_session_id && file === session.native_session_file) break
+          const updated = SessionSchema.parse({
+            ...session,
+            native_session_id: native,
+            native_session_file: file,
+          })
+          this.core.db
+            .prepare(
+              "INSERT INTO provider_native_sessions(session_id,provider,native_session_id,session_file) VALUES(?,'pi',?,?) ON CONFLICT(session_id) DO UPDATE SET native_session_id=excluded.native_session_id,session_file=excluded.session_file"
+            )
+            .run(session_id, native, file)
+          this.core.db
+            .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+            .run(JSON.stringify(updated), session_id)
+          this.core.append(session_id, 'session.updated', actor, updated)
+          this.core.append('catalog', 'session.updated', actor, updated)
+          break
+        }
+        case 'codex.session.bound': {
+          const session = this.core.session(session_id)
+          const thread = String(d.native_session_id)
+          this.owner.recordCodexBinding(session_id, thread, d)
+          if (session.native_session_id && session.native_session_id !== thread)
+            throw new Error('native_session_id_mismatch')
+          if (session.native_session_id === thread) break
+          const updated = SessionSchema.parse({ ...session, native_session_id: thread })
+          this.core.db
+            .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+            .run(JSON.stringify(updated), session_id)
+          this.core.append(session_id, 'session.updated', actor, updated)
+          this.core.append('catalog', 'session.updated', actor, updated)
+          break
+        }
+        case 'pi.compact.started': {
+          if (!slot.compacting) {
+            slot.compacting = true
+            this.core.append(session_id, 'compaction.started', actor, { run_id })
+          }
+          return
+        }
+        case 'pi.compact.failed': {
+          slot.compacting = false
+          slot.compaction = undefined
+          this.core.append(session_id, 'compaction.completed', actor, {
+            run_id,
+            result: 'failed',
+            trigger: (d.trigger as string | null) ?? null,
+            pre_tokens: null,
+            post_tokens: null,
+            duration_ms: null,
+            error: typeof d.error === 'string' ? d.error.slice(0, 256) : null,
+          })
+          return
+        }
+        case 'live.native':
         case 'claude.init': {
-          const native = (d.configuration as Record<string, unknown>)?.session_id
+          const native =
+            event.type === 'live.native'
+              ? d.native_session_id
+              : (d.configuration as Record<string, unknown>)?.session_id
           const session = this.core.session(session_id)
           if (typeof native === 'string' && native !== session.native_session_id) {
             const updated = SessionSchema.parse({ ...session, native_session_id: native })
@@ -846,6 +943,7 @@ export class LiveSessions {
             this.core.append(session_id, 'session.updated', actor, updated)
             this.core.append('catalog', 'session.updated', actor, updated)
           }
+          if (event.type === 'live.native') return
           break
         }
         case 'claude.input.delivered': {
@@ -881,6 +979,7 @@ export class LiveSessions {
           return
         }
         case 'claude.turn.completed': {
+          void this.core.resources.lsp.afterEdit(session_id)
           const ids = (Array.isArray(d.input_ids) ? d.input_ids : []).map(String)
           const outcome = String(d.outcome) as 'success' | 'failed' | 'interrupted'
           for (const id of ids) {

@@ -11,6 +11,7 @@
     { "path": "../provider-claude" },
     { "path": "../provider-pi" },
     { "path": "../provider-codex" },
+    { "path": "../provider-acp" },
     { "path": "../provider-contract" },
     {
       "path": "../node-protocol"

@@ -194,6 +194,8 @@ export class ClaudeEventMapper {
             content: snapshot.map(([, block]) => ({ ...block })),
             block_indices: snapshot.map(([index]) => index),
             finalized_indices: [...state.finalized].sort((a, b) => a - b),
+            /** The blocks this record changed; the rest of the snapshot was seen before. */
+            updated_indices: updates.map((u: { index: number }) => u.index),
             usage: r.message.usage ?? null,
           },
         },

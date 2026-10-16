@@ -15,6 +15,13 @@ import {
 } from '@abele/provider-claude'
 import { WorkerMessageSchema } from './wire.js'
 import type { PiAction, Answer } from './host.js'
+import { startPiLiveSession } from './live.js'
+import type {
+  LiveSession,
+  LiveSessionContext,
+  LiveSessionSettings,
+  LiveSessionSink,
+} from '@abele/provider-contract'
 export { PiApprovalPolicy, PiExtensionUiBridge, PiSdkWorker, PiEventMapper } from './host.js'
 export { registerDebuggerTools, registerDebuggerContext } from './debugger.js'
 export type { PiAction, Answer, PiEvent, HostRuntime, HostSession } from './host.js'
@@ -30,7 +37,23 @@ export interface PiOptions {
   /** Node-local test/embedding seam; never a protocol field. */
   hostModule?: string
   processProbe?: ProcessProbe
+  /** Long-lived owner sessions, one SDK worker each. On by default. */
+  live?: boolean
+  /** Defaults for a new owner session; each session may change them. */
+  sessionEffort?: string
+  sessionPermissionMode?: string
+  /** How long an owner session's permission question waits. */
+  sessionPermissionTtlMs?: number
+  /** Operator opt-in: owner sessions may run without permission questions. Off by default. */
+  allowBypass?: boolean
+  /** How long an owner session keeps running while no node reads it (a restart, an update). */
+  detachedMs?: number
+  /** Output limit per model response in owner sessions. */
+  sessionMaxTokens?: number
 }
+export const PI_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+const validModel = (m: unknown): m is string =>
+  typeof m === 'string' && /^[A-Za-z0-9_.[\]-]{1,128}$/.test(m) && !m.startsWith('-')
 export interface PiSink extends ProviderEventSink {
   question?(action: PiAction, signal: AbortSignal): Promise<Answer>
   reaped?(leader: ProcessIdentity): void
@@ -38,6 +61,7 @@ export interface PiSink extends ProviderEventSink {
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 export class PiProviderAdapter {
   readonly available: boolean
+  readonly liveAvailable: boolean
   readonly configuration: Record<string, any>
   private options: Required<Omit<PiOptions, 'processProbe'>>
   private probe: ProcessProbe
@@ -51,6 +75,13 @@ export class PiProviderAdapter {
       maxTokens: options.maxTokens ?? 4096,
       deadlineMs: options.deadlineMs ?? 120000,
       permissionTtlMs: options.permissionTtlMs ?? 60000,
+      live: options.live ?? true,
+      sessionEffort: options.sessionEffort ?? 'medium',
+      sessionPermissionMode: options.sessionPermissionMode ?? 'manual',
+      sessionPermissionTtlMs: options.sessionPermissionTtlMs ?? 30 * 60000,
+      allowBypass: options.allowBypass ?? false,
+      detachedMs: options.detachedMs ?? 10 * 60000,
+      sessionMaxTokens: options.sessionMaxTokens ?? 32768,
       hostModule:
         options.hostModule ??
         process.env.ABELE_PI_HOST ??
@@ -71,7 +102,17 @@ export class PiProviderAdapter {
       o.deadlineMs > 1800000 ||
       !Number.isSafeInteger(o.permissionTtlMs) ||
       o.permissionTtlMs < 1 ||
-      o.permissionTtlMs > 3600000
+      o.permissionTtlMs > 3600000 ||
+      !(PI_EFFORTS as readonly string[]).includes(o.sessionEffort) ||
+      !this.permissionModes().includes(o.sessionPermissionMode) ||
+      !Number.isSafeInteger(o.sessionPermissionTtlMs) ||
+      o.sessionPermissionTtlMs < 1 ||
+      o.sessionPermissionTtlMs > 24 * 3600000 ||
+      !Number.isSafeInteger(o.detachedMs) ||
+      o.detachedMs < 0 ||
+      !Number.isSafeInteger(o.sessionMaxTokens) ||
+      o.sessionMaxTokens < 64 ||
+      o.sessionMaxTokens > 32768
     )
       throw new Error('invalid_pi_configuration')
     let version = 'unavailable'
@@ -87,6 +128,7 @@ export class PiProviderAdapter {
       patch = JSON.parse(readFileSync(join(dirname(brace), '../../package.json'), 'utf8')).version
     } catch {}
     this.available = version === '0.87.0' && patch === '5.0.12'
+    this.liveAvailable = this.available && o.live
     this.configuration = {
       sdk_version: version,
       brace_expansion_version: patch,
@@ -103,8 +145,90 @@ export class PiProviderAdapter {
           ? 'DefaultResourceLoader; node project trust first; local supported skills/context/extensions'
           : 'Isolated resources, same local ModelRuntime auth/configuration',
       credentials: 'Worker-local ModelRuntime; no endpoints, headers, environment or auth exported',
-      steering: 'unsupported; ordinary followups stay in node queue',
+      steering: this.liveAvailable
+        ? 'owner sessions: taken at the next tool boundary'
+        : 'unsupported; ordinary followups stay in node queue',
+      live_sessions: this.liveAvailable,
+      accounts: ['default'],
+      session_defaults: this.sessionDefaults(),
+      session_permission_ttl_ms: o.sessionPermissionTtlMs,
+      session_max_tokens: o.sessionMaxTokens,
+      efforts: [...PI_EFFORTS],
+      permission_modes: this.permissionModes(),
     }
+  }
+  private permissionModes() {
+    return ['manual', ...(this.options.allowBypass ? ['bypassPermissions'] : [])]
+  }
+  sessionDefaults(): LiveSessionSettings {
+    return {
+      model: 'default',
+      effort: this.options.sessionEffort,
+      account: 'default',
+      permission_mode: this.options.sessionPermissionMode,
+    }
+  }
+  /** Rejects a choice this node cannot launch. 'default' is the node's configured model. */
+  validateSettings(settings: Partial<LiveSessionSettings>) {
+    if (
+      (settings.model !== undefined && !validModel(settings.model)) ||
+      (settings.effort !== undefined &&
+        !(PI_EFFORTS as readonly string[]).includes(settings.effort)) ||
+      (settings.account !== undefined && settings.account !== 'default') ||
+      (settings.permission_mode !== undefined &&
+        !this.permissionModes().includes(settings.permission_mode))
+    )
+      throw new Error('invalid_session_settings')
+  }
+  /** The session's private native directory, made on first use. */
+  private sessionRoot(session_id: string) {
+    const parent = join(this.options.stateDir, 'pi-sessions')
+    mkdirSync(parent, { recursive: true, mode: 0o700 })
+    chmodSync(parent, 0o700)
+    const sessionDir = join(parent, session_id)
+    mkdirSync(sessionDir, { mode: 0o700, recursive: true })
+    if (lstatSync(sessionDir).isSymbolicLink()) throw new Error('invalid_pi_session_directory')
+    chmodSync(sessionDir, 0o700)
+    return realpathSync(sessionDir)
+  }
+  /** One SDK worker that outlives turns and, held by a session host, the node itself. */
+  async startSession(context: LiveSessionContext, sink: LiveSessionSink): Promise<LiveSession> {
+    if (!this.liveAvailable) throw new Error('pi_sdk_unavailable')
+    if (!isAbsolute(context.cwd) || !/^[a-f0-9-]{36}$/.test(context.session_id))
+      throw new Error('invalid_pi_turn')
+    this.validateSettings(context.settings)
+    const root = this.sessionRoot(context.session_id)
+    const file = context.native_session_file
+    if (file && resolve(dirname(file)) !== root) throw new Error('invalid_pi_session_mapping')
+    const o = this.options
+    const model = context.settings.model === 'default' ? o.model : context.settings.model
+    return startPiLiveSession(
+      {
+        probe: this.probe,
+        hostModule: o.hostModule,
+        root,
+        detachedMs: o.detachedMs,
+        config: {
+          cwd: context.cwd,
+          sessionDir: root,
+          agentDir: o.agentDir,
+          provider: o.provider,
+          model,
+          profile: o.profile,
+          maxTokens: o.sessionMaxTokens,
+          ...(sink.debugger?.tools.length ? { debugger_tools: sink.debugger.tools } : {}),
+          ...(context.native_session_id && file
+            ? { native_session_id: context.native_session_id, native_session_file: file }
+            : {}),
+          live: {
+            effort: context.settings.effort,
+            permission_mode: context.settings.permission_mode,
+          },
+        },
+      },
+      context,
+      sink
+    )
   }
   configurationForTurn(_turn: unknown) {
     return this.configuration
@@ -136,10 +260,19 @@ export class PiProviderAdapter {
         extension_prompts: unverified(
           'Durable select/confirm/input/trust bridge passed fake SDK tests; real inherited extension compatibility is not yet accepted'
         ),
-        compaction: unverified(
-          'Retry/compaction/settled boundaries and retained journal passed fake SDK tests; real compaction not exercised'
-        ),
-        steering: unsupported('No unverified steer API'),
+        compaction: this.liveAvailable
+          ? unverified(
+              'Owner sessions run /compact through session.compact and report compaction events; real compaction not exercised'
+            )
+          : unverified(
+              'Retry/compaction/settled boundaries and retained journal passed fake SDK tests; real compaction not exercised'
+            ),
+        steering: this.liveAvailable
+          ? supported('owner-sessions-sdk-steer-at-tool-boundary')
+          : unsupported('No unverified steer API'),
+        long_lived_sessions: this.liveAvailable
+          ? supported('session-host-sdk-worker; steer; interrupt; compact; context; commands')
+          : unsupported(this.available ? 'Turned off by the node' : 'SDK missing'),
         custom_ui: unsupported('No TUI emulation; capability error'),
         exhaustive_children: {
           status: 'unverified',
@@ -158,14 +291,7 @@ export class PiProviderAdapter {
     if (!this.available) throw new Error('pi_sdk_unavailable')
     if (!isAbsolute(turn.cwd) || !/^[a-f0-9-]{36}$/.test(turn.session_id))
       throw new Error('invalid_pi_turn')
-    const parent = join(this.options.stateDir, 'pi-sessions')
-    mkdirSync(parent, { recursive: true, mode: 0o700 })
-    chmodSync(parent, 0o700)
-    const sessionDir = join(parent, turn.session_id)
-    mkdirSync(sessionDir, { mode: 0o700, recursive: true })
-    if (lstatSync(sessionDir).isSymbolicLink()) throw new Error('invalid_pi_session_directory')
-    chmodSync(sessionDir, 0o700)
-    const root = realpathSync(sessionDir)
+    const root = this.sessionRoot(turn.session_id)
     if (turn.native_session_file && resolve(dirname(turn.native_session_file)) !== root)
       throw new Error('invalid_pi_session_mapping')
     const worker = spawn(

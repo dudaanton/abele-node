@@ -8,6 +8,8 @@ import {
 } from '@abele/channel-protocol'
 import { LocalChannelConnector, RequestChannel, reconnect } from '@abele/channel-client'
 import { DebuggerClient } from './debugger.js'
+import { LspClient } from './lsp.js'
+export { LspClient, type LspRoot } from './lsp.js'
 export { DebuggerClient } from './debugger.js'
 export { TraceClient } from './trace.js'
 import { TraceClient } from './trace.js'
@@ -56,6 +58,8 @@ import {
   TurnAcceptedSchema,
   LiveSessionStateSchema,
   type SessionSettings,
+  SessionCommandsSchema,
+  commandText,
 } from '@abele/node-protocol'
 import { NodePathClient } from './node-path.js'
 export * from './node-path.js'
@@ -76,6 +80,16 @@ export {
   type LocalRegistration,
 } from './local-discovery.js'
 export type { PairingInvite } from '@abele/node-protocol'
+export type {
+  SessionUpdate,
+  SessionUpdateOf,
+  SessionUpdateKind,
+  SessionCommand,
+  SessionCommands,
+  ToolContent,
+  PlanEntry,
+} from '@abele/node-protocol'
+export { sessionUpdatesOf, isKnownSessionUpdate, commandText } from '@abele/node-protocol'
 export type { NodeConnection, ChannelConnector, RecordTransport } from '@abele/channel-protocol'
 export type {
   Prompt,
@@ -154,6 +168,7 @@ export class MemoryClientStore implements ClientStore {
   }
 }
 export class NodeClient {
+  readonly lsp = new LspClient((method, params) => this.request(method, params))
   readonly nodePath = new NodePathClient(
     (method, params) => this.request(method, params),
     (method, params, operation) => this.mutation(method, params, operation)
@@ -410,6 +425,28 @@ export class NodeClient {
   /** Ends the session's process and everything it started; queued messages are cancelled. */
   stopSession(session_id: string, operation?: string) {
     return this.mutation('session.stop', { session_id }, operation)
+  }
+  /** The agent's "/" commands as it last reported them; render each update with sessionUpdatesOf. */
+  async sessionCommands(session_id: string) {
+    return SessionCommandsSchema.parse(await this.request('session.commands', { session_id }))
+  }
+  /** A command runs as an ordinary message, queued and delivered like any other. */
+  runCommand(
+    session_id: string,
+    name: string,
+    input: string,
+    observed_seq: number,
+    expected_target?: ExpectedExecutionTarget,
+    retainedOperationId?: string
+  ) {
+    return this.send(
+      session_id,
+      commandText(name, input),
+      observed_seq,
+      undefined,
+      expected_target,
+      retainedOperationId
+    )
   }
   async sessionState(session_id: string) {
     return LiveSessionStateSchema.parse(await this.request('session.state', { session_id }))

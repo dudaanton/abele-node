@@ -8,12 +8,11 @@ import type {
 import { RpcPeer } from './rpc.js'
 import { CodexEventMapper, opaqueId } from './mapper.js'
 import { CodexApprovalBridge } from './approval.js'
-import { checkEffective, launchOverrides, policyFingerprint, type PolicyPaths } from './policy.js'
+import { launchOverrides, policyFingerprint, type PolicyPaths } from './policy.js'
+import { checkNativeBinding, openCodexThread } from './thread.js'
 import type { CodexExecutable } from './discovery.js'
 import { createProcessScope } from './scope.js'
 import { systemDeadlineTimers, type DeadlineTimers } from './timers.js'
-import { isCodexAuthenticated } from './auth.js'
-import { codexModelAvailable, validCodexModel, validCodexCatalog } from './models.js'
 export interface WorkerOptions {
   /** Node-local process supervision seam, never a protocol field. */
   probe?: ProcessProbe
@@ -36,15 +35,7 @@ export async function startCodexTurn(
   const fingerprint = policyFingerprint(paths)
   if (turn.cwd !== paths.workspace || !opaqueId(turn.run_id) || !opaqueId(turn.session_id))
     throw new Error('codex_invalid_turn')
-  if (
-    turn.native_session_id &&
-    (!opaqueId(turn.native_session_id) ||
-      turn.native_binding?.workspace_path !== paths.workspace ||
-      turn.native_binding?.policy_fingerprint !== fingerprint ||
-      !validCodexModel(turn.native_binding?.model) ||
-      (model !== undefined && turn.native_binding?.model !== model))
-  )
-    throw new Error('codex_native_binding_mismatch')
+  checkNativeBinding(paths, model, turn.native_session_id, turn.native_binding)
   const localAbort = new AbortController(),
     generation = randomUUID()
   const mapper = new CodexEventMapper(turn.run_id, (e) =>
@@ -171,73 +162,14 @@ export async function startCodexTurn(
       : peer.request(method, params)
   void (async () => {
     try {
-      const init = await request('initialize', {
-        clientInfo: { name: 'abele-node', version: '0.3.7' },
-        capabilities: { experimentalApi: true },
+      const native = await openCodexThread(request, () => peer.initialized(), {
+        paths,
+        model,
+        native_session_id: turn.native_session_id,
+        binding: turn.native_binding,
       })
-      if (init.codexHome !== paths.home) throw new Error('codex_home_mismatch')
-      await peer.initialized()
-      const inspect = async () => {
-        const requirements = await request('configRequirements/read')
-        const effective = await request('config/read', {
-          cwd: paths.workspace,
-          includeLayers: true,
-        })
-        checkEffective(effective.config, requirements, paths)
-      }
-      await inspect()
-      const account = await request('account/read', { refreshToken: false })
-      if (!isCodexAuthenticated(account)) throw new Error('codex_authentication_required')
-      const models = await request('model/list', { includeHidden: false, limit: 100 })
-      if (!validCodexCatalog(models) || (model && !codexModelAvailable(models, model)))
-        throw new Error('codex_selected_model_unavailable')
-      const params = {
-        ...(model ? { model } : {}),
-        cwd: paths.workspace,
-        runtimeWorkspaceRoots: [paths.workspace],
-        approvalPolicy: 'on-request',
-        approvalsReviewer: 'user',
-        permissions: 'abele',
-      }
-      const native = await request(
-        turn.native_session_id ? 'thread/resume' : 'thread/start',
-        turn.native_session_id
-          ? {
-              ...params,
-              modelProvider: 'openai',
-              threadId: turn.native_session_id,
-              excludeTurns: true,
-            }
-          : { ...params, modelProvider: 'openai', ephemeral: false }
-      ).catch((error) => {
-        if (
-          turn.native_session_id &&
-          error instanceof Error &&
-          error.message.startsWith('codex_rpc_error:')
-        )
-          throw new Error('codex_native_context_unavailable')
-        throw error
-      })
-      if (
-        !opaqueId(native?.thread?.id) ||
-        (turn.native_session_id && native.thread.id !== turn.native_session_id) ||
-        !validCodexModel(native.model) ||
-        (model !== undefined && native.model !== model) ||
-        (turn.native_session_id && native.model !== turn.native_binding?.model) ||
-        native.modelProvider !== 'openai' ||
-        native.cwd !== paths.workspace ||
-        native.approvalPolicy !== 'on-request' ||
-        native.approvalsReviewer !== 'user' ||
-        native.activePermissionProfile?.id !== 'abele' ||
-        native.activePermissionProfile.extends !== null ||
-        JSON.stringify(native.runtimeWorkspaceRoots) !== JSON.stringify([paths.workspace])
-      )
-        throw new Error('codex_thread_policy_mismatch')
-      // Codex resolves its own default at thread creation. Check the actual model
-      // before binding or sending text, without turning it into a node override.
-      if (!codexModelAvailable(models, native.model))
-        throw new Error('codex_selected_model_unavailable')
-      mapper.bind(native.thread.id)
+      const { params, inspect } = native
+      mapper.bind(native.thread_id)
       await inspect()
       if (localAbort.signal.aborted) throw new Error('interrupted')
       // The sink commits the exact binding synchronously before any user text is sent.
@@ -246,7 +178,7 @@ export async function startCodexTurn(
         data: {
           run_id: turn.run_id,
           generation,
-          native_session_id: native.thread.id,
+          native_session_id: native.thread_id,
           workspace_path: paths.workspace,
           policy_fingerprint: fingerprint,
           model: native.model,
@@ -254,7 +186,7 @@ export async function startCodexTurn(
       })
       const accepted = await request('turn/start', {
         ...params,
-        threadId: native.thread.id,
+        threadId: native.thread_id,
         input: [{ type: 'text', text: turn.text, text_elements: [] }],
         effort: 'low',
       })

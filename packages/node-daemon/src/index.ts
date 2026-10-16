@@ -20,6 +20,7 @@ import {
   ClaudeProviderAdapter,
   PiProviderAdapter,
   CodexProviderAdapter,
+  AcpProviderAdapter,
   canonicalStateDir,
   type LiveOptions,
 } from '@abele/node-core'
@@ -342,6 +343,7 @@ export async function startDaemon(
       claude: new ClaudeProviderAdapter(claudeOptions),
       pi: new PiProviderAdapter({ ...piOptions, stateDir: dir }),
       codex,
+      acp: new AcpProviderAdapter({ stateDir: dir }),
       live: liveOptions,
     })
     await core.resources.ready

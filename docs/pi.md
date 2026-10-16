@@ -38,8 +38,9 @@ Start/install options:
 | `--pi-provider`, `--pi-model`      | User-only SDK defaults when omitted; explicit identifiers override them    |
 | `--pi-agent-dir`                   | SDK configuration directory for local authentication, models and resources |
 | `--pi-profile inherited\|isolated` | `inherited`                                                                |
-| `--pi-max-tokens`                  | 4096; range 64–32768                                                       |
-| `--pi-deadline-ms`                 | 120000; range 1000–1800000                                                 |
+| `--pi-max-tokens`                  | 4096; range 64–32768; delegated turns                                      |
+| `--pi-deadline-ms`                 | 120000; range 1000–1800000; delegated turns                                |
+| `--no-pi-live`                     | Owner sessions run one worker per message too                              |
 | `--permission-ttl-ms`              | 60000; shared approval deadline                                            |
 
 `inherited` uses `DefaultResourceLoader` for supported trusted skills, context and
@@ -90,10 +91,43 @@ missing UI transport and unconfirmed delivery never grant permission. SDK dialog
 cancellation invalidates its exact question; late answers are not retargeted.
 Client disconnection alone does not stop a run or discard its pending prompt.
 
+## Long-lived owner sessions
+
+An owner session (not delegated work) keeps one SDK worker for as long as it is in use,
+like a Claude session. The worker runs under the same detached session host, so a node
+restart or update leaves it and its turn running and the next node takes it over from
+the last journaled line. `--no-pi-live` returns to one worker per message.
+
+- A message written while a turn runs is steered into that turn: the SDK takes it at the
+  next tool boundary, before its next model request. Extension commands still run at once.
+  A message the turn ended before taking starts the next turn. Each input is reported as
+  delivered when the SDK takes it, and with the turn that answers it.
+- There is no per-message deadline. `session.interrupt` aborts the current turn and keeps
+  the worker; everything written for that turn ends as interrupted. `session.stop` ends the
+  worker and its process groups; the next message reopens the exact native session file.
+- `/compact [focus]` (or `session.compact`) runs `session.compact` once the current turn is
+  over and journals `compaction.started`, `compaction.completed` and `compaction.summary`.
+  Automatic compaction follows the SDK's own settings and is journaled the same way.
+- `session.context` is refreshed after every turn from the SDK's context usage.
+- The session's `/` commands go into the shared list (`session.commands`) when the worker
+  starts: `compact`, then extension commands, prompt templates and skills (`skill:NAME`). Each
+  runs by sending `/name input` as an ordinary message.
+- pi's records are also journaled as `session.update` (text, reasoning, tool calls with kinds,
+  titles, files and diffs, compaction, model choice, notices), so a client renders pi the same
+  way as Claude. The `pi.*` records stay as they were.
+- Settings: `model` is a model id of the configured provider (`default` is the node's own
+  choice) and switches in the running session; `effort` maps to the SDK thinking level and
+  applies at the next start; `permission_mode` is `manual` (every tool asks) or, with the
+  operator's `--claude-allow-bypass`, `bypassPermissions`, which runs tools without asking
+  while still journaling every call and result live. Questions wait for the session
+  permission TTL. Owner sessions answer with up to 32768 output tokens per response.
+- The node's own tools (messages to other sessions, worktree switch, debugger) are offered
+  to the session the same way as to Claude.
+
 ## Lifecycle, resume and process ownership
 
-Each active session turn uses a supervised worker hosting SDK APIs directly, not
-the pi CLI/RPC executable. Ordinary follow-ups remain in the node queue. Completion
+Each delegated session turn uses a supervised worker hosting SDK APIs directly, not
+the pi CLI/RPC executable; owner sessions keep theirs as above. Ordinary follow-ups remain in the node queue. Completion
 requires session-level `waitForIdle()`, not low-level `agent_end`, so retries,
 compaction and native continuations do not prematurely complete the input.
 Swallowed extension-command and `session_shutdown` errors are included in the

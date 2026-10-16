@@ -1,5 +1,6 @@
 /** Stable stage 0 fixture types, with stage 1 runtime schemas below. */
 import { z } from 'zod'
+export * from './lsp.js'
 export * from './pairing.js'
 export * from './debugger.js'
 export * from './debugger-control.js'
@@ -69,3 +70,8 @@ export interface CapabilityReport {
   /** Absence means unverified, not supported. Evidence identifies a probe or fixture. */
   capabilities: Record<string, Capability>
 }
+export * from './claude-updates.js'
+export * from './pi-updates.js'
+export * from './acp-updates.js'
+export * from './codex-updates.js'
+export * from './session-update-replay.js'

@@ -14,6 +14,10 @@ it.each(['bundled', 'optional'])(
     const native = join(nativeRoot, 'vendor', triple, 'codex/codex')
     mkdirSync(join(root, 'bin'), { recursive: true })
     mkdirSync(join(nativeRoot, 'vendor', triple, 'codex'), { recursive: true })
+    // The tool helper ships beside the native executable.
+    writeFileSync(join(nativeRoot, 'vendor', triple, 'codex/codex-code-mode-host'), '', {
+      mode: 0o700,
+    })
     writeFileSync(
       join(root, 'package.json'),
       JSON.stringify({ name: '@openai/codex', version: '0.160.1' })

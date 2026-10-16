@@ -25,6 +25,9 @@ import {
 export { ClaudeStreamDecoder, ClaudeEventMapper, ProcessSupervisor }
 export type { ProcessIdentity, ProcessProbe, ClaudeEvent }
 export { systemProcessProbe, descendants } from './supervisor.js'
+export { createRunIpc, cleanupRunIpc, isRunIpc, verifyRunIpc, HOST_PROTOCOL } from './ipc.js'
+/** Holds one long-lived stdio process so it outlives the daemon; other providers use it too. */
+export const SESSION_HOST = fileURLToPath(new URL('./session-host.js', import.meta.url))
 export interface ClaudeOptions {
   executable?: string
   profile?: 'inherited' | 'isolated'

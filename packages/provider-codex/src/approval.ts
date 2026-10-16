@@ -48,7 +48,8 @@ function confinedPath(workspace: string, path: string) {
 interface BridgeOptions {
   generation: string
   workspace: string
-  mapper: CodexEventMapper
+  /** The turn being answered for; a long-lived session swaps it at every turn. */
+  mapper: Pick<CodexEventMapper, 'threadId' | 'turnId' | 'item'>
   ask(action: ProviderAction, signal: AbortSignal): Promise<Answer>
   cancel(): Promise<void>
 }

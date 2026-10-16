@@ -26,6 +26,16 @@ export interface HostConfiguration {
   profile: 'inherited' | 'isolated'
   maxTokens: number
   debugger_tools?: DebuggerToolDefinition[]
+  /** A long-lived owner session: its effort and permission mode; absent for one bounded turn. */
+  live?: { effort: string; permission_mode: string }
+}
+/** Session efforts as pi thinking levels; the SDK clamps them to what the model supports. */
+const THINKING: Record<string, 'low' | 'medium' | 'high' | 'xhigh'> = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  max: 'xhigh',
 }
 export async function createSdkHost(
   sdk: typeof PiSdk,
@@ -65,6 +75,9 @@ export async function createSdkHost(
     signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
   })
   const policy = new PiApprovalPolicy(ask, signal)
+  policy.bypass = config.live?.permission_mode === 'bypassPermissions'
+  let selectedProvider = config.provider,
+    initialModel = config.model
   const ui = new PiExtensionUiBridge(ask, signal, emit)
   const factory: PiSdk.CreateAgentSessionRuntimeFactory = async ({
     cwd: effectiveCwd,
@@ -188,13 +201,15 @@ export async function createSdkHost(
     if (!provider || !modelId) throw new Error('pi_model_configuration_required')
     const model = modelRuntime.getModel(provider, modelId)
     if (!model) throw new Error('pi_model_unavailable')
+    selectedProvider = provider
+    initialModel ||= modelId
     return {
       ...(await createAgentSessionFromServices({
         services,
         sessionManager,
         sessionStartEvent,
         model: { ...model, maxTokens: Math.min(model.maxTokens, config.maxTokens) },
-        thinkingLevel: 'off',
+        thinkingLevel: (config.live && THINKING[config.live.effort]) || 'off',
       })),
       services,
       diagnostics: services.diagnostics,
@@ -243,8 +258,55 @@ export async function createSdkHost(
     type: 'pi.project.trust',
     data: { source: 'node_project_registration', trusted: true, extensions_sandboxed: false },
   })
+  const session = () => runtime.session
   return {
     prompt: (text: string) => worker.prompt(text),
+    // While a turn runs, input is taken at the next tool boundary; commands still run at once.
+    steer: (text: string) => session().prompt(text, { streamingBehavior: 'steer' }),
+    streaming: () => session().isStreaming,
+    clearQueue: () => void session().clearQueue(),
+    compact: async (instructions?: string) => {
+      const result = await session().compact(instructions)
+      return { tokens_before: result.tokensBefore ?? null, summary: result.summary ?? '' }
+    },
+    context: () => {
+      const usage = session().getContextUsage()
+      return usage ? { ...usage, model: session().model?.id ?? null } : undefined
+    },
+    commands: () => [
+      ...session()
+        .extensionRunner.getRegisteredCommands()
+        .map((c) => ({ name: c.invocationName, description: c.description, source: 'extension' })),
+      ...session().promptTemplates.map((t) => ({
+        name: t.name,
+        description: t.description,
+        source: 'prompt',
+      })),
+      ...session()
+        .resourceLoader.getSkills()
+        .skills.map((s) => ({
+          name: `skill:${s.name}`,
+          description: s.description,
+          source: 'skill',
+        })),
+    ],
+    setModel: async (id: string) => {
+      const model =
+        selectedProvider &&
+        modelRuntime.getModel(selectedProvider, id === 'default' ? initialModel : id)
+      if (!model) throw new Error('pi_model_unavailable')
+      await session().setModel({ ...model, maxTokens: Math.min(model.maxTokens, config.maxTokens) })
+    },
+    setEffort: (effort: string) => {
+      const level = THINKING[effort]
+      if (!level) throw new Error('invalid_session_settings')
+      session().setThinkingLevel(level)
+    },
+    setPermissionMode: (mode: string) => {
+      if (mode !== 'manual' && mode !== 'bypassPermissions')
+        throw new Error('invalid_session_settings')
+      policy.bypass = mode === 'bypassPermissions'
+    },
     completionResult: (result: Awaited<ReturnType<PiSdkWorker['prompt']>>) =>
       worker.completionResult(result),
     abort: () => worker.abort(),

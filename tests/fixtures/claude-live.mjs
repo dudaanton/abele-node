@@ -66,6 +66,9 @@ const begin = () => {
     model,
     permissionMode: mode,
     messaging_socket_path: `/tmp/cc-socks-fixture/${process.pid}.sock`,
+    slash_commands: ['review', 'compact', 'context', 'doctor', 'color', '__internal', 'plugin:act'],
+    terminal_slash_commands: ['doctor', 'color'],
+    skills: ['review', 'plugin:act'],
   })
   emit({ type: 'system', subtype: 'status', status: 'requesting' })
 }
