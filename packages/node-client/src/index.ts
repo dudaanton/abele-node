@@ -212,7 +212,7 @@ export class NodeClient {
   attach(channel: AuthenticatedChannel) {
     const requests = new RequestChannel(channel)
     this.channel = requests
-    requests.onEvent = (event) => this.ingest(event)
+    requests.onEvent = (event) => this.receive(event)
     requests.onClose = () => {
       if (this.channel === requests) {
         this.debugger.disconnected()
@@ -230,45 +230,96 @@ export class NodeClient {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
   }
-  async ingest(raw: unknown) {
-    const event = NodeEventSchema.parse(raw)
-    let outcome: 'gap' | 'duplicate' | 'stored'
+  /** Events received but not yet kept, each with who waits for it. */
+  private ingestQueue: { raw: unknown; resolve: () => void; reject: (error: unknown) => void }[] =
+    []
+  private ingesting = false
+  /**
+   * Keeps a received event. Events that arrive while earlier ones are being written are kept
+   * together in the next store transaction, with one cumulative ack per stream: a slow store (a
+   * phone's IndexedDB) spent a transaction, and a round trip of acks, on every event of a streamed
+   * answer. Resolves once this event is kept (or found duplicate, or a gap asked again).
+   */
+  ingest(raw: unknown): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.ingestQueue.push({ raw, resolve, reject })
+      if (!this.ingesting) void this.drainIngest()
+    })
+  }
+  /** The receive loop's hand-off: it goes on reading while the store writes, up to a bound. */
+  private receive(raw: unknown): Promise<void> {
+    const kept = this.ingest(raw)
+    kept.catch(() => {})
+    return this.ingestQueue.length >= 512 ? kept : Promise.resolve()
+  }
+  private async drainIngest() {
+    this.ingesting = true
     try {
-      outcome = await this.store.transaction((s) => {
-        if (s.node_id !== event.node_id) throw new ChannelError('node_identity_mismatch')
-        const cursor = s.cursors[event.stream_id] ?? 0
-        if (event.seq <= cursor) return 'duplicate'
-        if (event.seq !== cursor + 1) return 'gap'
-        const history = (s.events[event.stream_id] ??= [])
-        history.push(event)
-        s.cursors[event.stream_id] = event.seq
-        return 'stored'
+      while (this.ingestQueue.length) await this.ingestBatch(this.ingestQueue.splice(0))
+    } finally {
+      this.ingesting = false
+    }
+  }
+  private async ingestBatch(
+    batch: { raw: unknown; resolve: () => void; reject: (error: unknown) => void }[]
+  ) {
+    const parsed: { event: JournalEvent; entry: (typeof batch)[number] }[] = []
+    for (const entry of batch) {
+      try {
+        parsed.push({ event: NodeEventSchema.parse(entry.raw), entry })
+      } catch (error) {
+        entry.reject(error)
+      }
+    }
+    if (!parsed.length) return
+    let result: { outcomes: ('gap' | 'duplicate' | 'stored')[]; cursors: Record<string, number> }
+    try {
+      result = await this.store.transaction((s) => {
+        const outcomes = parsed.map(({ event }) => {
+          if (s.node_id !== event.node_id) throw new ChannelError('node_identity_mismatch')
+          const cursor = s.cursors[event.stream_id] ?? 0
+          if (event.seq <= cursor) return 'duplicate' as const
+          if (event.seq !== cursor + 1) return 'gap' as const
+          ;(s.events[event.stream_id] ??= []).push(event)
+          s.cursors[event.stream_id] = event.seq
+          return 'stored' as const
+        })
+        const cursors: Record<string, number> = {}
+        for (const { event } of parsed) cursors[event.stream_id] = s.cursors[event.stream_id] ?? 0
+        return { outcomes, cursors }
       })
     } catch (error) {
       await this.channel?.channel.transport.close('cursor_storage_failure')
-      throw error
+      for (const { entry } of parsed) entry.reject(error)
+      return
     }
-    const seq = await this.cursor(event.stream_id)
+    // One answer per stream: ask again from the cursor after a gap, else ack what is kept.
+    const gaps = new Set(
+      parsed.filter((_, i) => result.outcomes[i] === 'gap').map((p) => p.event.stream_id)
+    )
     if (this.channel)
-      await this.channel.channel.transport.send(
-        FrameCodec.encode({
-          kind: 'request',
-          request_id: crypto.randomUUID(),
-          method: outcome === 'gap' ? 'stream.subscribe' : 'stream.ack',
-          params:
-            outcome === 'gap'
-              ? { stream_id: event.stream_id, after_seq: seq }
-              : { stream_id: event.stream_id, seq },
-        })
-      )
-    if (outcome === 'stored')
-      for (const listener of this.listeners) {
-        try {
-          listener(event)
-        } catch {
-          /* presentation cannot undo durable cursor */
+      for (const [stream, seq] of Object.entries(result.cursors))
+        await this.channel.channel.transport.send(
+          FrameCodec.encode({
+            kind: 'request',
+            request_id: crypto.randomUUID(),
+            method: gaps.has(stream) ? 'stream.subscribe' : 'stream.ack',
+            params: gaps.has(stream)
+              ? { stream_id: stream, after_seq: seq }
+              : { stream_id: stream, seq },
+          })
+        )
+    parsed.forEach(({ event, entry }, i) => {
+      if (result.outcomes[i] === 'stored')
+        for (const listener of this.listeners) {
+          try {
+            listener(event)
+          } catch {
+            /* presentation cannot undo durable cursor */
+          }
         }
-      }
+      entry.resolve()
+    })
   }
   cursor(stream: string) {
     return this.store.transaction((s) => s.cursors[stream] ?? 0)
@@ -281,6 +332,14 @@ export class NodeClient {
   }
   operationResult(operation: string) {
     return this.store.transaction((s) => s.results[operation])
+  }
+  /** Where a stream's journal ends now, without replaying it. */
+  async head(stream: string): Promise<number> {
+    const result = (await this.request('stream.head', { stream_id: stream })) as {
+      head_seq?: unknown
+    }
+    if (!Number.isSafeInteger(result?.head_seq)) throw new ChannelError('invalid_result')
+    return result.head_seq as number
   }
   async subscribe(stream: string) {
     await this.store.transaction((s) => {

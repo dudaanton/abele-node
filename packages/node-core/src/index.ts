@@ -997,6 +997,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       }
       case 'stream.read':
         return this.read(String(p.stream_id), Number(p.after_seq), Number(p.limit))
+      case 'stream.head':
+        return { head_seq: this.head(String(p.stream_id)) }
       case 'artifact.read': {
         const row = this.db
           .prepare('SELECT content FROM artifacts WHERE artifact_id=? AND session_id=?')

@@ -173,22 +173,19 @@ it(
     ])
     first = new NodeClient(target(t1.token), new FileClientStore(store.path))
     clients.push(first)
-    // Reproduce the exact stream/store interleaving without a timing sleep: the
-    // input's terminal event is visible before its following run terminal event.
-    const terminalPrefix = new Promise<Awaited<ReturnType<NodeClient['history']>>>(
-      (resolve, reject) => {
-        const sendingClient = first
-        let inputs = 0
-        sendingClient.onEvent((event) => {
-          if (
-            event.stream_id === session.session_id &&
-            (event.type === 'input.completed' || event.type === 'input.failed') &&
-            ++inputs === 3
-          )
-            void sendingClient.history(session.session_id).then(resolve, reject)
-        })
-      }
-    )
+    // Reproduce the exact stream interleaving without a timing sleep: the input's terminal
+    // event is seen before its following run terminal event. The prefix is what the listener
+    // heard, in order; the store may already hold the rest of a burst kept in one write.
+    const terminalPrefix = new Promise<Awaited<ReturnType<NodeClient['history']>>>((resolve) => {
+      const heard: Awaited<ReturnType<NodeClient['history']>> = []
+      let inputs = 0
+      first.onEvent((event) => {
+        if (event.stream_id !== session.session_id) return
+        heard.push(event)
+        if ((event.type === 'input.completed' || event.type === 'input.failed') && ++inputs === 3)
+          resolve([...heard])
+      })
+    })
     await first.connect()
     await first.subscribe(session.session_id)
     await eventually(

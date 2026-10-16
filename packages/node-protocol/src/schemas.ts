@@ -287,6 +287,8 @@ export const MethodSchemas = {
       limit: z.number().int().min(1).max(256).default(256),
     })
     .strict(),
+  /** Where a stream ends now: a client opening a long session starts near it. */
+  'stream.head': z.object({ stream_id: id }).strict(),
   'stream.subscribe': z.object({ stream_id: id, after_seq: SeqSchema }).strict(),
   'stream.ack': z.object({ stream_id: id, seq: SeqSchema }).strict(),
   'stream.unsubscribe': z.object({ stream_id: id }).strict(),

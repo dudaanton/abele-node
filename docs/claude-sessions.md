@@ -155,6 +155,13 @@ ends the sessions together with the daemon. A node that adopts a process checks 
 run directory is private and owned by the node's user, and that the installation that
 started it may still run it in a trusted project; otherwise the process is ended.
 
+## Opening a long session
+
+A session's journal can hold tens of thousands of events. A client does not replay it to show
+the end: `stream.head { stream_id }` returns `{ head_seq }`, the client subscribes with
+`after_seq` a little before it, and reads older pages with `stream.read { after_seq, limit }`
+(at most 256 events) only when the person scrolls back.
+
 ## Messages between sessions
 
 Owner sessions get two agent tools from the node (on the same MCP server as the node's
