@@ -15,6 +15,7 @@ export type GitCommand =
   | { kind: 'divergence'; base: string; head: string }
   | { kind: 'root' }
   | { kind: 'common' }
+  | { kind: 'identity' }
   | { kind: 'directory' }
   | { kind: 'branch' }
   | { kind: 'resolve'; ref: string }
@@ -155,6 +156,9 @@ export class GitRunner {
         break
       case 'common':
         args = ['rev-parse', '--path-format=absolute', '--git-common-dir']
+        break
+      case 'identity':
+        args = ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir']
         break
       case 'directory':
         args = ['rev-parse', '--absolute-git-dir']
@@ -591,6 +595,12 @@ export class GitRunner {
   }
   async text(cwd: string, command: GitCommand) {
     return decodeGit(await this.run(cwd, command)).replace(/\n$/, '')
+  }
+  /** The worktree's top level and common git directory, both from one process. */
+  async identity(cwd: string): Promise<{ root: string; common: string }> {
+    const [root, common, ...rest] = (await this.text(cwd, { kind: 'identity' })).split('\n')
+    if (!root || !common || rest.length) throw new ChannelError('repository_unavailable')
+    return { root, common }
   }
 }
 export interface GitWorktree {

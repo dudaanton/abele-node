@@ -401,25 +401,30 @@ export class RepositoryService {
     if (!target.active) throw new ChannelError('stale_resource')
     const project = this.r.projects.get(target.project_id)
     this.checkRead(target)
-    await this.r.projects.available(project)
-    try {
+    // Every read pays for these checks twice, so their Git processes run side by side.
+    const available = this.r.projects.available(project)
+    const checks = (async () => {
       if (
         realpathSync(target.path) !== target.path ||
         lstatSync(target.path).isSymbolicLink() ||
         this.targetFingerprint(target.path) !== target.fingerprint
       )
         throw new Error()
+      const [identity, worktrees] = await Promise.all([
+        this.r.git.identity(target.path),
+        this.r.git.run(project.root_path, { kind: 'worktrees' }),
+      ])
       if (
-        realpathSync(await this.r.git.text(target.path, { kind: 'root' })) !== target.path ||
-        realpathSync(await this.r.git.text(target.path, { kind: 'common' })) !==
-          project.git_common_dir
+        realpathSync(identity.root) !== target.path ||
+        realpathSync(identity.common) !== project.git_common_dir
       )
         throw new Error()
-      const records = parseWorktrees(await this.r.git.run(project.root_path, { kind: 'worktrees' }))
+      const records = parseWorktrees(worktrees)
       if (!records.some((w) => w.path === target.path && !w.bare)) throw new Error()
-    } catch {
+    })().catch(() => {
       throw new ChannelError('repository_unavailable')
-    }
+    })
+    await Promise.all([available, checks])
     this.checkRead(target)
     return target
   }

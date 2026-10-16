@@ -78,6 +78,26 @@ describe('Node.js programs waiting for a debugger', () => {
     })
   })
 
+  it('reads a program file and folder whose names have spaces in them', async () => {
+    const dir = folder({ 'sample tools/my app.js': SERVE })
+    const program = await inspected(join(dir, 'sample tools'), 'my app.js')
+    const found = (await inspectorPrograms()).find((p) => p.pid === program.pid)
+    expect(found).toMatchObject({
+      cwd: join(dir, 'sample tools'),
+      script: join(dir, 'sample tools', 'my app.js'),
+      command: expect.stringMatching(/ my app\.js$/),
+    })
+  })
+
+  it('takes the words of a path back together only where the file is there', () => {
+    const exists = (path: string) => path === '/w/my app.js'
+    expect(scriptOf(['node', '--inspect', 'my', 'app.js', '--port', '3'], '/w', exists)).toBe(
+      '/w/my app.js'
+    )
+    // Without such a file the first word is the program, as before.
+    expect(scriptOf(['node', '--inspect', 'other', 'app.js'], '/w', exists)).toBe('/w/other')
+  })
+
   it('leaves out a program’s own server and an inspector open beyond loopback', async () => {
     const dir = folder({
       'server.js':

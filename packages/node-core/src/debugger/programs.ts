@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { request } from 'node:http'
+import { statSync } from 'node:fs'
 import { readdir, readFile, readlink } from 'node:fs/promises'
 import { basename, isAbsolute, resolve } from 'node:path'
 import { ownedDebugPids } from './process.js'
@@ -61,6 +62,8 @@ type Listening = {
   ports: Set<number>
   argv: string[]
   cwd: string | null
+  /** The OS gave the arguments joined by spaces, not one by one. */
+  joined?: boolean
 }
 
 async function darwinListening(): Promise<Listening[]> {
@@ -79,18 +82,21 @@ async function darwinListening(): Promise<Listening[]> {
   }
   return Promise.all(
     [...found].map(async ([pid, ports]) => {
-      const [args, cwd] = await Promise.all([
+      const [args, exe, cwd] = await Promise.all([
         run('/bin/ps', ['-o', 'args=', '-p', String(pid)]),
+        run('/bin/ps', ['-o', 'comm=', '-p', String(pid)]),
         run('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn']),
       ])
       const folder = cwd.split('\n').find((l) => l.startsWith('n'))
-      // ps joins the arguments with spaces: a path with a space in it reads as two words here.
-      return {
-        pid,
-        ports,
-        argv: args.trim().split(/\s+/).filter(Boolean),
-        cwd: folder ? folder.slice(1) : null,
-      }
+      // ps joins the arguments with spaces. Node's own path comes whole from comm; a program path
+      // with a space in it is put back together by scriptOf, where such a file is there.
+      const line = args.trim(),
+        path = exe.trim()
+      const argv =
+        path && line.startsWith(path + ' ')
+          ? [path, ...line.slice(path.length).trim().split(/\s+/).filter(Boolean)]
+          : line.split(/\s+/).filter(Boolean)
+      return { pid, ports, argv, cwd: folder ? folder.slice(1) : null, joined: true }
     })
   )
 }
@@ -193,23 +199,50 @@ export function isInspector(port: number, timeout = 1000): Promise<boolean> {
 }
 
 /** The file a node command line runs: its first word that is not an option or an option's value. */
-export function scriptOf(argv: string[], cwd: string | null): string | null {
+export function scriptOf(
+  argv: string[],
+  cwd: string | null,
+  exists?: (path: string) => boolean
+): string | null {
   for (let i = 1; i < argv.length; i++) {
     const word = argv[i]!
-    if (word === '--') return resolveIn(argv[i + 1], cwd)
+    if (word === '--') return joinedPath(argv, i + 1, cwd, exists)
     if (['-e', '--eval', '-p', '--print', '-'].includes(word)) return null
     if (word.startsWith('-')) {
       if (VALUED.has(word)) i++
       continue
     }
-    return resolveIn(word, cwd)
+    return joinedPath(argv, i, cwd, exists)
   }
   return null
+}
+/** The path starting at word `i`: with `exists`, the longest run of words naming a file that is
+ * there, for arguments the OS joined by spaces; otherwise that one word. */
+function joinedPath(
+  argv: string[],
+  i: number,
+  cwd: string | null,
+  exists?: (path: string) => boolean
+) {
+  if (exists)
+    for (let j = Math.min(argv.length, i + 16); j > i + 1; j--) {
+      const path = resolveIn(argv.slice(i, j).join(' '), cwd)
+      if (path && exists(path)) return path
+    }
+  return resolveIn(argv[i], cwd)
 }
 function resolveIn(word: string | undefined, cwd: string | null) {
   if (!word) return null
   if (isAbsolute(word)) return word
   return cwd ? resolve(cwd, word) : null
+}
+
+function isFile(path: string) {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
 }
 
 export function shortCommand(argv: string[]) {
@@ -238,7 +271,7 @@ export async function inspectorPrograms(): Promise<InspectorProgram[]> {
       port,
       command: shortCommand(p.argv),
       cwd: p.cwd,
-      script: scriptOf(p.argv, p.cwd),
+      script: scriptOf(p.argv, p.cwd, p.joined ? isFile : undefined),
     }))
   return programs.sort((a, b) => a.pid - b.pid || a.port - b.port)
 }

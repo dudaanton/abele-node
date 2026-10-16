@@ -132,6 +132,34 @@ it('does not enumerate the repository or rebuild its snapshot for warm tree/blob
     )
   ).toEqual([])
 })
+it('checks the repository around a read with a few Git processes run side by side', async () => {
+  const s = await setup()
+  const revision = await s.observe()
+  const blob = await s.request('repository.v1.blob', {
+    worktree_id: s.worktree_id,
+    revision,
+    path: 'deep/f00000.txt',
+  })
+  const git = s.core.resources.git
+  const original = git.run.bind(git)
+  let running = 0,
+    overlap = 0
+  const run = vi.spyOn(git, 'run').mockImplementation(async (...args) => {
+    overlap = Math.max(overlap, ++running)
+    try {
+      return await original(...args)
+    } finally {
+      running--
+    }
+  })
+  // Reading bytes the node already holds is only the checks before and after it.
+  await s.request('repository.v1.content', {
+    worktree_id: s.worktree_id,
+    content_id: blob.content_id,
+  })
+  expect(run.mock.calls.length).toBeLessThanOrEqual(6)
+  expect(overlap).toBeGreaterThan(1)
+})
 describe('10,500-file worktree', () => {
   let s: Awaited<ReturnType<typeof setup>>
   beforeAll(async () => {

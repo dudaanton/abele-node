@@ -110,11 +110,10 @@ export class ProjectService {
       )
         throw new Error()
       if (project.repository_path) {
+        const identity = await this.resources.git.identity(project.root_path)
         if (
-          realpathSync(await this.resources.git.text(project.root_path, { kind: 'root' })) !==
-            project.repository_path ||
-          realpathSync(await this.resources.git.text(project.root_path, { kind: 'common' })) !==
-            project.git_common_dir
+          realpathSync(identity.root) !== project.repository_path ||
+          realpathSync(identity.common) !== project.git_common_dir
         )
           throw new Error()
       }
