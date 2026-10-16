@@ -8,6 +8,35 @@ import { target } from './helpers.js'
 
 afterEach(() => vi.useRealTimers())
 describe('typed debugger client current-state reconciliation', () => {
+  it('sends folder ownership and restart requests through the typed human client', async () => {
+    const rpc = vi.fn(async (method: string) =>
+      method.endsWith('programs')
+        ? { programs: [] }
+        : method.endsWith('sessions')
+          ? []
+          : { debug_session_id: 'new-session', sources: [] }
+    )
+    const client = new DebuggerClient(rpc)
+    const folder = { kind: 'workspace' as const, workspace_id: 'folder' }
+    await client.start({ operation_id: 'start', folder, program: 'app.js' })
+    await client.attach({ operation_id: 'attach', folder, pid: 1, port: 9229 })
+    await client.programs({ folder })
+    await client.sessions({ folder })
+    await client.restart({ operation_id: 'restart', debug_session_id: 'old-session' })
+    expect(rpc.mock.calls.map(([method]) => method)).toEqual([
+      'debugger.v1.start',
+      'debugger.v1.attachProgram',
+      'debugger.v1.programs',
+      'debugger.v1.sessions',
+      'debugger.v1.restart',
+    ])
+    expect(rpc.mock.calls[0]).toEqual([
+      'debugger.v1.start',
+      { operation_id: 'start', folder, program: 'app.js', argv: [], sources: [] },
+    ])
+    await client.programs('chat')
+    expect(rpc.mock.calls.at(-1)).toEqual(['debugger.v1.programs', { conversation_id: 'chat' }])
+  })
   it('watches from an atomic cursor outside input, cancels and labels disconnected state last-known', async () => {
     vi.useFakeTimers()
     const dir = mkdtempSync(join(tmpdir(), 'debug-client-'))

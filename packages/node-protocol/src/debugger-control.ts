@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DebuggerMethodSchemas } from './debugger.js'
+import { DebuggerMethodSchemas, DebuggerOwnerShape, hasDebuggerOwner } from './debugger.js'
 import { DelegationAuthoritySchema } from './delegation.js'
 
 const id = z.string().min(1).max(128)
@@ -82,12 +82,13 @@ const relativePath = z
 export const DebuggerStartSchema = z
   .object({
     operation_id: id,
-    conversation_id: id,
+    ...DebuggerOwnerShape,
     program: relativePath,
     argv: z.array(z.string().max(8192)).max(256).default([]),
     sources: z.array(relativePath).max(255).default([]),
   })
   .strict()
+  .refine(hasDebuggerOwner, 'debugger owner required')
 export const DebuggerStartResultSchema = z
   .object({
     debug_session_id: id,
@@ -96,7 +97,10 @@ export const DebuggerStartResultSchema = z
   .strict()
 export type DebuggerStartResult = z.infer<typeof DebuggerStartResultSchema>
 /** The Node.js programs on the node's machine whose inspector listens on loopback, for a chat. */
-export const DebuggerProgramsSchema = z.object({ conversation_id: id }).strict()
+export const DebuggerProgramsSchema = z
+  .object(DebuggerOwnerShape)
+  .strict()
+  .refine(hasDebuggerOwner, 'debugger owner required')
 const absolute = z.string().min(1).max(4096)
 export const DebuggerProgramSchema = z
   .object({
@@ -121,13 +125,14 @@ export const DebuggerProgramsResultSchema = z
 export const DebuggerAttachProgramSchema = z
   .object({
     operation_id: id,
-    conversation_id: id,
+    ...DebuggerOwnerShape,
     pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     port: z.number().int().min(1).max(65535),
     sources: z.array(relativePath).max(255).default([]),
     outside_folder: z.boolean().default(false),
   })
   .strict()
+  .refine(hasDebuggerOwner, 'debugger owner required')
 /** B3 exposes only authorized implemented methods. Profile startup, source,
  * tools, subscriptions and timers retain their later-stage gates. */
 export const DebuggerControlMethodSchemas = {
@@ -135,6 +140,7 @@ export const DebuggerControlMethodSchemas = {
   'debugger.v1.start': DebuggerStartSchema,
   'debugger.v1.programs': DebuggerProgramsSchema,
   'debugger.v1.attachProgram': DebuggerAttachProgramSchema,
+  'debugger.v1.restart': z.object({ operation_id: id, debug_session_id: id }).strict(),
   'debugger.v1.sessions': DebuggerMethodSchemas['debugger.v1.sessions'],
   'debugger.v1.status': DebuggerMethodSchemas['debugger.v1.status'],
   'debugger.v1.commandResult': DebuggerMethodSchemas['debugger.v1.commandResult'],

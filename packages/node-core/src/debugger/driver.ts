@@ -556,7 +556,9 @@ export class DapSession {
     const frameId = raw[0]?.id
     if (!Number.isSafeInteger(frameId))
       return { frames, values: takes.map((t) => ({ name: t.name, error: 'No frame to read' })) }
-    const context = this.capabilities.supportsClipboardContext ? 'clipboard' : 'repl'
+    // These are executable capture expressions. js-debug advertises clipboard support but
+    // rejects these evaluations in that context; repl also preserves their string results.
+    const context = 'repl'
     const evaluate = async (expression: string) => {
       const r = await this.request('evaluate', { frameId, expression, context })
       // Someone else moved the session meanwhile: the frame is no longer the one recorded.

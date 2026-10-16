@@ -2,11 +2,13 @@ import {
   DebuggerMethodSchemas,
   DebuggerControlMethodSchemas,
   DebuggerSnapshotResultSchema,
+  DebuggerSnapshotSchema,
   DebuggerReplayResultSchema,
   DebuggerReceiptSchema,
   DebuggerWaitResultSchema,
   DebuggerAttachProgramSchema,
   DebuggerProgramsResultSchema,
+  DebuggerProgramsSchema,
   DebuggerStartSchema,
   DebuggerStartResultSchema,
   type DebuggerSnapshot,
@@ -107,9 +109,30 @@ export class DebuggerClient {
     )
   }
   /** Node.js programs on the node's machine waiting for a debugger on loopback, for a chat. */
-  async programs(conversation_id: string) {
+  async programs(owner: string | (typeof DebuggerProgramsSchema)['_input']) {
     return DebuggerProgramsResultSchema.parse(
-      await this.rpc('debugger.v1.programs', { conversation_id })
+      await this.rpc(
+        'debugger.v1.programs',
+        DebuggerProgramsSchema.parse(typeof owner === 'string' ? { conversation_id: owner } : owner)
+      )
+    )
+  }
+  async sessions(params: Input<'debugger.v1.sessions'>) {
+    return DebuggerSnapshotSchema.array()
+      .max(128)
+      .parse(
+        await this.rpc(
+          'debugger.v1.sessions',
+          DebuggerMethodSchemas['debugger.v1.sessions'].parse(params)
+        )
+      )
+  }
+  async restart(params: (typeof DebuggerControlMethodSchemas)['debugger.v1.restart']['_input']) {
+    return DebuggerStartResultSchema.parse(
+      await this.rpc(
+        'debugger.v1.restart',
+        DebuggerControlMethodSchemas['debugger.v1.restart'].parse(params)
+      )
     )
   }
   /** Attaches to one of them; the owner's act, never resent. Detaching leaves it running. */

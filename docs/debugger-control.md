@@ -10,10 +10,34 @@ infrastructure**: target startup arrived later as the owner's `debugger.v1.start
 `abele-node start --debugger` (or the daemon's explicit `debuggerOptions.enabled`)
 enables the infrastructure capability; it defaults to **off**. It does not enable
 or install a real profile. `profiles` remains empty while the JS audit is blocked.
-The owner's `start`, `programs` and `attachProgram` are routed (see
-[recorded runs](trace.md#starting-a-program)); create, restart, source export and arbitrary DAP
+The owner's `start`, `programs`, `attachProgram` and `restart` are routed (see
+[recorded runs](trace.md#starting-a-program)); create, source export and arbitrary DAP
 are not.
 B5 extends the gated subset with wait/sleep and caller-scoped cancellation. There is no automatic target creation or adapter reconnect.
+
+### Folder ownership (node protocol 0.1)
+
+`start`, `attachProgram`, `programs` and `sessions` accept `folder`, an existing
+execution target (`{kind: 'workspace', workspace_id}` or `{kind: 'worktree', worktree_id}`),
+with an optional `conversation_id`. At least one owner is required. When both are
+supplied at launch or attach, they must identify the same folder. Folder startup
+uses the same trusted project and execution grant checks as a bound chat; every
+RPC retains the enrolled human authority gate.
+
+Folder-only sessions have a null target conversation. Listing by folder includes
+chat-started sessions, while listing by conversation preserves its existing scope.
+An owner can grant a chat agent read access to a folder-only session on that chat's
+current folder. Run, task, expiry, incarnation and action restrictions still apply,
+including to recorded values and steps; changing the chat's folder invalidates access.
+
+`restart({operation_id, debug_session_id})` returns a `DebuggerStartResult` for a
+fresh session after termination, detach, failure or adapter disconnect. The node
+retains launch/attach configuration and reapplies requested breakpoints; old history
+stays on the original session. Restart revalidates the saved folder's execution
+permission and refuses an active session. Attach restart rediscovers the saved PID
+and inspector port and leaves the external process owned by its caller. Retrying
+the same operation in the running node returns the same new session. Old sessions
+created before configuration retention cannot be restarted this way.
 
 `DebuggerControlMethodSchemas` is the implemented RPC subset; the full
 `DebuggerMethodSchemas` remains a declaration of v1, not an availability promise.

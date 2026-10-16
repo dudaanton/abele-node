@@ -92,6 +92,7 @@ export const LspStatusSchema = z
         server: z.string().nullable(),
         version: z.string().nullable(),
         found: z.boolean(),
+        reason: z.literal('untrusted_folder').optional(),
         project_eslint: z.string().optional(),
       })
       .strict()

@@ -620,9 +620,20 @@ export class DebuggerCoordinator {
       this.permissions.owner(principal.authority)
       return this.core.db
         .prepare(
-          "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.conversation_id')=? ORDER BY debug_session_id LIMIT ?"
+          p.folder
+            ? "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.worktree_id')=? AND (json_extract(body,'$.target.conversation_id')=? OR ? IS NULL) ORDER BY debug_session_id LIMIT ?"
+            : "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.conversation_id')=? ORDER BY debug_session_id LIMIT ?"
         )
-        .all(p.conversation_id, p.limit ?? 128)
+        .all(
+          ...(p.folder
+            ? [
+                p.folder.worktree_id ?? p.folder.workspace_id,
+                p.conversation_id ?? null,
+                p.conversation_id ?? null,
+                p.limit ?? 128,
+              ]
+            : [p.conversation_id, p.limit ?? 128])
+        )
         .map((r) => JSON.parse(String(r.body)))
     }
     // Replay has exactly one resource identity: the validated cursor. A second
@@ -757,6 +768,7 @@ export class DebuggerCoordinator {
     const method = full.slice('debugger.v1.'.length)
     if (
       (effects.has(method) || ['stack', 'scopes', 'threads'].includes(method)) &&
+      method !== 'restart' &&
       !this.backends.size
     )
       throw new ChannelError('unsupported_method')
@@ -784,7 +796,8 @@ export class DebuggerCoordinator {
     if (method === 'start') return this.core.debuggerLaunches.start(owner, p as any)
     if (method === 'attachProgram') return this.core.debuggerLaunches.attach(owner, p as any)
     // Listing what runs on the machine is the owner's (checked above), as attaching is.
-    if (method === 'programs') return this.core.debuggerLaunches.programs(p.conversation_id)
+    if (method === 'programs') return this.core.debuggerLaunches.programs(p as any)
+    if (method === 'restart') return this.core.debuggerLaunches.restart(owner, p as any)
     if (method === 'approvals') {
       this.checkPublication(human, p.debug_session_id)
       const all = this.core.db

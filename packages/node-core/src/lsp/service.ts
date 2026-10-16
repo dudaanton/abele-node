@@ -4,7 +4,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { LspDiagnosticSchema, LspRangeSchema, type LspDiagnostic } from '@abele/node-protocol'
 import { LspConnection } from './connection.js'
-import { servers, discover, projectEslint, type Language } from './servers.js'
+import { servers, discover, projectEslint, projectCodeServers, type Language } from './servers.js'
 
 type Document = { path: string; text: string; version: number; languageId: string }
 type Slot = {
@@ -21,6 +21,7 @@ type Slot = {
 export type LspOptions = {
   idleMs?: number
   memoryMB?: number
+  trusted?: (root: string) => boolean
   command?: (language: Language) => { command: string; args: string[] } | null
   read?: (root: string, path: string) => string
   check: (root: string, path: string) => string
@@ -61,11 +62,25 @@ export class LspService {
   private key(root: string, language: Language) {
     return root + '\0' + language
   }
+  private allowed(root: string, language: Language) {
+    return !projectCodeServers.has(language) || this.options.trusted?.(root) === true
+  }
+  async enforceTrust(root: string) {
+    await Promise.all(
+      [...this.slots.values()]
+        .filter((slot) => slot.root === root && !this.allowed(root, slot.language))
+        .map((slot) => this.remove(slot))
+    )
+  }
   canRefresh(root: string) {
     return (
-      [...this.slots.values()].some((slot) => slot.root === root) ||
-      (Object.keys(servers) as Language[]).some((language) =>
-        this.options.command ? this.options.command(language) : discover(this.state, language)
+      [...this.slots.values()].some(
+        (slot) => slot.root === root && this.allowed(root, slot.language)
+      ) ||
+      (Object.keys(servers) as Language[]).some(
+        (language) =>
+          this.allowed(root, language) &&
+          (this.options.command ? this.options.command(language) : discover(this.state, language))
       )
     )
   }
@@ -113,6 +128,7 @@ export class LspService {
     return result
   }
   private start(slot: Slot, command: { command: string; args: string[] }) {
+    if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
     const c = (slot.connection = new LspConnection(
       command.command,
       command.args,
@@ -120,6 +136,10 @@ export class LspService {
       this.options.memoryMB ?? 384
     ))
     c.onNotification = (method, params) => {
+      if (!this.allowed(slot.root, slot.language)) {
+        void this.remove(slot)
+        return
+      }
       if (method !== 'textDocument/publishDiagnostics') return
       try {
         const path = this.uriPath(slot.root, params.uri)
@@ -172,6 +192,10 @@ export class LspService {
       clearInterval(slot.memory)
       for (const doc of slot.docs.values()) this.setDiagnostics(slot, doc.path, [])
       if (this.closed || this.slots.get(this.key(slot.root, slot.language)) !== slot) return
+      if (!this.allowed(slot.root, slot.language)) {
+        void this.remove(slot)
+        return
+      }
       if (slot.crashes++ === 0) {
         this.options.error?.(slot.root, slot.language + ' crashed; restarting once')
         slot.ready = this.start(slot, command)
@@ -216,6 +240,7 @@ export class LspService {
           slot.language === 'typescript' ? { maxTsServerMemory: this.options.memoryMB ?? 384 } : {},
       })
       .then(() => {
+        if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
         c.notify('initialized', {})
         for (const doc of slot.docs.values()) this.sendOpen(slot, doc)
       })
@@ -256,17 +281,20 @@ export class LspService {
     signal?: AbortSignal
   ) {
     if (this.closed) throw new Error('lsp_closed')
+    await this.enforceTrust(root)
     const target = this.options.check(root, path)
     text ??= this.options.read ? this.options.read(root, path) : readFileSync(target, 'utf8')
     if (Buffer.byteLength(text) > 512 * 1024) throw new Error('lsp_document_limit')
     const extension = extname(path).slice(1)
     const languages = (Object.keys(servers) as Language[]).filter(
       (l) =>
+        this.allowed(root, l) &&
         (servers[l].extensions as readonly string[]).includes(extension) &&
         (l !== 'eslint' || projectEslint(root))
     )
     const opened: string[] = []
     for (const language of languages) {
+      if (!this.allowed(root, language)) continue
       const key = this.key(root, language)
       let slot = this.slots.get(key)
       if (!slot) {
@@ -296,6 +324,7 @@ export class LspService {
       if (slot.failed) throw new Error('lsp_repeated_crash: ' + language)
       this.touch(slot)
       await waitFor(slot.ready, signal)
+      if (!this.allowed(root, language)) throw new Error('untrusted_folder')
       if (slot.docs.size >= 64 && !slot.docs.has(path)) throw new Error('lsp_document_limit')
       const previous = slot.docs.get(path)
       const next = version ?? (previous?.version ?? 0) + 1
@@ -357,6 +386,7 @@ export class LspService {
     signal?: AbortSignal
   ) {
     const target = this.options.check(root, path)
+    await this.enforceTrust(root)
     if (![...this.slots.values()].some((s) => s.root === root && s.docs.has(path)))
       await this.open(root, path, undefined, undefined, signal)
     if (method === 'diagnostics') {
@@ -366,9 +396,21 @@ export class LspService {
     const slot = [...this.slots.values()].find(
       (s) => s.root === root && s.language !== 'eslint' && s.docs.has(path)
     )
-    if (!slot || slot.failed) throw new Error('lsp_unavailable')
+    if (!slot || slot.failed) {
+      const extension = extname(path).slice(1)
+      if (
+        [...projectCodeServers].some(
+          (l) =>
+            !this.allowed(root, l) &&
+            (servers[l].extensions as readonly string[]).includes(extension)
+        )
+      )
+        throw new Error('untrusted_folder')
+      throw new Error('lsp_unavailable')
+    }
     this.touch(slot)
     await waitFor(slot.ready, signal)
+    if (!this.allowed(root, slot.language)) throw new Error('untrusted_folder')
     const result = await slot.connection.request(
       'textDocument/' + (method === 'symbols' ? 'documentSymbol' : method),
       {
@@ -378,6 +420,7 @@ export class LspService {
       },
       signal
     )
+    if (!this.allowed(root, slot.language)) throw new Error('untrusted_folder')
     if (method === 'definition' || method === 'references') {
       const locations = []
       for (const item of (Array.isArray(result) ? result : result ? [result] : []).slice(0, 128)) {
@@ -421,6 +464,7 @@ export class LspService {
     return { symbols }
   }
   async refresh(root: string, skip = new Set<string>()) {
+    await this.enforceTrust(root)
     const paths = new Set(
       [...this.slots.values()].filter((s) => s.root === root).flatMap((s) => [...s.docs.keys()])
     )

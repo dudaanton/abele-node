@@ -19,7 +19,7 @@ export interface ProtocolVersion {
 
 export const NODE_PROTOCOL_VERSION: Readonly<ProtocolVersion> = Object.freeze({
   major: 0,
-  minor: 0,
+  minor: 1,
 })
 
 /** Until negotiation exists, only the exact experimental version is compatible. */

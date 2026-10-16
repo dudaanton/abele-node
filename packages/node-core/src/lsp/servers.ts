@@ -8,8 +8,9 @@ import {
   renameSync,
   rmSync,
   mkdtempSync,
+  realpathSync,
 } from 'node:fs'
-import { join, delimiter } from 'node:path'
+import { join, delimiter, isAbsolute } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
@@ -55,6 +56,17 @@ export const servers = {
   rust: { bin: 'rust-analyzer', packages: [], extensions: ['rs'] },
 } as const
 export type Language = keyof typeof servers
+/** These servers can load project plugins/configuration or invoke project-selected tools:
+ * tsserver plugins; ESLint config/plugins; Python interpreters; shell tooling;
+ * Go toolchains; Rust build scripts and procedural macros. Data-only servers stay available. */
+export const projectCodeServers: ReadonlySet<Language> = new Set([
+  'typescript',
+  'eslint',
+  'python',
+  'bash',
+  'go',
+  'rust',
+])
 export const popular = Object.keys(servers) as Language[]
 export function installPlan(languages: string[], state: string) {
   return [...new Set(languages)].map((raw) => {
@@ -84,9 +96,9 @@ export function installPlan(languages: string[], state: string) {
 }
 export function executable(name: string, path = process.env.PATH ?? '') {
   for (const dir of path.split(delimiter)) {
-    if (!dir) continue
-    const file = join(dir, name)
+    if (!isAbsolute(dir)) continue
     try {
+      const file = realpathSync(join(dir, name))
       accessSync(file, constants.X_OK)
       return file
     } catch {
@@ -110,12 +122,13 @@ export function projectEslint(root: string) {
   // Resolve only the project's installation, never a global fallback.
   return existsSync(join(root, 'node_modules', 'eslint', 'package.json'))
 }
-export async function status(state: string, root?: string) {
+export async function status(state: string, root?: string, trusted = false) {
   return Promise.all(
     popular.map(async (language) => {
       const server = discover(state, language)
+      const blocked = projectCodeServers.has(language) && !trusted
       let version: string | null = null
-      if (server) {
+      if (server && !blocked) {
         try {
           version = (await run(server, ['--version'], {}, 3000)).trim().slice(0, 256) || 'unknown'
         } catch {
@@ -127,6 +140,7 @@ export async function status(state: string, root?: string) {
         server,
         version,
         found: !!server,
+        ...(blocked && root ? { reason: 'untrusted_folder' as const } : {}),
         ...(language === 'eslint' && root
           ? {
               project_eslint: projectEslint(root)

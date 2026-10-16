@@ -26,6 +26,26 @@ export type DebuggerPrincipal =
     }
 export type DebuggerAction = DebuggerGrant['actions'][number]
 export class DebuggerPermissions {
+  private conversationMatches(state: DebuggerSnapshot, conversation: string) {
+    if (state.target.conversation_id !== null) return state.target.conversation_id === conversation
+    const current = this.core.resources.targets.currentTarget(conversation)
+    if (!current) return false
+    const target = current.target
+    const folder = target.kind === 'workspace' ? target.workspace_id : target.worktree_id
+    const root = this.core.resources.targets.pathForSession(conversation)
+    const project =
+      this.core.resources.targets.bound(conversation)?.project_id ??
+      (this.core.session(conversation).workspace_id
+        ? this.core.resources.workspaces.get(this.core.session(conversation).workspace_id!)
+            .project_id
+        : undefined)
+    return (
+      !!root &&
+      state.target.node_id === this.core.node_id &&
+      state.target.project_id === project &&
+      state.target.worktree_id === folder
+    )
+  }
   private readonly runs = new Map<string, () => boolean>()
   /** Host-only activity fence; queued proposals and physical dispatch consult it
    * through authorize, not just at the original bridge call. */
@@ -70,7 +90,7 @@ export class DebuggerPermissions {
     const state = this.core.debugger.snapshot(input.debug_session_id).snapshot
     if (
       state.incarnation !== input.incarnation ||
-      state.target.conversation_id !== input.conversation_id ||
+      !this.conversationMatches(state, input.conversation_id) ||
       state.target.workspace_id !== input.workspace_id ||
       state.target.target_id !== input.target_id
     )
@@ -197,7 +217,7 @@ export class DebuggerPermissions {
       g.target_id !== principal.target_id ||
       g.debug_session_id !== state.debug_session_id ||
       g.incarnation !== state.incarnation ||
-      g.conversation_id !== state.target.conversation_id ||
+      !this.conversationMatches(state, g.conversation_id) ||
       g.workspace_id !== state.target.workspace_id ||
       g.target_id !== state.target.target_id
     )

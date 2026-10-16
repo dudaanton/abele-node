@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
-import type { DebuggerProgram, DebuggerStartResult, DebuggerTarget } from '@abele/node-protocol'
+import type {
+  DebuggerProgram,
+  DebuggerStartResult,
+  DebuggerTarget,
+  ExecutionTarget,
+} from '@abele/node-protocol'
 import type { NodeCore } from '../index.js'
 import { DapDebuggerBackend } from './dap-backend.js'
 import type { DapSession } from './driver.js'
@@ -39,7 +44,8 @@ export interface LaunchedRun {
 
 type StartParams = {
   operation_id: string
-  conversation_id: string
+  conversation_id?: string
+  folder?: ExecutionTarget
   program: string
   argv: string[]
   sources: string[]
@@ -47,7 +53,8 @@ type StartParams = {
 
 type AttachParams = {
   operation_id: string
-  conversation_id: string
+  conversation_id?: string
+  folder?: ExecutionTarget
   pid: number
   port: number
   sources: string[]
@@ -68,11 +75,18 @@ function within(root: string, path: string | null) {
  * runs with the node's own Node, an empty environment and no shell; it waits on its first line. */
 export class DebuggerLaunches {
   private readonly runs = new Set<LaunchedRun>()
+  private readonly sessions = new Map<string, DapSession>()
+  private readonly sessionRuns = new Map<string, LaunchedRun>()
+  private readonly closing = new WeakMap<LaunchedRun, Promise<void>>()
   private readonly operations = new Map<string, Promise<DebuggerStartResult>>()
   constructor(
     private readonly core: NodeCore,
     private readonly profile: LaunchProfile
-  ) {}
+  ) {
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS debug_launches(debug_session_id TEXT PRIMARY KEY, body TEXT NOT NULL)'
+    )
+  }
 
   profiles() {
     return this.core.debugger.enabled ? this.profile.profiles() : []
@@ -80,12 +94,58 @@ export class DebuggerLaunches {
 
   /** A retried operation answers with the program it already started, never a second one. */
   start(owner: AuthorityContext, p: StartParams): Promise<DebuggerStartResult> {
-    return this.once(owner, p.operation_id, () => this.launch(p))
+    return this.once(owner, p.operation_id, () => this.remember('start', p))
   }
 
   /** Attaches to a running program: the same retry rule, a session under the same coordinator. */
   attach(owner: AuthorityContext, p: AttachParams): Promise<DebuggerStartResult> {
-    return this.once(owner, p.operation_id, () => this.attachTo(p))
+    return this.once(owner, p.operation_id, () => this.remember('attach', p))
+  }
+
+  private async remember(kind: 'start' | 'attach', params: StartParams | AttachParams) {
+    const result =
+      kind === 'start'
+        ? await this.launch(params as StartParams)
+        : await this.attachTo(params as AttachParams)
+    const target = this.core.debugger.snapshot(result.debug_session_id).snapshot.target
+    const folder: ExecutionTarget = target.workspace_id
+      ? { kind: 'workspace', workspace_id: target.workspace_id }
+      : { kind: 'worktree', worktree_id: target.worktree_id }
+    this.core.db
+      .prepare('INSERT OR REPLACE INTO debug_launches VALUES(?,?)')
+      .run(result.debug_session_id, JSON.stringify({ kind, params: { ...params, folder } }))
+    return result
+  }
+
+  /** A fresh adapter incarnation, using the retained recipe rather than a dead backend. */
+  restart(owner: AuthorityContext, p: { operation_id: string; debug_session_id: string }) {
+    return this.once(owner, p.operation_id, async () => {
+      const state = this.core.debugger.snapshot(p.debug_session_id).snapshot
+      if (!['terminated', 'detached', 'failed', 'connection-lost'].includes(state.lifecycle))
+        throw new ChannelError('debugger_session_active')
+      const row = this.core.db
+        .prepare('SELECT body FROM debug_launches WHERE debug_session_id=?')
+        .get(p.debug_session_id)
+      if (!row) throw new ChannelError('debugger_configuration_unavailable')
+      const recipe = JSON.parse(String(row.body))
+      const previous = this.sessionRuns.get(p.debug_session_id)
+      if (previous) await this.closeRun(previous)
+      const result = await this.remember(recipe.kind, recipe.params)
+      if (state.breakpoints.length) {
+        const next = this.core.debugger.snapshot(result.debug_session_id).snapshot
+        const requests = state.breakpoints.map(
+          ({ status, resolved_line, resolved_column, message, ...request }) => request
+        )
+        this.core.debugger.patchBreakpoints(
+          result.debug_session_id,
+          next.breakpoint_revision,
+          requests,
+          []
+        )
+        await this.sessions.get(result.debug_session_id)?.syncBreakpoints()
+      }
+      return result
+    })
   }
 
   private once(
@@ -139,9 +199,31 @@ export class DebuggerLaunches {
     return { root, place }
   }
 
+  private async ownerFolder(p: { conversation_id?: string; folder?: ExecutionTarget }) {
+    if (!p.folder) {
+      if (!p.conversation_id) throw new ChannelError('workspace_required')
+      return this.chatFolder(p.conversation_id)
+    }
+    const binding = await this.core.resources.targets.resolve(p.folder)
+    this.core.resources.targets.check(binding)
+    const place = {
+      node_id: this.core.node_id,
+      project_id: binding.project_id,
+      workspace_id: p.folder.kind === 'workspace' ? p.folder.workspace_id : null,
+      worktree_id: p.folder.kind === 'worktree' ? p.folder.worktree_id : p.folder.workspace_id,
+      conversation_id: p.conversation_id ?? null,
+    }
+    if (p.conversation_id) {
+      const chat = this.chatFolder(p.conversation_id)
+      if (chat.root !== binding.path || chat.place.worktree_id !== place.worktree_id)
+        throw new ChannelError('debugger_owner_mismatch')
+    }
+    return { root: binding.path, place }
+  }
+
   private async launch(p: StartParams): Promise<DebuggerStartResult> {
     if (!this.profile.profiles().length) throw new ChannelError('debugger_profile_unavailable')
-    const { root, place } = this.chatFolder(p.conversation_id)
+    const { root, place } = await this.ownerFolder(p)
     const program = this.inside(root, p.program)
     const sources = new Map<string, string>([['s1', program]])
     const asked = p.sources.map((path) => this.inside(root, path))
@@ -171,8 +253,12 @@ export class DebuggerLaunches {
 
   /** The Node.js programs waiting for a debugger on this machine, as seen from a chat: which of
    * them run from its folder, and which registered project folder each of the others is in. */
-  async programs(conversation_id: string): Promise<{ programs: DebuggerProgram[] }> {
-    const root = this.core.resources.targets.pathForSession(conversation_id) ?? null
+  async programs(
+    owner: string | { conversation_id?: string; folder?: ExecutionTarget }
+  ): Promise<{ programs: DebuggerProgram[] }> {
+    const { root } = await this.ownerFolder(
+      typeof owner === 'string' ? { conversation_id: owner } : owner
+    )
     const projects = this.core.db
       .prepare('SELECT project_id, root_path FROM projects WHERE registered=1')
       .all()
@@ -193,7 +279,7 @@ export class DebuggerLaunches {
   private async attachTo(p: AttachParams): Promise<DebuggerStartResult> {
     if (!this.profile.attach || !this.profile.profiles().length)
       throw new ChannelError('debugger_profile_unavailable')
-    const { root, place } = this.chatFolder(p.conversation_id)
+    const { root, place } = await this.ownerFolder(p)
     // Only what is listening on loopback right now, as the OS says, under this very process: a
     // port named by the caller alone is never trusted to be the program it says.
     const program = (await inspectorPrograms()).find((x) => x.pid === p.pid && x.port === p.port)
@@ -241,6 +327,9 @@ export class DebuggerLaunches {
     this.runs.add(run)
     const unregister: (() => void)[] = []
     const off = run.onSession((session) => {
+      this.sessions.set(session.id, session)
+      this.sessionRuns.set(session.id, run)
+      unregister.push(() => this.sessions.delete(session.id))
       unregister.push(
         this.core.debuggerControl.registerBackend(
           session.id,
@@ -258,8 +347,9 @@ export class DebuggerLaunches {
       ended = true
       off()
       for (const u of unregister.splice(0)) u()
-      this.runs.delete(run)
-      void run.close().catch((error) => console.debug('[debugger] Run cleanup failed', error))
+      void this.closeRun(run).catch((error) =>
+        console.debug('[debugger] Run cleanup failed', error)
+      )
     }
     // The run ends with its root connection: the program exited, was stopped or the adapter went.
     run.root.dap.onClose(end)
@@ -301,9 +391,22 @@ export class DebuggerLaunches {
     return this.core.debugger.subscribe(session.id, check)
   }
 
+  private closeRun(run: LaunchedRun): Promise<void> {
+    const known = this.closing.get(run)
+    if (known) return known
+    // Publish before invoking close: closing the root can synchronously reenter end().
+    const work = Promise.resolve()
+      .then(() => run.close())
+      .then(() => {
+        this.runs.delete(run)
+        for (const [id, owner] of this.sessionRuns) if (owner === run) this.sessionRuns.delete(id)
+      })
+    this.closing.set(run, work)
+    return work
+  }
+
   async close() {
-    const outcomes = await Promise.allSettled([...this.runs].map((run) => run.close()))
-    this.runs.clear()
+    const outcomes = await Promise.allSettled([...this.runs].map((run) => this.closeRun(run)))
     const failure = outcomes.find((o) => o.status === 'rejected')
     if (failure?.status === 'rejected') throw failure.reason
   }

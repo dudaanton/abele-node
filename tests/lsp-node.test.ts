@@ -1,6 +1,8 @@
 import { it, expect } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, symlinkSync } from 'node:fs'
 import { resolve, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { ProjectSchema } from '@abele/node-protocol'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { GitRunner } from '../packages/node-core/src/git.js'
 import { LspTools } from '../packages/node-core/src/lsp/tools.js'
@@ -40,6 +42,36 @@ it('dispatches typed calls through the real confinement and journals agent diagn
       .run(workspace_id)
     const session = (await rpc('session.create', { workspace_id })) as any
     const client = new LspClient(rpc)
+    const untrusted = await client.status({ workspace_id })
+    expect(untrusted.find((row) => row.language === 'typescript')).toMatchObject({
+      found: true,
+      reason: 'untrusted_folder',
+    })
+    expect(await client.open({ workspace_id }, 'a.ts')).toEqual({ servers: [] })
+    expect(await client.diagnostics({ workspace_id }, 'a.ts')).toEqual([])
+    await expect(
+      client.definition({ workspace_id }, 'a.ts', { line: 0, character: 1 })
+    ).rejects.toThrow('untrusted_folder')
+    core.resources.lsp.observe(session.session_id, 'pi.tool.call', {
+      name: 'write',
+      input: { path: 'a.ts' },
+    })
+    await core.resources.lsp.afterEdit(session.session_id)
+    expect((core.resources.lsp.service as any).slots.size).toBe(0)
+    await rpc('project.trust', { project_id: project.project_id, trust: 'trusted' })
+    const other = join(dir, 'other')
+    mkdirSync(other)
+    writeFileSync(join(other, 'a.ts'), '')
+    const otherProject = (await rpc('project.register', { path: other, trust: 'untrusted' })) as any
+    const [otherWorkspace] = (await rpc('workspace.list', {
+      project_id: otherProject.project_id,
+    })) as any[]
+    expect(await client.open({ workspace_id: otherWorkspace.workspace_id }, 'a.ts')).toEqual({
+      servers: [],
+    })
+    expect(
+      (await client.status({ workspace_id })).find((row) => row.language === 'typescript')
+    ).not.toHaveProperty('reason')
     const locations = await client.definition({ workspace_id }, 'a.ts', { line: 0, character: 1 })
     expect(locations.map((l) => l.path)).toEqual(['a.ts'])
     await expect(client.open({ workspace_id }, '../secret.ts')).rejects.toThrow()
@@ -69,6 +101,27 @@ it('dispatches typed calls through the real confinement and journals agent diagn
     abort.abort()
     await expect(pending).rejects.toThrow('cancelled')
     bridge.close()
+    const connection = [...(core.resources.lsp.service as any).slots.values()][0].connection
+    await rpc('project.trust', { project_id: project.project_id, trust: 'untrusted' })
+    expect((core.resources.lsp.service as any).slots.size).toBe(0)
+    connection.onNotification('textDocument/publishDiagnostics', {
+      uri: pathToFileURL(join(root, 'a.ts')).href,
+      diagnostics: [
+        {
+          message: 'late untrusted result',
+          range: {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 1 },
+          },
+        },
+      ],
+    })
+    expect(await client.diagnostics({ workspace_id }, 'a.ts')).toEqual([])
+    const registered = core
+      .read('catalog', 0)
+      .filter((e) => e.type === 'project.registered')
+      .at(-1)
+    expect(ProjectSchema.parse(registered?.data).trust).toBe('untrusted')
   } finally {
     await core.resources.stop()
     core.close()

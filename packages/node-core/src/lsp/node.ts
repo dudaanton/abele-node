@@ -9,7 +9,7 @@ import { install, status, servers } from './servers.js'
 
 export class NodeLsp {
   readonly service: LspService
-  private roots = new Map<string, { id: string; repository: boolean }>()
+  private roots = new Map<string, { id: string; repository: boolean; project: string }>()
   private requests = new Map<string, AbortController>()
   private stopped = false
   private edited = new Map<string, Set<string>>()
@@ -18,6 +18,7 @@ export class NodeLsp {
     this.service = new LspService(r.core.stateDir, {
       idleMs: Number(process.env.ABELE_LSP_IDLE_MS) || 180000,
       memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || 384,
+      trusted: (root) => this.trusted(root),
       read: (root, path) => {
         const ref = this.roots.get(root)
         if (!ref) throw new ChannelError('unsafe_path')
@@ -94,8 +95,30 @@ export class NodeLsp {
   }
   root(id: string, repository = false) {
     const root = this.r.files.root(id, repository)
-    this.roots.set(root, { id, repository })
+    const project = repository
+      ? this.r.repository.executionIdentity(id).project_id
+      : this.r.workspaces.get(id).project_id
+    this.roots.set(root, { id, repository, project })
     return root
+  }
+  private trusted(root: string) {
+    try {
+      const ref = this.roots.get(root)
+      return (
+        !!ref &&
+        this.r.files.root(ref.id, ref.repository) === root &&
+        this.r.projects.get(ref.project).trust === 'trusted'
+      )
+    } catch {
+      return false
+    }
+  }
+  async enforceTrust(project: string) {
+    await Promise.all(
+      [...this.roots.entries()]
+        .filter(([, ref]) => ref.project === project)
+        .map(([root]) => this.service.enforceTrust(root))
+    )
   }
   sessionRoot(session: string) {
     const binding = this.r.targets.bound(session)
@@ -150,7 +173,8 @@ export class NodeLsp {
       : p.worktree_id
         ? this.root(p.worktree_id, true)
         : undefined
-    if (method === 'lsp.v1.status') return status(this.r.core.stateDir, root)
+    if (method === 'lsp.v1.status')
+      return status(this.r.core.stateDir, root, !!root && this.trusted(root))
     if (!root) throw new ChannelError('workspace_required')
     this.r.core.authority.check(actor, 'resource', String(p.workspace_id ?? p.worktree_id))
     if (method === 'lsp.v1.open') return this.service.open(root, p.path, p.text, p.version, signal)

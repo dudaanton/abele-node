@@ -59,7 +59,7 @@ describe('stage 0 contracts', () => {
     expect(isCompatibleVersion(NODE_PROTOCOL_VERSION)).toBe(true)
     for (const version of [
       { major: 1, minor: 0 },
-      { major: 0, minor: 1 },
+      { major: 0, minor: NODE_PROTOCOL_VERSION.minor + 1 },
       { major: 0, minor: -1 },
       { major: 0, minor: NaN },
       null,

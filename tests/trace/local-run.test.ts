@@ -142,6 +142,26 @@ const valueOf = async (s: any, runId: string, step: string, name: string) =>
     .join('\n')
 
 describe.skipIf(!enabled)('real programs under the pinned js-debug', () => {
+  it('records a changing function argument at repeated timer hits', async () => {
+    const s = await setup({
+      'inspect.js': [
+        'function inspectItem(n) {',
+        '  return n',
+        '}',
+        'let n = 0',
+        'const timer = setInterval(() => {',
+        '  inspectItem(n++)',
+        '  if (n === 7) clearInterval(timer)',
+        '}, 200)',
+      ].join('\n'),
+    })
+    const { run, runId } = await record(s, 'inspect.js', 'inspect.js', 2, ['n'])
+    const probes = run.steps.filter((x: any) => x.kind === 'probe')
+    expect(probes).toHaveLength(7)
+    const values = []
+    for (const p of probes) values.push(await valueOf(s, runId, p.id, 'n'))
+    expect(values).toEqual(['0', '1', '2', '3', '4', '5', '6'])
+  }, 60000)
   it('records what a point takes at each hit of a JavaScript program', async () => {
     const s = await setup({
       'src/total.js': [

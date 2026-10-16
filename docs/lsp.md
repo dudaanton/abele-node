@@ -20,6 +20,25 @@ ESLint status also checks the current project: its own `node_modules/eslint` and
 are required. Installing the ESLint server does not install ESLint into a project or change
 its configuration. Missing project ESLint does not prevent TypeScript features.
 
+Language servers that can execute project code require the existing project trust to be
+`trusted`. This covers ESLint (configuration and plugins), TypeScript/JavaScript (tsserver
+plugins), Python (project-selected interpreters), Bash (external shell tools), Go (toolchains),
+and Rust (build scripts and procedural macros). JSON, CSS, HTML, and YAML servers only consume
+project data and remain available in untrusted folders.
+
+The owner grants or revokes trust with the existing journaled protocol method
+`project.trust({ project_id, trust: 'trusted' | 'untrusted' })`; the plugin uses
+`NodePathClient.trust` (`nodePath.trust`). Workspaces and worktrees use their owning project's
+trust. No trust is inferred from opening a folder, installing a server, or requesting
+diagnostics. Revocation stops active gated servers and clears their diagnostics.
+
+Root-scoped `lsp.v1.status` includes `reason: 'untrusted_folder'` for gated servers when trust
+is absent; `found` still reports installation availability. Blocked servers are not started,
+even for version probes (`version` is null). Opens return no gated servers, diagnostics are
+empty for those servers, and language queries report `untrusted_folder`. The same rule covers
+agent tools, turn refreshes, diagnostic pushes, and crash restarts. Existing owners must have
+explicitly marked the project trusted for these servers to run.
+
 Private npm installs use `--ignore-scripts`, exact versions, and separate prefixes inside
 the node state folder. Pins: typescript-language-server 4.3.4, TypeScript 5.9.3, pyright
 1.1.396, vscode-langservers-extracted 4.10.0 (ESLint/JSON/CSS/HTML), yaml-language-server

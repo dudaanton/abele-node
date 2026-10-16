@@ -1,4 +1,12 @@
 import { z } from 'zod'
+import { ExecutionTargetSchema } from './turn.js'
+
+export const DebuggerOwnerShape = {
+  conversation_id: z.string().min(1).max(128).optional(),
+  folder: ExecutionTargetSchema.optional(),
+}
+export const hasDebuggerOwner = (p: { conversation_id?: string; folder?: unknown }) =>
+  !!(p.conversation_id || p.folder)
 
 /** Opt-in infrastructure contract, not a publicly enabled control API. */
 export const DEBUGGER_VERSION = 'debugger.v1' as const
@@ -37,7 +45,7 @@ export const DebuggerTargetSchema = z
     project_id: id,
     workspace_id: id.nullable(),
     worktree_id: id,
-    conversation_id: id,
+    conversation_id: id.nullable(),
     target_id: id,
     adapter_profile: id,
     adapter_version: id,
@@ -349,8 +357,9 @@ export const DebuggerHistoryResultSchema = z
 export const DebuggerMethodSchemas = {
   'debugger.v1.profiles': z.object({}).strict(),
   'debugger.v1.sessions': z
-    .object({ conversation_id: id, limit: z.number().int().min(1).max(128).default(128) })
-    .strict(),
+    .object({ ...DebuggerOwnerShape, limit: z.number().int().min(1).max(128).default(128) })
+    .strict()
+    .refine(hasDebuggerOwner, 'debugger owner required'),
   'debugger.v1.create': z.object({ operation_id: id, target: DebuggerTargetSchema }).strict(),
   'debugger.v1.launch': z.object({ ...effect, launch_configuration_id: id }).strict(),
   'debugger.v1.attach': z.object({ ...effect, target_id: id }).strict(),

@@ -469,8 +469,8 @@ export class ExecutionTargetService {
         return session
       })
     }
-    if (method === 'project.trust')
-      return core.commitOperation(actor, method, p, operation, () => {
+    if (method === 'project.trust') {
+      const result = core.commitOperation(actor, method, p, operation, () => {
         const project = this.r.projects.get(String(p.project_id))
         if (this.projectBusy(project.project_id)) throw new ChannelError('resource_busy')
         const updated = ProjectSchema.parse({
@@ -493,6 +493,9 @@ export class ExecutionTargetService {
         )
         return updated
       })
+      await this.r.lsp.enforceTrust(String(p.project_id))
+      return result
+    }
     if (method === 'project.execution') {
       const project = this.r.projects.get(String(p.project_id)),
         target = p.target as ExecutionTarget

@@ -1,5 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { runInNewContext } from 'node:vm'
 import { join } from 'node:path'
 import { NodeCore } from '../../packages/node-core/src/index.js'
 import { describe, expect, it, vi } from 'vitest'
@@ -39,9 +40,12 @@ function stopped(w: ReturnType<typeof wire>, thread = 1) {
     body: { threadId: thread, allThreadsStopped: true, reason: 'breakpoint' },
   })
 }
-async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0]) {
+async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard = false) {
   const p = f.session.start('attach', { type: 'pwa-node', port: 12345, address: '127.0.0.1' })
-  f.w.reply(f.w.messages[0], { supportsConfigurationDoneRequest: true })
+  f.w.reply(f.w.messages[0], {
+    supportsConfigurationDoneRequest: true,
+    supportsClipboardContext: clipboard,
+  })
   f.w.send({ type: 'event', event: 'initialized' })
   await Promise.resolve()
   await Promise.resolve()
@@ -56,6 +60,35 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0]) {
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('records in repl even when clipboard is advertised, preserving frame, chunks and cleanup', async () =>
+    fixture(async (f) => {
+      await ready(f, true)
+      const sandbox = { n: 'x'.repeat(200000), Buffer }
+      const pending = f.session.recordStop(1, [{ name: 'argument', expression: 'n' }])
+      const evaluations: any[] = []
+      let done = false
+      void pending.then(() => {
+        done = true
+      })
+      for (let i = 0; i < 200 && !done; i++) {
+        for (const m of f.w.messages.filter((m) => !m.replied)) {
+          m.replied = true
+          if (m.command === 'stackTrace')
+            f.w.reply(m, { stackFrames: [{ id: 42, name: 'inspectItem', line: 2 }] })
+          else if (m.command === 'evaluate') {
+            evaluations.push(m.arguments)
+            if (m.arguments.context !== 'repl') f.w.reply(m, {}, false)
+            else f.w.reply(m, { result: String(runInNewContext(m.arguments.expression, sandbox)) })
+          }
+        }
+        await Promise.resolve()
+      }
+      const result = await pending
+      expect(result.values).toEqual([{ name: 'argument', text: sandbox.n, string: true }])
+      expect(evaluations.length).toBeGreaterThan(3)
+      expect(evaluations.every((a) => a.frameId === 42 && a.context === 'repl')).toBe(true)
+      expect((sandbox as any).__abeleTrace).toEqual({})
+    }))
   it('waits for initialized after attach and before configuring, even after a successful attach reply', async () =>
     fixture(async (f) => {
       const pending = f.session.start('attach', { type: 'pwa-node', port: 12345 })
