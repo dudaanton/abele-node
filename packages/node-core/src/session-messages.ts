@@ -23,6 +23,24 @@ const PERMISSIVENESS: Record<string, number> = {
 }
 const permissiveness = (mode: string) => PERMISSIVENESS[mode] ?? 5
 
+/** Whether a message from one session may run in another now, or the code that refuses it. Both
+ * when it is sent and when it is delivered: either session's mode may have changed in between. */
+export function messageRefusal(live: LiveSessions, from: string, to: string) {
+  try {
+    if (!live.effective(to).messaging) return 'messaging_off'
+    // A session cannot start work that asks fewer questions than it would have to itself: the
+    // receiver counts as the most it may run without asking, the sender as the least.
+    if (
+      Math.max(...live.modes(to).map(permissiveness)) >
+      Math.min(...live.modes(from).map(permissiveness))
+    )
+      return 'target_more_permissive'
+    return null
+  } catch {
+    return 'not_found'
+  }
+}
+
 /** What the receiving process reads: the message, and who wrote it. */
 export function messageContent(body: { text: string; from_session?: From }) {
   if (!body.from_session) return body.text
@@ -166,13 +184,8 @@ export class SessionMessageTools implements DebuggerToolBridge {
     if (session_id === this.sender.session_id) return { code: 'invalid_target' }
     const target = this.owned().find((s) => s.session_id === session_id)
     if (!target) return { code: 'not_found' }
-    if (!this.live.effective(session_id).messaging) return { code: 'messaging_off' }
-    // A session cannot start work that asks fewer questions than it would have to itself.
-    if (
-      permissiveness(this.live.effective(session_id).permission_mode) >
-      permissiveness(this.live.effective(this.sender.session_id).permission_mode)
-    )
-      return { code: 'target_more_permissive' }
+    const refusal = messageRefusal(this.live, this.sender.session_id, session_id)
+    if (refusal) return { code: refusal }
     const from: From = {
       session_id: this.sender.session_id,
       title: this.core.session(this.sender.session_id).title,

@@ -201,6 +201,14 @@ const turn = async (content, uuid) => {
   echo(content, uuid)
   begin()
   if (text === 'crash') process.exit(3)
+  // The CLI changes its own mode, as leaving plan mode does once the owner approves the plan.
+  const own = /^mode (\w+)$/.exec(text)
+  if (own) {
+    mode = own[1]
+    emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode })
+    say('mode-' + turns, 'mode ' + mode)
+    return result('mode ' + mode)
+  }
   if (text === 'whoami') {
     const who = JSON.stringify({
       model,

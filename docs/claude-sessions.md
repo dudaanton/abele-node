@@ -172,6 +172,13 @@ other tools):
   sender's: `plan`, `dontAsk` < `manual` < `acceptEdits` < `auto` < `bypassPermissions`),
   or an admission code. The text cannot close or open a `session-message` block.
 
+A session's mode for this rule is both the one the owner set and, while it differs, the one its
+process reports (the CLI changes its own, as when it leaves plan mode): the receiver counts with
+the more permissive of the two, the sender with the less. The rule and the receiver's
+`messaging` are checked again when a waiting message is delivered; a message that no longer
+passes fails with `session.error { input_id, code }` in the receiver's journal and never reaches
+its process.
+
 The receiver's journal has `input.accepted { input_id, text, from_session: { session_id,
 title } }`; the process reads the text inside a `<session-message from_session_id=…
 from_title=…>` block with a note that it comes from another session, not from the owner.

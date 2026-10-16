@@ -20,7 +20,7 @@ import type { ProviderAdapter } from './providers.js'
 import { updateInProgress, tryRunAdmission } from './update-lock.js'
 import { DebuggerRunBinding } from './debugger/run.js'
 import { RunTargetTools } from './run-target-tools.js'
-import { SessionMessageTools, messageContent } from './session-messages.js'
+import { SessionMessageTools, messageContent, messageRefusal } from './session-messages.js'
 
 type Input = Record<string, string | number | null>
 type Task = { task_id: string; task_type: string | null; description: string | null }
@@ -148,6 +148,13 @@ export class LiveSessions {
       messaging: true,
       ...(session.settings ?? {}),
     } as Effective
+  }
+  /** The permission modes a session is under: the owner's setting and, while it differs, the one
+   * its process reports (the CLI changes its own, as when it leaves plan mode). */
+  modes(session_id: string) {
+    const set = this.effective(session_id).permission_mode
+    const running = this.slots.get(session_id)?.settings.permission_mode
+    return running && running !== set ? [set, running] : [set]
   }
   /** Inside the configure transaction: validate against what this node can launch. */
   validate(session_id: string, settings: SessionSettings) {
@@ -547,6 +554,7 @@ export class LiveSessions {
     const body = JSON.parse(String(input.body)) as {
       text: string
       expected_target?: ExpectedExecutionTarget
+      from_session?: { session_id: string }
     }
     const input_id = String(input.input_id)
     const ready = this.core.transaction(() => {
@@ -556,6 +564,10 @@ export class LiveSessions {
       if (!['accepted', 'queued'].includes(String(current.state))) return false
       try {
         this.core.checkExecution(String(input.principal_id), slot.session_id, body.expected_target)
+        // Another session's message waited: what allowed it then must still hold now.
+        const refusal =
+          body.from_session && messageRefusal(this, body.from_session.session_id, slot.session_id)
+        if (refusal) throw new ChannelError(refusal)
       } catch (error) {
         this.core.transition(current, 'failed')
         this.core.append(slot.session_id, 'session.error', actor, {
@@ -929,6 +941,8 @@ export class LiveSessions {
           return
         }
         case 'claude.status': {
+          if (typeof d.permission_mode === 'string')
+            slot.settings = { ...slot.settings, permission_mode: d.permission_mode }
           if (d.status === 'compacting' && !slot.compacting) {
             slot.compacting = true
             this.core.append(session_id, 'compaction.started', actor, { run_id })

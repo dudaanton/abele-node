@@ -169,6 +169,27 @@ it('removes credentials and token parameters from every git message it returns o
   expect(stripCredentials('To https://u:it\'s<"secret>@example.com/r')).toBe(
     'To https://example.com/r'
   )
+  // Git reads a password up to the last `@` before the path, `?` and `#` included.
+  expect(stripCredentials("unable to access 'https://u:p?ss@example.com/r/'")).toBe(
+    "unable to access 'https://example.com/r/'"
+  )
+  expect(stripCredentials('To https://u:p#ss@example.com/r')).toBe('To https://example.com/r')
+  // A URL glued to the word before it is still a URL.
+  expect(stripCredentials('url_https://u:secret@example.com/r 2https://u:secret@x.org/r')).toBe(
+    'url_https://example.com/r 2https://x.org/r'
+  )
+  expect(
+    stripCredentials("'https://u:p://ss@x.org/r' 'https://x.org/r?t=1','ssh://y.org/s#t'")
+  ).toBe("'https://x.org/r' 'https://x.org/r','ssh://y.org/s'")
+  // With credentials anywhere in the word, all of it up to them goes.
+  expect(stripCredentials("'https://x.org/r','ssh://c:d@y.org/s'")).toBe("'https://y.org/s'")
+  // Megabytes from a remote take one pass: a pattern that backtracks would hold the node for minutes.
+  const started = Date.now()
+  expect(stripCredentials('a'.repeat(1 << 20) + ' x.'.repeat(1 << 18))).toHaveLength(
+    (1 << 20) + 3 * (1 << 18)
+  )
+  expect(stripCredentials('https://' + 'a1'.repeat(1 << 19) + '/://x')).toHaveLength((1 << 20) + 13)
+  expect(Date.now() - started).toBeLessThan(2000)
   expect(
     stripCredentials(
       "unable to access 'https://example.com/r.git?access_token=abc&x=1/': failed\n" +

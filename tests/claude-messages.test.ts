@@ -150,3 +150,42 @@ it('does not let a session that asks first start work in one that never asks', a
   const back = await call(s, free, 'node_session_send', { session_id: careful, text: 'fine' })
   await until(() => s.input(back.input_id).state === 'completed')
 })
+
+it('checks the permission rule again when a waiting message is delivered', async () => {
+  const s = await setup({ allowBypass: true }, { maxLive: 1 })
+  const careful = await s.session('Careful'),
+    later = await s.session('Later')
+  // A background task keeps the only process slot, so the message waits for its receiver.
+  const hold = s.send(careful, 'background 1500 hold')
+  await until(() => s.input(hold).state === 'completed')
+  const sent = await call(s, careful, 'node_session_send', { session_id: later, text: 'go' })
+  expect(sent).toMatchObject({ state: 'queued' })
+  // Meanwhile the owner lets the receiver run everything without asking.
+  s.request('session.configure', {
+    session_id: later,
+    settings: { permission_mode: 'bypassPermissions' },
+  })
+  await until(() => s.input(sent.input_id).state === 'failed')
+  expect(s.events(later, 'session.error').at(-1)!.data).toMatchObject({
+    input_id: sent.input_id,
+    code: 'target_more_permissive',
+  })
+  expect(s.replies(later).join('\n')).not.toContain('go')
+})
+
+it('counts the mode a receiving process switched to by itself', async () => {
+  const s = await setup()
+  const careful = await s.session('Careful'),
+    planner = await s.session('Planner', { permission_mode: 'plan' })
+  const left = s.send(planner, 'mode acceptEdits')
+  await until(() => s.input(left).state === 'completed')
+  await until(
+    () =>
+      s.request('session.state', { session_id: planner }).process_settings?.permission_mode ===
+      'acceptEdits'
+  )
+  expect(await call(s, careful, 'node_session_send', { session_id: planner, text: 'x' })).toEqual({
+    code: 'target_more_permissive',
+  })
+  expect(s.events(planner, 'input.accepted')).toHaveLength(1)
+})

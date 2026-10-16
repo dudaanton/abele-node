@@ -10,11 +10,17 @@ export interface OwnerGitResult {
 }
 /** Remove user/password, query and fragment (token parameters) from every URL a git message may quote. */
 export function stripCredentials(text: string) {
-  // Userinfo runs to the last `@` before the path, whatever characters a password holds.
-  return text.replace(
-    /\b([a-z][a-z0-9+.-]*:\/\/)(?:[^\s/?#]*@)?([^\s'"<>]*)/gi,
-    (_, scheme: string, rest: string) => scheme + rest.replace(/[?#].*$/, '')
-  )
+  // One pass over words, never a pattern that backtracks: git output may hold megabytes from the
+  // remote. Userinfo runs to the last `@` of the word, whatever characters a password holds (git
+  // takes `?`, `#` and even `://` into it); a second URL in the same word may lose its start too.
+  return text.replace(/\S+/g, (word) => {
+    const at = word.indexOf('://')
+    if (at < 0) return word
+    const rest = word.slice(at + 3)
+    return (
+      word.slice(0, at + 3) + rest.slice(rest.lastIndexOf('@') + 1).replace(/[?#][^'"<>]*/g, '')
+    )
+  })
 }
 const tail = (text: string, bytes = 4000) => {
   const clean = stripCredentials(text)
