@@ -9,7 +9,8 @@ import {
   rmSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
+import { type Progress, progressDue } from './update-progress.js'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
 import { acquireUpdateLock } from '@abele/node-core'
@@ -18,9 +19,14 @@ import { recoverServiceTransition } from './service.js'
 type Options = { version?: string; check: boolean; force: boolean }
 type ActiveRun = { run_id: string; session_id: string }
 export type UpdateReport = {
+  stage?: string
+  bytes?: number
+  total?: number | null
+  elapsed?: number
   command: 'update'
   status:
     | 'checking'
+    | 'progress'
     | 'available'
     | 'paused'
     | 'warning'
@@ -129,12 +135,16 @@ function reason(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   return cause instanceof Error && cause.message ? `${message} (${cause.message})` : message
 }
-async function download(value: string, interrupted?: AbortSignal): Promise<Buffer> {
+async function download(
+  value: string,
+  interrupted?: AbortSignal,
+  progress?: (p: Progress) => void
+): Promise<Buffer> {
   const started = Date.now()
   const backoff = Number(process.env.ABELE_UPDATE_RETRY_DELAY_MS ?? 1000)
   for (let attempt = 1; ; attempt++) {
     try {
-      return await downloadOnce(value, interrupted)
+      return await downloadOnce(value, interrupted, progress)
     } catch (error) {
       if (interrupted?.aborted) throw interrupted.reason ?? error
       if (!(error instanceof TransientDownloadError)) throw error
@@ -149,6 +159,9 @@ async function download(value: string, interrupted?: AbortSignal): Promise<Buffe
           }. The download server may be temporarily unavailable; try again in a few minutes.`
         )
       try {
+        progress?.({
+          stage: `Waiting ${Math.round(wait / 1000)} s before download retry ${attempt + 1}/${RETRY_ATTEMPTS} (90 s retry budget)`,
+        })
         await sleep(wait, undefined, interrupted ? { signal: interrupted } : undefined)
       } catch (abort) {
         throw interrupted?.reason ?? abort
@@ -156,7 +169,11 @@ async function download(value: string, interrupted?: AbortSignal): Promise<Buffe
     }
   }
 }
-async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<Buffer> {
+async function downloadOnce(
+  value: string,
+  interrupted?: AbortSignal,
+  progress?: (p: Progress) => void
+): Promise<Buffer> {
   let url = endpoint(value)
   const timeout = AbortSignal.timeout(30000)
   const signal = interrupted ? AbortSignal.any([timeout, interrupted]) : timeout
@@ -171,7 +188,7 @@ async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<B
       response = await fetch(url, {
         signal,
         redirect: 'manual',
-        headers: { 'User-Agent': 'abele-node-update' },
+        headers: { 'User-Agent': 'abele-node-update', 'Accept-Encoding': 'identity' },
       })
     } catch (error) {
       throw network(error)
@@ -194,6 +211,21 @@ async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<B
     if (!reader) throw new Error(`Empty update download: ${url}`)
     const chunks: Buffer[] = []
     let length = 0
+    const started = Date.now()
+    const total = Number(response.headers.get('content-length')) || null
+    let previousBytes = 0,
+      previousTime = started
+    const emit = () => {
+      progress?.({
+        stage: 'Downloading metadata (30 s request timeout)',
+        bytes: length,
+        total,
+        elapsed: (Date.now() - started) / 1000,
+      })
+      previousBytes = length
+      previousTime = Date.now()
+    }
+    const heartbeat = setInterval(emit, 5000)
     try {
       for (;;) {
         let read: Awaited<ReturnType<typeof reader.read>>
@@ -202,12 +234,17 @@ async function downloadOnce(value: string, interrupted?: AbortSignal): Promise<B
         } catch (error) {
           throw network(error)
         }
-        if (read.done) return Buffer.concat(chunks)
+        if (read.done) {
+          emit()
+          return Buffer.concat(chunks)
+        }
         length += read.value.length
         if (length > 4 * 1024 * 1024) throw new Error('Update metadata/installer exceeds 4 MiB.')
         chunks.push(Buffer.from(read.value))
+        if (progressDue(length, total, Date.now(), previousBytes, previousTime)) emit()
       }
     } finally {
+      clearInterval(heartbeat)
       await reader.cancel().catch(() => {})
     }
   }
@@ -283,12 +320,34 @@ export async function update(
     next_step:
       'Inspect the error and selected release; run abele-node status and abele-node doctor before retrying.',
   }
+  let lastProgress = Date.now()
+  let stageStarted = lastProgress
+  let previousStage: string | undefined
+  const emit = (value: UpdateReport) => {
+    lastProgress = Date.now()
+    if (report.stage !== previousStage) {
+      previousStage = report.stage
+      stageStarted = lastProgress
+    }
+    progress?.(value)
+  }
+  const heartbeat = setInterval(() => {
+    if (Date.now() - lastProgress >= 5000) {
+      emit({
+        ...report,
+        status: 'progress',
+        stage: `Waiting: ${report.stage ?? 'preparing update'} (${Math.round((Date.now() - stageStarted) / 1000)} s elapsed)`,
+      })
+    }
+  }, 250)
   try {
-    report.exit_code = await performUpdate(runtime, args, report, progress)
+    report.exit_code = await performUpdate(runtime, args, report, emit)
   } catch (error) {
     report.status = 'failed'
-    report.error = error instanceof Error ? error.message : String(error)
+    report.error = `${report.stage ?? 'Preparing update'}: ${error instanceof Error ? error.message : String(error)} State and provider credentials retained; inspect installer rollback diagnostics before retrying.`
     report.exit_code = 1
+  } finally {
+    clearInterval(heartbeat)
   }
   return report
 }
@@ -303,6 +362,13 @@ async function performUpdate(
   report.force = options.force
   report.target_kind = options.version ? 'pinned' : 'latest'
   const notify = (status: UpdateReport['status']) => progress?.({ ...report, status })
+  const event = (p: Progress) => {
+    report.stage = p.stage
+    progress?.({ ...report, status: 'progress', ...p })
+  }
+  const stage = (name: string) => event({ stage: name })
+  const fetchProgress = (p: Progress) => progress?.({ ...report, status: 'progress', ...p })
+  stage('Preparing update')
   recoverServiceTransition(runtime)
   const root = dirname(runtime)
   if (!existsSync(join(root, '.installer-owned'))) {
@@ -343,7 +409,10 @@ async function performUpdate(
     : api
   if (options.version && releaseUrl === api)
     throw new Error('ABELE_INSTALL_API_URL must end in /latest for pinned updates.')
-  const release = JSON.parse((await download(releaseUrl)).toString('utf8')) as {
+  stage('Checking for a release (30 s request timeout)')
+  const release = JSON.parse(
+    (await download(releaseUrl, undefined, fetchProgress)).toString('utf8')
+  ) as {
     tag_name?: unknown
     draft?: unknown
     prerelease?: unknown
@@ -386,7 +455,9 @@ async function performUpdate(
     releaseLock = acquireUpdateLock(state)
     report.agents.admission_paused = true
     checkRuns(state, options.force, report)
+    stage(`Pausing agent turns (${report.agents.kept_sessions?.length ?? 0} sessions kept alive)`)
     notify('paused')
+    stage('Downloading the installer and checksums')
 
     if (!Array.isArray(release.assets)) throw new Error('Invalid release asset metadata.')
     const hasInstaller = release.assets.some((asset) => asset.name === 'install.sh')
@@ -397,9 +468,11 @@ async function performUpdate(
         process.env.ABELE_INSTALL_BASE_URL ?? 'https://github.com/dudaanton/abele-node'
       ).replace(/\/$/, '')
       const tagged = `${base}/releases/download/${release.tag_name}`
-      script = await download(`${tagged}/install.sh`, interrupted.signal)
+      script = await download(`${tagged}/install.sh`, interrupted.signal, fetchProgress)
       if (hasSums) {
-        const sums = (await download(`${tagged}/SHA256SUMS`, interrupted.signal)).toString('utf8')
+        const sums = (
+          await download(`${tagged}/SHA256SUMS`, interrupted.signal, fetchProgress)
+        ).toString('utf8')
         const matches = sums
           .split(/\r?\n/)
           .map((line) => line.match(/^([a-fA-F0-9]{64})\s+\*?(.+)$/))
@@ -426,7 +499,11 @@ async function performUpdate(
         `Legacy release: using tag ${release.tag_name}'s raw install.sh over HTTPS without an installer checksum (explicit --version pin).`
       )
       notify('warning')
-      script = await download(`${raw}/${release.tag_name}/install.sh`, interrupted.signal)
+      script = await download(
+        `${raw}/${release.tag_name}/install.sh`,
+        interrupted.signal,
+        fetchProgress
+      )
     }
     work = mkdtempSync(join(root, '.update-'))
     const file = join(work, 'install.sh')
@@ -434,36 +511,94 @@ async function performUpdate(
     // Defensive recheck before installer handoff, including state written by a
     // legacy runtime without the admission fence. --check never touches live state.
     checkRuns(state, options.force, report)
-    const result = spawnSync(
-      '/bin/sh',
-      [
-        file,
-        '--version',
-        target,
-        '--prefix',
-        prefix,
-        '--state-dir',
-        state,
-        '--claude-path',
-        claude,
-        ...(config.service === 0 ? ['--no-service'] : []),
-      ],
-      { encoding: 'utf8', stdio: ['inherit', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024 }
-    )
+    const result = await new Promise<{
+      status: number | null
+      signal: NodeJS.Signals | null
+      stdout: string
+      stderr: string
+      error?: Error
+    }>((done) => {
+      stage('Starting verified installer')
+      const child = spawn(
+        '/bin/sh',
+        [
+          file,
+          '--version',
+          target,
+          '--prefix',
+          prefix,
+          '--state-dir',
+          state,
+          '--claude-path',
+          claude,
+          ...(config.service === 0 ? ['--no-service'] : []),
+        ],
+        {
+          detached: true,
+          stdio: ['inherit', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            ABELE_INSTALL_PROGRESS: 'json',
+            ABELE_PROGRESS_TTY: process.stdout.isTTY ? '1' : '0',
+          },
+        }
+      )
+      const abort = () => {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, interruptSignal ?? 'SIGTERM')
+          } catch {
+            /* Already exited. */
+          }
+        }
+      }
+      interrupted.signal.addEventListener('abort', abort, { once: true })
+      if (interrupted.signal.aborted) abort()
+      let stdout = '',
+        stderr = '',
+        pending = ''
+      child.stdout.on('data', (data: Buffer) => {
+        stdout = (stdout + data.toString()).slice(-8 * 1024 * 1024)
+      })
+      child.stderr.on('data', (data: Buffer) => {
+        stderr = (stderr + data.toString()).slice(-8 * 1024 * 1024)
+        pending = (pending + data.toString()).slice(-8 * 1024 * 1024)
+        const lines = pending.split('\n')
+        pending = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.startsWith('ABELE_PROGRESS ')) continue
+          try {
+            const p = JSON.parse(line.slice(15)) as Progress
+            if (typeof p.stage === 'string') event(p)
+          } catch {
+            /* Keep unrecognized diagnostics in the installer report. */
+          }
+        }
+      })
+      child.on('error', (error) => {
+        interrupted.signal.removeEventListener('abort', abort)
+        done({ status: 1, signal: null, stdout, stderr, error })
+      })
+      child.on('close', (status, signal) => {
+        interrupted.signal.removeEventListener('abort', abort)
+        done({ status, signal, stdout, stderr })
+      })
+    })
     report.installer = {
       exit_code: result.status ?? 1,
       signal: result.signal,
       stdout: result.stdout ?? '',
       stderr: result.stderr ?? '',
     }
+    if (interrupted.signal.aborted) throw interrupted.signal.reason
     if (result.error) throw result.error
     if (result.status !== 0) {
       const lines = report.installer.stderr.trim().split(/\r?\n/).filter(Boolean)
       const diagnostic =
         lines.find((line) => line.startsWith('abele-node:')) ??
-        lines.find((line) => !line.startsWith('{'))
+        lines.find((line) => !line.startsWith('{') && !line.startsWith('ABELE_PROGRESS '))
       report.status = 'failed'
-      report.error = `Update installer failed (${result.signal ?? result.status}); ${diagnostic ? diagnostic.slice(0, 240) : 'inspect its diagnostics and retained state.'}`
+      report.error = `Update installer failed during ${report.stage ?? 'installer'} (${result.signal ?? result.status}); ${diagnostic ? diagnostic.slice(0, 240) : 'inspect its diagnostics and retained state.'} State and provider credentials retained; inspect rollback diagnostics before retrying.`
       return result.status ?? 1
     }
     report.status = 'updated'
@@ -473,7 +608,7 @@ async function performUpdate(
   } catch (error) {
     if (!interruptSignal) throw error
     report.status = 'interrupted'
-    report.error = `Update interrupted by ${interruptSignal}.`
+    report.error = `Update interrupted by ${interruptSignal} during ${report.stage ?? 'preparing update'}. State and provider credentials retained; inspect rollback diagnostics before retrying.`
     report.next_step = 'Run abele-node status, then retry abele-node update when ready.'
     return { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[interruptSignal]
   } finally {

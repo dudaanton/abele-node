@@ -23,6 +23,51 @@ import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+for (const unknownTotal of [false, true]) {
+  test(`installer emits structured stages and download bytes (unknown total: ${unknownTotal})`, async () => {
+    const h = await home()
+    const asset = `/releases/download/v0.2.0/abele-node-0.2.0-${platform}.tar.gz`
+    if (unknownTotal) chunked.add(asset)
+    try {
+      const result = await install(h, ['--version', '0.2.0', '--no-service'], {
+        ABELE_INSTALL_PROGRESS: 'json',
+      })
+      assert.equal(result.code, 0, result.stderr)
+      const events = result.stderr
+        .split('\n')
+        .filter((line) => line.startsWith('ABELE_PROGRESS '))
+        .map((line) => JSON.parse(line.slice(15)))
+      const stages = events.filter((event) => event.bytes === undefined).map((event) => event.stage)
+      assert.ok(
+        stages.indexOf('Verifying archive and checksums') <
+          stages.indexOf('Installing (validating runtime before service stop)')
+      )
+      assert.ok(
+        stages.indexOf('Installing (validating runtime before service stop)') <
+          stages.indexOf('Waiting for health (15 attempts, 1 s between attempts)')
+      )
+      const download = events.find(
+        (event) => event.stage.startsWith('Downloading AbeleNode') && event.bytes > 0
+      )
+      assert.ok(download)
+      assert.equal(unknownTotal ? download.total === null : download.total > 0, true)
+      assert.ok(download.elapsed >= 0)
+      assert.ok(!result.stderr.includes('\r'))
+    } finally {
+      chunked.delete(asset)
+    }
+  })
+}
+test('installer reports verification, deployment and health stages', async () => {
+  const h = await home()
+  const result = await install(h, ['--version', '0.2.0', '--no-service'])
+  assert.equal(result.code, 0, result.stderr)
+  const output = result.stdout + result.stderr
+  assert.match(output, /Downloading AbeleNode 0.2.0/)
+  assert.match(output, /Verifying/)
+  assert.match(output, /Installing/)
+  assert.match(output, /Waiting for health/)
+})
 for (const platform of ['mac', 'linux']) {
   test(`installer debugger flags persist and adoption rejects unrelated edits: ${platform}`, async () => {
     const h = await home(),
@@ -244,6 +289,7 @@ test('missing Claude still installs and explains how to configure it later', asy
 const platform = `${process.platform}-${process.arch === 'x64' ? 'x64' : 'arm64'}`
 let scratch, server, base, archive
 const routes = new Map()
+const chunked = new Set()
 // Statuses answered before the real body, one per request; every request is counted.
 const failures = new Map(),
   hits = new Map()
@@ -482,6 +528,10 @@ before(async () => {
     }
     const body = routes.get(req.url)
     res.statusCode = body === undefined ? 404 : 200
+    if (chunked.has(req.url) && body !== undefined) {
+      res.write(body)
+      return res.end()
+    }
     res.end(body ?? 'not found')
   })
   await new Promise((done) => server.listen(0, '127.0.0.1', done))
@@ -2597,17 +2647,23 @@ test(
     )
     try {
       const h = await home()
-      const result = await install(h, ['--version', realVersion, '--no-service'])
+      // Keep production doctor coverage independent of providers installed on the host.
+      const missingCodex = join(h, 'missing-codex')
+      const result = await install(h, ['--version', realVersion, '--no-service'], {
+        ABELE_CODEX_PATH: missingCodex,
+      })
       assert.equal(result.code, 0, result.stderr)
       for (const command of ['status', 'doctor']) {
         const check = await run(join(h, '.local/bin/abele-node'), [command, '--json'], {
           HOME: h,
           ABELE_CLAUDE_PATH: '/nonexistent/claude',
+          ABELE_CODEX_PATH: missingCodex,
           ABELE_TAILSCALE_PATH: '/nonexistent/tailscale',
         })
         assert.equal(check.code, 0, check.stderr)
         const report = JSON.parse(check.stdout)
         assert.equal(report.running, false)
+        if (command === 'doctor') assert.equal(report.codex.available, false)
         assert.equal(report.state_dir, join(await realpath(h), '.local/state/abele-node'))
       }
       const serviceStatus = await run(

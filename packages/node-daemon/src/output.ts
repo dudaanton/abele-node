@@ -1,4 +1,5 @@
 import { shortPairingFingerprint } from '@abele/node-protocol'
+import { formatProgress, type Progress } from './update-progress.js'
 
 // Keep presentation separate from the machine protocol: never mutate JSON reports.
 type Report = Record<string, unknown>
@@ -300,6 +301,7 @@ export function humanOutput(
   }
 }
 function humanUpdate(r: Report): string {
+  if (r.status === 'progress') return formatProgress(r as Progress)
   const agents = record(r.agents)
   const resumed = agents.admission_resumed ? ' Agent turns resumed.' : ''
   const next = `Next: ${line(r.next_step)}`

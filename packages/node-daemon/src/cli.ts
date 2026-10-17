@@ -382,12 +382,20 @@ async function main() {
       return
     case 'update': {
       const runtime = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
-      const report = await update(
-        runtime,
-        args.slice(1),
-        json ? undefined : (progress) => console.log(humanOutput(['update'], progress))
-      )
+      let inline = false
+      const report = await update(runtime, args.slice(1), (progress) => {
+        if (json) console.error(JSON.stringify(progress))
+        else {
+          const nextInline = !!process.stdout.isTTY && progress.bytes !== undefined
+          if (inline && !nextInline) process.stdout.write('\n')
+          process.stdout.write(
+            `${nextInline ? '\r\u001b[2K' : ''}${humanOutput(['update'], progress)}${nextInline ? '' : '\n'}`
+          )
+          inline = nextInline
+        }
+      })
       const rendered = json ? JSON.stringify(report) : humanOutput(['update'], report)
+      if (inline) process.stdout.write('\n')
       if (json || report.exit_code === 0) console.log(rendered)
       else console.error(rendered)
       process.exitCode = report.exit_code

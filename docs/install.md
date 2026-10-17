@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.22
+  sh -s -- --version 0.4.23
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -727,6 +727,35 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
 ## Upgrade
 
+`abele-node update` reports each stage as it starts. For example:
+
+```text
+Checking for a release (30 s request timeout)
+Pausing agent turns (2 sessions kept alive)
+Downloading the installer and checksums
+Downloading AbeleNode 0.4.23 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.23: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading checksums
+Verifying archive and checksums
+Installing (validating runtime before service stop)
+Waiting for service stop (45 s polling timeout)
+Restarting the service
+Waiting for health (15 attempts, 1 s between attempts)
+Done: 0.4.22 → 0.4.23
+```
+
+Terminal downloads update in place. Pipes receive a line approximately every 10%
+or 5 seconds; unknown sizes show downloaded bytes and rate. Waiting stages emit
+heartbeats. Downloads have a 20 second connection timeout, a 300 second timeout per
+attempt and a 120 second retry budget (an in-flight attempt can exceed that budget).
+The health polling limit excludes time spent running status and doctor checks.
+With `--json`, stdout remains exactly one JSON document: the final update report.
+Progress events are newline-delimited JSON on stderr. Progress reports have
+`status: "progress"`, `stage`, and, for downloads, `bytes`, `total` (null if unknown),
+and `elapsed` seconds. Scripts can parse stdout directly or read stderr separately
+for live progress; do not merge the streams when parsing JSON. Older release
+installers without progress support show a waiting heartbeat during the handoff.
+
 1. Stop via launchd/systemd (or Ctrl-C for foreground). Confirm `status` is stopped
    and investigate any unconfirmed provider cleanup before proceeding.
 2. Back up the **whole stopped state directory** and preserve the provider's native
@@ -742,7 +771,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.22  # example; select an existing release
+   git checkout v0.4.23  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

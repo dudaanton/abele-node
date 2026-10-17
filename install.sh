@@ -5,7 +5,60 @@ abele_install() {
 set -eu
 umask 077
 unset ABELE_SERVICE_TRANSITION
-fail() { printf 'abele-node: %s\n' "$*" >&2; exit 1; }
+current_stage='Preparing installation'
+failed_stage=''
+fail() { failed_stage=${failed_stage:-$current_stage}; printf 'abele-node: failed during %s: %s\n' "$failed_stage" "$*" >&2; exit 1; }
+
+stage_heartbeat=''
+stop_stage_heartbeat() {
+  if [ -n "$stage_heartbeat" ]; then
+    # This process only owns a timer; reap it promptly even during Node startup.
+    kill -KILL "$stage_heartbeat" 2>/dev/null || :
+    wait "$stage_heartbeat" 2>/dev/null || :
+    stage_heartbeat=''
+  fi
+}
+stage() {
+  stop_stage_heartbeat
+  current_stage=$*
+  if [ "${ABELE_INSTALL_PROGRESS:-}" = json ]; then
+    "$node" -e 'console.error("ABELE_PROGRESS "+JSON.stringify({stage:process.argv[1]}))' "$current_stage"
+  else
+    printf '%s\n' "$current_stage"
+    # Standalone installs also explain long waits; the updater supplies its own
+    # heartbeat when consuming structured events.
+    "$node" -e 'const stage=process.argv[1],owner=Number(process.argv[2]),start=Date.now();setInterval(()=>{try{process.kill(owner,0)}catch{process.exit(0)}console.error("Waiting: "+stage+" ("+Math.round((Date.now()-start)/1000)+" s elapsed)")},5000)' "$current_stage" "$$" &
+    stage_heartbeat=$!
+  fi
+}
+download_progress() {
+  stop_stage_heartbeat
+  current_stage="$current_stage (20 s connect timeout; 300 s/attempt; 120 s retry budget)"
+  "$node" - "$1" "$2" "$current_stage" <<'PROGRESS'
+const {spawn}=require('node:child_process'),fs=require('node:fs');
+const [url,file,stage]=process.argv.slice(2), started=Date.now();
+const tty=process.env.ABELE_PROGRESS_TTY==='1'||process.stderr.isTTY;
+let last=0,previous=0,child;
+const size=n=>n<1024?Math.round(n)+' B':n<1048576?(n/1024).toFixed(1)+' KiB':(n/1048576).toFixed(1)+' MiB';
+function emit(final=false){
+  let bytes=0,total=null;
+  try{bytes=fs.statSync(file).size}catch{}
+  try{const headers=fs.readFileSync(file+'.headers','utf8').split(/\r?\n\r?\n/).filter(Boolean).pop()||'';const m=headers.match(/^content-length:\s*(\d+)/im);if(m)total=Number(m[1])||null}catch{}
+  const now=Date.now();
+  if(!final&&now-last<(tty?200:5000)&&!(total&&(bytes-previous)/total>=0.1))return;
+  const elapsed=(now-started)/1000,rate=bytes/Math.max(elapsed,0.001);
+  const p={stage,bytes,total,elapsed};
+  if(process.env.ABELE_INSTALL_PROGRESS==='json')console.error('ABELE_PROGRESS '+JSON.stringify(p));
+  else process.stderr.write((tty?'\r\x1b[2K':'')+stage+': '+size(bytes)+(total?' / '+size(total)+' ('+Math.min(100,Math.floor(bytes/total*100))+'%)':'')+', '+size(rate)+'/s'+(total&&rate?', '+Math.ceil(Math.max(0,total-bytes)/rate)+' s left':'')+(tty&&!final?'':'\n'));
+  last=now;previous=bytes;
+}
+child=spawn('curl',['-fsSL','--retry','5','--retry-connrefused','--retry-max-time','120','--connect-timeout','20','--max-time','300','--dump-header',file+'.headers',url,'-o',file],{stdio:['ignore','ignore','inherit']});
+const timer=setInterval(()=>emit(),200);
+for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,()=>child.kill(signal));
+child.on('error',e=>{clearInterval(timer);console.error(e.message);process.exitCode=1});
+child.on('close',code=>{clearInterval(timer);emit(true);process.exitCode=code??1});
+PROGRESS
+}
 usage() {
   printf '%s\n' 'Usage: sh install.sh [--version X.Y.Z] [--prefix PATH] [--state-dir PATH]' \
     '  [--claude-path PATH] [--codex-path PATH] [--codex-model MODEL_ID] [--codex-home PATH]' \
@@ -603,6 +656,7 @@ report_stop_confirmation_failure() {
   if [ -n "$stop_stderr" ]; then cat "$stop_stderr" >&2; fi
 }
 stop_service() {
+  stage 'Waiting for service stop (45 s polling timeout)'
   stop_stderr=''
   preflight_stop || return 1
   if [ "$old_service" = 1 ] && [ "$os" = linux ]; then
@@ -642,6 +696,7 @@ stop_service() {
     verify_state_identity "$state" || { report_stop_confirmation_failure; return 1; }
     cli "$old" status > "$work/stopped.json" || { report_stop_confirmation_failure; return 1; }
     if "$node" -e 'if(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).running)process.exit(1)' "$work/stopped.json"; then break; fi
+    if [ "$((count % 5))" = 0 ]; then stage "Waiting for service stop ($count s elapsed, 45 s polling timeout)"; fi
     count=$((count + 1)); [ "$count" -lt 45 ] || { report_stop_confirmation_failure; return 1; }; sleep 1
   done
 }
@@ -660,6 +715,7 @@ prepare_state() {
   journal_done "$retained_state_id" || return 1
 }
 start_service() {
+  stage 'Restarting the service'
   runtime=$1
   # Repeat under the install lock at the write boundary; never signal a daemon
   # that appeared after the initial admission check.
@@ -712,6 +768,7 @@ NODE
   fi
 }
 check_health() {
+  stage 'Waiting for health (15 attempts, 1 s between attempts)'
   attempt=0
   while [ "$attempt" -lt 15 ]; do
     if cli "$1" status > "$work/status.json" && cli "$1" doctor > "$work/doctor.json" &&
@@ -730,6 +787,7 @@ NODE
       return 0
     fi
     [ "$2" = 1 ] || break
+    if [ "$((attempt % 5))" = 0 ]; then stage "Waiting for health (attempt $attempt/15)"; fi
     attempt=$((attempt + 1)); sleep 1
   done
   return 1
@@ -861,6 +919,8 @@ NODE
 }
 cleanup() {
   result=$?
+  if [ "$result" != 0 ]; then failed_stage=${failed_stage:-$current_stage}; fi
+  stop_stage_heartbeat
   trap - 0 HUP INT TERM
   journal_sync
   if [ "$transaction" = 1 ]; then
@@ -880,11 +940,20 @@ cleanup() {
     if [ -n "$service_action" ] && [ "$retain_backup" = 1 ]; then printf 'Service recovery journal retained: %s\n' "$work" >&2
     else rm -rf "$work"; fi
   fi
+  stop_stage_heartbeat
   if [ -n "$service_action" ] && [ "$retain_backup" = 0 ]; then
     "$node" "$transition_helper" finish "$root" || { printf '%s\n' 'Service transition cleanup is incomplete; the next invocation will recover it.' >&2; exit 1; }
     if [ -L "$root/.install-lock" ] && [ "$(readlink "$root/.install-lock")" = "service-group:$$" ]; then rm -f "$root/.install-lock"; fi
   fi
   rmdir "$root/.install-lock" 2>/dev/null || :
+  stop_stage_heartbeat
+  if [ "$result" != 0 ]; then
+    current_stage=$failed_stage
+    if [ "${ABELE_INSTALL_PROGRESS:-}" = json ]; then
+      "$node" -e 'console.error("ABELE_PROGRESS "+JSON.stringify({stage:process.argv[1]}))' "$current_stage"
+    fi
+    printf 'abele-node: failed during %s; state and provider credentials retained; inspect rollback diagnostics above before retrying.\n' "$current_stage" >&2
+  fi
   exit "$result"
 }
 preflight_stop || fail 'Cannot confirm ownership before mutation; nothing was stopped or changed.'
@@ -1004,22 +1073,26 @@ if [ -n "$service_action" ]; then
 else
 base=${ABELE_INSTALL_BASE_URL:-https://github.com/dudaanton/abele-node}
 # curl retries timeouts, 408, 429 (honouring Retry-After) and 5xx; never other 4xx.
-retry='--retry 5 --retry-connrefused --retry-max-time 120 --connect-timeout 20'
+
 api=${ABELE_INSTALL_API_URL:-https://api.github.com/repos/dudaanton/abele-node/releases/latest}
 if [ -z "$version" ]; then
-  curl -fsSL $retry "$api" -o "$work/latest.json" || fail 'Cannot resolve latest GitHub release; try --version X.Y.Z.'
+  stage 'Checking for a release'
+  download_progress "$api" "$work/latest.json" || fail 'Cannot resolve latest GitHub release; try --version X.Y.Z.'
   version=$("$node" -e 'const v=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).tag_name; if(typeof v!=="string")process.exit(1); console.log(v.replace(/^v/,""))' "$work/latest.json") || fail 'Invalid latest release response.'
   valid_version "$version" || fail 'Invalid release version; expected vX.Y.Z.'
 fi
 asset=abele-node-$version-$os-$arch.tar.gz
 url=$base/releases/download/v$version
-printf 'Downloading AbeleNode %s (%s-%s)...\n' "$version" "$os" "$arch"
-curl -fsSL $retry "$url/$asset" -o "$work/$asset" || fail "Cannot download $asset. If the download server is temporarily unavailable, try again in a few minutes; otherwise select a release with native installer assets."
-curl -fsSL $retry "$url/SHA256SUMS" -o "$work/SHA256SUMS" || fail 'Cannot download SHA256SUMS; try again in a few minutes.'
+stage "Downloading AbeleNode $version ($os-$arch; size reported when known)"
+download_progress "$url/$asset" "$work/$asset" || fail "Cannot download $asset. If the download server is temporarily unavailable, try again in a few minutes; otherwise select a release with native installer assets."
+stage 'Downloading checksums'
+download_progress "$url/SHA256SUMS" "$work/SHA256SUMS" || fail 'Cannot download SHA256SUMS; try again in a few minutes.'
+stage 'Verifying archive and checksums'
 expected=$("$node" -e 'const lines=require("node:fs").readFileSync(process.argv[1],"utf8").trim().split(/\r?\n/); const matches=lines.map(l=>l.match(/^([a-fA-F0-9]{64})\s+\*?(.+)$/)).filter(m=>m&&m[2]===process.argv[2]); if(matches.length!==1)process.exit(1); console.log(matches[0][1].toLowerCase())' "$work/SHA256SUMS" "$asset") || fail 'Invalid checksum manifest.'
 if [ "$checksum" = shasum ]; then actual=$(shasum -a 256 "$work/$asset"); else actual=$(sha256sum "$work/$asset"); fi
 actual=${actual%% *}
 [ "$expected" = "$actual" ] || fail 'SHA256 checksum mismatch; no runtime was changed.'
+stage 'Installing (validating runtime before service stop)'
 mkdir "$work/runtime"
 tar -tzf "$work/$asset" > "$work/entries"
 "$node" -e 'const entries=require("node:fs").readFileSync(process.argv[1],"utf8").split("\n"); if(entries.some(p=>p.startsWith("/")||p.split("/").includes("..")))process.exit(1)' "$work/entries" || fail 'Unsafe archive paths.'
@@ -1088,6 +1161,7 @@ if [ -n "$service_action" ]; then
 fi
 case ":${PATH:-}:" in *":$prefix/bin:"*) ;; *) printf 'Add %s/bin to PATH before running abele-node.\n' "$prefix" ;; esac
 local_port=$("$node" -e 'const s=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); console.log(Number.isInteger(s.port) && s.port>0 && s.port<=65535 ? s.port : 7777)' "$work/status.json")
+stage "Done: ${old:-none} → $version"
 printf '%s\n' 'AbeleNode installed.'
 [ "$service" = 1 ] || printf '%s\n' 'First start it in a terminal: abele-node start'
 printf '%s\n' 'Next: abele-node token create desktop' \

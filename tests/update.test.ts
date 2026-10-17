@@ -24,7 +24,69 @@ const version = '0.3.2'
 const installer = `#!/bin/sh
 exec "$TEST_NODE" -e 'require("node:fs").writeFileSync(process.env.TEST_CAPTURE,JSON.stringify(process.argv.slice(1)));process.exit(Number(process.env.TEST_INSTALL_EXIT || 0))' -- "$@"
 `
+function expectJsonEvents(stderr: string) {
+  for (const line of stderr.trim().split('\n').filter(Boolean)) {
+    expect(JSON.parse(line)).toMatchObject({ command: 'update', status: expect.any(String) })
+  }
+}
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
+
+it('keeps one JSON document on stdout and streams progress on stderr', async () => {
+  const result = await cli(['update', '--json'])
+  expect(JSON.parse(result.stdout).status).toBe('updated')
+  const events = result.stderr
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+  const stages = events.filter((event) => event.status === 'progress').map((event) => event.stage)
+  expect(stages).toContain('Checking for a release (30 s request timeout)')
+  expect(stages).toContain('Downloading the installer and checksums')
+  expect(stages).toContain('Pausing agent turns (0 sessions kept alive)')
+  expect(events.some((event) => event.bytes > 0)).toBe(true)
+  expect(stages.indexOf('Checking for a release (30 s request timeout)')).toBeLessThan(
+    stages.indexOf('Pausing agent turns (0 sessions kept alive)')
+  )
+  expect(stages.indexOf('Downloading the installer and checksums')).toBeLessThan(
+    stages.indexOf('Starting verified installer')
+  )
+})
+
+it('forwards installer stages before exit and names the failed stage', async () => {
+  const scripted = `#!/bin/sh
+printf '%s\\n' 'ABELE_PROGRESS {"stage":"Verifying archive"}' >&2
+sleep 1
+printf '%s\\n' 'abele-node: checksum mismatch; previous runtime retained' >&2
+exit 7
+`
+  routes.set('/releases/download/v0.4.0/install.sh', scripted)
+  routes.set('/releases/download/v0.4.0/SHA256SUMS', `${digest(scripted)}  install.sh\n`)
+  let streamed = false
+  const result = await cli(['update'], false, {}, (child) => {
+    child.stdout!.on('data', (data: Buffer) => {
+      if (data.toString().includes('Verifying archive')) streamed = child.exitCode === null
+    })
+  })
+  expect(streamed).toBe(true)
+  expect(result.code).toBe(7)
+  expect(result.stderr).toContain('failed during Verifying archive')
+  expect(result.stderr).toContain('previous runtime retained')
+  expect(result.stdout).not.toContain('\r')
+})
+
+it('explains a wait while release response headers are delayed', async () => {
+  const respond = server.listeners('request')[0]!
+  server.removeAllListeners('request')
+  server.on('request', (req, res) => {
+    if (req.url === '/releases/latest') setTimeout(() => respond.call(server, req, res), 6500)
+    else respond.call(server, req, res)
+  })
+  const result = await cli(['update', '--check'])
+  expect(result.code).toBe(0)
+  expect(result.stdout).toMatch(
+    /Waiting: Checking for a release \(30 s request timeout\) \([56] s elapsed\)/
+  )
+  expect(result.stdout).not.toContain('\r')
+}, 10000)
 
 function release(target = '0.4.0', assets = ['install.sh', 'SHA256SUMS']) {
   const info = JSON.stringify({
@@ -472,7 +534,7 @@ it.each([false, true])(
         agents: { admission_paused: false, admission_resumed: false, active_runs: [] },
         installer: null,
       })
-      expect(result.stderr).toBe('')
+      expectJsonEvents(result.stderr)
     } else {
       expect(() => JSON.parse(result.stdout)).toThrow()
       expect(result.stdout).toContain('Current: 0.3.2')
@@ -530,7 +592,7 @@ it.each([false, true])(
           stderr: 'internal installer stderr\n',
         },
       })
-      expect(result.stderr).toBe('')
+      expectJsonEvents(result.stderr)
     } else {
       expect(result.stdout).toContain('Agent turns paused')
       expect(result.stdout).toContain('Updated to 0.4.0')
@@ -538,7 +600,10 @@ it.each([false, true])(
       expect(result.stdout).toContain('Next: abele-node start')
       expect(result.stdout).not.toContain('internal_installer_report')
       expect(result.stdout).not.toContain('internal installer stderr')
-      expect(result.stdout.trim().split('\n').length).toBeLessThanOrEqual(7)
+      expect(result.stdout).toContain('Checking for a release (30 s request timeout)')
+      expect(result.stdout).toContain('Downloading the installer and checksums')
+      // Separate stage and bounded metadata progress lines replace the old silent handoff.
+      expect(result.stdout.trim().split('\n').length).toBeLessThanOrEqual(20)
       expect(result.stderr).toBe('')
     }
   }
@@ -567,7 +632,7 @@ it.each([false, true])(
         error: expect.stringContaining('installer failed'),
         next_step: expect.stringContaining('abele-node doctor'),
       })
-      expect(result.stderr).toBe('')
+      expectJsonEvents(result.stderr)
     } else {
       expect(result.stderr).toContain('Update failed')
       expect(result.stderr).toContain('Service ownership modified')
@@ -591,7 +656,7 @@ it('JSON reports active runs and refuses them without printing human progress', 
     },
     installer: null,
   })
-  expect(result.stderr).toBe('')
+  expectJsonEvents(result.stderr)
   expect(requests).toEqual(['/releases/latest'])
 })
 it('lets long-lived sessions run through an update instead of refusing it', async () => {
@@ -661,7 +726,7 @@ it('JSON interruption reports the signal and resumed admission without human out
       agents: { admission_paused: true, admission_resumed: true },
       installer: null,
     })
-    expect(result.stderr).toBe('')
+    expectJsonEvents(result.stderr)
     expect(existsSync(join(state, 'update.lock'))).toBe(false)
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
@@ -694,7 +759,7 @@ it('invalid update arguments are structured when --json is requested', async () 
     error: expect.stringContaining('--bogus'),
     exit_code: 1,
   })
-  expect(result.stderr).toBe('')
+  expectJsonEvents(result.stderr)
   expect(requests).toEqual([])
 })
 it('propagates installer failure without claiming success and cleans downloaded code', async () => {
