@@ -679,6 +679,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       capabilities: {
         ...this.provider.capabilities().capabilities,
         ...this.debugger.capabilities(),
+        ...(this.debugger.enabled
+          ? {
+              'debugger.access.v1': {
+                status: 'supported' as const,
+                evidence: 'debugger-access-request-v1; owner-decide; issuer-list-revoke-delete',
+              },
+            }
+          : {}),
         ...this.trace.capabilities(),
         ...this.http.capabilities(),
         expected_target: {

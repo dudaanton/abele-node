@@ -101,6 +101,17 @@ const hash = (v: unknown) => createHash('sha256').update(canonical(v)).digest('h
 /** Shared, per-session FIFO. Proposals return immediately; approval never holds
  * the command lock. Durable receipts, not the offline outbox, govern retries. */
 export class DebuggerCoordinator {
+  readonly accessRequests = new Map<
+    string,
+    {
+      item: Record<string, unknown>
+      input: unknown
+      authority: AuthorityContext
+      active(): boolean
+      decided: boolean
+      decision?: 'allow' | 'deny'
+    }
+  >()
   readonly permissions: DebuggerPermissions
   readonly waits: DebuggerWaits
   private readonly permissionListeners = new Set<() => void>()
@@ -119,6 +130,7 @@ export class DebuggerCoordinator {
     }
   }
   close() {
+    this.accessRequests.clear()
     this.waits.close()
     this.permissionListeners.clear()
   }
@@ -778,6 +790,26 @@ export class DebuggerCoordinator {
       human: DebuggerPrincipal = { kind: 'human', authority: owner }
     if (operation && p.operation_id && operation !== p.operation_id)
       throw new ChannelError('idempotency_mismatch')
+    if (method === 'access.requests')
+      return [...this.accessRequests.values()]
+        .filter((r) => r.active() && !r.decided)
+        .map((r) => r.item)
+    if (method === 'access.decide') {
+      const request = this.accessRequests.get(p.request_id)
+      if (!request || !request.active() || request.decided) throw new ChannelError('stale_state')
+      this.core.authority.check(request.authority, 'debugger_read')
+      const grant = p.decision === 'allow' ? this.createGrant(owner, request.input) : null
+      request.decided = true
+      request.decision = p.decision
+      return grant ?? { denied: true }
+    }
+    if (method === 'grant.list')
+      return this.permissions.list(owner).slice(p.offset, p.offset + p.limit)
+    if (method === 'grant.delete') {
+      this.revokeGrant(owner, p.grant_id)
+      this.permissions.delete(owner, p.grant_id)
+      return { deleted: true }
+    }
     if (method === 'grant.create') return this.createGrant(owner, p)
     if (method === 'grant.setMode') return this.setGrantMode(owner, p.grant_id, p.mode)
     if (method === 'grant.revoke') {
@@ -785,6 +817,15 @@ export class DebuggerCoordinator {
       return { revoked: true }
     }
     if (method === 'task.settle') {
+      // The public legacy settlement RPC must not bypass issuer-only revoke.
+      // Actual host lifecycle settlement continues to revoke every run grant.
+      for (const row of this.core.db
+        .prepare(
+          "SELECT grant_id FROM debug_grants WHERE json_extract(body,'$.task_id')=? AND json_extract(body,'$.run_id')=?"
+        )
+        .all(p.task_id, p.run_id)) {
+        this.permissions.issuer(owner, this.permissions.grant(String(row.grant_id)))
+      }
       this.settleTask(p.task_id, p.run_id)
       return { settled: true }
     }

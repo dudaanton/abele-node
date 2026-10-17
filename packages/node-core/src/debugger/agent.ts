@@ -107,6 +107,7 @@ const schemas = new Map(
     ]
   })
 )
+export const debuggerToolSpec = (name: string) => schemas.get(name)
 export const debuggerToolDefinitions: DebuggerToolDefinition[] = [...schemas].map(
   ([name, { method, schema }]) => ({
     name,

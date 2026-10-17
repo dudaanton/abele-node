@@ -612,8 +612,32 @@ export class ProviderSessions {
   appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
     const provider = this.core.session(session_id).provider
     // Mapped from the whole record, before a large one is moved to an artifact.
-    const updates = providerSessionUpdates(provider, event.type, event.data)
-    const mapped = updates.length ? { mapped: true } : {}
+    let updates = providerSessionUpdates(provider, event.type, event.data)
+    const rateLimit = provider === 'claude' && event.type === 'claude.rate_limit'
+    // Read durable session state, rather than process/turn state. Keep every raw record,
+    // including recovery to allowed, so a later warning is a new transition.
+    if (rateLimit) {
+      const previous = this.core.db
+        .prepare(
+          "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type')='claude.rate_limit' ORDER BY seq DESC LIMIT 1"
+        )
+        .get(session_id) as { body: string } | undefined
+      const warning = updates.find((u) => u.kind === 'notice' && u.status === 'allowed_warning')
+      if (previous && warning?.kind === 'notice') {
+        const prior = providerSessionUpdates(provider, event.type, JSON.parse(previous.body).data)
+        if (
+          prior.some(
+            (u) =>
+              u.kind === 'notice' &&
+              u.status === warning.status &&
+              u.resets_at === warning.resets_at
+          )
+        )
+          updates = []
+      }
+    }
+    // Suppressed records must also be marked mapped, or clients replay them as notices.
+    const mapped = updates.length || rateLimit ? { mapped: true } : {}
     let data: Record<string, unknown> = {
       ...event.data,
       ...(event.data.run_id !== undefined && event.data.run_id !== run_id

@@ -44,7 +44,6 @@ export class DapDebuggerBackend implements DebuggerBackend {
         case 'continue':
           return this.session.continue(thread, p.single_thread)
         case 'pause':
-          if (!thread) throw new ChannelError('thread_required')
           return this.session.pause(thread)
         case 'breakpoints.patch':
           return this.session.patchBreakpoints(p.expected_breakpoint_revision, p.upsert, p.remove)

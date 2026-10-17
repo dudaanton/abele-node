@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DebuggerAccessRequestSchema } from './debugger-control.js'
 
 /**
  * One transcript vocabulary for every agent, modelled on ACP `session/update` kinds.
@@ -85,6 +86,7 @@ export const ConfigOptionSchema = z.object({
 })
 
 const kinds = {
+  debugger_access_requested: DebuggerAccessRequestSchema,
   user_message: z.object({ kind: z.literal('user_message'), ...message, text, ...truncated }),
   /** Appended to the text of (message_id, block). */
   agent_message_chunk: z.object({ kind: z.literal('agent_message_chunk'), ...message, text }),
@@ -144,6 +146,9 @@ const kinds = {
     level: z.enum(['info', 'warning', 'error']),
     text: z.string().max(4096),
     code: z.string().max(64).optional(),
+    status: z.enum(['allowed_warning', 'rejected']).optional(),
+    /** Provider reset time in Unix seconds; clients format it in their local timezone. */
+    resets_at: z.number().finite().nullable().optional(),
   }),
 } as const
 export type SessionUpdateKind = keyof typeof kinds

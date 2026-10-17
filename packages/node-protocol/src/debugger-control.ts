@@ -1,5 +1,11 @@
 import { z } from 'zod'
-import { DebuggerMethodSchemas, DebuggerOwnerShape, hasDebuggerOwner } from './debugger.js'
+import {
+  DebuggerMethodSchemas,
+  DebuggerOwnerShape,
+  DebuggerTargetSchema,
+  DEBUGGER_LIMITS,
+  hasDebuggerOwner,
+} from './debugger.js'
 import { DelegationAuthoritySchema } from './delegation.js'
 
 const id = z.string().min(1).max(128)
@@ -64,6 +70,19 @@ export const DebuggerGrantSchema = DebuggerGrantInputSchema.extend({
   controller_authority: DelegationAuthoritySchema,
 }).strict()
 export type DebuggerGrant = z.infer<typeof DebuggerGrantSchema>
+/** Additive access workflow version; old session-update clients retain/ignore this kind. */
+export const DEBUGGER_ACCESS_VERSION = 1
+export const DebuggerAccessRequestSchema = DebuggerGrantInputSchema.omit({ mode: true }).extend({
+  kind: z.literal('debugger_access_requested'),
+  version: z.literal(DEBUGGER_ACCESS_VERSION),
+  request_id: id,
+  method: z.string().min(1).max(128),
+  access: z.string().min(1).max(128),
+  target: DebuggerTargetSchema,
+  folder: z.string().max(4096).nullable(),
+  program: z.string().max(4096),
+})
+export type DebuggerAccessRequest = z.infer<typeof DebuggerAccessRequestSchema>
 export const DebuggerApprovalSchema = z
   .object({
     principal_key: z.string().min(1).max(512),
@@ -136,6 +155,17 @@ export const DebuggerAttachProgramSchema = z
 /** B3 exposes only authorized implemented methods. Profile startup, source,
  * tools, subscriptions and timers retain their later-stage gates. */
 export const DebuggerControlMethodSchemas = {
+  'debugger.v1.access.requests': z.object({}).strict(),
+  'debugger.v1.access.decide': z
+    .object({ request_id: id, decision: z.enum(['allow', 'deny']) })
+    .strict(),
+  'debugger.v1.grant.list': z
+    .object({
+      offset: z.number().int().min(0).max(DEBUGGER_LIMITS.grants).default(0),
+      limit: z.number().int().min(1).max(16).default(16),
+    })
+    .strict(),
+  'debugger.v1.grant.delete': z.object({ grant_id: id }).strict(),
   'debugger.v1.profiles': DebuggerMethodSchemas['debugger.v1.profiles'],
   'debugger.v1.start': DebuggerStartSchema,
   'debugger.v1.programs': DebuggerProgramsSchema,

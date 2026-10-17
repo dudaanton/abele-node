@@ -303,6 +303,8 @@ describe('Claude records as session updates', () => {
         kind: 'notice',
         level: 'error',
         code: 'rate_limit',
+        status: 'rejected',
+        resets_at: 1_800_000_000,
         text: 'Usage limit reached, resets 2027-01-15T08:00:00.000Z',
       },
     ])

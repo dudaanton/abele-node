@@ -13,6 +13,8 @@ import {
   DebuggerStartResultSchema,
   type DebuggerSnapshot,
   DebuggerVariablesResultSchema,
+  DebuggerAccessRequestSchema,
+  DebuggerGrantSchema,
 } from '@abele/node-protocol'
 
 /** Parse requested_data from a completed variables history entry. Child handles
@@ -41,6 +43,39 @@ export type DebuggerObservationState = {
  * use a trusted run-bound DebuggerToolBridge, never reuse an owner's RPC identity.
  * All debugger calls are online-only; uncertain commands are never resent. */
 export class DebuggerClient {
+  async accessRequests() {
+    return DebuggerAccessRequestSchema.array()
+      .max(128)
+      .parse(await this.rpc('debugger.v1.access.requests', {}))
+  }
+  async decideAccess(request_id: string, decision: 'allow' | 'deny') {
+    const method = 'debugger.v1.access.decide'
+    return this.rpc(method, DebuggerControlMethodSchemas[method].parse({ request_id, decision }))
+  }
+  async grants(
+    params: (typeof DebuggerControlMethodSchemas)['debugger.v1.grant.list']['_input'] = {}
+  ) {
+    return DebuggerGrantSchema.array()
+      .max(16)
+      .parse(
+        await this.rpc(
+          'debugger.v1.grant.list',
+          DebuggerControlMethodSchemas['debugger.v1.grant.list'].parse(params)
+        )
+      )
+  }
+  revokeGrant(grant_id: string) {
+    return this.rpc(
+      'debugger.v1.grant.revoke',
+      DebuggerControlMethodSchemas['debugger.v1.grant.revoke'].parse({ grant_id })
+    )
+  }
+  deleteGrant(grant_id: string) {
+    return this.rpc(
+      'debugger.v1.grant.delete',
+      DebuggerControlMethodSchemas['debugger.v1.grant.delete'].parse({ grant_id })
+    )
+  }
   private readonly states = new Map<string, DebuggerObservationState>()
   private readonly watchers = new Map<AbortController, () => void>()
   private generation = 0

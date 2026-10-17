@@ -21,6 +21,38 @@ const event = (type: string, data: unknown) => ({
 })
 
 const samples: SessionUpdate[] = [
+  {
+    kind: 'debugger_access_requested',
+    version: 1,
+    request_id: 'request-1',
+    installation_id: 'installation-1',
+    run_id: 'r1',
+    task_id: 'task-1',
+    conversation_id: 'session-fixture',
+    workspace_id: null,
+    target_id: 'target-1',
+    debug_session_id: 'debug-1',
+    incarnation: 'incarnation-1',
+    expires_at: '2026-10-16T01:00:00.000Z',
+    actions: ['read'],
+    method: 'status',
+    access: 'read',
+    target: {
+      node_id: 'node-fixture',
+      project_id: 'project-1',
+      workspace_id: null,
+      worktree_id: 'worktree-1',
+      conversation_id: 'session-fixture',
+      target_id: 'target-1',
+      adapter_profile: 'js',
+      adapter_version: '1',
+      launch_configuration_id: 'launch-1',
+      process_ownership: 'unknown',
+      build_identity: 'unknown',
+    },
+    folder: null,
+    program: 'config',
+  },
   { kind: 'user_message', message_id: 'u1', text: 'hi' },
   {
     kind: 'agent_message_chunk',

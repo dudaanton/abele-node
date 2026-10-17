@@ -26,7 +26,7 @@ export type DebuggerPrincipal =
     }
 export type DebuggerAction = DebuggerGrant['actions'][number]
 export class DebuggerPermissions {
-  private conversationMatches(state: DebuggerSnapshot, conversation: string) {
+  conversationMatches(state: DebuggerSnapshot, conversation: string) {
     if (state.target.conversation_id !== null) return state.target.conversation_id === conversation
     const current = this.core.resources.targets.currentTarget(conversation)
     if (!current) return false
@@ -124,6 +124,7 @@ export class DebuggerPermissions {
   setMode(owner: AuthorityContext, id: string, mode: DebuggerGrant['mode']) {
     this.owner(owner)
     const grant = this.grant(id)
+    this.issuer(owner, grant)
     if (grant.revoked || Date.parse(grant.expires_at) <= Date.now())
       throw new ChannelError('unauthorized')
     this.core.authority.check(grant.owner_authority, 'debugger_grant_owner')
@@ -140,7 +141,7 @@ export class DebuggerPermissions {
   }
   revoke(owner: AuthorityContext, id: string) {
     this.owner(owner)
-    this.grant(id)
+    this.issuer(owner, this.grant(id))
     this.core.transaction(
       () =>
         this.core.db
@@ -148,6 +149,40 @@ export class DebuggerPermissions {
             "UPDATE debug_grants SET body=json_set(body,'$.revoked',json('true')) WHERE grant_id=?"
           )
           .run(id),
+      true
+    )
+  }
+  issuer(owner: AuthorityContext, grant: DebuggerGrant) {
+    this.owner(owner)
+    const authority = this.core.authority.snapshot(owner)
+    if (
+      authority.installation_id !== grant.owner_authority.installation_id ||
+      authority.profile !== grant.owner_authority.profile ||
+      (authority.profile === 'paired-wss-v1' &&
+        (grant.owner_authority.profile !== 'paired-wss-v1' ||
+          authority.device_key !== grant.owner_authority.device_key))
+    )
+      throw new ChannelError('unauthorized')
+  }
+  list(owner: AuthorityContext) {
+    this.owner(owner)
+    return this.core.db
+      .prepare('SELECT body FROM debug_grants ORDER BY rowid DESC')
+      .all()
+      .map((row) => DebuggerGrantSchema.parse(JSON.parse(String(row.body))))
+      .filter((grant) => {
+        try {
+          this.issuer(owner, grant)
+          return true
+        } catch {
+          return false
+        }
+      })
+  }
+  delete(owner: AuthorityContext, id: string) {
+    this.issuer(owner, this.grant(id))
+    this.core.transaction(
+      () => this.core.db.prepare('DELETE FROM debug_grants WHERE grant_id=?').run(id),
       true
     )
   }

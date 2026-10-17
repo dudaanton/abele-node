@@ -7,7 +7,11 @@ import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { wire } from './dap-wire.js'
 import { target } from './helpers.js'
 
-async function fixture(work: (f: any) => Promise<void>, options: Parameters<typeof wire>[0] = {}) {
+async function fixture(
+  work: (f: any) => Promise<void>,
+  options: Parameters<typeof wire>[0] = {},
+  initiallyStopped = true
+) {
   const dir = mkdtempSync(join(tmpdir(), 'control-driver-'))
   const core = new NodeCore(dir, { debuggerEnabled: true })
   const w = wire(options)
@@ -29,11 +33,12 @@ async function fixture(work: (f: any) => Promise<void>, options: Parameters<type
       await Promise.resolve()
     }
     await start
-    w.send({
-      type: 'event',
-      event: 'stopped',
-      body: { threadId: 1, allThreadsStopped: true, reason: 'pause' },
-    })
+    if (initiallyStopped)
+      w.send({
+        type: 'event',
+        event: 'stopped',
+        body: { threadId: 1, allThreadsStopped: true, reason: 'pause' },
+      })
     const owner = core.authority.authenticate(core.createToken('fixture').token)
     const human = { kind: 'human', authority: owner }
     core.debuggerControl.registerBackend(session.id, new DapDebuggerBackend(session))
@@ -62,6 +67,97 @@ async function request(w: ReturnType<typeof wire>, command: string) {
   throw new Error('missing_request_' + command)
 }
 describe('authorized typed DAP backend', () => {
+  it.each([[[7]], [[7, 8]], [[0]]])(
+    'pauses a never-stopped program using adapter threads %j',
+    (ids) =>
+      fixture(
+        async (f) => {
+          expect(f.session.snapshot.selected_thread_id).toBeNull()
+          const pending = f.core.debuggerControl.command(f.human, 'pause', f.body('pause'))
+          const result = pending.then(
+            (value: any) => value,
+            (error: unknown) => error
+          )
+          f.w.reply(await request(f.w, 'threads'), {
+            threads: ids.map((id) => ({ id, name: 'main' })),
+          })
+          const pause = await request(f.w, 'pause')
+          expect(pause.arguments).toEqual({ threadId: ids[0] })
+          f.w.reply(pause)
+          expect(await result).toMatchObject({ outcome: 'completed' })
+          f.w.send({
+            type: 'event',
+            event: 'stopped',
+            body: {
+              threadId: ids[0],
+              allThreadsStopped: true,
+              reason: 'pause',
+            },
+          })
+          expect(f.session.snapshot.selected_thread_id).toBeTruthy()
+        },
+        {},
+        false
+      )
+  )
+  it.each(['step', 'continue'])(
+    'rejects %s on a never-stopped program before sending DAP',
+    (method) =>
+      fixture(
+        async (f) => {
+          const result = await f.core.debuggerControl.command(f.human, method, {
+            ...f.body(method),
+            ...(method === 'step' ? { thread_id: 1, kind: 'over' } : {}),
+          })
+          expect(result).toMatchObject({ outcome: 'rejected', code: 'not_stopped' })
+          expect(f.w.messages.some((m: any) => ['next', 'continue'].includes(m.command))).toBe(
+            false
+          )
+        },
+        {},
+        false
+      )
+  )
+  it.each(['selected', 'explicit'])('pauses the %s thread without discovery', (selection) =>
+    fixture(async (f) => {
+      const pending = f.core.debuggerControl.command(f.human, 'pause', {
+        ...f.body('pause-known'),
+        ...(selection === 'explicit' ? { thread_id: 2 } : {}),
+      })
+      const pause = await request(f.w, 'pause')
+      expect(pause.arguments.threadId).toBe(selection === 'explicit' ? 2 : 1)
+      f.w.reply(pause)
+      expect(await pending).toMatchObject({ outcome: 'completed' })
+      expect(f.w.messages.some((m: any) => m.command === 'threads')).toBe(false)
+    })
+  )
+  it.each(['empty', 'failed', 'stale'])('does not pause after %s thread discovery', (mode) =>
+    fixture(
+      async (f) => {
+        const pending = f.core.debuggerControl.command(f.human, 'pause', f.body('pause-discovery'))
+        const threads = await request(f.w, 'threads')
+        if (mode === 'stale')
+          f.w.send({
+            type: 'event',
+            event: 'stopped',
+            body: {
+              threadId: 9,
+              allThreadsStopped: true,
+              reason: 'breakpoint',
+            },
+          })
+        f.w.reply(
+          threads,
+          { threads: mode === 'empty' ? [] : [{ id: 7, name: 'main' }] },
+          mode !== 'failed'
+        )
+        expect(await pending).toMatchObject({ outcome: 'outcome_unknown' })
+        expect(f.w.messages.some((m: any) => m.command === 'pause')).toBe(false)
+      },
+      {},
+      false
+    )
+  )
   it.each(['condition', 'log_message'])(
     'does not replay an undispatched %s through a basic patch',
     (expressionKind) =>

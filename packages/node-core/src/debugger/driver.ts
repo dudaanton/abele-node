@@ -686,8 +686,21 @@ export class DapSession {
     await this.request(command, { threadId: toDap(thread), singleThread })
     return this.snapshot
   }
-  async pause(thread: number) {
+  async pause(thread?: number | null) {
     this.current()
+    if (thread == null) {
+      // Discover a target without publishing an inventory change mid-command:
+      // that would invalidate the coordinator's physical dispatch fence.
+      const body = await this.request('threads')
+      this.current()
+      const threads = list(body.threads)
+      if (threads.some((t) => !dapThread(t.id) || typeof t.name !== 'string'))
+        throw new Error('dap_invalid_body')
+      if (!threads.length) throw new ChannelError('thread_required')
+      // DAP requires a thread even for a program-wide pause. Use the first
+      // adapter thread; the stopped event selects the actual stopped thread.
+      thread = fromDap(threads[0].id)
+    }
     if (!positive(thread)) throw new Error('invalid_thread')
     await this.request('pause', { threadId: toDap(thread) })
     return this.snapshot

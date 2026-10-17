@@ -1,10 +1,13 @@
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
+import { randomUUID } from 'node:crypto'
+import type { DebuggerAction } from './permissions.js'
 import type { DebuggerToolBridge } from '@abele/provider-contract'
 import type { NodeCore } from '../index.js'
 import {
   DebuggerAgentBinding,
   debuggerToolDefinitions,
   unpublishedDebuggerResult,
+  debuggerToolSpec,
 } from './agent.js'
 
 /** Host-only scope: no corresponding model/RPC constructor. The scheduler
@@ -20,6 +23,7 @@ export class DebuggerRunBinding implements DebuggerToolBridge {
   readonly tools
   private readonly bindings = new Map<string, { grant_id: string; binding: DebuggerAgentBinding }>()
   private closed = false
+  private readonly requests = new Map<string, string>()
   private readonly untrackRun: () => void
   constructor(
     private readonly core: NodeCore,
@@ -97,19 +101,158 @@ export class DebuggerRunBinding implements DebuggerToolBridge {
       throw error
     }
   }
+  private requestAccess(name: string, args: unknown) {
+    const spec = debuggerToolSpec(name)
+    if (!spec || !spec.schema.safeParse(args).success) return {}
+    const { method } = spec
+    if (this.closed || !this.context.active()) return {}
+    const { authority, run_id, conversation_id, workspace_id } = this.context
+    this.core.authority.check(authority, 'debugger_read')
+    const session = this.session(args)!
+    const state = this.core.debugger.snapshot(session).snapshot
+    const control = this.core.debuggerControl
+    if (
+      !control.permissions.conversationMatches(state, conversation_id) ||
+      state.target.workspace_id !== workspace_id
+    )
+      return {}
+    const action: DebuggerAction = ['evaluate', 'setVariable', 'variables'].includes(method)
+      ? 'expressions'
+      : ['breakpoints.patch', 'exceptionBreakpoints.set'].includes(method)
+        ? 'breakpoints'
+        : ['pause', 'continue', 'step', 'detach', 'terminate'].includes(method)
+          ? (method as DebuggerAction)
+          : 'read'
+    const key = JSON.stringify([session, state.incarnation, action])
+    for (const [id, request] of control.accessRequests) {
+      if (!request.active()) control.accessRequests.delete(id)
+    }
+    for (const [scope, id] of this.requests) {
+      if (!control.accessRequests.has(id)) this.requests.delete(scope)
+    }
+    const existing = this.requests.get(key)
+    const previous = existing ? control.accessRequests.get(existing) : undefined
+    if (existing && previous?.decision !== 'allow')
+      return {
+        request_id: existing,
+        message:
+          previous?.decision === 'deny'
+            ? 'The owner denied this debugger access request. No matching live owner grant permits this operation.'
+            : 'Missing owner-issued debugger access grant for this run and target; the owner was asked in the chat. Retry after Allow.',
+      }
+    if (existing) {
+      control.accessRequests.delete(existing)
+      this.requests.delete(key)
+    }
+    if (control.accessRequests.size >= 128) throw new ChannelError('debugger_authority_limit')
+    const request_id = randomUUID()
+    const actions = action === 'read' ? ['read'] : ['read', action]
+    const expires_at = new Date(
+      Date.now() + control.permissions.policy().max_grant_ms
+    ).toISOString()
+    const input = {
+      installation_id: authority.installation_id,
+      run_id,
+      task_id: randomUUID(),
+      conversation_id,
+      workspace_id,
+      target_id: state.target.target_id,
+      debug_session_id: session,
+      incarnation: state.incarnation,
+      actions,
+      expires_at,
+    }
+    let folder: string | null = null
+    try {
+      folder = this.core.resources.targets.pathForSession(conversation_id) ?? null
+    } catch {}
+    const recipe = this.core.db
+      .prepare('SELECT body FROM debug_launches WHERE debug_session_id=?')
+      .get(session)
+    const launch = recipe ? JSON.parse(String(recipe.body)) : null
+    const program =
+      launch?.kind === 'start' ? launch.params.program : state.target.launch_configuration_id
+    const item = {
+      kind: 'debugger_access_requested',
+      version: 1,
+      request_id,
+      ...input,
+      method,
+      access: action === 'expressions' ? 'evaluate/setVariable' : action,
+      target: state.target,
+      folder,
+      program,
+    }
+    control.accessRequests.set(request_id, {
+      item,
+      input,
+      authority,
+      decided: false,
+      active: () => {
+        try {
+          this.core.authority.check(authority, 'debugger_read')
+          return (
+            !this.closed &&
+            this.context.active() &&
+            Date.parse(expires_at) > Date.now() &&
+            this.core.debugger.snapshot(session).snapshot.incarnation === state.incarnation
+          )
+        } catch {
+          return false
+        }
+      },
+    })
+    try {
+      this.core.append(
+        conversation_id,
+        'session.update',
+        { kind: 'node' },
+        { run_id, update: item }
+      )
+    } catch (error) {
+      control.accessRequests.delete(request_id)
+      throw error
+    }
+    this.requests.set(key, request_id)
+    return {
+      request_id,
+      message:
+        'Missing owner-issued debugger access grant for this run and target; the owner was asked in the chat. Retry after Allow.',
+    }
+  }
   async call(name: string, args: unknown, signal?: AbortSignal) {
     try {
-      return await this.resolve(args).call(name, args, signal)
+      const result = await this.resolve(args).call(name, args, signal)
+      if (result?.code === 'unauthorized') return { ...result, ...this.requestAccess(name, args) }
+      return result
     } catch (error) {
+      let request = {}
+      if (error instanceof ChannelError && error.code === 'unauthorized') {
+        try {
+          request = this.requestAccess(name, args)
+        } catch {}
+      }
       return {
         outcome: 'rejected',
         code: error instanceof ChannelError ? error.code : 'debugger_unavailable',
         snapshot: null,
         observation: 'unknown',
+        ...request,
       }
     }
   }
   publish(args: unknown, result: any) {
+    // Access refusals contain no debugger data. Preserve the host-created request
+    // through the provider publication fence without trusting a supplied message.
+    if (result?.code === 'unauthorized' && [...this.requests.values()].includes(result?.request_id))
+      return {
+        ...unpublishedDebuggerResult(result, 'unauthorized'),
+        request_id: result.request_id,
+        message:
+          this.core.debuggerControl.accessRequests.get(result.request_id)?.decision === 'deny'
+            ? 'The owner denied this debugger access request. No matching live owner grant permits this operation.'
+            : 'Missing owner-issued debugger access grant for this run and target; the owner was asked in the chat. Retry after Allow.',
+      }
     try {
       return this.resolve(args).publish(args, result)
     } catch {
@@ -119,6 +262,8 @@ export class DebuggerRunBinding implements DebuggerToolBridge {
   close() {
     if (this.closed) return
     this.closed = true
+    for (const id of this.requests.values()) this.core.debuggerControl.accessRequests.delete(id)
+    this.requests.clear()
     // Remove timers/subscriptions even if durable task settlement fails. Effects
     // cannot resume through this closure; audit failure remains fail-closed.
     let error: unknown

@@ -348,6 +348,8 @@ function mapClaude(type: string, d: Data): SessionUpdate[] {
           kind: 'notice',
           level: status === 'rejected' ? 'error' : 'warning',
           code: 'rate_limit',
+          status,
+          resets_at: resets,
           text:
             (status === 'rejected' ? 'Usage limit reached' : 'Usage limit close') +
             (resets ? `, resets ${new Date(resets * 1000).toISOString()}` : ''),
