@@ -59,7 +59,7 @@ const usage: Record<string, string> = {
   doctor:
     'doctor\nChecks local runtime, provider and service prerequisites without model inference.',
   service:
-    'service enable [--paired-config PATH | --no-paired-config] | disable | status\nEnable registers and starts the existing installer runtime; disable stops/unregisters it and retains state. No reinstall or download. Stop a foreground daemon with abele-node stop before enabling.\n--paired-config records a protected (owner-only, not a symlink) paired listener configuration for remote access and restarts the service with it; update and later enables keep it. --no-paired-config removes it.',
+    'service enable [--paired-config PATH | --no-paired-config] | disable | status | debugger on|off|adopt\nEnable registers and starts the existing installer runtime; disable stops/unregisters it and retains state. No reinstall or download. Stop a foreground daemon with abele-node stop before enabling.\nDebugger on/off enables and restarts the service with the recorded choice; updates and reinstalls keep it. Debugger adopt explicitly accepts an existing service edit only when removing one --debugger argument reproduces the recorded digest; it does not restart the service.\n--paired-config records a protected (owner-only, not a symlink) paired listener configuration for remote access and restarts the service with it; update and later enables keep it. --no-paired-config removes it.',
   install:
     'install\nDeprecated alias to service enable for installer deployments; retains recorded settings. Source deployments keep the legacy manual macOS runtime-copy path.',
   update:

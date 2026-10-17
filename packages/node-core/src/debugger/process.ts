@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
 import { EventEmitter } from 'node:events'
 import { isAbsolute } from 'node:path'
+import { boundedText } from './storage.js'
 
 export type ProcessEvidence = {
   pid: number
@@ -53,6 +54,17 @@ export async function processStartIdentity(pid: number): Promise<string> {
 export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner {
   readonly evidence: ProcessEvidence
   private text = ''
+  private stderr = ''
+  private processError: string | undefined
+  get diagnostics() {
+    return {
+      pid: this.pid,
+      exit_code: this.child.exitCode,
+      signal: this.child.signalCode,
+      stderr: this.stderr,
+      ...(this.processError ? { error: this.processError } : {}),
+    }
+  }
   private constructor(
     private readonly child: ChildProcess,
     evidence: ProcessEvidence,
@@ -64,6 +76,14 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
       stream?.on('data', (chunk: Buffer) => {
         // A rolling, private startup preview, never raw traffic in persisted history.
         this.text = (this.text + chunk.toString('utf8')).slice(-16384)
+        if (stream === child.stderr) {
+          const text = this.stderr + chunk.toString('utf8')
+          // Keep the tail, including the final crash line, in a fixed byte budget.
+          const bytes = Buffer.from(text)
+          let start = Math.max(0, bytes.length - 16384)
+          while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
+          this.stderr = bytes.subarray(start).toString('utf8')
+        }
         this.emit('text')
       })
     ownedDebugPids.add(evidence.pid)
@@ -71,7 +91,12 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
       ownedDebugPids.delete(evidence.pid)
       this.emit('exit')
     })
-    child.on('error', () => this.emit('exit'))
+    child.on('error', (error) => {
+      this.processError = boundedText(error.message, 1024)
+      this.emit('exit')
+    })
+    // Unlike exit, close follows the final stderr bytes.
+    child.on('close', () => this.emit('close', this.diagnostics))
   }
   static async spawn(
     executable: string,

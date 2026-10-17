@@ -10,7 +10,8 @@ usage() {
   printf '%s\n' 'Usage: sh install.sh [--version X.Y.Z] [--prefix PATH] [--state-dir PATH]' \
     '  [--claude-path PATH] [--codex-path PATH] [--codex-model MODEL_ID] [--codex-home PATH]' \
     '  [--codex | --no-codex] [--paired-config PATH | --no-paired-config]' \
-    '  [--no-service] [--uninstall]' \
+    '  [--debugger | --no-debugger] [--no-service] [--uninstall]' \
+    '  [--adopt-debugger] (recover an existing debugger-only service edit)' \
     '  [--purge-state --confirm-purge-state ABSOLUTE_STATE_PATH]' \
     'Default prefix: ~/.local; Node 22.23.2 must already be installed.'
 }
@@ -18,6 +19,7 @@ version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service
 codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABELE_CODEX_HOME:-} codex_enabled=''
 # Paired listener configuration: keep the recorded one unless set or cleared.
 paired_config='' paired_change=''
+debugger_enabled='' old_debugger_enabled=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action|--paired-config)
@@ -31,19 +33,23 @@ while [ "$#" -gt 0 ]; do
       esac
       shift 2 ;;
     --codex) codex_enabled=true; shift ;; --no-codex) codex_enabled=false; shift ;;
+    --debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=true; shift ;;
+    --no-debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=false; shift ;;
+    --adopt-debugger) service_action=adopt-debugger; shift ;;
     --no-paired-config) [ -z "$paired_change" ] || fail 'Choose either --paired-config PATH or --no-paired-config.'; paired_change=clear; shift ;;
     --no-service) no_service=1; shift ;; --uninstall) uninstall=1; shift ;;
     --purge-state) purge=1; shift ;; --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
 done
-case "$service_action" in ''|enable|disable) ;; *) fail 'Invalid service action: enable or disable required.' ;; esac
+case "$service_action" in ''|enable|disable|adopt-debugger) ;; *) fail 'Invalid service action.' ;; esac
+[ -z "$debugger_enabled" ] || { [ "$uninstall" = 0 ] && [ "$service_action" != disable ] && [ "$service_action" != adopt-debugger ]; } || fail 'Debugger options apply only to installation or service enable.'
 if [ -n "$service_action" ]; then
   [ "$uninstall" = 0 ] && [ "$purge" = 0 ] && [ -z "$version" ] && [ "$no_service" = 0 ] || fail 'Service actions cannot be combined with deployment/removal options.'
 fi
 [ "$purge" = 0 ] || [ "$uninstall" = 1 ] || fail '--purge-state requires --uninstall'
 if [ -n "$paired_change" ]; then
-  [ "$uninstall" = 0 ] && [ "$service_action" != disable ] || fail '--paired-config/--no-paired-config apply only to installation or service enable.'
+  [ "$uninstall" = 0 ] && [ "$service_action" != disable ] && [ "$service_action" != adopt-debugger ] || fail '--paired-config/--no-paired-config apply only to installation or service enable.'
 fi
 [ -z "$confirmation" ] || [ "$purge" = 1 ] || fail '--confirm-purge-state requires --purge-state'
 [ "$(id -u)" != 0 ] || fail 'Refusing root. Run as your ordinary user, without sudo.'
@@ -55,7 +61,7 @@ node=$(command -v node)
 "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number); if(major!==22 || minor<23) process.exit(1); const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); db.close()' >/dev/null 2>&1 || fail "$node_fix"
 # Resolve the executable now: services do not read shell startup files.
 node=$("$node" -p 'process.execPath')
-if [ -n "$service_action" ]; then
+if [ -n "$service_action" ] && [ "$service_action" != adopt-debugger ]; then
   "$node" - "$$" <<'NODE' || fail 'Service transitions require an isolated process group; use abele-node service enable/disable.'
 const {spawnSync}=require('node:child_process');const pid=process.argv[2],r=spawnSync('/bin/ps',['-o','pgid=','-p',pid],{encoding:'utf8',timeout:1000});if(r.status!==0||r.stdout.trim()!==pid)process.exit(1);
 NODE
@@ -214,6 +220,9 @@ if [ -f "$config" ]; then
   codex_home=${codex_home:-$(get_config codex_home)}
   codex_enabled=${codex_enabled:-$(get_config codex_enabled)}
   old_paired_config=$(get_config paired_config)
+  old_debugger_enabled=$(get_config debugger_enabled)
+  old_debugger_enabled=${old_debugger_enabled:-false}
+  [ -n "$debugger_enabled" ] || debugger_enabled=$old_debugger_enabled
   [ -n "$paired_change" ] || paired_config=$old_paired_config
   [ -L "$root/current" ] || fail 'Installed current pointer is missing; refusing to adopt an unknown deployment.'
   [ "$(readlink "$root/current")" = "$old" ] || fail 'Installed current pointer differs from the recorded version.'
@@ -221,6 +230,8 @@ if [ -f "$config" ]; then
     fail 'Recorded foreground state identity is missing; inspect the legacy installation manually before stop or purge.'
   fi
 fi
+debugger_enabled=${debugger_enabled:-false}
+case "$debugger_enabled" in true|false) ;; *) fail 'Invalid debugger enabled configuration.' ;; esac
 if [ -z "$old" ] && { [ -e "$root/current" ] || [ -L "$root/current" ]; }; then fail 'Unrecorded current pointer; refusing to replace it.'; fi
 plist=$HOME/Library/LaunchAgents/dev.abele.node.plist
 unit=$HOME/.config/systemd/user/abele-node.service
@@ -263,7 +274,20 @@ if [ "$old_service" = 1 ]; then
   actual_file=$(physical_path "$service_file") || fail 'Cannot resolve service ownership path.'
   actual_digest=$(file_digest "$service_file") || fail 'Cannot read service ownership file.'
   owned_matches=$(path_relation same "$owned_file" "$actual_file") || fail 'Cannot compare service ownership paths.'
-  if [ "$owned_matches" != true ] || [ "$owned_digest" != "$actual_digest" ]; then fail 'Service ownership missing or modified; refusing to stop or overwrite it.'; fi
+  if [ "$owned_matches" != true ]; then fail 'Service ownership missing or modified; refusing to stop or overwrite it.'; fi
+  if [ "$owned_digest" != "$actual_digest" ]; then
+    [ "$service_action" = adopt-debugger ] || fail 'Service ownership missing or modified; refusing to stop or overwrite it.'
+    "$node" - "$service_file" "$os" "$owned_digest" <<'NODE' || fail 'Service differs by more than one --debugger argument; refusing adoption.'
+const fs=require('node:fs'),crypto=require('node:crypto');const [file,os,digest]=process.argv.slice(2),text=fs.readFileSync(file,'utf8');
+const region=os==='darwin'?/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/:/^ExecStart=(.*)$/m;
+const match=text.match(region);if(!match)throw new Error('missing_arguments');
+const token=os==='darwin'?/<string>--debugger<\/string>/g:/ "--debugger"/g;
+if([...match[1].matchAll(token)].length!==1)throw new Error('ambiguous_debugger');
+const candidate=text.replace(region,whole=>whole.replace(token,''));
+if(crypto.createHash('sha256').update(candidate).digest('hex')!==digest)throw new Error('other_service_edits');
+NODE
+    debugger_enabled=true
+  fi
   service_file=$actual_file
   # The authenticated service file, not a possibly retargeted caller alias,
   # defines the state used by the loaded service.
@@ -274,6 +298,7 @@ if [ "$old_service" = 1 ]; then
 elif [ -e "$plist" ] || [ -L "$plist" ] || [ -e "$unit" ] || [ -L "$unit" ]; then
   fail 'An unmanaged service already exists; stop and remove it manually first.'
 fi
+[ "$service_action" != adopt-debugger ] || [ "$old_service" = 1 ] || fail 'Debugger adoption requires an installed service.'
 # Check the recorded object before resolving paths or inspecting a daemon, for
 # foreground deployments as well as services. Never adopt a replacement inode.
 if [ -n "$old" ]; then
@@ -288,6 +313,22 @@ if [ -n "$old" ] && [ -n "$state" ]; then
 fi
 if [ -n "$old" ]; then state=$old_state; fi
 state=${state:-${old_state:-$HOME/.local/state/abele-node}}
+if [ "$service_action" = adopt-debugger ]; then
+  mkdir "$root/.install-lock" 2>/dev/null || fail 'Another install is active.'
+  trap 'rm -f "$root/.install-lock/adopt-config"; rmdir "$root/.install-lock"' 0
+  verify_state_identity "$state" || fail 'State identity changed before adoption.'
+  "$node" - "$config" "$service_file" "$actual_digest" "$owned_digest" "$debugger_enabled" "$root/.install-lock/adopt-config" <<'NODE' || fail 'Service changed during adoption; nothing adopted.'
+const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
+const [file,service,actual,previous,enabled,temp]=process.argv.slice(2),c=JSON.parse(fs.readFileSync(file,'utf8'));
+if(c.service_sha256!==previous || fs.lstatSync(service).isSymbolicLink() || fs.realpathSync(service)!==service || crypto.createHash('sha256').update(fs.readFileSync(service)).digest('hex')!==actual)throw new Error('ownership_changed');
+c.service_sha256=actual;c.debugger_enabled=enabled==='true';
+fs.writeFileSync(temp,JSON.stringify(c)+'\n',{mode:0o600});
+const fd=fs.openSync(temp,'r');try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}
+fs.renameSync(temp,file);const dir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(dir)}finally{fs.closeSync(dir)}
+NODE
+  printf '%s\n' 'Debugger service argument adopted; service was not restarted. Updates now retain this choice.'
+  exit 0
+fi
 discover_claude() {
   [ -z "$claude" ] || return 0
   claude=${ABELE_CLAUDE_PATH:-}
@@ -351,6 +392,7 @@ selected_cli() {
   [ -z "$codex_home" ] || set -- "$@" --codex-home "$codex_home"
   [ "$codex_enabled" = true ] || set -- "$@" --no-codex
   [ -z "$paired_config" ] || set -- "$@" --paired-config "$paired_config"
+  [ "$debugger_enabled" != true ] || set -- "$@" --debugger
   "$node" "$selected_runtime/packages/node-daemon/dist/cli.js" "$@"
 }
 # End provider discovery
@@ -638,9 +680,9 @@ start_service() {
     mkdir -p "$(dirname "$unit")" || return 1
     journal_intent write-service "$service_file" "$runtime" || return 1
     write_id=$journal_action_id
-    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" <<'NODE' || return 1
-const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired]=process.argv.slice(2);
-const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[])];
+    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" "$debugger_enabled" <<'NODE' || return 1
+const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired,debuggerEnabled]=process.argv.slice(2);
+const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[]),...(debuggerEnabled==='true'?['--debugger']:[])];
 if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
@@ -924,7 +966,7 @@ if [ -n "$service_action" ]; then
     printf '%s\n' 'Service already disabled; foreground mode.'
     exit 0
   fi
-  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && [ "$paired_config" = "$old_paired_config" ] && check_health "$old" 1; then
+  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && [ "$debugger_enabled" = "$old_debugger_enabled" ] && [ "$paired_config" = "$old_paired_config" ] && check_health "$old" 1; then
     printf '%s\n' 'Service already enabled and running.'
     exit 0
   fi
@@ -1014,8 +1056,8 @@ if [ "$service" = 1 ]; then
   installed_state=$(service_state) || fail 'Cannot read newly installed service state.'
   [ "$installed_state" = "$state" ] || fail 'Service state differs from the canonical installation state.'
 fi
-"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" <<'NODE'
-const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled,paired]=process.argv.slice(2);
+"$node" - "$work/wrapper" "$work/config.json" "$node" "$root" "$state" "$claude" "$version" "$service" "$service_file" "$expected_state_identity" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" "$debugger_enabled" <<'NODE'
+const fs=require('node:fs'); const [wrapper,config,node,root,state,claude,version,service,serviceFile,expectedIdentity,codex,model,home,enabled,paired,debuggerEnabled]=process.argv.slice(2);
 const stateStat=fs.statSync(state,{bigint:true}),marker=state+'/.abele-state-identity',markerStat=fs.lstatSync(marker),state_identity='marker:'+stateStat.ino+':'+fs.readFileSync(marker,'utf8');
 if(!markerStat.isFile() || markerStat.isSymbolicLink())throw new Error('state_identity_changed_before_publication');
 if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathSync(state)!==state)throw new Error('state_identity_changed_before_publication');
@@ -1023,7 +1065,7 @@ const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
-fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,service:Number(service),...ownership})+'\n',{mode:0o600});
+fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,debugger_enabled:debuggerEnabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
 if(process.env.ABELE_SERVICE_TRANSITION){const path=require('node:path'),dir=process.env.ABELE_SERVICE_TRANSITION;for(const [name,file] of [['wrapper',wrapper],['config',config]]){const stage=path.join(dir,'next-'+name);fs.copyFileSync(file,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}const fd=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi

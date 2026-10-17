@@ -72,7 +72,7 @@ function fixture() {
   )
   writeFileSync(
     join(runtime, 'fake-installer.cjs'),
-    `const fs=require('node:fs');const file=${JSON.stringify(configFile)};const args=process.argv.slice(2);const action=args[args.indexOf('--service-action')+1];const c=JSON.parse(fs.readFileSync(file));fs.appendFileSync(${JSON.stringify(join(home, 'actions'))},action+'\\n');fs.appendFileSync(${JSON.stringify(join(home, 'installer-args'))},JSON.stringify(args)+'\\n');c.service=action==='enable'?1:0;if(args.includes('--paired-config'))c.paired_config=args[args.indexOf('--paired-config')+1];if(args.includes('--no-paired-config'))c.paired_config='';fs.writeFileSync(file,JSON.stringify(c));`
+    `const fs=require('node:fs');const file=${JSON.stringify(configFile)};const args=process.argv.slice(2);const action=args[args.indexOf('--service-action')+1];const c=JSON.parse(fs.readFileSync(file));fs.appendFileSync(${JSON.stringify(join(home, 'actions'))},action+'\\n');fs.appendFileSync(${JSON.stringify(join(home, 'installer-args'))},JSON.stringify(args)+'\\n');if(action!=='adopt-debugger')c.service=action==='enable'?1:0;if(args.includes('--debugger')||action==='adopt-debugger')c.debugger_enabled=true;if(args.includes('--no-debugger'))c.debugger_enabled=false;if(args.includes('--paired-config'))c.paired_config=args[args.indexOf('--paired-config')+1];if(args.includes('--no-paired-config'))c.paired_config='';fs.writeFileSync(file,JSON.stringify(c));`
   )
   return {
     entry: join(runtime, 'packages/node-daemon/dist/cli.js'),
@@ -139,6 +139,23 @@ it('service commands are human by default, JSON on request, and preserve recorde
     state: f.state,
     state_identity: f.config.state_identity,
   })
+})
+it('service debugger commands use the installer boundary and default to plain text', () => {
+  const f = fixture()
+  const on = run(f.entry, f.state, 'service', 'debugger', 'on')
+  expect(on.status, on.stderr).toBe(0)
+  expect(on.stdout).toContain('Mode: background service')
+  expect(on.stdout).toContain('Debugger: on')
+  expect(installerArgs(f.home)[0]).toContain('--debugger')
+  const off = run(f.entry, f.state, 'service', 'debugger', 'off', '--json')
+  expect(off.status, off.stderr).toBe(0)
+  expect(JSON.parse(off.stdout)).toMatchObject({ managed: true, debugger_enabled: false })
+  expect(installerArgs(f.home)[1]).toContain('--no-debugger')
+  const adopt = run(f.entry, f.state, 'service', 'debugger', 'adopt')
+  expect(adopt.status, adopt.stderr).toBe(0)
+  expect(installerArgs(f.home)[2]).toContain('adopt-debugger')
+  expect(run(f.entry, f.state, 'service', 'debugger', 'maybe').status).toBe(1)
+  expect(installerArgs(f.home)).toHaveLength(3)
 })
 it('start in a service installation invokes enable and never creates a foreground daemon', () => {
   const f = fixture()

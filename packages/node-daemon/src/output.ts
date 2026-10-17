@@ -117,6 +117,7 @@ export function humanOutput(
       return [
         `Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`,
         `Service: ${r.enabled ? 'enabled' : 'disabled'}; daemon ${r.running ? 'running' : 'stopped'}`,
+        `Debugger: ${r.debugger_enabled ? 'on' : 'off'}`,
         ...(r.enabled ? [`Ownership: ${shown(r.ownership)}`] : []),
         pairedListener(r.paired_listener),
         ...(!r.enabled ? ['Start in a terminal: abele-node start'] : []),

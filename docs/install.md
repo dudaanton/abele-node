@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.21
+  sh -s -- --version 0.4.22
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -207,6 +207,34 @@ to service-mode transitions, not interrupted runtime upgrades.
 
 Later `abele-node update` preserves the selected mode. For manual installer reruns,
 continue passing `--no-service` while foreground mode is selected.
+
+Enable or disable the installed service's debugger with:
+
+```sh
+abele-node service debugger on
+abele-node service debugger off
+abele-node service status
+```
+
+On/off enables and restarts the service using the existing runtime, recording the
+choice and the new service digest. Updates, reinstalls, and later service enables
+retain it. A fresh install defaults to off; `sh install.sh --debugger` and
+`sh install.sh --no-debugger` explicitly select it during installation. Status
+shows the recorded choice. With `service status --json`, `debugger_enabled` is a
+boolean describing the saved installer choice, even when the service is disabled;
+it does not report a foreground daemon's debugger capability. Output is plain text
+unless you request `--json`.
+
+If you previously added `--debugger` to the service file by hand, explicitly adopt
+that edit with `abele-node service debugger adopt`. On an older installed CLI
+that lacks this command, download the current installer using the instructions
+above, inspect it, then run `sh install.sh --adopt-debugger` (include `--prefix PATH`
+if you installed under a custom prefix). This recovery does not download a runtime,
+stop or restart the service. It accepts the file only if removing exactly one
+`--debugger` argument reproduces its recorded SHA-256 digest byte for byte. Other
+edits, including formatting changes, are refused; inspect and restore those
+manually. Then run `abele-node update` normally. A service edited but not reloaded
+must be reloaded manually before update can verify the loaded service arguments.
 
 `abele-node service enable --paired-config PATH` records a paired listener
 configuration for remote access and restarts the service with it;
@@ -714,7 +742,7 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.21  # example; select an existing release
+   git checkout v0.4.22  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

@@ -16,14 +16,15 @@ async function fixture(
     w: ReturnType<typeof wire>
     path: string
   }) => Promise<void>,
-  wireOptions: Parameters<typeof wire>[0] = {}
+  wireOptions: Parameters<typeof wire>[0] = {},
+  profile = 'fake'
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'dap-driver-'))
   const core = new NodeCore(join(dir, 'state'), { debuggerEnabled: true })
   const path = join(dir, 'fixture.cjs')
   writeFileSync(path, 'setInterval(() => {}, 1000)\n')
   const w = wire(wireOptions),
-    state = core.debugger.create(target)
+    state = core.debugger.create({ ...target, adapter_profile: profile })
   const session = new DapSession(core.debugger, state, w.dap, new Map([['source', path]]))
   try {
     await work({ core, session, w, path })
@@ -60,6 +61,95 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('never exports a lazy getter reference or evaluates it while inspecting native objects', async () =>
+    fixture(
+      async (f) => {
+        await ready(f)
+        const scope = f.core.debugger.issueHandle(f.session.id, 'object', 23, 1)
+        ;(f.session as any).objectThreads.set(scope, 1)
+        const pending = f.session.approvedVariables(scope)
+        f.w.reply(f.w.messages.at(-1), {
+          variables: [
+            {
+              name: 'getter',
+              value: '(...)',
+              variablesReference: 99,
+              presentationHint: { lazy: true },
+            },
+            { name: 'item', value: 'Object', variablesReference: 100 },
+          ],
+        })
+        const page = await pending
+        expect(page.items[0]).toMatchObject({ name: 'getter', handle: null })
+        expect(page.items[1]).toMatchObject({ name: 'item', handle: expect.any(String) })
+        const depthZero = f.session.approvedVariables(scope, 0, 50, 8192, 0)
+        f.w.reply(f.w.messages.at(-1), {
+          variables: [{ name: 'item', value: 'Object', variablesReference: 100 }],
+        })
+        expect((await depthZero).items[0]).toMatchObject({ handle: null })
+        expect(f.w.messages.filter((m) => m.command === 'variables')).toHaveLength(2)
+        expect(f.w.messages.some((m) => m.command === 'evaluate')).toBe(false)
+      },
+      {},
+      'js-ts-native'
+    ))
+  it('does not publish native child references from a reply overtaken by a step', async () =>
+    fixture(
+      async (f) => {
+        await ready(f)
+        const scope = f.core.debugger.issueHandle(f.session.id, 'object', 23, 1)
+        ;(f.session as any).objectThreads.set(scope, 1)
+        const pending = f.session.approvedVariables(scope)
+        const rejected = expect(pending).rejects.toThrow('stale_state')
+        const variables = f.w.messages.at(-1)
+        const step = f.session.step(1, 'over')
+        f.w.reply(f.w.messages.at(-1))
+        await step
+        f.w.reply(variables, {
+          variables: [{ name: 'item', value: 'old', variablesReference: 100 }],
+        })
+        await rejected
+      },
+      {},
+      'js-ts-native'
+    ))
+  it('exports approved children and rejects them after execution moves without a request', async () =>
+    fixture(
+      async (f) => {
+        await ready(f)
+        const scope = f.core.debugger.issueHandle(f.session.id, 'object', 23, 1)
+        ;(f.session as any).objectThreads.set(scope, 1)
+        const pending = f.session.approvedVariables(scope, 0, 2)
+        f.w.reply(f.w.messages.at(-1), {
+          variables: [{ name: 'item', value: 'Object', variablesReference: 99 }],
+        })
+        const page = await pending
+        const child = (page.items[0] as any).handle
+        expect(child).toEqual(expect.any(String))
+        expect(page.observation_stop_epoch).toBe(f.session.snapshot.stop_epoch)
+        const expansion = f.session.approvedVariables(child, 0, 2)
+        expect(f.w.messages.at(-1).arguments).toEqual({
+          variablesReference: 99,
+          start: 0,
+          count: 2,
+        })
+        f.w.reply(f.w.messages.at(-1), {
+          variables: [{ name: 'nested', value: '3', variablesReference: 101 }],
+        })
+        const nested = (await expansion).items[0] as any
+        const step = f.session.step(1, 'over')
+        f.w.reply(f.w.messages.at(-1))
+        await step
+        const sent = f.w.messages.length
+        await expect(f.session.approvedVariables(nested.handle)).rejects.toThrow(
+          /expired.*program moved on/
+        )
+        expect(f.w.messages).toHaveLength(sent)
+        expect(f.w.messages.some((m) => m.command === 'evaluate')).toBe(false)
+      },
+      {},
+      'js-ts-native'
+    ))
   it('records in repl even when clipboard is advertised, preserving frame, chunks and cleanup', async () =>
     fixture(async (f) => {
       await ready(f, true)

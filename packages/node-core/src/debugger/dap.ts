@@ -1,5 +1,6 @@
 import type { Readable, Writable } from 'node:stream'
 import type { DebugProtocol } from '@vscode/debugprotocol'
+import { debuggerLog } from './log.js'
 
 export const DAP_LIMITS = Object.freeze({
   frameBytes: 1024 * 1024,
@@ -48,6 +49,7 @@ export class DapTransport {
   private readonly pending = new Map<number, Pending>()
   private readonly slotWaiters = new Set<SlotWaiter>()
   private readonly retired = new Map<number, string>()
+  private retiredThrough = 0
   private readonly reverses = new Map<
     number,
     { controller: AbortController; timer: ReturnType<typeof setTimeout> }
@@ -208,7 +210,11 @@ export class DapTransport {
     clearTimeout(pending.timer)
     pending.removeAbort()
     this.retired.set(seq, pending.command)
-    if (this.retired.size > 128) this.retired.delete(this.retired.keys().next().value!)
+    if (this.retired.size > 128) {
+      const oldest = this.retired.keys().next().value!
+      this.retiredThrough = Math.max(this.retiredThrough, oldest)
+      this.retired.delete(oldest)
+    }
     this.drainSlots()
     return pending
   }
@@ -297,6 +303,10 @@ export class DapTransport {
         throw new Error('dap_message')
       const command =
         this.pending.get(message.request_seq)?.command ?? this.retired.get(message.request_seq)
+      // Timeouts/cancellation do not retract a request from the wire. Keep late
+      // replies inert after bounded tombstone eviction. Live requests still
+      // require exact command correlation below.
+      if (command === undefined && message.request_seq <= this.retiredThrough) return
       if (command !== message.command) throw new Error('dap_correlation')
       const pending = this.take(message.request_seq)
       if (!pending) return // bounded tombstones allow late timeout/cancellation replies
@@ -368,6 +378,12 @@ export class DapTransport {
   }
   close(error = new Error('dap_closed')) {
     if (this.failure) return
+    debuggerLog('Transport closing', () => ({
+      reason: error.message,
+      pending: [...this.pending.values()].map((p) => p.command),
+      reverse_pending: this.reverses.size,
+      partial_frame_bytes: this.filled,
+    }))
     this.failure = error
     clearTimeout(this.frameTimer)
     this.frameTimer = undefined

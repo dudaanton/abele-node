@@ -12,6 +12,25 @@ import { wire } from './dap-wire.js'
 import { target } from './helpers.js'
 
 describe('native profile resource lifetimes (fake adapter)', () => {
+  it('does not let diagnostic snapshot failure suppress owned cleanup', async () => {
+    const tree = {
+      root: {
+        id: 'fixture-root',
+        get snapshot() {
+          throw new Error('closed_storage')
+        },
+      },
+      close: vi.fn(),
+    } as unknown as JsSessionTree
+    const adapter = { terminate: vi.fn(async () => {}) } as unknown as OwnedDebugProcess
+    const owner = { terminate: vi.fn(async () => {}) } as unknown as OwnedDebugProcess
+    const removed = vi.fn()
+    await new NativeJsRun(tree, adapter, owner, removed).close()
+    expect(tree.close).toHaveBeenCalledOnce()
+    expect(owner.terminate).toHaveBeenCalledOnce()
+    expect(adapter.terminate).toHaveBeenCalledOnce()
+    expect(removed).toHaveBeenCalledOnce()
+  })
   it('closes a newly connected adapter if initial audit storage fails', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'native-dap-')),
       core = new NodeCore(dir, { debuggerEnabled: true })
@@ -23,9 +42,12 @@ describe('native profile resource lifetimes (fake adapter)', () => {
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
     const port = (server.address() as { port: number }).port,
       terminate = vi.fn(async () => {})
-    const spawn = vi
-      .spyOn(OwnedDebugProcess, 'spawn')
-      .mockResolvedValue({ waitForText: async () => /:(\d+)/.exec(':' + port), terminate } as any)
+    const spawn = vi.spyOn(OwnedDebugProcess, 'spawn').mockResolvedValue({
+      waitForText: async () => /:(\d+)/.exec(':' + port),
+      terminate,
+      on: vi.fn(),
+      diagnostics: { pid: 123, exit_code: null, signal: null, stderr: '' },
+    } as any)
     const installed = vi.spyOn(installation, 'installedJsAdapter').mockResolvedValue({
       version: 'fixture',
       sha256: 'a'.repeat(64),
@@ -174,7 +196,10 @@ describe('native profile resource lifetimes (fake adapter)', () => {
           if (failure) throw new Error('cleanup_failed')
         }),
       } as unknown as OwnedDebugProcess
-      const tree = { close: vi.fn() } as unknown as JsSessionTree
+      const tree = {
+        close: vi.fn(),
+        root: { id: 'fixture-root', snapshot: { lifecycle: 'active' } },
+      } as unknown as JsSessionTree
       const removed = vi.fn(),
         run = new NativeJsRun(tree, adapter, owner, removed)
       const profile = new JsDebugProfile({} as any, { stateDirectory: 'unused' })

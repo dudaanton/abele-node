@@ -174,6 +174,21 @@ travels as `Number.MAX_SAFE_INTEGER`, an id no adapter may use itself. Terminati
 answers the root's disconnect only once they are gone.
 Root connection loss closes child transports; child loss does not corrupt root state.
 
+The node debug log records transport close reasons and outstanding command names,
+session incarnation/lifecycle/stop epoch, requested run cleanup, and adapter spawn,
+startup failure and exit. Adapter exit records retain the OS exit code or signal
+and the last 16 KiB of stderr separately from stdout, after stderr closes. These
+records contain no DAP request arguments or automatic variable dumps; diagnostic
+failure cannot prevent transport settlement or process cleanup.
+
+A late response to a cancelled or timed-out request remains inert even after
+128 newer completions evict its command tombstone. Previously that valid late
+reply caused `dap_correlation`, closing a healthy connection during longer runs.
+Live requests still require exact command correlation, including old requests
+that remain pending while newer captures complete. This fake-stream reproduction
+does not establish the cause of every observed native adapter closure; retain the
+new lifecycle and exit records when reproducing launch/restart failures.
+
 Detach always requests `terminateDebuggee: false` and leaves attached targets alive.
 Termination never asks an adapter to choose which process to kill: only the node's
 owned supervisor may signal its directly spawned target. Disconnect failure and

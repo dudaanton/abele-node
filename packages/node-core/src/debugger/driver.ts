@@ -10,6 +10,7 @@ import { DebuggerService, DebuggerStateError } from './index.js'
 import { DapTransport, DAP_LIMITS } from './dap.js'
 import type { DebugProcessOwner } from './process.js'
 import { boundedText } from './storage.js'
+import { debuggerLog } from './log.js'
 import {
   CAPTURE_MAX_CHARS,
   captureChunk,
@@ -107,7 +108,16 @@ export class DapSession {
     this.id = state.debug_session_id
     this.incarnation = state.incarnation
     dap.onEvent((event) => this.event(event))
-    dap.onClose(() => {
+    dap.onClose((error) => {
+      debuggerLog('DAP closed', () => ({
+        session: this.id,
+        incarnation: this.incarnation,
+        lifecycle: this.snapshot.lifecycle,
+        execution: this.snapshot.execution,
+        stop_epoch: this.snapshot.stop_epoch,
+        ending: this.ending,
+        reason: error.message,
+      }))
       this.frameThreads.clear()
       this.objectThreads.clear()
       if (!this.ending && live(this.snapshot))
@@ -503,7 +513,10 @@ export class DapSession {
         truncated = true
         break
       }
-      item.handle = this.objectHandle(variable.variablesReference, thread)
+      item.handle =
+        variable.presentationHint?.lazy === true
+          ? null
+          : this.objectHandle(variable.variablesReference, thread)
       items.push(item)
     }
     return { items, truncated, snapshot: this.snapshot }
@@ -606,6 +619,22 @@ export class DapSession {
     paging(start, count)
     byteLimit(maxBytes)
     if (!Number.isInteger(depth) || depth < 0 || depth > 3) throw new Error('invalid_depth')
+    // Fixed native configuration has no custom generators. Ordinary pages
+    // preserve the stop; lazy getter references are never exported.
+    if (this.snapshot.target.adapter_profile === 'js-ts-native') {
+      const before = this.snapshot
+      const page = await this.variables(handle, start, count, maxBytes)
+      return {
+        items: page.items.map((item) => ({ ...item, handle: depth > 0 ? item.handle : null })),
+        truncated: page.truncated,
+        start,
+        count,
+        next: page.truncated || page.items.length >= count ? start + page.items.length : null,
+        depth_limit: depth,
+        expansion_depth: 0,
+        observation_stop_epoch: before.stop_epoch,
+      }
+    }
     const variablesReference = this.service.resolveHandle(this.id, handle, 'object')
     const before = this.expressionIntent()
     const body = await this.request('variables', { variablesReference, start, count })
@@ -623,9 +652,7 @@ export class DapSession {
       }
       items.push(item)
     }
-    // A depth is an upper bound, not permission to execute additional getters.
-    // Unknown/effectful profiles return one explicit flat page and never recurse
-    // or export child references after the expression intent expires handles.
+    // Unknown profiles retain conservative invalidation and export no children.
     return {
       items,
       truncated,

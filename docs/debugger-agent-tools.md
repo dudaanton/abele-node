@@ -106,12 +106,29 @@ requested-data citation if still retained. History
 is the source of those bytes, not an unbounded receipt cache; eviction remains
 explicit in history. No unrelated values are automatically fetched/exported.
 
+The owner's variables request also takes exact approval. DAP `variables` is not
+a universal promise of nonexecution: the pinned js-debug creates lazy references
+for getters, whose expansion calls into the target, and its property/description
+preview helpers use `Runtime.callFunctionOn` (ordinary property previews use
+`throwOnSideEffect`). Fixed native configuration supplies no custom generators;
+this node never adds evaluate/getter/formatter fallbacks, and suppresses lazy
+getter references. Those restrictions do not prove all adapter inspection to be
+nonexecuting, so they do not remove the approval rule.
+
 Variables accept `start`, `count` (1–100), `depth` (0–3) and `max_bytes` (1–8192).
 Depth is an **upper bound**, not permission for extra getter/formatter execution.
-The current conservative backend returns one explicit flat page:
+The backend returns one explicit page:
 `expansion_depth: 0`, requested `depth_limit`, `start`, `count`, `next` and
-`truncated`. It never recursively reads children or returns new live child handles
-after the effectful intent invalidates the old stop. A byte-limited first item can
+`truncated`. The native JS profile also returns nullable opaque `handle` fields
+on items. Use a non-null handle in another explicitly approved variables request;
+no children are fetched automatically. Depth zero suppresses child handles. Lazy
+getter references are never exported. Handles belong only to the current stop:
+stepping, resuming, invalidation, restart or connection loss expires them.
+`stale_handle` means “reference expired, the program moved on”; refresh scopes,
+never present cached children as current. Unknown profiles retain conservative
+effectful invalidation and export no child handles. `DebuggerVariablesResultSchema`
+and the client's `parseDebuggerVariables` parse retained requested data (receipts
+contain control state, not values). A byte-limited first item can
 leave `next` at the same offset; callers must change the explicit budget, not loop
 blindly. Byte limits bound returned item data; small envelope/paging metadata and
 the current snapshot are separate. One stopped thread does not prove globally

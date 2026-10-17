@@ -40,7 +40,11 @@ export class DebuggerStateError extends Error {
     readonly code: 'stale_state' | 'stale_handle' | 'not_stopped' | 'stale_breakpoints',
     readonly snapshot: DebuggerSnapshot
   ) {
-    super(code)
+    super(
+      code === 'stale_handle'
+        ? 'stale_handle: reference expired, the program moved on; refresh the current stop'
+        : code
+    )
   }
 }
 

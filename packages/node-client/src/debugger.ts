@@ -12,7 +12,12 @@ import {
   DebuggerStartSchema,
   DebuggerStartResultSchema,
   type DebuggerSnapshot,
+  DebuggerVariablesResultSchema,
 } from '@abele/node-protocol'
+
+/** Parse requested_data from a completed variables history entry. Child handles
+ * expire when the stop changes; refresh scopes after stale_handle. */
+export const parseDebuggerVariables = (data: unknown) => DebuggerVariablesResultSchema.parse(data)
 
 type Methods = typeof DebuggerMethodSchemas
 type Input<M extends keyof Methods> = Methods[M]['_input']

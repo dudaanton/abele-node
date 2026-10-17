@@ -354,6 +354,34 @@ export const DebuggerHistoryResultSchema = z
 
 /** Full v1 declarations. Only the implemented authorized B3 subset is routed;
  * these are never merged into ordinary offline mutation MethodSchemas. */
+/** One explicit approved page. Handles are opaque, stop-scoped and may be used
+ * only in another variables request. No recursion or getter evaluation is implied.
+ * An inspection may invalidate previous handles; use the receipt snapshot. */
+export const DebuggerVariablesResultSchema = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            name: z.string().max(256),
+            value: z.string().max(4096),
+            type: z.string().max(256).optional(),
+            handle: id.nullable().optional(),
+          })
+          .strict()
+      )
+      .max(100),
+    truncated: z.boolean(),
+    start: seq,
+    count: z.number().int().min(1).max(100),
+    next: seq.nullable(),
+    depth_limit: z.number().int().min(0).max(3),
+    expansion_depth: z.literal(0),
+    observation_stop_epoch: seq,
+  })
+  .strict()
+export type DebuggerVariablesResult = z.infer<typeof DebuggerVariablesResultSchema>
+
 export const DebuggerMethodSchemas = {
   'debugger.v1.profiles': z.object({}).strict(),
   'debugger.v1.sessions': z

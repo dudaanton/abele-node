@@ -394,6 +394,22 @@ async function main() {
       return
     }
     case 'service': {
+      if (args[1] === 'debugger') {
+        if (args.length !== 3 || !['on', 'off', 'adopt'].includes(args[2]!))
+          throw new Error('Usage: abele-node service debugger on|off|adopt [--json]')
+        if (explicitPairedConfig || noPairedConfig)
+          throw new Error('Paired configuration options apply only to service enable.')
+        output(
+          await changeService(
+            runtimeRoot,
+            state,
+            args[2] === 'adopt' ? 'adopt-debugger' : 'enable',
+            undefined,
+            args[2] === 'adopt' ? undefined : args[2] === 'on'
+          )
+        )
+        return
+      }
       if (args.length !== 2 || !['enable', 'disable', 'status'].includes(args[1]!))
         throw new Error('Usage: abele-node service enable|disable|status [--json]')
       const paired = explicitPairedConfig || (noPairedConfig ? null : undefined)

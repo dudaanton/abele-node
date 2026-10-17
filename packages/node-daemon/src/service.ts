@@ -163,6 +163,7 @@ export function installedService(runtime: string, state: string) {
     service_file?: string
     service_sha256?: string
     paired_config?: string
+    debugger_enabled?: boolean
   }
   if (
     !/^\d+\.\d+\.\d+$/.test(config.version) ||
@@ -227,6 +228,7 @@ export function serviceStatus(runtime: string, state: string) {
     service_file: config?.service_file ?? null,
     state_dir: state,
     paired_listener: pairedListener(config?.paired_config || undefined),
+    debugger_enabled: config?.debugger_enabled === true,
   }
 }
 
@@ -235,9 +237,10 @@ export async function changeService(
   runtime: string,
   state: string,
   action: string,
-  paired?: string | null
+  paired?: string | null,
+  debuggerEnabled?: boolean
 ) {
-  if (!['enable', 'disable'].includes(action))
+  if (!['enable', 'disable', 'adopt-debugger'].includes(action))
     throw new Error('Usage: abele-node service enable|disable|status [--json]')
   if (paired !== undefined && action !== 'enable')
     throw new Error('--paired-config and --no-paired-config apply only to service enable.')
@@ -260,7 +263,15 @@ export async function changeService(
     )
   const child = spawn(
     '/bin/sh',
-    [installer, '--prefix', config.prefix, '--service-action', action, ...pairedArgs],
+    [
+      installer,
+      '--prefix',
+      config.prefix,
+      '--service-action',
+      action,
+      ...pairedArgs,
+      ...(debuggerEnabled === undefined ? [] : [debuggerEnabled ? '--debugger' : '--no-debugger']),
+    ],
     {
       detached: true, // Isolate the shell and mutation children from the caller's process group.
       // Services must use the same Node executable as this CLI, not shell discovery.

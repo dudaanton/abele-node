@@ -7,6 +7,11 @@ infrastructure**: target startup arrived later as the owner's `debugger.v1.start
 
 ## Availability and RPC boundary
 
+For an installer-managed background service, use `abele-node service debugger on`
+or `abele-node service debugger off`. The installer records this choice and keeps
+it through updates and reinstalls. Use `abele-node service debugger adopt` to
+recover a service edited only by adding the flag; see [installation and recovery](install.md).
+
 `abele-node start --debugger` (or the daemon's explicit `debuggerOptions.enabled`)
 enables the infrastructure capability; it defaults to **off**. It does not enable
 or install a real profile. `profiles` remains empty while the JS audit is blocked.

@@ -7,6 +7,7 @@ import { DapTransport } from './dap.js'
 import { DapSession, JsSessionTree } from './driver.js'
 import { OwnedDebugProcess, processStartIdentity } from './process.js'
 import { installedJsAdapter, jsAdapterInstalled, requireJsPin } from './js-install.js'
+import { debuggerLog } from './log.js'
 
 export type JsLaunch = {
   cwd: string
@@ -221,10 +222,17 @@ export class JsDebugProfile {
       [installed.entry, '0', '127.0.0.1'],
       { env: {} }
     )
+    let phase = 'starting'
+    let sessionId: string | undefined
+    debuggerLog('Adapter spawned', () => ({ pid: adapter.pid, phase }))
+    adapter.on('close', (diagnostics) => {
+      debuggerLog('Adapter exited', () => ({ session: sessionId, phase, ...diagnostics }))
+    })
     let tree: JsSessionTree | undefined
     let rootDap: DapTransport | undefined
     try {
       const match = await adapter.waitForText(/listening at 127\.0\.0\.1:(\d+)/)
+      phase = 'connecting'
       const port = Number(match[1])
       const connect = (signal?: AbortSignal) => connection(port, signal)
       // Reverse coverage is exact and one-level. It does not authorize terminals,
@@ -237,6 +245,8 @@ export class JsDebugProfile {
         adapter_version: installed.version,
       })
       const root = new DapSession(this.service, state, rootDap, sources)
+      sessionId = root.id
+      phase = 'configuring'
       if (owner) root.setOwner(owner)
       tree = new JsSessionTree(this.service, root, connect, {
         mode: 'attach',
@@ -245,10 +255,17 @@ export class JsDebugProfile {
       })
       rootDap.setReverseHandler((request, signal) => tree!.reverse(request, signal))
       await root.start('attach', configuration)
+      phase = 'active'
       const run = new NativeJsRun(tree, adapter, owner, () => this.runs.delete(run))
       this.runs.add(run)
       return run
     } catch (error) {
+      phase = 'startup-failed'
+      debuggerLog('Adapter startup failed', () => ({
+        session: sessionId,
+        reason: error instanceof Error ? error.message : String(error),
+        ...adapter.diagnostics,
+      }))
       tree?.close()
       rootDap?.close()
       await adapter.terminate()
@@ -350,6 +367,12 @@ export class NativeJsRun {
     return (this.completion ??= Promise.resolve().then(() => this.cleanup()))
   }
   private async cleanup() {
+    debuggerLog('Run cleanup', () => ({
+      session: this.root.id,
+      detached: this.detached,
+      lifecycle: this.root.snapshot.lifecycle,
+      ...this.adapter.diagnostics,
+    }))
     try {
       try {
         this.tree.close()

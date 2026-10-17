@@ -23,6 +23,98 @@ import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+for (const platform of ['mac', 'linux']) {
+  test(`installer debugger flags persist and adoption rejects unrelated edits: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    for (const args of [
+      ['--version', '0.2.0', '--debugger'],
+      ['--version', '0.2.3'],
+      ['--version', '0.2.3'],
+    ]) {
+      const result = await install(h, args, env)
+      assert.equal(result.code, 0, result.stderr)
+      const c = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
+      assert.equal(c.debugger_enabled, true)
+      assert.match(await readFile(c.service_file, 'utf8'), /--debugger/)
+    }
+    const off = await install(h, ['--version', '0.2.3', '--no-debugger'], env)
+    assert.equal(off.code, 0, off.stderr)
+    const file = join(h, '.local/share/abele-node/config.json')
+    const before = await readFile(file, 'utf8'),
+      c = JSON.parse(before)
+    assert.equal(c.debugger_enabled, false)
+    const text = await readFile(c.service_file, 'utf8')
+    assert.doesNotMatch(text, /--debugger/)
+    const edited =
+      platform === 'mac'
+        ? text.replace('</array>', '<string>--debugger</string></array>')
+        : text.replace(/^(ExecStart=.*)$/m, '$1 "--debugger"')
+    await writeFile(c.service_file, edited + '\n# unrelated\n')
+    assert.notEqual((await install(h, ['--adopt-debugger'], env)).code, 0)
+    assert.equal(await readFile(file, 'utf8'), before)
+    await writeFile(c.service_file, edited)
+    assert.notEqual((await install(h, ['--version', '0.2.3'], env)).code, 0)
+    const adopted = await install(h, ['--adopt-debugger'], env)
+    assert.equal(adopted.code, 0, adopted.stderr)
+    const after = JSON.parse(await readFile(file, 'utf8'))
+    assert.equal(after.debugger_enabled, true)
+    assert.equal(after.service_sha256, createHash('sha256').update(edited).digest('hex'))
+    assert.equal(await readFile(c.service_file, 'utf8'), edited)
+  })
+}
+for (const platform of ['mac', 'linux']) {
+  test(`service debugger choice survives reinstall and strict adoption: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    let result = await install(h, ['--version', '0.2.0', '--debugger'], env)
+    assert.equal(result.code, 0, result.stderr)
+    const configFile = join(h, '.local/share/abele-node/config.json')
+    const recorded = async (enabled) => {
+      const c = JSON.parse(await readFile(configFile, 'utf8'))
+      const text = await readFile(c.service_file, 'utf8')
+      assert.equal(c.debugger_enabled, enabled)
+      assert.equal(text.includes('--debugger'), enabled)
+      assert.equal(c.service_sha256, createHash('sha256').update(text).digest('hex'))
+      return { c, text }
+    }
+    await recorded(true)
+    result = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(result.code, 0, result.stderr)
+    await recorded(true)
+    result = await install(h, ['--service-action', 'enable', '--no-debugger'], env)
+    assert.equal(result.code, 0, result.stderr)
+    const { c, text } = await recorded(false)
+    const modified =
+      platform === 'mac'
+        ? text.replace('</array>', '<string>--debugger</string></array>')
+        : text.replace(/^(ExecStart=.*)$/m, '$1 "--debugger"')
+    await writeFile(c.service_file, modified)
+    result = await install(h, ['--version', '0.2.3'], env)
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /ownership missing or modified/)
+    await writeFile(c.service_file, modified + '\n# foreign edit\n')
+    result = await install(h, ['--service-action', 'adopt-debugger'], env)
+    assert.notEqual(result.code, 0)
+    assert.equal(await readFile(configFile, 'utf8'), JSON.stringify(c) + '\n')
+    await writeFile(c.service_file, modified)
+    if (platform === 'mac') {
+      // Model the owner reloading the manually edited LaunchAgent.
+      for (const name of ['.fake-launch-job', '.test-service-running']) {
+        const file = join(h, name),
+          job = JSON.parse(await readFile(file, 'utf8'))
+        job.arguments.push('--debugger')
+        await writeFile(file, JSON.stringify(job))
+      }
+    }
+    result = await install(h, ['--service-action', 'adopt-debugger'], env)
+    assert.equal(result.code, 0, result.stderr)
+    await recorded(true)
+    result = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(result.code, 0, result.stderr)
+    await recorded(true)
+  })
+}
 test('installer retains launcher symlinks across version-directory replacement', async () => {
   const h = await home(),
     bin = join(h, 'launchers'),
@@ -206,7 +298,7 @@ const completed=(action,target)=>{if(journal && !fs.existsSync(process.env.HOME+
 if(isMac && args[0]==='install'){
   if(fs.existsSync(marker) && JSON.parse(fs.readFileSync(marker,'utf8')).state===state){console.error('stop_before_install');process.exit(1)}
   fs.mkdirSync(state,{recursive:true,mode:0o700});fs.mkdirSync(process.env.HOME+'/Library/LaunchAgents',{recursive:true});
-  const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[])];
+  const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[]),...(args.includes('--debugger')?['--debugger']:[])];
   const xml=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
   const text='<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>';
   if(process.env.ABELE_SERVICE_TRANSITION)fs.writeFileSync(process.env.ABELE_SERVICE_TRANSITION+'/next-service',text,{mode:0o600});
@@ -1692,7 +1784,7 @@ if(args==='--user enable --now abele-node.service' || args==='--user start abele
   await writeFile(
     join(bin, 'busctl'),
     `#!${process.execPath}
-const fs=require('node:fs'),home=process.env.HOME;
+import fs from 'node:fs';const home=process.env.HOME;
 fs.appendFileSync(home+'/busctl.log',JSON.stringify(process.argv.slice(2))+'\\n');
 const roots=fs.existsSync(home+'/manager-unit-paths.json')?JSON.parse(fs.readFileSync(home+'/manager-unit-paths.json','utf8')):[home+'/.config/systemd/user',home+'/.local/share/systemd/user'];
 console.log(JSON.stringify({type:'as',data:roots}));
@@ -2533,6 +2625,8 @@ test(
         service_file: null,
         state_dir: join(await realpath(h), '.local/state/abele-node'),
         paired_listener: null,
+        // Service status reports the saved installer choice, even in foreground mode.
+        debugger_enabled: false,
       })
       const help = await run(join(h, '.local/bin/abele-node'), ['service', '--help'], { HOME: h })
       assert.equal(help.code, 0, help.stderr)

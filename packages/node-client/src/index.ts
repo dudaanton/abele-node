@@ -10,7 +10,7 @@ import { LocalChannelConnector, RequestChannel, reconnect } from '@abele/channel
 import { DebuggerClient } from './debugger.js'
 import { LspClient } from './lsp.js'
 export { LspClient, type LspRoot } from './lsp.js'
-export { DebuggerClient } from './debugger.js'
+export { DebuggerClient, parseDebuggerVariables } from './debugger.js'
 export { TraceClient } from './trace.js'
 import { TraceClient } from './trace.js'
 export type { DebuggerObservationState } from './debugger.js'

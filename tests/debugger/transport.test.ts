@@ -4,6 +4,53 @@ import { DapTransport } from '../../packages/node-core/src/debugger/dap.js'
 import { wire, packet } from './dap-wire.js'
 
 describe('bounded production DAP transport', () => {
+  it('still rejects mismatched live replies below the retirement watermark', async () => {
+    const w = wire()
+    const pending = w.dap.request('attach')
+    const rejected = expect(pending).rejects.toThrow('dap_correlation')
+    for (let i = 0; i < 150; i++) {
+      const capture = w.dap.request('evaluate')
+      w.reply(w.messages.at(-1), { result: String(i) })
+      await capture
+    }
+    w.send({ type: 'response', request_seq: w.messages[0].seq, command: 'wrong', success: true })
+    await rejected
+    expect(w.dap.closed).toBe(true)
+  })
+  it.each(['cancelled-launch', 'timed-out-capture'])(
+    'ignores a %s reply after many captures evict its correlation tombstone',
+    async (scenario) => {
+      const w = wire()
+      const controller = new AbortController()
+      try {
+        const launch = w.dap.request(
+          scenario === 'cancelled-launch' ? 'attach' : 'evaluate',
+          {},
+          {
+            signal: controller.signal,
+            timeoutMs: 1,
+          }
+        )
+        const old = w.messages.at(-1)
+        if (scenario === 'cancelled-launch') controller.abort()
+        await expect(launch).rejects.toThrow(
+          scenario === 'cancelled-launch' ? 'dap_cancelled' : 'dap_timeout'
+        )
+        for (let i = 0; i < 150; i++) {
+          const capture = w.dap.request('evaluate')
+          w.reply(w.messages.at(-1), { result: String(i) })
+          await capture
+        }
+        w.reply(old)
+        expect(w.dap.closed).toBe(false)
+        const next = w.dap.request('threads')
+        w.reply(w.messages.at(-1), { threads: [] })
+        await expect(next).resolves.toEqual({ threads: [] })
+      } finally {
+        w.dap.close()
+      }
+    }
+  )
   it('decodes fragmented UTF-8 and batches; correlates out-of-order replies by request_seq', async () => {
     const w = wire(),
       events: any[] = []

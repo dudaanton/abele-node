@@ -3,11 +3,27 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { NodeCore } from '@abele/node-core'
-import { DebuggerClient } from '@abele/node-client'
+import { DebuggerClient, parseDebuggerVariables } from '@abele/node-client'
 import { target } from './helpers.js'
 
 afterEach(() => vi.useRealTimers())
 describe('typed debugger client current-state reconciliation', () => {
+  it('parses retained explicit child pages without accepting raw adapter references', () => {
+    const page = {
+      items: [{ name: 'item', value: 'Object', handle: 'opaque-child' }],
+      start: 0,
+      count: 50,
+      next: null,
+      truncated: false,
+      depth_limit: 1,
+      expansion_depth: 0,
+      observation_stop_epoch: 3,
+    }
+    expect(parseDebuggerVariables(page)).toEqual(page)
+    expect(() =>
+      parseDebuggerVariables({ ...page, items: [{ ...page.items[0], variablesReference: 99 }] })
+    ).toThrow()
+  })
   it('sends folder ownership and restart requests through the typed human client', async () => {
     const rpc = vi.fn(async (method: string) =>
       method.endsWith('programs')
