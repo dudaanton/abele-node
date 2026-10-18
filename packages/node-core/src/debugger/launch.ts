@@ -385,10 +385,15 @@ export class DebuggerLaunches {
         .finally(() => {
           asking = false
           // Changed again while it was asked: the answer was fenced off, so ask once more.
-          if (session.snapshot.thread_inventory_revision !== revision) check()
+          if (!session.dap.closed && session.snapshot.thread_inventory_revision !== revision)
+            check()
         })
     }
-    return this.core.debugger.subscribe(session.id, check)
+    const unsubscribe = this.core.debugger.subscribe(session.id, check)
+    // Native startup may already have handed its first pause to the adapter
+    // before this run is adopted. Do not wait for a later event to read it.
+    check()
+    return unsubscribe
   }
 
   private closeRun(run: LaunchedRun): Promise<void> {

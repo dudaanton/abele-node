@@ -181,6 +181,32 @@ and the last 16 KiB of stderr separately from stdout, after stderr closes. These
 records contain no DAP request arguments or automatic variable dumps; diagnostic
 failure cannot prevent transport settlement or process cleanup.
 
+Native launch establishes the first `--inspect-brk` pause through a temporary
+inspector connection before starting js-debug. That connection sends only
+`Debugger.enable` followed by `Runtime.runIfWaitingForDebugger`, waits for
+`Debugger.paused`, and stays open until the adapter reports its own stopped
+thread. The adapter can then evaluate runtime metadata against a fully paused
+program; closing the temporary connection leaves the adapter in control. Failure
+or timeout closes the connection and cleans up the owned run. Scope and variable
+requests remain explicit and source maps stay enabled.
+Run adoption reads the existing thread inventory immediately, so a pause that
+predates registration is still presented as stopped without waiting for another
+adapter event.
+
+This avoids the startup `ScopeIterator::NeedsContext` fatal check reproduced on
+Node 22.23.2 with js-debug 1.140.0. The triggering adapter sequence was
+`Runtime.runIfWaitingForDebugger` followed by `Runtime.evaluate` of process
+metadata before the first pause, rather than a scopes/variables request for an
+async or generator frame. Disabling child bootloader injection alone still
+allowed that metadata evaluation. As checked on 2026-10-18, the matching
+[Node issue #57606](https://github.com/nodejs/node/issues/57606) is open, the
+[proposed V8 fix](https://chromium-review.googlesource.com/c/v8/v8/+/7822241)
+was abandoned, and the Node 22, 24 and 26 changelogs name no confirmed fix for
+this check. Do not recommend an unverified upgrade as a cure. The opt-in
+`local-scopes` regression exercises 24 launches, inspecting closure, async,
+generator and class-method locals through the real adapter, then checking normal
+exit and that user code did not execute before the initial stop.
+
 A late response to a cancelled or timed-out request remains inert even after
 128 newer completions evict its command tombstone. Previously that valid late
 reply caused `dap_correlation`, closing a healthy connection during longer runs.

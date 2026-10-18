@@ -8,6 +8,7 @@ import { DapSession, JsSessionTree } from './driver.js'
 import { OwnedDebugProcess, processStartIdentity } from './process.js'
 import { installedJsAdapter, jsAdapterInstalled, requireJsPin } from './js-install.js'
 import { debuggerLog } from './log.js'
+import { holdJsStartup } from './js-startup.js'
 
 export type JsLaunch = {
   cwd: string
@@ -159,28 +160,60 @@ export class JsDebugProfile {
       debuggerLog('Program exited', () => ({ target: target.target_id, ...diagnostics }))
     })
     try {
-      const match = await owner.waitForText(/ws:\/\/127\.0\.0\.1:(\d+)\//)
-      // Launch is node-owned spawning followed by attach, not adapter-spawned
-      // process ownership inferred from a DAP process event or success response.
-      return await this.open(
-        {
-          type: 'pwa-node',
-          address: '127.0.0.1',
-          port: Number(match[1]),
-          cwd: config.cwd,
-          sourceMaps: true,
-          restart: false,
-          continueOnAttach: false,
-          // The pinned adapter otherwise injects its child bootloader through
-          // Runtime.evaluate while --inspect-brk is entering the main script.
-          // That races V8's startup pause (and can crash Node with SIGTRAP).
-          // Native launch covers this program, not automatic child instrumentation.
-          autoAttachChildProcesses: false,
-        },
-        { ...target, process_ownership: 'owned', process_evidence: owner.evidence },
-        sources,
-        owner
-      )
+      const match = await owner.waitForText(/ws:\/\/127\.0\.0\.1:(\d+)\/[^\s]+/)
+      const releaseStartup = await holdJsStartup(match[0])
+      try {
+        // Launch is node-owned spawning followed by attach, not adapter-spawned
+        // process ownership inferred from a DAP process event or success response.
+        const run = await this.open(
+          {
+            type: 'pwa-node',
+            address: '127.0.0.1',
+            port: Number(match[1]),
+            cwd: config.cwd,
+            sourceMaps: true,
+            restart: false,
+            continueOnAttach: false,
+            // The pinned adapter otherwise injects its child bootloader through
+            // Runtime.evaluate while --inspect-brk is entering the main script.
+            // That races V8's startup pause (and can crash Node with SIGTRAP).
+            // Native launch covers this program, not automatic child instrumentation.
+            autoAttachChildProcesses: false,
+          },
+          { ...target, process_ownership: 'owned', process_evidence: owner.evidence },
+          sources,
+          owner
+        )
+        try {
+          const session = await run.program()
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(
+              () => finish(new Error('debugger_startup_handoff_timeout')),
+              10000
+            )
+            let offEvent = () => {},
+              offClose = () => {}
+            const finish = (error?: Error) => {
+              clearTimeout(timer)
+              offEvent()
+              offClose()
+              if (error) reject(error)
+              else resolve()
+            }
+            offEvent = session.dap.onEvent((event) => {
+              if (event.event === 'stopped') finish()
+            })
+            offClose = session.dap.onClose(() => finish(new Error('debugger_startup_handoff_lost')))
+            if (session.snapshot.threads.some((t) => t.status === 'stopped')) finish()
+          })
+          return run
+        } catch (error) {
+          await run.close()
+          throw error
+        }
+      } finally {
+        releaseStartup()
+      }
     } catch (error) {
       await owner.terminate()
       throw error
