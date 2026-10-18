@@ -785,9 +785,20 @@ export class ResourceServices {
         )
           throw new ChannelError('invalid_params')
         return this.core.commitOperation(actor, method, p, operation!, () => {
-          const existing = this.core.db
+          let existing = this.core.db
             .prepare('SELECT body,registered FROM projects WHERE root_path=?')
             .get(inspected.root_path) as { body: string; registered: number } | undefined
+          if (existing && !existing.registered) {
+            const previous = ProjectSchema.parse(JSON.parse(existing.body))
+            if (!this.repository.sameRegistration(previous, inspected)) {
+              // Preserve old sessions/provenance while freeing the unique lookup
+              // slot for a different filesystem identity at this path.
+              this.core.db
+                .prepare('UPDATE projects SET root_path=? WHERE project_id=?')
+                .run('retired:' + previous.project_id, previous.project_id)
+              existing = undefined
+            }
+          }
           if (existing) {
             const project = ProjectSchema.parse(JSON.parse(existing.body))
             if (project.trust !== inspected.trust) throw new ChannelError('stale_revision')
@@ -810,7 +821,7 @@ export class ResourceServices {
                 refreshed
               )
             }
-            this.repository.registered(refreshed)
+            this.repository.registered(refreshed, !existing.registered)
             return refreshed
           }
           const project = ProjectSchema.parse({

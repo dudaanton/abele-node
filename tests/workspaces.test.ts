@@ -2,6 +2,7 @@ import { afterEach, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -56,6 +57,127 @@ async function registered(s: ReturnType<typeof setup>) {
     project_id: string
   }
 }
+it.each([false, true])(
+  're-adds an unregistered repository with the same project, target and sessions (legacy=%s)',
+  async (legacy) => {
+    const s = setup()
+    const p = {
+      project_id: ((await s.request('project.register', { path: s.repo, trust: 'trusted' })) as any)
+        .project_id,
+    }
+    const before = (await s.request('repository.v1.worktrees', p)) as any
+    const root = before.entries[0]
+    const target = { kind: 'worktree', worktree_id: root.worktree_id }
+    await s.request('project.execution', { ...p, target, enabled: true })
+    const session = (await s.request('session.create', {
+      provider: 'fake',
+      title: 'saved',
+      target,
+    })) as any
+    await s.request('project.remove', p)
+    if (legacy)
+      s.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(p.project_id)
+    expect(await s.request('project.register', { path: s.repo, trust: 'trusted' })).toMatchObject(p)
+    expect(await s.request('project.list')).toContainEqual(expect.objectContaining(p))
+    expect(await s.request('repository.v1.worktrees', p)).toMatchObject({ entries: [root] })
+    expect(
+      s.core.db
+        .prepare('SELECT active FROM repository_targets WHERE worktree_id=?')
+        .get(root.worktree_id)
+    ).toMatchObject({ active: 1 })
+    expect(await s.request('session.list')).toContainEqual(session)
+    expect(
+      await s.request('session.worktree.get', { session_id: session.session_id })
+    ).toMatchObject({ ...p, target })
+    expect(await s.request('session.create', { provider: 'fake', target })).toHaveProperty(
+      'session_id'
+    )
+  }
+)
+it.each([false, true])(
+  'registers a fresh project after repository replacement (legacy=%s)',
+  async (legacy) => {
+    const s = setup()
+    const p = {
+      project_id: ((await s.request('project.register', { path: s.repo, trust: 'trusted' })) as any)
+        .project_id,
+    }
+    const before = (await s.request('repository.v1.worktrees', p)) as any
+    const target = { kind: 'worktree', worktree_id: before.entries[0].worktree_id }
+    await s.request('project.execution', { ...p, target, enabled: true })
+    const session = (await s.request('session.create', { provider: 'fake', target })) as any
+    await s.request('project.remove', p)
+    if (legacy)
+      s.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(p.project_id)
+    renameSync(join(s.repo, '.git'), join(s.dir, 'old-git'))
+    git(s.repo, 'init', '-b', 'main')
+    const fresh = (await s.request('project.register', { path: s.repo, trust: 'trusted' })) as any
+    expect(fresh.project_id).not.toBe(p.project_id)
+    expect(await s.request('project.list')).toEqual([fresh])
+    const catalog = (await s.request('repository.v1.worktrees', {
+      project_id: fresh.project_id,
+    })) as any
+    await expect(
+      s.request('session.create', {
+        provider: 'fake',
+        target: { kind: 'worktree', worktree_id: catalog.entries[0].worktree_id },
+      })
+    ).rejects.toThrow('unauthorized')
+    expect(s.core.resources.targets.bound(session.session_id)).toMatchObject({ ...p, target })
+    await expect(
+      s.request('repository.v1.refs', { worktree_id: before.entries[0].worktree_id })
+    ).rejects.toThrow()
+  }
+)
+it('never repins a registered linked root to a replaced common directory or revives its grants', async () => {
+  const s = setup()
+  const linked = join(s.dir, 'linked')
+  git(s.repo, 'worktree', 'add', '-b', 'linked', linked)
+  const p = {
+    project_id: ((await s.request('project.register', { path: linked, trust: 'trusted' })) as any)
+      .project_id,
+  }
+  const catalog = (await s.request('repository.v1.worktrees', p)) as any
+  const target = {
+    kind: 'worktree',
+    worktree_id: catalog.entries.find((e: any) => e.kind === 'root').worktree_id,
+  }
+  await s.request('project.execution', { ...p, target, enabled: true })
+  const session = (await s.request('session.create', { provider: 'fake', target })) as any
+  const pin = () =>
+    s.core.db
+      .prepare('SELECT fingerprint FROM repository_projects WHERE project_id=?')
+      .get(p.project_id)
+  const original = pin()
+  const common = join(s.repo, '.git')
+  renameSync(common, join(s.dir, 'old-common'))
+  cpSync(join(s.dir, 'old-common'), common, { recursive: true })
+  await expect(s.core.resources.targets.runtime(session.session_id)).rejects.toThrow(
+    'stale_resource'
+  )
+  await expect(s.request('project.register', { path: linked, trust: 'trusted' })).rejects.toThrow(
+    'stale_resource'
+  )
+  expect(pin()).toEqual(original)
+  await s.request('project.remove', p)
+  const fresh = (await s.request('project.register', { path: linked, trust: 'trusted' })) as any
+  expect(fresh.project_id).not.toBe(p.project_id)
+  await expect(s.core.resources.targets.runtime(session.session_id)).rejects.toThrow()
+  await expect(s.request('session.create', { provider: 'fake', target })).rejects.toThrow()
+})
+it.each(['missing', 'leftover folder'])('unregisters a %s without deleting files', async (kind) => {
+  const s = setup()
+  const p = { project_id: (await registered(s)).project_id }
+  await s.request('repository.v1.worktrees', p)
+  if (kind === 'missing') renameSync(s.repo, join(s.dir, 'saved'))
+  else {
+    renameSync(join(s.repo, '.git'), join(s.dir, 'old-git'))
+    mkdirSync(join(s.repo, '.abele'))
+  }
+  expect(await s.request('project.remove', p)).toEqual({ ...p, removed: true })
+  expect(await s.request('project.list')).toEqual([])
+  expect(existsSync(join(kind === 'missing' ? join(s.dir, 'saved') : s.repo, '.hidden'))).toBe(true)
+})
 async function provision(s: ReturnType<typeof setup>, project_id: string, id?: string) {
   const result = (await s.request('workspace.create', { project_id }, id)) as {
     workspace_id: string

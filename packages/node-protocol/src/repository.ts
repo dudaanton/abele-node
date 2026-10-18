@@ -33,6 +33,14 @@ export const WorktreeEntrySchema = z
     workspace_id: id.nullable(),
     kind: z.enum(['root', 'managed', 'external']),
     path_label: z.string().max(4096),
+    // Opt-in: released clients parse catalogue entries strictly.
+    identity: z
+      .object({
+        canonical_path: z.string().max(4096),
+        fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict()
+      .optional(),
     branch: z.string().nullable(),
     detached: z.boolean(),
     head: CommitSchema.nullable(),
@@ -280,7 +288,12 @@ export const RepositoryMethodSchemas = {
     })
     .strict(),
   'repository.v1.worktrees': z
-    .object({ project_id: id, include_selection: z.boolean().optional(), ...paging })
+    .object({
+      project_id: id,
+      include_selection: z.boolean().optional(),
+      include_identity: z.boolean().optional(),
+      ...paging,
+    })
     .strict(),
   'repository.v1.refs': z.object({ ...target, ...paging }).strict(),
   'repository.v1.resolve': z.object({ ...target, ref }).strict(),

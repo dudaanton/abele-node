@@ -39,8 +39,31 @@ managed workspace. Every target returns:
 - available, missing, unavailable, or bare availability;
 - locked/prunable flags and observed dirty state (`null` means not observed).
 
+Call `repository.v1.worktrees` with `include_identity: true` to receive an
+`identity: { canonical_path, fingerprint }` on available entries. The fingerprint
+is an opaque pin of the target directory and its `.git` inode identity. Save both
+fields with the project and target IDs. An automatic rebind requires exactly one
+available entry in the same node/project with both fields unchanged; basename,
+branch, HEAD, or path alone is insufficient. Legacy selections without a saved
+identity require explicit reselection. Older nodes reject `include_identity` as
+`invalid_params`; clients may retry without it, but cannot safely auto-rebind.
+The default response omits identity to preserve compatibility with strict clients.
+
+Target IDs persist in the node state database across restarts. Version 0.4.27
+keeps 0.4.26's ID allocation and fingerprint derivation. It canonicalizes Git's
+symlinked worktree registration paths before discovery, which can retire an old
+logical-path entry; plain canonical repository paths are unaffected. A fresh
+state home or changed filesystem identity must not revive an old ID.
+
 Root/common-directory and target inode identities are pinned. Registration
-removal retires target IDs; replacing a directory or Git metadata creates a new
+removal suspends target IDs; explicitly re-adding the same root/common-directory
+identity restores unchanged targets and their session bindings. Browsing settings
+and editing approvals remain revoked. Legacy removed plain repositories can be
+recognized from their saved root target fingerprint; when identity cannot be
+proved, re-registration creates a fresh project and leaves old sessions/grants
+attached to the retired project. Unregistering needs no filesystem access and
+never deletes files, even if the folder or Git metadata is gone.
+Replacing a directory or Git metadata creates a new
 identity, never retargets the old ID. Reads revalidate registration, canonical
 root, worktree-list membership, common directory, and current opt-in. Opt-out
 stops external watchers and invalidates external observations, comparisons,

@@ -278,15 +278,70 @@ export class RepositoryService {
       JSON.stringify([stamp(p.root_path), p.git_common_dir ? stamp(p.git_common_dir) : null])
     )
   }
-  registered(p: Project) {
+  sameRegistration(p: Project, inspected: Pick<Project, 'repository_path' | 'git_common_dir'>) {
+    if (
+      p.repository_path !== inspected.repository_path ||
+      p.git_common_dir !== inspected.git_common_dir
+    )
+      return false
+    try {
+      const pin = this.r.core.db
+        .prepare('SELECT fingerprint FROM repository_projects WHERE project_id=?')
+        .get(p.project_id) as { fingerprint: string } | undefined
+      if (pin) return pin.fingerprint === this.projectFingerprint(p)
+      // Older unregisters discarded the project pin. A plain repository's root
+      // target pins the same root and common directory; linked roots cannot prove it.
+      if (p.git_common_dir !== join(p.root_path, '.git')) return false
+      const root = this.r.core.db
+        .prepare(
+          "SELECT fingerprint FROM repository_targets WHERE project_id=? AND kind='root' ORDER BY rowid DESC LIMIT 1"
+        )
+        .get(p.project_id) as { fingerprint: string } | undefined
+      return !!root && root.fingerprint === this.targetFingerprint(p.root_path)
+    } catch {
+      return false
+    }
+  }
+  registered(p: Project, restore = false) {
     const fingerprint = this.projectFingerprint(p)
     const old = this.r.core.db
       .prepare('SELECT fingerprint FROM repository_projects WHERE project_id=?')
       .get(p.project_id) as { fingerprint: string } | undefined
-    if (old && old.fingerprint !== fingerprint) this.removed(p.project_id)
+    if (old && old.fingerprint !== fingerprint) {
+      // Only an explicit folder -> Git upgrade may change a pin in place.
+      // A repository/common-directory replacement must never inherit sessions
+      // or execution grants, even if the linked root and its .git file survived.
+      const folderFingerprint = hash(JSON.stringify([stamp(p.root_path), null]))
+      if (!p.git_common_dir || old.fingerprint !== folderFingerprint)
+        throw new ChannelError('stale_resource')
+      this.removed(p.project_id)
+    }
     this.r.core.db
-      .prepare('INSERT OR IGNORE INTO repository_projects(project_id,fingerprint) VALUES(?,?)')
+      .prepare(
+        'INSERT INTO repository_projects(project_id,fingerprint) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET fingerprint=excluded.fingerprint'
+      )
       .run(p.project_id, fingerprint)
+    if (restore) {
+      const targets = this.r.core.db
+        .prepare('SELECT * FROM repository_targets WHERE project_id=? ORDER BY rowid DESC')
+        .all(p.project_id) as unknown as Target[]
+      const seen = new Set<string>()
+      for (const target of targets) {
+        if (seen.has(target.path)) continue
+        seen.add(target.path)
+        try {
+          if (
+            realpathSync(target.path) === target.path &&
+            this.targetFingerprint(target.path) === target.fingerprint
+          )
+            this.r.core.db
+              .prepare('UPDATE repository_targets SET active=1 WHERE worktree_id=?')
+              .run(target.worktree_id)
+        } catch {
+          // Missing/replaced targets stay retired, even when the project returns.
+        }
+      }
+    }
   }
   removed(id: string) {
     this.invalidateReads(id)
@@ -297,7 +352,12 @@ export class RepositoryService {
       this.dropMonitor(row.worktree_id)
       this.changes.drop(row.worktree_id)
     }
-    this.r.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(id)
+    // Keep the identity pin for safe re-registration, but revoke browsing settings.
+    this.r.core.db
+      .prepare(
+        'UPDATE repository_projects SET external_read=0,default_branch=NULL WHERE project_id=?'
+      )
+      .run(id)
     this.r.core.db.prepare('UPDATE repository_targets SET active=0 WHERE project_id=?').run(id)
     this.r.core.db
       .prepare(
@@ -956,6 +1016,9 @@ export class RepositoryService {
         workspace_id: target.workspace_id,
         kind,
         path_label: basename(record.path),
+        ...(p.include_identity && availability === 'available'
+          ? { identity: { canonical_path: target.path, fingerprint: target.fingerprint } }
+          : {}),
         branch: record.branch,
         detached: record.detached,
         head: record.head && !/^0+$/.test(record.head) ? record.head : null,
