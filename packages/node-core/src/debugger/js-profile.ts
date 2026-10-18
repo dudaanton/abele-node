@@ -155,6 +155,9 @@ export class JsDebugProfile {
       ['--inspect-brk=127.0.0.1:0', ...(config.runtime_argv ?? []), config.program, ...config.argv],
       { cwd: config.cwd, env: config.env }
     )
+    owner.on('close', (diagnostics) => {
+      debuggerLog('Program exited', () => ({ target: target.target_id, ...diagnostics }))
+    })
     try {
       const match = await owner.waitForText(/ws:\/\/127\.0\.0\.1:(\d+)\//)
       // Launch is node-owned spawning followed by attach, not adapter-spawned
@@ -168,6 +171,11 @@ export class JsDebugProfile {
           sourceMaps: true,
           restart: false,
           continueOnAttach: false,
+          // The pinned adapter otherwise injects its child bootloader through
+          // Runtime.evaluate while --inspect-brk is entering the main script.
+          // That races V8's startup pause (and can crash Node with SIGTRAP).
+          // Native launch covers this program, not automatic child instrumentation.
+          autoAttachChildProcesses: false,
         },
         { ...target, process_ownership: 'owned', process_evidence: owner.evidence },
         sources,

@@ -275,6 +275,7 @@ export class DapTransport {
           throw new Error('dap_json')
         }
         this.body = undefined
+        this.filled = 0
         clearTimeout(this.frameTimer)
         this.frameTimer = undefined
         this.dispatch(message)

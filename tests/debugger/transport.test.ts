@@ -4,6 +4,21 @@ import { DapTransport } from '../../packages/node-core/src/debugger/dap.js'
 import { wire, packet } from './dap-wire.js'
 
 describe('bounded production DAP transport', () => {
+  it('reports only unfinished body bytes when closing between frames', () => {
+    const log = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const w = wire()
+    try {
+      w.send({ type: 'event', event: 'initialized' })
+      w.dap.close()
+      expect(log).toHaveBeenCalledWith(
+        '[debugger] Transport closing',
+        expect.objectContaining({ partial_frame_bytes: 0 })
+      )
+    } finally {
+      w.dap.close()
+      log.mockRestore()
+    }
+  })
   it('still rejects mismatched live replies below the retirement watermark', async () => {
     const w = wire()
     const pending = w.dap.request('attach')
