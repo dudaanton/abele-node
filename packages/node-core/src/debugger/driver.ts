@@ -85,6 +85,8 @@ export class DapSession {
   private readonly sentSources = new Set<string>()
   private ending: 'detached' | 'terminated' | undefined
   private owner: DebugProcessOwner | undefined
+  /** A session tree keeps its root transport until its independently connected children end. */
+  onTerminated?: () => void
   private started = false
   private initialized = false
   private admission: DebuggerDispatchGuard | undefined
@@ -791,7 +793,8 @@ export class DapSession {
         break
       case 'terminated':
         this.observe({ kind: 'lifecycle', lifecycle: 'terminated' })
-        this.dap.close()
+        if (this.onTerminated) this.onTerminated()
+        else this.dap.close()
         break
       case 'breakpoint': {
         const breakpoint = body.breakpoint,
@@ -839,6 +842,7 @@ export class JsSessionTree {
   }
   private readonly pendingIds = new Set<string>()
   private closed = false
+  private startingChildren = 0
   constructor(
     private readonly service: DebuggerService,
     readonly root: DapSession,
@@ -852,6 +856,7 @@ export class JsSessionTree {
         coverage.maxChildren > 8)
     )
       throw new Error('invalid_child_limit')
+    root.onTerminated = () => this.closeEndedRoot()
     root.dap.onClose(() => this.close())
   }
   async reverse(request: DebugProtocol.Request, signal: AbortSignal): Promise<object> {
@@ -892,6 +897,7 @@ export class JsSessionTree {
       throw new Error('reverse_request_denied')
     this.service.assertEffectsAvailable()
     this.pendingIds.add(pending)
+    ++this.startingChildren
     let dap: DapTransport | undefined
     try {
       dap = await this.connect(signal)
@@ -906,6 +912,7 @@ export class JsSessionTree {
       })
       const child = new DapSession(this.service, state, dap, this.root.sources)
       this.children.set(child.id, child)
+      dap.onClose(() => this.closeEndedRoot())
       for (const listener of [...this.childListeners]) listener(child)
       await child.start(coverage.mode, { ...config, __pendingTargetId: pending }, signal)
       if (signal.aborted || this.closed) throw new Error('reverse_request_denied')
@@ -913,7 +920,20 @@ export class JsSessionTree {
     } catch (error) {
       dap?.close()
       throw error
+    } finally {
+      --this.startingChildren
+      this.closeEndedRoot()
     }
+  }
+  private closeEndedRoot() {
+    if (this.closed || this.startingChildren) return
+    // The broker can end before the child sends its first stop or final event.
+    // Only transport loss, or all children ending, closes their shared tree.
+    if (
+      this.root.snapshot.lifecycle === 'terminated' &&
+      [...this.children.values()].every((child) => child.dap.closed)
+    )
+      this.root.dap.close()
   }
   close() {
     this.closed = true
