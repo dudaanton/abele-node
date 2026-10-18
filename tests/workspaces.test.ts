@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
@@ -46,6 +46,7 @@ function setup() {
   return { dir, state, repo, core, actor, request }
 }
 afterEach(async () => {
+  vi.restoreAllMocks()
   for (const core of cores.splice(0)) {
     await core.resources.stop()
     core.close()
@@ -57,6 +58,65 @@ async function registered(s: ReturnType<typeof setup>) {
     project_id: string
   }
 }
+it.each([false, true])('Open preserves a trusted plain folder (removed=%s)', async (removed) => {
+  const s = setup()
+  const folder = join(s.dir, 'sample-folder')
+  mkdirSync(folder)
+  const input = { path: folder, trust: 'untrusted', exact_root: true }
+  const project = (await s.request('project.register', input)) as any
+  const p = { project_id: project.project_id }
+  await s.request('project.trust', { ...p, trust: 'trusted' })
+  const current = await s.request('project.get', p)
+  const workspaces = await s.request('workspace.list', p)
+  if (removed) await s.request('project.remove', p)
+  expect(await s.request('project.register', input)).toEqual(current)
+  expect(await s.request('workspace.list', p)).toEqual(workspaces)
+})
+it.each(['trusted', 'untrusted'] as const)(
+  'Open preserves current %s trust and is idempotent',
+  async (trust) => {
+    const s = setup()
+    const input = { path: s.repo, trust: 'untrusted', exact_root: true }
+    const project = (await s.request('project.register', input)) as any
+    expect(project.trust).toBe('untrusted')
+    await s.request('project.trust', { project_id: project.project_id, trust })
+    if (trust === 'trusted')
+      await s.request('project.claude_permissions', {
+        project_id: project.project_id,
+        use_repository_permissions: true,
+      })
+    const current = await s.request('project.get', { project_id: project.project_id })
+    for (let i = 0; i < 2; i++) {
+      expect(await s.request('project.register', input)).toEqual(current)
+      expect(await s.request('project.get', { project_id: project.project_id })).toEqual(current)
+    }
+    expect(await s.request('project.register', { ...input, trust: 'trusted' })).toEqual(current)
+  }
+)
+it.each(['trusted', 'untrusted'] as const)(
+  'Open preserves a concurrent explicit trust change to %s',
+  async (trust) => {
+    const s = setup()
+    const project = await registered(s)
+    await s.request('project.trust', {
+      project_id: project.project_id,
+      trust: trust === 'trusted' ? 'untrusted' : 'trusted',
+    })
+    const inspect = s.core.resources.projects.inspect.bind(s.core.resources.projects)
+    vi.spyOn(s.core.resources.projects, 'inspect').mockImplementationOnce(async (...args) => {
+      const result = await inspect(...args)
+      await s.request('project.trust', { project_id: project.project_id, trust })
+      return result
+    })
+    const reopened = await s.request('project.register', {
+      path: s.repo,
+      trust: 'untrusted',
+      exact_root: true,
+    })
+    expect(reopened).toMatchObject({ project_id: project.project_id, trust })
+    expect(await s.request('project.get', { project_id: project.project_id })).toEqual(reopened)
+  }
+)
 it.each([false, true])(
   're-adds an unregistered repository with the same project, target and sessions (legacy=%s)',
   async (legacy) => {
@@ -77,7 +137,9 @@ it.each([false, true])(
     await s.request('project.remove', p)
     if (legacy)
       s.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(p.project_id)
-    expect(await s.request('project.register', { path: s.repo, trust: 'trusted' })).toMatchObject(p)
+    expect(
+      await s.request('project.register', { path: s.repo, trust: 'untrusted', exact_root: true })
+    ).toMatchObject({ ...p, trust: 'trusted' })
     expect(await s.request('project.list')).toContainEqual(expect.objectContaining(p))
     expect(await s.request('repository.v1.worktrees', p)).toMatchObject({ entries: [root] })
     expect(
@@ -111,12 +173,19 @@ it.each([false, true])(
       s.core.db.prepare('DELETE FROM repository_projects WHERE project_id=?').run(p.project_id)
     renameSync(join(s.repo, '.git'), join(s.dir, 'old-git'))
     git(s.repo, 'init', '-b', 'main')
-    const fresh = (await s.request('project.register', { path: s.repo, trust: 'trusted' })) as any
+    const fresh = (await s.request('project.register', {
+      path: s.repo,
+      trust: 'untrusted',
+      exact_root: true,
+    })) as any
+    expect(fresh.trust).toBe('untrusted')
     expect(fresh.project_id).not.toBe(p.project_id)
     expect(await s.request('project.list')).toEqual([fresh])
     const catalog = (await s.request('repository.v1.worktrees', {
       project_id: fresh.project_id,
     })) as any
+    // Explicit trust still cannot revive a replaced identity's execution grant.
+    await s.request('project.trust', { project_id: fresh.project_id, trust: 'trusted' })
     await expect(
       s.request('session.create', {
         provider: 'fake',
@@ -155,12 +224,17 @@ it('never repins a registered linked root to a replaced common directory or revi
   await expect(s.core.resources.targets.runtime(session.session_id)).rejects.toThrow(
     'stale_resource'
   )
-  await expect(s.request('project.register', { path: linked, trust: 'trusted' })).rejects.toThrow(
-    'stale_resource'
-  )
+  await expect(
+    s.request('project.register', { path: linked, trust: 'untrusted', exact_root: true })
+  ).rejects.toThrow('stale_resource')
   expect(pin()).toEqual(original)
   await s.request('project.remove', p)
-  const fresh = (await s.request('project.register', { path: linked, trust: 'trusted' })) as any
+  const fresh = (await s.request('project.register', {
+    path: linked,
+    trust: 'untrusted',
+    exact_root: true,
+  })) as any
+  expect(fresh.trust).toBe('untrusted')
   expect(fresh.project_id).not.toBe(p.project_id)
   await expect(s.core.resources.targets.runtime(session.session_id)).rejects.toThrow()
   await expect(s.request('session.create', { provider: 'fake', target })).rejects.toThrow()

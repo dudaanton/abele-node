@@ -801,7 +801,6 @@ export class ResourceServices {
           }
           if (existing) {
             const project = ProjectSchema.parse(JSON.parse(existing.body))
-            if (project.trust !== inspected.trust) throw new ChannelError('stale_revision')
             if (
               project.repository_path &&
               (project.repository_path !== inspected.repository_path ||
@@ -809,7 +808,14 @@ export class ResourceServices {
             )
               throw new ChannelError('repository_unavailable')
             // Explicit external git init + re-registration upgrades a folder; never init implicitly.
-            const refreshed = ProjectSchema.parse({ ...project, ...inspected })
+            // Registration restores identity, not trust. Read trust inside the
+            // commit so an explicit change during inspection also wins. The
+            // identity checks below must still succeed before anything commits.
+            const refreshed = ProjectSchema.parse({
+              ...project,
+              ...inspected,
+              trust: project.trust,
+            })
             if (!existing.registered || (!project.repository_path && inspected.repository_path)) {
               this.core.db
                 .prepare('UPDATE projects SET registered=1,body=? WHERE project_id=?')
