@@ -361,6 +361,10 @@ async function performUpdate(
   report.check = options.check
   report.force = options.force
   report.target_kind = options.version ? 'pinned' : 'latest'
+  if (process.platform === 'darwin' && process.arch === 'x64')
+    throw new Error(
+      'Unsupported platform: macOS x64 (Intel or Rosetta). Use a native arm64 shell and Node.js on Apple Silicon; Intel Macs are unsupported.'
+    )
   const notify = (status: UpdateReport['status']) => progress?.({ ...report, status })
   const event = (p: Progress) => {
     report.stage = p.stage

@@ -17,7 +17,7 @@ import { copyWorkspaceRuntime } from './workspace-runtime.mjs'
 const root = resolve('.')
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('invalid_release_version')
-if (!['darwin', 'linux'].includes(process.platform) || !['arm64', 'x64'].includes(process.arch))
+if (!['darwin-arm64', 'linux-arm64', 'linux-x64'].includes(`${process.platform}-${process.arch}`))
   throw new Error('unsupported_release_platform')
 const platform = `${process.platform}-${process.arch}`
 const output = resolve(process.argv[2] ?? '.scratch/release')

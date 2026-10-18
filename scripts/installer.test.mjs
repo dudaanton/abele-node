@@ -404,7 +404,7 @@ console.log(JSON.stringify({running,service_unloaded,state_dir:state,pid:running
     ...new Set([
       name,
       `abele-node-${version}-linux-${process.arch}.tar.gz`,
-      `abele-node-${version}-darwin-${process.arch}.tar.gz`,
+      `abele-node-${version}-darwin-arm64.tar.gz`,
     ]),
   ]
   for (const asset of names) routes.set(`/releases/download/v${version}/${asset}`, bytes)
@@ -1631,7 +1631,15 @@ async function mockedMacService(h) {
   await mkdir(bin)
   await writeFile(
     join(bin, 'uname'),
-    '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; else exec /usr/bin/uname "$@"; fi\n',
+    '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; else echo arm64; fi\n',
+    { mode: 0o755 }
+  )
+  await writeFile(
+    join(bin, 'node'),
+    `#!/bin/sh
+if [ "$1" = -p ] && [ "$2" = process.arch ]; then echo arm64
+else exec '${process.execPath.replaceAll("'", "'\\''")}' "$@"; fi
+`,
     { mode: 0o755 }
   )
   return { PATH: `${bin}:${process.env.PATH}`, TEST_MAC_SERVICE: '1' }

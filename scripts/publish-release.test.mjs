@@ -12,7 +12,7 @@ async function publish(mode) {
       bin = join(home, 'bin')
     await mkdir(assets)
     await mkdir(bin)
-    for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64']) {
+    for (const platform of ['darwin-arm64', 'linux-arm64', 'linux-x64']) {
       await writeFile(
         join(assets, `abele-node-0.2.0-${platform}.tar.gz`),
         `test release ${platform}`
@@ -66,7 +66,7 @@ switch(args[1]){
     if(mode==='corrupt-installer')fs.writeFileSync(path.join(flag('--dir'),'install.sh'),'corrupt');
     break;
   case 'edit':
-    state.isDraft=false; if(state.assets.length!==6)state.exposed_incomplete=true; save(); break;
+    state.isDraft=false; if(state.assets.length!==5)state.exposed_incomplete=true; save(); break;
   default: throw new Error('unexpected gh operation '+args);
 }
 `,
@@ -118,12 +118,12 @@ switch(args[1]){
     await rm(home, { recursive: true, force: true })
   }
 }
-test('release remains draft until all six assets have been downloaded and verified', async () => {
+test('release remains draft until all five assets have been downloaded and verified', async () => {
   const result = await publish('success')
   assert.equal(result.code, 0, result.stderr)
   assert.equal(result.remote.exposed_incomplete, false)
   assert.equal(result.remote.isDraft, false)
-  assert.equal(result.remote.assets.length, 6)
+  assert.equal(result.remote.assets.length, 5)
   assert.ok(result.remote.assets.includes('install.sh'))
   assert.equal(result.installer, await readFile('install.sh', 'utf8'))
   assert.match(result.manifest, /^[a-f0-9]{64}  install\.sh$/m)

@@ -108,10 +108,14 @@ fi
 [ "$(id -u)" != 0 ] || fail 'Refusing root. Run as your ordinary user, without sudo.'
 case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) fail 'Unsupported OS: use macOS or Linux.' ;; esac
 case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=x64 ;; *) fail 'Unsupported architecture: use arm64 or x64.' ;; esac
+[ "$os-$arch" != darwin-x64 ] || fail 'Unsupported platform: macOS x64 (Intel or Rosetta). Use a native arm64 shell and Node.js on Apple Silicon; Intel Macs are unsupported.'
 node_fix='Install Node.js 22.23.2 yourself, then retry: nvm install 22.23.2 && nvm use 22.23.2 (https://nodejs.org/en/download). The installer does not install Node.'
 command -v node >/dev/null 2>&1 || fail "$node_fix"
 node=$(command -v node)
 "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number); if(major!==22 || minor<23) process.exit(1); const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); db.close()' >/dev/null 2>&1 || fail "$node_fix"
+if [ "$os" = darwin ]; then
+  [ "$("$node" -p 'process.arch')" = arm64 ] || fail 'Unsupported platform: macOS x64 Node.js. Use a native arm64 shell and Node.js on Apple Silicon.'
+fi
 # Resolve the executable now: services do not read shell startup files.
 node=$("$node" -p 'process.execPath')
 if [ -n "$service_action" ] && [ "$service_action" != adopt-debugger ]; then

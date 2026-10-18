@@ -13,14 +13,14 @@ for file in ./*.tar.gz; do
   [ -f "$file" ] || fail 'Missing release archives.'
   count=$((count + 1))
 done
-[ "$count" = 4 ] || fail 'Expected exactly four platform archives.'
+[ "$count" = 3 ] || fail 'Expected exactly three platform archives.'
 checksum() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
   else shasum -a 256 "$@"; fi
 }
 set --
 : > SHA256SUMS
-for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+for platform in darwin-arm64 linux-arm64 linux-x64; do
   asset=abele-node-$version-$platform.tar.gz
   if [ ! -f "$asset" ] || [ -L "$asset" ]; then fail "Missing regular asset: $asset"; fi
   checksum "$asset" >> SHA256SUMS || fail 'Cannot compute release checksums.'

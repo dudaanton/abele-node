@@ -145,7 +145,7 @@ curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.s
 
 **Read [the script](install.sh) first** before piping downloaded code into a shell.
 It downloads a platform-specific GitHub release, verifies its SHA-256 checksum,
-installs under `$HOME/.local`, and starts a macOS LaunchAgent or Linux user service.
+supports macOS arm64 and Linux arm64/x64, installs under `$HOME/.local`, and starts a macOS LaunchAgent or Linux user service.
 It does not install Node, provider CLIs or credentials. Linux requires a running
 systemd user manager; use `sh -s -- --no-service` instead of `sh` above for a
 foreground-only installation, then run `abele-node start` yourself.

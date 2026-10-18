@@ -50,18 +50,28 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.30
+  sh -s -- --version 0.4.31
 ```
 
 Only releases with installer assets can be installed this way. The installer
 resolves the latest stable GitHub release when no version is specified. It downloads
 `abele-node-X.Y.Z-PLATFORM.tar.gz` and `SHA256SUMS`, checks the exact asset checksum,
 and unpacks the built packages plus production dependencies. Supported platforms
-are `darwin-arm64`, `darwin-x64`, `linux-arm64` and `linux-x64`. The pi SDK includes
+are `darwin-arm64`, `linux-arm64` and `linux-x64`. The pi SDK includes
 native terminal-library prebuilds, so the artifacts are platform-specific. Node is
 **not** bundled or installed: the script requires Node 22.x, at least 22.23,
 with working `node:sqlite`, and recommends the tested 22.23.2. It also checks
 `/usr/bin/git` >=2.31, curl, tar and shasum/sha256sum.
+
+Intel Macs are unsupported. On Apple Silicon, invoke the installer from a native
+arm64 shell with arm64 Node.js. Rosetta (x64) shells or Node.js are rejected; the
+installer does not switch architectures or download an incompatible package.
+The current CLI rejects macOS x64 updates before update preparation, admission
+pauses, downloads, or installation and state writes. This guard does not change
+older CLI binaries already installed: they may prepare an update, temporarily
+pause admission, and download the installer and checksums first. The new installer
+then rejects macOS x64 before replacing the installation or changing services or
+state, leaving the existing installation running.
 
 By default, versions live in `$HOME/.local/share/abele-node/X.Y.Z`, with an
 atomically replaced `current` symlink. The command is a wrapper at
@@ -733,15 +743,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.30 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.30: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.31 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.31: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.29 → 0.4.30
+Done: 0.4.30 → 0.4.31
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -771,7 +781,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.30  # example; select an existing release
+   git checkout v0.4.31  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
