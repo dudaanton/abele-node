@@ -9,6 +9,8 @@ import {
   fstatSync,
   lstatSync,
   realpathSync,
+  readFileSync,
+  readlinkSync,
   readSync,
   watch,
   type FSWatcher,
@@ -34,7 +36,34 @@ import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
 import { WorktreeMonitor, pathMetadata, sourceMetadata } from './worktree-monitor.js'
 import { ChangeStreams, baselineOf } from './repository-changes.js'
-import { decodeGit, parseWorktrees, type GitCommand } from './git.js'
+import { decodeGit, parseWorktrees as parseGitWorktrees, type GitCommand } from './git.js'
+
+// Git may retain a logical path after a worktree pool moves behind a symlink.
+// Resolve at discovery, before workspace matching and identity pinning. All later
+// filesystem checks still require the stored target path to remain canonical.
+const parseWorktrees = (bytes: Uint8Array) =>
+  parseGitWorktrees(bytes).map((record) => {
+    let path = record.path
+    try {
+      path = realpathSync(path)
+    } catch {
+      // Keep missing/prunable entries visible without granting filesystem access.
+    }
+    return { ...record, path, registered_path: record.path }
+  })
+
+// Include every component: lstat on just the leaf follows substituted parents.
+// Directory timestamps are deliberately excluded (unrelated children may change).
+const pathIdentity = (path: string) => {
+  const parts: unknown[] = []
+  let at = '/'
+  for (const component of path.split('/').filter(Boolean)) {
+    at = join(at, component)
+    const s = lstatSync(at)
+    parts.push([at, s.dev, s.ino, s.mode, s.isSymbolicLink() ? readlinkSync(at) : null])
+  }
+  return hash(JSON.stringify(parts))
+}
 
 const hash = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex')
 const stamp = (path: string) => {
@@ -111,6 +140,7 @@ interface Observation {
   expires: number
   includeIgnored: boolean
   snapshot: WorkingSnapshot
+  registration?: string
 }
 interface TreeEntry {
   path: string
@@ -396,6 +426,17 @@ export class RepositoryService {
   }
   private targetFingerprint(path: string) {
     return hash(JSON.stringify([stamp(path), stamp(join(path, '.git'))]))
+  }
+  private async deletionRegistration(target: Target) {
+    const project = this.r.projects.get(target.project_id)
+    const matches = parseWorktrees(
+      await this.r.git.run(project.root_path, { kind: 'worktrees' })
+    ).filter((record) => record.path === target.path && !record.bare)
+    if (matches.length !== 1) throw new ChannelError('stale_revision')
+    return matches[0]!
+  }
+  private registrationIdentity(record: { registered_path: string }) {
+    return hash(JSON.stringify([record.registered_path, pathIdentity(record.registered_path)]))
   }
   private async validate(target: Target) {
     if (!target.active) throw new ChannelError('stale_resource')
@@ -1246,6 +1287,8 @@ export class RepositoryService {
           const record = records.find((w) => w.path === target.path)
           if (!record || record.bare || record.prunable)
             throw new ChannelError('unmanaged_workspace')
+          if (this.registrationIdentity(record) !== observed.registration)
+            throw new ChannelError('stale_revision')
           if (
             record.locked ||
             this.r.targets.leasedPath(target.path) ||
@@ -1253,9 +1296,64 @@ export class RepositoryService {
           )
             throw new ChannelError('resource_busy')
           const gitDir = await this.r.git.text(target.path, { kind: 'directory' })
+          const gitDirIdentity = pathIdentity(gitDir)
+          const backlink = join(gitDir, 'gitdir')
+          const registeredIdentity = this.registrationIdentity(record)
+          const checkPaths = () => {
+            try {
+              if (
+                this.registrationIdentity(record) !== registeredIdentity ||
+                realpathSync(gitDir) !== gitDir ||
+                pathIdentity(gitDir) !== gitDirIdentity ||
+                realpathSync(target.path) !== target.path ||
+                this.targetFingerprint(target.path) !== target.fingerprint
+              )
+                throw new Error()
+            } catch {
+              throw new ChannelError('stale_revision')
+            }
+          }
+          const checkBacklink = (path: string) => {
+            checkPaths()
+            try {
+              if (
+                !lstatSync(backlink).isFile() ||
+                realpathSync(backlink) !== backlink ||
+                readFileSync(backlink, 'utf8') !== join(path, '.git') + '\n'
+              )
+                throw new Error()
+            } catch {
+              throw new ChannelError('stale_revision')
+            }
+          }
+          // Git remove can use its backlink rather than the canonical argv path.
+          // Repair metadata first; never let destructive Git follow the logical alias.
+          if (record.registered_path !== target.path) {
+            await this.r.git.run(
+              project.root_path,
+              { kind: 'worktree.repair', path: target.path },
+              () => {
+                checkBacklink(record.registered_path)
+                core.authority.check(actor, 'mutate', target.worktree_id)
+                this.r.targets.checkDeletionReservation(actor, target.path, operation!)
+              }
+            )
+            checkPaths()
+            const repaired = await this.deletionRegistration(target)
+            if (repaired.registered_path !== target.path) throw new ChannelError('stale_revision')
+            await this.validate(target)
+          }
+          const checkRegistration = () => {
+            checkBacklink(target.path)
+          }
+          checkRegistration()
           const effectFingerprint = () =>
             hash(
               JSON.stringify([
+                this.registrationIdentity(record),
+                pathIdentity(target.path),
+                pathIdentity(gitDir),
+                readFileSync(backlink, 'utf8'),
                 this.r.nodePath.snapshot(target.path),
                 this.r.nodePath.snapshot(join(project.git_common_dir!, 'refs')),
                 ...[
@@ -1307,15 +1405,22 @@ export class RepositoryService {
               .run(actor.installation_id, operation!, request_hash, JSON.stringify(intent))
           })
           if (reserved) return reserved.result
+          let refusedBeforeEffect = false
           try {
             await this.r.git.run(
               project.root_path,
               { kind: 'worktree.remove', path: target.path },
               () => {
-                core.authority.check(actor, 'mutate', target.worktree_id)
-                this.checkPublication(actor, p)
-                this.r.targets.checkDeletionReservation(actor, target.path, operation!)
-                if (effectFingerprint() !== inspected) throw new ChannelError('stale_revision')
+                try {
+                  checkRegistration()
+                  core.authority.check(actor, 'mutate', target.worktree_id)
+                  this.checkPublication(actor, p)
+                  this.r.targets.checkDeletionReservation(actor, target.path, operation!)
+                  if (effectFingerprint() !== inspected) throw new ChannelError('stale_revision')
+                } catch (error) {
+                  refusedBeforeEffect = true
+                  throw error
+                }
               },
               undefined,
               {
@@ -1331,6 +1436,14 @@ export class RepositoryService {
               }
             )
           } catch (e) {
+            // The IPC gate never sent "start". A settled refusal is not an
+            // uncertain deletion and must not leave the target permanently fenced.
+            if (refusedBeforeEffect && e instanceof ChannelError && e.code === 'stale_revision') {
+              core.db
+                .prepare('DELETE FROM repository_deletions WHERE principal_id=? AND operation_id=?')
+                .run(actor.installation_id, operation!)
+              throw e
+            }
             if (
               !(e instanceof ChannelError) ||
               ![
@@ -2888,6 +3001,13 @@ export class RepositoryService {
               expires: Date.now() + ttl,
               includeIgnored,
               snapshot: after,
+              ...(target.kind === 'external'
+                ? {
+                    registration: this.registrationIdentity(
+                      await this.deletionRegistration(target)
+                    ),
+                  }
+                : {}),
             }
             if (this.leaseSize(observation) > 8 * 1024 * 1024) throw new ChannelError('scan_limit')
             this.observations.set(revision.observation_id, observation)

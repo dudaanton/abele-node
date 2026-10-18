@@ -23,6 +23,7 @@ export type GitCommand =
   | { kind: 'branch.create'; branch: string; commit: string }
   | { kind: 'worktree.add'; branch: string; path: string }
   | { kind: 'worktree.remove'; path: string }
+  | { kind: 'worktree.repair'; path: string }
   | { kind: 'status' }
   | { kind: 'untracked' }
   | { kind: 'diff' }
@@ -185,6 +186,9 @@ export class GitRunner {
         break
       case 'worktree.remove':
         args = ['worktree', 'remove', '--', command.path]
+        break
+      case 'worktree.repair':
+        args = ['worktree', 'repair', '--', command.path]
         break
       case 'status':
         args = [
