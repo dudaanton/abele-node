@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.32
+  sh -s -- --version 0.4.33
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -752,15 +752,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.32 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.32: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.33 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.33: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.31 → 0.4.32
+Done: 0.4.32 → 0.4.33
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -790,7 +790,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.32  # example; select an existing release
+   git checkout v0.4.33  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

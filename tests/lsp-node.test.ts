@@ -16,6 +16,23 @@ import { GitRunner } from '../packages/node-core/src/git.js'
 import { LspTools } from '../packages/node-core/src/lsp/tools.js'
 import { LspClient } from '../packages/node-client/src/lsp.js'
 
+it('preserves optional server diagnostics through the typed status client', async () => {
+  const rows = [
+    {
+      language: 'rust',
+      server: null,
+      version: null,
+      found: false,
+      diagnostic: 'rust-analyzer component unavailable; run rustup component add rust-analyzer',
+    },
+  ]
+  const client = new LspClient(async (method) => {
+    expect(method).toBe('lsp.v1.status')
+    return rows
+  })
+  await expect(client.status()).resolves.toEqual(rows)
+})
+
 it.each(['direct', 'symlinked'] as const)(
   'dispatches typed calls through the real confinement and journals agent diagnostics notices (%s root)',
   async (kind) => {
