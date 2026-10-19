@@ -26,8 +26,11 @@ function provider(name: string, value: unknown) {
       return `Codex: macOS required (model: ${model}) — run on macOS: abele-node doctor`
     const repairs: Record<string, [string, string]> = {
       codex_disabled: ['disabled', 'abele-node install --codex'],
-      codex_executable_unavailable: ['not installed', 'npm install -g @openai/codex@0.160.1'],
-      codex_version_unsupported: ['requires Codex 0.160.1', 'npm install -g @openai/codex@0.160.1'],
+      codex_executable_unavailable: ['not installed', 'npm install -g @openai/codex'],
+      codex_version_unsupported: [
+        'requires Codex >=0.160.1 with compatible protocol',
+        'npm install -g @openai/codex',
+      ],
       codex_opaque_wrapper_unsupported: [
         'native executable required',
         'abele-node install --codex-path /absolute/path/to/native/codex',
@@ -58,7 +61,11 @@ function provider(name: string, value: unknown) {
       `preflight failed (${diagnostic})`,
       'abele-node doctor',
     ]
-    return `Codex: ${reason} (model: ${model}) — run: ${command}`
+    const found =
+      p.provider_version && p.provider_version !== 'unavailable'
+        ? `Codex ${shown(p.provider_version)} found, unsupported because `
+        : 'Codex: '
+    return `${found}${reason} (model: ${model}) — run: ${command}`
   }
   const diagnostic = line(
     p.diagnostic ?? 'Provider diagnostics missing. Run abele-node doctor after restarting the node.'
@@ -116,8 +123,14 @@ export function humanOutput(
       return `Installed the JavaScript debugger ${line(r.version)} (${line(r.license)}, ${Object.keys(record(r.files)).length} files checked against its pinned archive).`
     case 'service':
       return [
-        `Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`,
-        `Service: ${r.enabled ? 'enabled' : 'disabled'}; daemon ${r.running ? 'running' : 'stopped'}`,
+        `Mode: ${r.mode === 'unknown' ? 'unknown' : r.mode === 'service' ? 'background service' : 'foreground'}`,
+        `Service: ${r.problem ? 'unknown' : r.enabled ? 'enabled' : 'disabled'}; daemon ${r.running ? 'running' : 'stopped'}`,
+        ...(r.transition_pending
+          ? [
+              'Service transition pending; showing recorded state without recovery. Wait for the active operation to finish before making changes.',
+            ]
+          : []),
+        ...(r.problem ? [`Configuration problem: ${line(r.problem)}`] : []),
         `Debugger: ${r.debugger_enabled ? 'on' : 'off'}`,
         ...(r.enabled ? [`Ownership: ${shown(r.ownership)}`] : []),
         pairedListener(r.paired_listener),
@@ -386,8 +399,16 @@ const serveFailures: Record<string, string> = {
     'It is not certain this node created the current Serve mapping; inspect tailscale serve status',
   serve_mapping_changed: 'The Serve mapping was changed outside AbeleNode; it was left untouched',
 }
+/** Subprocesses can report uncaught exceptions on stderr. Show their reason,
+ * never the source excerpt, stack frames, or Node's loader internals. */
+export function errorMessage(error: unknown): string {
+  const raw = String(error instanceof Error ? error.message : error)
+  const exception = raw.match(/^(?:[A-Za-z]*Error):\s*(.+)$/m)
+  if (exception) return exception[1]!.trim()
+  return raw.split(/\n\s+at\s/)[0]!.trim()
+}
 export function humanError(error: unknown) {
-  const message = line(error instanceof Error ? error.message : error)
+  const message = line(errorMessage(error))
   const launchFailures: Record<string, string> = {
     launch_agent_stop_unconfirmed:
       'Could not confirm that the AbeleNode service and its daemon stopped',

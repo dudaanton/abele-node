@@ -15,6 +15,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readRuntime } from './index.js'
 import { PairedListenerSchema, type PairedListenerConfig } from './paired.js'
+import { errorMessage } from './output.js'
 
 /**
  * A paired configuration a service will read on every start: a regular file, not a
@@ -149,8 +150,8 @@ export function installationMode(runtime: string, state: string): 'service' | 'f
 }
 
 /** The installer remains the single owner of service admission and recovery. */
-export function installedService(runtime: string, state: string) {
-  recoverServiceTransition(runtime)
+export function installedService(runtime: string, state: string, recover = true) {
+  if (recover) recoverServiceTransition(runtime)
   const root = dirname(runtime)
   if (!existsSync(join(root, '.installer-owned')) || !existsSync(join(root, 'config.json')))
     return undefined
@@ -207,7 +208,24 @@ export function installedService(runtime: string, state: string) {
 }
 
 export function serviceStatus(runtime: string, state: string) {
-  const config = installedService(runtime, state)
+  // Observation must never acquire recovery locks, wait for process groups, or
+  // roll back another command's transaction. Mutation admission still recovers.
+  let config: ReturnType<typeof installedService>
+  let problem: string | undefined
+  try {
+    config = installedService(runtime, state, false)
+  } catch (error) {
+    problem = errorMessage(error)
+  }
+  const root = dirname(runtime)
+  const transitionPending = ['.service-transition', '.install-lock'].some((name) => {
+    try {
+      lstatSync(join(root, name))
+      return true
+    } catch {
+      return false
+    }
+  })
   let ownership = config?.service === 1 ? 'missing' : 'none'
   if (config?.service_file && existsSync(config.service_file)) {
     const file = statSync(config.service_file)
@@ -220,7 +238,7 @@ export function serviceStatus(runtime: string, state: string) {
         : 'modified'
   }
   return {
-    mode: config?.service === 1 ? 'service' : 'foreground',
+    mode: problem ? 'unknown' : config?.service === 1 ? 'service' : 'foreground',
     managed: !!config,
     enabled: config?.service === 1,
     running: !!readRuntime(state),
@@ -229,6 +247,8 @@ export function serviceStatus(runtime: string, state: string) {
     state_dir: state,
     paired_listener: pairedListener(config?.paired_config || undefined),
     debugger_enabled: config?.debugger_enabled === true,
+    ...(transitionPending ? { transition_pending: true } : {}),
+    ...(problem ? { problem } : {}),
   }
 }
 

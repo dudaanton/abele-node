@@ -70,7 +70,7 @@ const usage: Record<string, string> = {
   'approve-pair': 'approve-pair [NAME] [--installation-id ID] [--fingerprint FULL] | --list',
   serve: 'serve enable --tailnet-policy-verified | disable',
   debugger: 'debugger install js',
-  lsp: 'lsp status [--json] | install [LANG… | --popular]\nLanguages: typescript (includes JavaScript), eslint, python, rust, go, json, yaml, css, html, bash. Installs privately into node state; ESLint uses each project’s own installation and config.',
+  lsp: 'lsp status [--json] | install [LANG… | --popular]\nLanguages: typescript (includes JavaScript), eslint, python, rust, go, json, yaml, css, html, bash. With no languages, installs the popular set. Installs privately into node state; ESLint uses each project’s own installation and config.',
   'recover-worktree-deletion': 'recover-worktree-deletion [OPERATION_ID] [INSTALLATION_ID]',
 }
 export function cliHelp(command?: string): string {

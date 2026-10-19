@@ -57,6 +57,36 @@ it('discovers only explicit absolute fixtures and detects replacement', () => {
   }
 })
 afterEach(() => vi.unstubAllEnvs())
+it.each(['0.162.1', '0.163.0'])('discovers Codex %s for protocol preflight', (version) => {
+  const dir = mkdtempSync(resolve('.scratch/codex-version-'))
+  const executable = join(dir, 'codex.mjs')
+  try {
+    writeFileSync(
+      executable,
+      `#!/usr/bin/env node\nconsole.log(process.argv.includes('--version') ? 'codex-cli ${version}' : 'stdio://')\n`,
+      { mode: 0o700 }
+    )
+    expect(discoverCodex({ executable, fixture: true }).version).toBe(version)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+it('finds npm Codex through the owner login shell when daemon PATH omits it', () => {
+  const dir = mkdtempSync(resolve('.scratch/codex-login-path-'))
+  const executable = join(dir, 'codex')
+  try {
+    copyFileSync(resolve('tests/fixtures/codex.mjs'), executable)
+    chmodSync(executable, 0o700)
+    const shell = join(dir, 'login-shell')
+    writeFileSync(shell, `#!/bin/sh\nprintf '%s\\n' '${executable}'\n`, { mode: 0o700 })
+    vi.stubEnv('HOME', dir)
+    vi.stubEnv('SHELL', shell)
+    vi.stubEnv('ABELE_CODEX_PATH', '')
+    expect(discoverCodex({ fixture: true }).executable).toBe(executable)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 it('automatically discovers a pinned Codex in common user locations without shell PATH', () => {
   const dir = mkdtempSync(resolve('.scratch/codex-auto-discovery-'))
   vi.stubEnv('HOME', dir)

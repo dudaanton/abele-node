@@ -15,6 +15,23 @@ function program(body: string) {
   writeFileSync(executable, `#!${process.execPath}\n${body}\n`, { mode: 0o700 })
   return { dir, executable }
 }
+it('bounds oversized UTF-8 log subjects and preserves following records', async () => {
+  const fixture = program(String.raw`
+    process.stdout.write('a'.repeat(40) + '\0' + '界'.repeat(300000) + '\0\n');
+    process.stdout.write('b'.repeat(40) + '\0next\0\n');
+  `)
+  const bytes = await new GitRunner(5000, 512 * 1024, fixture.executable).run(fixture.dir, {
+    kind: 'log',
+    offset: 0,
+    limit: 2,
+  })
+  const fields = bytes.toString('utf8').split('\0')
+  expect(fields[0]).toBe('a'.repeat(40))
+  expect(fields[1]).toContain('[subject truncated]')
+  expect(fields[1]).not.toContain('�')
+  expect(fields.slice(2)).toEqual(['\n' + 'b'.repeat(40), 'next', '\n'])
+  expect(bytes.length).toBeLessThan(17000)
+})
 it('bounds stdout/stderr and kills timed-out processes before resolving', async () => {
   const noisy = program("process.stdout.write('x'.repeat(100000)); setTimeout(() => {}, 60000)")
   await expect(

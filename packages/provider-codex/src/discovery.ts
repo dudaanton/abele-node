@@ -13,6 +13,18 @@ export interface CodexDiscoveryOptions {
   fixture?: boolean
 }
 const digest = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex')
+export function supportedCodexVersion(version: string): boolean {
+  const match = /^(0)\.(\d+)\.(\d+)$/.exec(version)
+  return !!match && (Number(match[2]) > 160 || (Number(match[2]) === 160 && Number(match[3]) >= 1))
+}
+export class CodexDiscoveryError extends Error {
+  constructor(
+    message: string,
+    readonly version?: string
+  ) {
+    super(message)
+  }
+}
 // Resolve the official npm layout without running its JavaScript launcher.
 // All other wrappers remain unsupported; the native target still passes every pin.
 export function resolveCodexExecutable(requested: string): string {
@@ -23,7 +35,7 @@ export function resolveCodexExecutable(requested: string): string {
     const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
     if (
       manifest.name !== '@openai/codex' ||
-      manifest.version !== '0.160.1' ||
+      !/^\d+\.\d+\.\d+$/.test(manifest.version) ||
       entry !== join(root, 'bin/codex.js')
     )
       return entry
@@ -33,15 +45,21 @@ export function resolveCodexExecutable(requested: string): string {
     try {
       const file = createRequire(join(root, 'package.json')).resolve(`${name}/package.json`)
       const nativeManifest = JSON.parse(readFileSync(file, 'utf8'))
-      if (nativeManifest.name === name && nativeManifest.version === '0.160.1')
+      if (
+        (nativeManifest.name === name && nativeManifest.version === manifest.version) ||
+        (nativeManifest.name === '@openai/codex' &&
+          nativeManifest.version === `${manifest.version}-${process.platform}-${process.arch}`)
+      )
         vendorRoots.unshift(join(dirname(file), 'vendor'))
     } catch {}
     for (const vendor of vendorRoots) {
-      try {
-        const native = realpathSync(join(vendor, triple, 'codex/codex'))
-        accessSync(native, constants.X_OK)
-        if (readFileSync(native).subarray(0, 2).toString() !== '#!') return native
-      } catch {}
+      for (const folder of ['bin', 'codex']) {
+        try {
+          const native = realpathSync(join(vendor, triple, folder, 'codex'))
+          accessSync(native, constants.X_OK)
+          if (readFileSync(native).subarray(0, 2).toString() !== '#!') return native
+        } catch {}
+      }
     }
   } catch {}
   return entry
@@ -49,11 +67,24 @@ export function resolveCodexExecutable(requested: string): string {
 export function discoverCodex(options: CodexDiscoveryOptions = {}): CodexExecutable {
   const requested = options.executable || process.env.ABELE_CODEX_PATH
   if (requested) return inspectExecutable(recoverProviderLauncher(requested, 'codex'), options)
+  // Services do not inherit the interactive npm/Homebrew PATH. Ask the owner's
+  // login shell exactly as installation from that shell would resolve Codex.
+  const shell = process.env.SHELL
+  const login =
+    options.trustedPath === undefined && shell && isAbsolute(shell)
+      ? spawnSync(shell, ['-lc', 'command -v codex'], {
+          encoding: 'utf8',
+          timeout: 5000,
+          maxBuffer: 16384,
+        }).stdout?.trim()
+      : undefined
   const candidates = [
+    ...(login && isAbsolute(login) && !login.includes('\n') ? [login] : []),
     join(homedir(), '.local/bin/codex'),
     join(homedir(), '.codex/local/codex'),
     '/opt/homebrew/bin/codex',
     '/usr/local/bin/codex',
+    ...(options.trustedPath === undefined ? [join(dirname(process.execPath), 'codex')] : []),
     ...(options.trustedPath ?? process.env.PATH ?? '')
       .split(delimiter)
       .filter((root) => isAbsolute(root))
@@ -108,23 +139,24 @@ function inspectExecutable(requested: string, options: CodexDiscoveryOptions) {
       timeout: 5000,
       maxBuffer: 256 * 1024,
     })
+  const version = run(['--version']),
+    help = run(['app-server', '--help'])
+  const detectedVersion = /^codex-cli (\d+\.\d+\.\d+)$/.exec(version.stdout?.trim() ?? '')?.[1]
   // Codex runs its tools through this helper and looks for it beside itself; without it every
   // tool call fails inside the turn while the model still answers.
   if (!interpreter) {
     try {
       accessSync(join(dirname(executable), 'codex-code-mode-host'), constants.X_OK)
     } catch {
-      throw new Error('codex_code_mode_host_missing')
+      throw new CodexDiscoveryError('codex_code_mode_host_missing', detectedVersion)
     }
   }
-  const version = run(['--version']),
-    help = run(['app-server', '--help'])
-  if (version.status !== 0 || version.stdout.trim() !== 'codex-cli 0.160.1')
-    throw new Error('codex_version_unsupported')
+  if (version.status !== 0 || !detectedVersion || !supportedCodexVersion(detectedVersion))
+    throw new CodexDiscoveryError('codex_version_unsupported', detectedVersion)
   if (help.status !== 0 || !help.stdout.includes('stdio://'))
-    throw new Error('codex_stdio_unsupported')
+    throw new CodexDiscoveryError('codex_stdio_unsupported', detectedVersion)
   recheck()
-  return { executable, interpreter, sha256, version: '0.160.1', recheck }
+  return { executable, interpreter, sha256, version: detectedVersion, recheck }
 }
 export type CodexExecutable = ReturnType<typeof inspectExecutable>
 interface FileEvidence {

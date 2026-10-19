@@ -211,7 +211,7 @@ it.each([1536, 2048])(
     expect(new Set(ids).size).toBe(101)
   }
 )
-it('returns a fitting history prefix even when the next subject exceeds the Git output limit', async () => {
+it('pages past an oversized subject with an explicit truncated preview', async () => {
   const s = await setup(),
     tree = git(s.repo, 'rev-parse', 'HEAD^{tree}')
   let parent = git(s.repo, 'rev-parse', 'HEAD')
@@ -226,12 +226,29 @@ it('returns a fitting history prefix even when the next subject exceeds the Git 
     parent = made.stdout.trim()
   }
   git(s.repo, 'update-ref', 'refs/heads/main', parent)
-  expect(await s.request('workspace.log', { workspace_id: s.workspace_id, limit: 100 })).toEqual([
-    { commit: parent, subject: 'Small newest commit' },
-  ])
-  await expect(
-    s.request('workspace.log', { workspace_id: s.workspace_id, offset: 1, limit: 100 })
-  ).rejects.toThrow('output_limit')
+  const page = (await s.request('workspace.log', {
+    workspace_id: s.workspace_id,
+    limit: 100,
+  })) as { commit: string; subject: string }[]
+  expect(page).toHaveLength(3)
+  expect(page[0]).toEqual({ commit: parent, subject: 'Small newest commit' })
+  expect(page[1]!.subject).toContain('[subject truncated]')
+  expect(Buffer.byteLength(page[1]!.subject)).toBeLessThan(17000)
+  expect(page[2]!.subject).toBe('fixture')
+  expect(
+    await s.request('workspace.log', {
+      workspace_id: s.workspace_id,
+      offset: 1,
+      limit: 1,
+    })
+  ).toEqual([page[1]])
+  expect(() =>
+    FrameCodec.encode({
+      kind: 'response',
+      request_id: 'oversized-history',
+      result: page,
+    })
+  ).not.toThrow()
 })
 it('lists, reads and reviews literal backslash names without admitting slash traversal', async () => {
   const s = await setup(true),

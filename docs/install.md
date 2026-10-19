@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.31
+  sh -s -- --version 0.4.32
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -116,6 +116,9 @@ fresh installer deployment.
 The wrapper supplies those recorded settings for **every command**; use the source
 CLI for independently configured instances. It never creates, prints or stores
 enrollment secrets; it only prints the command you should run next.
+Global options are accepted after subcommand arguments. An explicit option before
+the wrapper's appended default takes precedence; repeated defaults are consumed
+before interpreting positional arguments.
 
 macOS uses the CLI's LaunchAgent installer with the selected immutable release
 runtime (no second runtime copy under state). Linux writes
@@ -190,6 +193,12 @@ abele-node service disable      # stop + unregister; retain state and runtime
 abele-node start                # now stays in the foreground until Ctrl-C
 abele-node service status --json
 ```
+
+Foreground startup announces its mode and the background-service command before
+provider preparation, so a slow prerequisite check does not look like a silent hang.
+`service status` only reads recorded state; it does not recover a transaction or wait
+for its process group. A pending transition is reported explicitly. Service changes
+still require recovery and retain the existing ownership checks.
 
 Enable and disable are idempotent. They use the **bundled local installer**, without
 network downloads, runtime copies, changing `current` or reinstalling. Enable uses
@@ -743,15 +752,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.31 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.31: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.32 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.32: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.30 → 0.4.31
+Done: 0.4.31 → 0.4.32
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -781,7 +790,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.31  # example; select an existing release
+   git checkout v0.4.32  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

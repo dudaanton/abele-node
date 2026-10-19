@@ -10,7 +10,7 @@ import {
   mkdtempSync,
   realpathSync,
 } from 'node:fs'
-import { join, delimiter, isAbsolute } from 'node:path'
+import { join, delimiter, isAbsolute, basename } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
@@ -125,7 +125,22 @@ export function projectEslint(root: string) {
 export async function status(state: string, root?: string, trusted = false) {
   return Promise.all(
     popular.map(async (language) => {
-      const server = discover(state, language)
+      let server = discover(state, language)
+      let diagnostic: string | undefined
+      // rust-analyzer in ~/.cargo/bin can be a rustup proxy even when the
+      // component is absent. Ask the manager for its target; do not execute
+      // project-code language servers in an untrusted folder.
+      if (language === 'rust' && server && basename(server) === 'rustup') {
+        try {
+          const target = (await run(server, ['which', 'rust-analyzer'], {}, 3000)).trim()
+          if (!isAbsolute(target)) throw new Error('missing_rust_analyzer')
+          accessSync(target, constants.X_OK)
+          server = realpathSync(target)
+        } catch {
+          server = null
+          diagnostic = 'rust-analyzer component unavailable; run rustup component add rust-analyzer'
+        }
+      }
       const blocked = projectCodeServers.has(language) && !trusted
       let version: string | null = null
       if (server && !blocked) {
@@ -140,6 +155,7 @@ export async function status(state: string, root?: string, trusted = false) {
         server,
         version,
         found: !!server,
+        ...(diagnostic ? { diagnostic } : {}),
         ...(blocked && root ? { reason: 'untrusted_folder' as const } : {}),
         ...(language === 'eslint' && root
           ? {

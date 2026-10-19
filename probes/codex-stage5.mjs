@@ -6,6 +6,7 @@ import { discoverCodex, requireManagedFile } from '../packages/provider-codex/di
 import { generateAndVerifySchemas } from '../packages/provider-codex/dist/doctor.js'
 import { launchOverrides, checkEffective } from '../packages/provider-codex/dist/policy.js'
 import { startRpc } from './codex-stage0.mjs'
+import { assertConfinementResult } from './codex-probe-checks.mjs'
 
 const args = process.argv.slice(2),
   json = args.includes('--json')
@@ -142,13 +143,7 @@ async function inspection(projectConfig, expectedRejection) {
         timeoutMs: 2000,
         outputBytesCap: 4096,
       })
-      if (
-        !Number.isInteger(result.exitCode) ||
-        (result.exitCode === 0) !== success ||
-        (target && existsSync(target) !== success) ||
-        String(result.stdout ?? '').includes('synthetic-')
-      )
-        throw new Error(`confinement_probe_failed:${name}`)
+      assertConfinementResult(name, result, success, target ? existsSync(target) : undefined)
       measured.push(name + ' ' + (success ? 'allowed' : 'denied'))
     }
   } finally {
@@ -231,6 +226,46 @@ try {
     'default nested node worktree write allowed',
     'state read from default nested worktree denied'
   )
+  // The workspace's ancestors are denied as "everything beside the path"; prove the
+  // neighbours, prefix-named lookalikes and entries created after launch stay denied.
+  const later = join(nested.state, 'created-after-launch')
+  writeFileSync(later, 'synthetic-later-secret', { mode: 0o600 })
+  const beside = [
+    ['neighbour worktree read', join(nested.sibling, 'neighbour/secret')],
+    ['prefix-named worktree read', join(nested.sibling, 'workspace-copy/secret')],
+    ['other project worktree read', join(nested.state, 'worktrees/other/ws/secret')],
+    ['state file created after launch read', later],
+  ]
+  for (const [, file] of beside.slice(0, 3)) {
+    mkdirSync(join(file, '..'), { recursive: true, mode: 0o700 })
+    writeFileSync(file, 'synthetic-neighbour-secret', { mode: 0o600 })
+  }
+  for (const [name, file] of beside) {
+    const result = await nestedPeer.rpc('command/exec', {
+      command: ['/bin/sh', '-c', `cat ${JSON.stringify(file)}`],
+      cwd: nested.workspace,
+      permissionProfile: 'abele',
+      timeoutMs: 2000,
+      outputBytesCap: 4096,
+    })
+    assertConfinementResult(name, result, false)
+    measured.push(name + ' denied')
+  }
+  for (const [name, target] of [
+    ['state root write', join(nested.state, 'escape-write')],
+    ['worktree root write', join(nested.state, 'worktrees/escape-write')],
+    ['neighbour worktree write', join(nested.sibling, 'escape-write')],
+  ]) {
+    const result = await nestedPeer.rpc('command/exec', {
+      command: ['/bin/sh', '-c', `printf bad > ${JSON.stringify(target)}`],
+      cwd: nested.workspace,
+      permissionProfile: 'abele',
+      timeoutMs: 2000,
+      outputBytesCap: 4096,
+    })
+    assertConfinementResult(name, result, false, existsSync(target))
+    measured.push(name + ' denied')
+  }
 } finally {
   await nestedPeer.stop()
 }

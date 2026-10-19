@@ -11,7 +11,13 @@ fall back to another provider. Codex execution on Linux and Windows is unavailab
 
 ## Detection
 
-Only Codex **0.160.1**, without a prerelease suffix, is accepted. The node checks
+Discovery accepts stable Codex **>=0.160.1** within major version 0.
+Protocol preflight accepts the reviewed 0.160.1 and 0.162.1 schema closures;
+newer versions must reproduce both closures of one reviewed protocol and pass
+the initialization, effective-policy and model probes. Native execution gates
+are version-specific: 0.160.1 and 0.162.1 are enabled on their own native
+proofs; any other version (including 0.163.0, whose protocol is not yet reviewed)
+stays disabled until its own proofs are collected. Doctor/status identify the found version and blocking gate. The node checks
 version/help output, fingerprints the canonical executable, and verifies the
 app-server protocol schemas. It never installs or upgrades Codex automatically.
 Official npm installations are resolved to their bundled/platform native executable
@@ -23,10 +29,11 @@ turn while the model still answered as if it had worked.
 
 - `--codex-path /absolute/codex` selects the executable explicitly.
 - `ABELE_CODEX_PATH` supplies the executable when `--codex-path` is omitted.
-- Discovery is automatic: `~/.local/bin/codex`, `~/.codex/local/codex`,
+- Discovery is automatic: the owner login shell (`$SHELL -lc`, including npm global
+  and Homebrew PATH setup), `~/.local/bin/codex`, `~/.codex/local/codex`,
   `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, then absolute entries in the
-  daemon's trusted `PATH`. Relative entries are ignored; startup does not search
-  a session's workspace or read shell startup files. Incompatible auto-discovered
+  daemon's trusted `PATH`, plus Codex beside the Node executable. Relative entries
+  are ignored; startup does not search a session's workspace. Incompatible auto-discovered
   candidates are skipped; an explicit executable never silently falls back.
 - `--no-codex` disables discovery/preflight/execution, even with an executable set.
   `--codex` remains accepted for compatibility and can re-enable installer setup.
@@ -193,7 +200,15 @@ listener is requested.
 Each active run or live owner chat has one supervised stdio app-server. Its permission profile
 grants writes to the canonical workspace and minimum runtime reads, with explicit
 denials for node state, sibling workspaces, host-temp locations and protected Git
-and policy paths. Effective values are checked before user input. Project or
+and policy paths. The filesystem root itself is denied too, so a command you
+approve with escalation keeps this same profile: it writes only inside the
+workspace, on 0.160.1 and 0.162.1 alike. (From 0.161.0, Codex would otherwise let an
+approved command write anywhere that is not explicitly denied; 0.160.1 never did.)
+Git metadata is never writable: the workspace's `.git` (folder or gitfile), the
+resolved gitdir and the common Git directory are read-only when inside the workspace
+and denied when outside it, so a node-created worktree cannot write its main
+repository's configuration or hooks.
+Effective values are checked before user input. Project or
 managed configuration that adds roots/resources or changes checked values causes
 refusal, not silent permission broadening. Only explicit node RPC methods are
 available; Codex endpoints are never exposed to the plugin.

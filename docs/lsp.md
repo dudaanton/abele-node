@@ -9,6 +9,9 @@ abele-node lsp status
 abele-node lsp status --json
 ```
 
+With no language arguments, `abele-node lsp install` installs the same set as `--popular`.
+Installer-supplied global options are accepted after subcommand arguments.
+
 `javascript` is an alias for `typescript`. Supported languages are TypeScript/JavaScript,
 Python, Rust, Go, JSON, YAML, CSS, HTML, Bash, and ESLint diagnostics. Go installation is
 skipped with an explanation when Go is absent. Rust binaries support macOS and Linux on
@@ -16,6 +19,9 @@ arm64 and x64. All commands accept `--state-dir`.
 
 Discovery checks the node's private installation first, then PATH. Status includes the
 executable, its reported version (or `unknown` if unsupported), and found/missing state.
+Unchecked versions are shown as `version not checked` in human output. If a rustup proxy
+has no usable rust-analyzer component, status reports it missing and suggests
+`rustup component add rust-analyzer`.
 ESLint status also checks the current project: its own `node_modules/eslint` and configuration
 are required. Installing the ESLint server does not install ESLint into a project or change
 its configuration. Missing project ESLint does not prevent TypeScript features.

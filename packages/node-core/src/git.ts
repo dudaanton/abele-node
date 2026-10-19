@@ -5,6 +5,7 @@ import type { ProcessIdentity } from '@abele/provider-contract'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { StringDecoder } from 'node:string_decoder'
 import { ChannelError } from '@abele/channel-protocol'
 
 /** Internal typed commands, never a client-supplied argv or shell string. */
@@ -505,7 +506,7 @@ export class GitRunner {
                   )
                 ? this.metadataOutputBytes
                 : this.outputBytes
-      const collect = (chunk: Buffer, stdout: boolean) => {
+      const collectBounded = (chunk: Buffer, stdout: boolean) => {
         bytes += chunk.byteLength
         if (bytes > limit) {
           failure = 'output_limit'
@@ -526,6 +527,43 @@ export class GitRunner {
               pending = pending.subarray(end + 1)
             }
           }
+        }
+      }
+      // Git's %s has no byte bound. Drain it without retaining the entire subject,
+      // so even the first entry on a page can always make progress. Keep framing
+      // intact and mark the preview in-band for existing workspace.log clients.
+      let logField = 0,
+        subjectBytes = 0,
+        subjectTruncated = false
+      let subject: Buffer[] = []
+      const collect = (chunk: Buffer, stdout: boolean) => {
+        if (command.kind !== 'log' || !stdout) return collectBounded(chunk, stdout)
+        let start = 0
+        while (start < chunk.length) {
+          const end = chunk.indexOf(0, start)
+          const part = chunk.subarray(start, end < 0 ? chunk.length : end)
+          if (logField % 2 === 1) {
+            const kept = part.subarray(0, Math.max(0, 16384 - subjectBytes))
+            if (kept.length) subject.push(Buffer.from(kept))
+            subjectBytes += kept.length
+            subjectTruncated ||= kept.length < part.length
+            if (end >= 0) {
+              const preview = Buffer.concat(subject)
+              collectBounded(
+                subjectTruncated
+                  ? Buffer.from(new StringDecoder('utf8').write(preview) + ' [subject truncated]')
+                  : preview,
+                true
+              )
+              subject = []
+              subjectBytes = 0
+              subjectTruncated = false
+            }
+          } else collectBounded(part, true)
+          if (end < 0) break
+          collectBounded(Buffer.from([0]), true)
+          logField++
+          start = end + 1
         }
       }
       child.stdout!.on('data', (b: Buffer) => collect(b, true))

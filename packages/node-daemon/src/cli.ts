@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import './warnings.js'
 import { DatabaseSync } from 'node:sqlite'
-import { humanOutput, humanError } from './output.js'
+import { humanOutput, humanError, errorMessage } from './output.js'
 import { homedir, hostname } from 'node:os'
 import { createInterface } from 'node:readline/promises'
 import {
@@ -76,48 +76,34 @@ async function main() {
     console.log(help)
     return
   }
-  function option(name: string, fallback: string) {
+  function option(name: string, fallback: string, repeatable = false) {
     const i = args.indexOf(name)
     if (i < 0) return fallback
     if (!args[i + 1]) throw new Error('missing_' + name)
     const value = args[i + 1]!
     args.splice(i, 2)
+    // Operator arguments precede wrapper defaults. Keep the first value, but
+    // consume every appended default before interpreting command positionals.
+    if (!repeatable) {
+      for (let next = args.indexOf(name); next >= 0; next = args.indexOf(name)) {
+        if (!args[next + 1] || args[next + 1]!.startsWith('--')) throw new Error('missing_' + name)
+        args.splice(next, 2)
+      }
+    }
     return value
   }
-  const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
-  if (args[0] === 'lsp') {
-    if (args[1] === 'status') {
-      const rows = await lspStatus(state, process.cwd())
-      console.log(
-        json
-          ? JSON.stringify(rows)
-          : rows
-              .map(
-                (row) =>
-                  `${row.language}: ${row.found ? `${row.server} (${row.version})` : 'missing'}${row.project_eslint ? `; project ESLint: ${row.project_eslint}` : ''}`
-              )
-              .join('\n')
-      )
-    } else if (args[1] === 'install') {
-      const languages = args.includes('--popular') ? popularLsp : args.slice(2)
-      if (!languages.length) throw new Error('usage: abele-node lsp install [lang…|--popular]')
-      const rows = await installLsp(state, languages)
-      console.log(
-        json
-          ? JSON.stringify(rows)
-          : rows.map((row) => `${row.language}: ${row.message}`).join('\n')
-      )
-    } else throw new Error('usage: abele-node lsp status [--json] | install [lang…|--popular]')
-    return
+  function flag(name: string) {
+    const present = args.includes(name)
+    for (let i = args.indexOf(name); i >= 0; i = args.indexOf(name)) args.splice(i, 1)
+    return present
   }
+  const state = canonicalStateDir(option('--state-dir', join(homedir(), '.local/state/abele-node')))
   const port = Number(option('--port', '7777'))
   // A release installer can use its already deployed, immutable runtime directly.
   const configuredRuntime = option('--runtime-dir', '')
   const installerJournal = option('--installer-journal', '')
   // Only the generated manager command bypasses the interactive start guard.
-  const serviceRunIndex = args.indexOf('--service-run')
-  const serviceRun = serviceRunIndex >= 0
-  if (serviceRun) args.splice(serviceRunIndex, 1)
+  const serviceRun = flag('--service-run')
   const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   function completedInstallerAction(action: string, target: string) {
     if (!installerJournal) return
@@ -137,9 +123,7 @@ async function main() {
     }
   }
   const explicitPairedConfig = option('--paired-config', '')
-  const noPairedFlag = args.indexOf('--no-paired-config')
-  const noPairedConfig = noPairedFlag >= 0
-  if (noPairedConfig) args.splice(noPairedFlag, 1)
+  const noPairedConfig = flag('--no-paired-config')
   if (noPairedConfig && explicitPairedConfig)
     throw new Error('Choose either --paired-config PATH or --no-paired-config.')
   // An installer deployment records its paired configuration; the service's own
@@ -177,9 +161,7 @@ async function main() {
   )
   const pairInstallation = option('--pair-installation', '')
   const nodeName = option('--node-name', hostname())
-  const policyFlag = args.indexOf('--tailnet-policy-verified')
-  const policyVerified = policyFlag >= 0
-  if (policyVerified) args.splice(policyFlag, 1)
+  const policyVerified = flag('--tailnet-policy-verified')
   // Read-only here: doctor and status consult the daemon's ownership record.
   const tailscale = new TailscaleServeManager(
     tailscaleRunner(tailscalePath),
@@ -201,17 +183,15 @@ async function main() {
   const claudeIdle = option('--claude-idle-ms', '')
   const claudeMaxLive = option('--claude-max-live', '')
   const claudeDetached = option('--claude-detached-ms', '')
-  const bypassFlag = args.indexOf('--claude-allow-bypass')
-  const allowBypass = bypassFlag >= 0
-  if (allowBypass) args.splice(bypassFlag, 1)
-  const noLiveFlag = args.indexOf('--no-claude-live')
-  const noLive = noLiveFlag >= 0
-  if (noLive) args.splice(noLiveFlag, 1)
-  const noPiLiveFlag = args.indexOf('--no-pi-live')
-  const noPiLive = noPiLiveFlag >= 0
-  if (noPiLive) args.splice(noPiLiveFlag, 1)
+  const allowBypass = flag('--claude-allow-bypass')
+  const noLive = flag('--no-claude-live')
+  const noPiLive = flag('--no-pi-live')
   const accountArgs: string[] = []
-  for (let value = option('--claude-account', ''); value; value = option('--claude-account', ''))
+  for (
+    let value = option('--claude-account', '', true);
+    value;
+    value = option('--claude-account', '', true)
+  )
     accountArgs.push(value)
   const claudeAccounts: Record<string, string> = {}
   for (const entry of accountArgs) {
@@ -232,18 +212,14 @@ async function main() {
   )
     throw new Error('invalid_claude_configuration')
   // Authorized debugger infrastructure, and the JS profile once its pinned adapter is installed.
-  const debuggerFlag = args.indexOf('--debugger')
-  const debuggerEnabled = debuggerFlag >= 0
-  if (debuggerEnabled) args.splice(debuggerFlag, 1)
-  const codexFlag = args.indexOf('--codex')
-  if (codexFlag >= 0) args.splice(codexFlag, 1)
-  const noCodexFlag = args.indexOf('--no-codex')
-  if (noCodexFlag >= 0) args.splice(noCodexFlag, 1)
+  const debuggerEnabled = flag('--debugger')
+  flag('--codex')
+  const noCodex = flag('--no-codex')
   const codexPath = option('--codex-path', process.env.ABELE_CODEX_PATH ?? '')
   const codexModel = option('--codex-model', process.env.ABELE_CODEX_MODEL ?? '')
   const codexHome = option('--codex-home', process.env.ABELE_CODEX_HOME ?? '')
   const codexOptions = {
-    enabled: noCodexFlag < 0,
+    enabled: !noCodex,
     ...(codexPath ? { executable: codexPath } : {}),
     model: codexModel,
     ...(codexHome ? { home: resolve(codexHome) } : {}),
@@ -299,6 +275,35 @@ async function main() {
     ...(claudeDetached ? { detachedMs: Number(claudeDetached) } : {}),
   }
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port')
+  // Consume shared options before dispatching any subcommand, including LSP.
+  if (args[0] === 'lsp') {
+    if (args[1] === 'status' && args.length === 2) {
+      const rows = await lspStatus(state, process.cwd())
+      console.log(
+        json
+          ? JSON.stringify(rows)
+          : rows
+              .map(
+                (row) =>
+                  `${row.language}: ${row.found ? `${row.server} (${row.version ?? 'version not checked'})` : 'missing'}${row.diagnostic ? `; ${row.diagnostic}` : ''}${row.project_eslint ? `; project ESLint: ${row.project_eslint}` : ''}`
+              )
+              .join('\n')
+      )
+    } else if (args[1] === 'install') {
+      const requested = args.slice(2)
+      const languages =
+        !requested.length || (requested.length === 1 && requested[0] === '--popular')
+          ? popularLsp
+          : requested
+      const rows = await installLsp(state, languages)
+      console.log(
+        json
+          ? JSON.stringify(rows)
+          : rows.map((row) => `${row.language}: ${row.message}`).join('\n')
+      )
+    } else throw new Error('usage: abele-node lsp status [--json] | install [lang…|--popular]')
+    return
+  }
   const version = JSON.parse(
     readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')
   ).version as string
@@ -431,6 +436,12 @@ async function main() {
       return
     }
     case 'start': {
+      if (!json && !serviceRun)
+        console.error(
+          installationMode(runtimeRoot, state) === 'service'
+            ? 'Starting the configured background service; checking its state…'
+            : 'Starting AbeleNode in the foreground; Ctrl-C stops it. For background operation: abele-node service enable.'
+        )
       if (!serviceRun && installedService(runtimeRoot, state)?.service === 1) {
         const report = await changeService(runtimeRoot, state, 'enable')
         if (json) output(report)
@@ -1000,6 +1011,6 @@ async function main() {
   }
 }
 void main().catch((error) => {
-  console.error(json ? (error instanceof Error ? error.message : String(error)) : humanError(error))
+  console.error(json ? errorMessage(error) : humanError(error))
   process.exitCode = 1
 })

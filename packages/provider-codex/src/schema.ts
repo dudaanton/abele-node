@@ -45,10 +45,13 @@ export function verifySchemaDirectory(directory: string, pins: SchemaPins) {
   )
     throw new Error('codex_schema_fingerprint_mismatch')
 }
-export function pinnedSchemas(experimental = false): SchemaPins {
+export function pinnedSchemas(experimental = false, version = '0.160.1'): SchemaPins {
   return JSON.parse(
     readFileSync(
-      new URL(`../schemas/${experimental ? 'experimental' : 'stable'}-pins.json`, import.meta.url),
+      new URL(
+        `../schemas/${experimental ? 'experimental' : 'stable'}${version === '0.162.1' ? '-0.162.1' : ''}-pins.json`,
+        import.meta.url
+      ),
       'utf8'
     )
   )

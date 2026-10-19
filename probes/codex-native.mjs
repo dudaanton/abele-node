@@ -8,10 +8,13 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  renameSync,
+  realpathSync,
   copyFileSync,
+  lstatSync,
 } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { discoverCodex, requireManagedFile } from '../packages/provider-codex/dist/discovery.js'
 import { RpcPeer } from '../packages/provider-codex/dist/rpc.js'
@@ -24,6 +27,7 @@ import { CodexEventMapper } from '../packages/provider-codex/dist/mapper.js'
 import { CodexApprovalBridge } from '../packages/provider-codex/dist/approval.js'
 import { NodeCore } from '../packages/node-core/dist/index.js'
 import { ProcessSupervisor, systemProcessProbe } from '../packages/provider-claude/dist/index.js'
+import { assertReplayProgress, assertChainIntact } from './codex-probe-checks.mjs'
 
 function png() {
   const crc = (bytes) => {
@@ -154,8 +158,22 @@ const adapter = {
   capabilities: () => ({ provider: 'codex', available: true }),
   reconcile: (p) => ProcessSupervisor.cleanup(p, 100),
   startTurn: async (turn, sink) => {
-    const paths = { state, home, workspace: turn.cwd, sibling: join(root, 'denied') }
-    mkdirSync(paths.sibling, { recursive: true, mode: 0o700 })
+    // The same paths the provider adapter derives for a launch.
+    const [commonDir, gitDir] = execFileSync(
+      '/usr/bin/git',
+      ['rev-parse', '--git-common-dir', '--absolute-git-dir'],
+      { cwd: turn.cwd, env, encoding: 'utf8' }
+    )
+      .trim()
+      .split('\n')
+    const paths = {
+      state,
+      home,
+      workspace: turn.cwd,
+      sibling: dirname(turn.cwd),
+      repository: realpathSync(resolve(turn.cwd, commonDir)),
+      gitdir: realpathSync(gitDir),
+    }
     const mapper = new CodexEventMapper(turn.run_id, (e) => sink.event(e))
     if (turn.native_session_id) mapper.bind(turn.native_session_id)
     let finishTerminal
@@ -321,9 +339,12 @@ const adapter = {
     return { done, interrupt }
   },
 }
-const wait = async (condition, label) => {
+const wait = async (condition, label, assertProgress = () => {}) => {
   const end = Date.now() + 15000
-  while (!condition() && Date.now() < end) await new Promise((r) => setTimeout(r, 10))
+  while (!condition() && Date.now() < end) {
+    assertProgress()
+    await new Promise((r) => setTimeout(r, 10))
+  }
   if (!condition()) throw new Error(`timeout:${label}`)
 }
 try {
@@ -340,11 +361,11 @@ try {
       provider: 'codex',
       workspace_id: job.workspace_id,
     })
-  const send = async (text) => {
+  const send = async (text, target = session) => {
     const input = request('session.send', {
-      session_id: session.session_id,
+      session_id: target.session_id,
       text,
-      observed_seq: core.head(session.session_id),
+      observed_seq: core.head(target.session_id),
     })
     await core.execution.drain()
     return input.input_id
@@ -364,7 +385,17 @@ try {
     const input = await send(`Approval fixture ${choice}`)
     await wait(
       () => core.prompts(session.session_id).some((p) => p.state === 'pending'),
-      'approval'
+      'approval',
+      () => {
+        const run = core.db.prepare('SELECT run_id FROM inputs WHERE input_id=?').get(input)
+        const events = core.db
+          .prepare('SELECT body FROM events WHERE stream_id=? ORDER BY seq DESC LIMIT 16')
+          .all(session.session_id)
+        assertReplayProgress(
+          run.run_id,
+          events.map((event) => JSON.parse(event.body))
+        )
+      }
     )
     if (existsSync(marker)) throw new Error('effect_before_approval')
     const prompt = core.prompts(session.session_id).find((p) => p.state === 'pending')
@@ -381,6 +412,202 @@ try {
       throw new Error('approval_effect_mismatch')
     measured.push(`native ${choice} through durable approval API`)
   }
+  // One explicitly escalated command, answered allow through the durable API.
+  const approvedEscalation = async (id, cmd, cwd = workspace, target = session) => {
+    queue.push(
+      call(id, 'exec_command', {
+        cmd,
+        workdir: cwd,
+        sandbox_permissions: 'require_escalated',
+        justification: 'Synthetic approved escalation fixture.',
+      }),
+      final()
+    )
+    const input = await send(`Approved escalation fixture ${id}`, target)
+    await wait(
+      () => core.prompts(target.session_id).some((p) => p.state === 'pending'),
+      id,
+      () => {
+        const run = core.db.prepare('SELECT run_id FROM inputs WHERE input_id=?').get(input)
+        const events = core.db
+          .prepare('SELECT body FROM events WHERE stream_id=? ORDER BY seq DESC LIMIT 16')
+          .all(target.session_id)
+        assertReplayProgress(
+          run.run_id,
+          events.map((event) => JSON.parse(event.body))
+        )
+      }
+    )
+    const prompt = core.prompts(target.session_id).find((p) => p.state === 'pending')
+    request('prompt.answer', {
+      session_id: prompt.session_id,
+      prompt_id: prompt.prompt_id,
+      run_id: prompt.run_id,
+      revision: 1,
+      action_digest: prompt.action_digest,
+      choice: 'allow',
+    })
+    await wait(() => stateOf(input) === 'completed', `${id} terminal`)
+    return JSON.stringify(outputs.get(id) ?? '')
+  }
+  // An approved escalation must not reach past the workspace: not the node's state,
+  // not neighbouring worktrees, and not any other writable-looking location.
+  const neighbour = join(dirname(workspace), 'neighbour-fixture'),
+    stateSecret = join(state, 'escalation-fixture-secret'),
+    outside = join(root, 'escalation-outside')
+  mkdirSync(neighbour, { mode: 0o700 })
+  writeFileSync(join(neighbour, 'secret'), 'synthetic-neighbour-secret', { mode: 0o600 })
+  writeFileSync(stateSecret, 'synthetic-state-secret', { mode: 0o600 })
+  for (const [id, cmd, target] of [
+    ['escalated-state-read', `cat ${JSON.stringify(stateSecret)}`],
+    ['escalated-neighbour-read', `cat ${JSON.stringify(join(neighbour, 'secret'))}`],
+    ['escalated-state-write', `printf bad > ${JSON.stringify(join(state, 'escalation-write'))}`],
+    ['escalated-outside-write', `printf bad > ${JSON.stringify(outside)}`, outside],
+  ]) {
+    const output = await approvedEscalation(id, cmd)
+    assertChainIntact(id, {
+      chainIntact: true,
+      escapedPaths: [target ?? join(state, 'escalation-write')].filter((p) => existsSync(p)),
+      output,
+    })
+  }
+  measured.push(
+    'approved escalation writes only inside the workspace and keeps node state and neighbouring worktrees denied'
+  )
+  // The registered repository itself: its Git metadata and policy folder stay
+  // protected when an approved command runs there.
+  await request('project.repository_settings', {
+    project_id: project.project_id,
+    external_read: true,
+  })
+  const checkout = (
+      await request('repository.v1.worktrees', { project_id: project.project_id })
+    ).entries.find((e) => e.kind === 'root'),
+    checkoutTarget = { kind: 'worktree', worktree_id: checkout.worktree_id }
+  await request('project.execution', {
+    project_id: project.project_id,
+    target: checkoutTarget,
+    enabled: true,
+  })
+  const repoSession = await request('session.create', {
+      title: 'Native replay repository',
+      provider: 'codex',
+      target: checkoutTarget,
+    }),
+    gitConfig = readFileSync(join(repo, '.git/config'), 'utf8')
+  for (const [id, cmd, target] of [
+    ['escalated-git-config', 'printf bad >> .git/config'],
+    [
+      'escalated-git-hook',
+      'printf bad > .git/hooks/escalation-hook',
+      join(repo, '.git/hooks/escalation-hook'),
+    ],
+    [
+      'escalated-codex-policy',
+      'mkdir -p .codex && printf bad > .codex/escalation',
+      join(repo, '.codex'),
+    ],
+  ]) {
+    const output = await approvedEscalation(id, cmd, repo, repoSession)
+    assertChainIntact(id, {
+      chainIntact: readFileSync(join(repo, '.git/config'), 'utf8') === gitConfig,
+      escapedPaths: target && existsSync(target) ? [target] : [],
+      output,
+    })
+  }
+  measured.push('approved escalation in a registered repository keeps .git and .codex read-only')
+  // Git metadata in every layout the node can bind: neither an ordinary nor an
+  // approved command may write the gitfile, the resolved gitdir or the common dir.
+  const ordinaryCommand = async (id, cmd, cwd, target) => {
+    queue.push(call(id, 'exec_command', { cmd, workdir: cwd }), final())
+    const input = await send(`Ordinary fixture ${id}`, target)
+    await wait(() => stateOf(input) === 'completed', `${id} terminal`)
+    return JSON.stringify(outputs.get(id) ?? '')
+  }
+  const snapshot = (paths) =>
+    paths.map((path) => (existsSync(path) ? readFileSync(path, 'utf8') : null)).join('\0')
+  const gitLayout = async (label, target, cwd) => {
+    const [commonDir, gitDir] = execFileSync(
+      '/usr/bin/git',
+      ['rev-parse', '--git-common-dir', '--absolute-git-dir'],
+      { cwd, env, encoding: 'utf8' }
+    )
+      .trim()
+      .split('\n')
+    const common = realpathSync(resolve(cwd, commonDir)),
+      gitdir = realpathSync(gitDir),
+      watched = [
+        join(cwd, '.git'),
+        join(common, 'config'),
+        join(gitdir, 'HEAD'),
+        join(common, 'hooks/escalation-hook'),
+        join(gitdir, 'config.worktree'),
+      ],
+      before = snapshot(watched)
+    const commands = [
+      ['gitfile', `printf 'gitdir: /tmp/elsewhere' > ${JSON.stringify(join(cwd, '.git'))}`],
+      ['common-config', `printf bad >> ${JSON.stringify(join(common, 'config'))}`],
+      ['gitdir-head', `printf bad >> ${JSON.stringify(join(gitdir, 'HEAD'))}`],
+      ['common-hook', `printf bad > ${JSON.stringify(join(common, 'hooks/escalation-hook'))}`],
+      ['gitdir-config', `printf bad > ${JSON.stringify(join(gitdir, 'config.worktree'))}`],
+    ]
+    for (const [name, cmd] of commands)
+      for (const [mode, run] of [
+        ['ordinary', ordinaryCommand],
+        ['escalated', (id, c, w, t) => approvedEscalation(id, c, w, t)],
+      ]) {
+        const id = `git-${label.replace(/[^a-z]+/g, '-')}-${name}-${mode}`
+        const output = await run(id, cmd, cwd, target)
+        assertChainIntact(id, {
+          chainIntact: snapshot(watched) === before,
+          escapedPaths: [],
+          output,
+        })
+      }
+    measured.push(`ordinary and approved commands cannot write Git metadata of a ${label}`)
+  }
+  await gitLayout('node-created worktree', session, workspace)
+  // The workspace as a worktree of a repository nested inside it: gitdir and common
+  // dir both inside the workspace. (A --separate-git-dir checkout is not offered as
+  // an execution target by the node, so it cannot reach Codex.)
+  const layoutSession = async (folder) => {
+    const registered = await request('project.register', { path: folder, trust: 'trusted' })
+    await request('project.repository_settings', {
+      project_id: registered.project_id,
+      external_read: true,
+    })
+    const entry = (
+        await request('repository.v1.worktrees', { project_id: registered.project_id })
+      ).entries.find((e) => e.kind === 'root'),
+      target = { kind: 'worktree', worktree_id: entry.worktree_id }
+    await request('project.execution', {
+      project_id: registered.project_id,
+      target,
+      enabled: true,
+    })
+    return request('session.create', { title: `Native ${folder}`, provider: 'codex', target })
+  }
+  const git = (cwd, ...args) => execFileSync('/usr/bin/git', args, { cwd, env, stdio: 'ignore' })
+  const outer = join(root, 'outer-worktree'),
+    inner = join(root, 'inner-repository')
+  git(root, 'init', '-q', '-b', 'main', inner)
+  writeFileSync(join(inner, 'file'), 'synthetic\n')
+  git(inner, 'add', 'file')
+  git(
+    inner,
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.invalid',
+    'commit',
+    '-q',
+    '-m',
+    'fixture'
+  )
+  git(inner, 'worktree', 'add', '-q', '-b', 'outer', outer)
+  renameSync(inner, join(outer, 'inner'))
+  git(join(outer, 'inner'), 'worktree', 'repair', outer)
+  await gitLayout('worktree of a repository nested inside it', await layoutSession(outer), outer)
   queue.push(
     call('question-native', 'request_user_input', {
       questions: [
@@ -422,10 +649,12 @@ try {
     'native question through durable answer API with free-text semantics and no default selection'
   )
   writeFileSync(join(workspace, 'allowed.png'), png(), { mode: 0o600 })
-  writeFileSync(join(root, 'denied', 'secret.png'), png(), { mode: 0o600 })
+  const deniedImage = join(dirname(workspace), 'denied-fixture', 'secret.png')
+  mkdirSync(dirname(deniedImage), { mode: 0o700 })
+  writeFileSync(deniedImage, png(), { mode: 0o600 })
   queue.push(
     call('read-allowed', 'view_image', { path: join(workspace, 'allowed.png') }),
-    call('read-denied', 'view_image', { path: join(root, 'denied', 'secret.png') }),
+    call('read-denied', 'view_image', { path: deniedImage }),
     final()
   )
   const readInput = await send('Native reader fixture')
@@ -538,6 +767,62 @@ try {
     failures.push('codex_detached_descendant_cleanup_failed')
     await ProcessSupervisor.cleanup([detachedEvidence], 100)
   } else measured.push('native detached child cleanup confirmed')
+  // Destructive, so last: the directories from the node state down to the workspace
+  // must not be moved, removed or replaced by an approved command, and no moved or
+  // linked path may reach denied content or write into the state.
+  const projectDir = dirname(workspace),
+    worktrees = dirname(projectDir),
+    chain = [state, worktrees, projectDir, workspace]
+  const intact = () =>
+    chain.every((dir) => {
+      const stat = existsSync(dir) && lstatSync(dir)
+      return stat && stat.isDirectory() && !stat.isSymbolicLink()
+    })
+  const q = JSON.stringify
+  for (const [id, cmd, escaped] of [
+    [
+      'chain-move-projectDir',
+      `mv ${q(projectDir)} ${q(join(root, 'moved-projectDir'))} && cat ${q(join(root, 'moved-projectDir/neighbour-fixture/secret'))}; printf bad > ${q(join(root, 'moved-projectDir/via-move'))}`,
+      [join(root, 'moved-projectDir')],
+    ],
+    [
+      'chain-move-worktrees',
+      `mv ${q(worktrees)} ${q(join(root, 'moved-worktrees'))}`,
+      [join(root, 'moved-worktrees')],
+    ],
+    [
+      'chain-move-state',
+      `mv ${q(state)} ${q(join(root, 'moved-state'))} && cat ${q(join(root, 'moved-state/escalation-fixture-secret'))}`,
+      [join(root, 'moved-state')],
+    ],
+    [
+      'chain-workspace-to-sibling',
+      `cd / && mv ${q(workspace)} ${q(join(projectDir, 'workspace-sibling'))}`,
+      [join(projectDir, 'workspace-sibling')],
+    ],
+    [
+      'chain-workspace-to-link',
+      `cd / && mv ${q(workspace)} ${q(join(root, 'moved-workspace'))} && ln -s ${q(state)} ${q(workspace)} && printf bad > ${q(join(workspace, 'via-link'))}; cat ${q(join(workspace, 'escalation-fixture-secret'))}`,
+      [join(root, 'moved-workspace'), join(state, 'via-link')],
+    ],
+    [
+      'chain-project-to-link',
+      `cd / && rm -rf ${q(projectDir)}; ln -s ${q(state)} ${q(projectDir)} && printf bad > ${q(join(projectDir, 'via-link'))}`,
+      [join(state, 'via-link')],
+    ],
+  ]) {
+    const output = await approvedEscalation(id, cmd)
+    assertChainIntact(id, {
+      chainIntact: intact(),
+      escapedPaths: escaped.filter((p) => existsSync(p)),
+      output,
+    })
+  }
+  if (!existsSync(join(projectDir, 'neighbour-fixture/secret')))
+    throw new Error('chain_probe_failed:chain-project-to-link:neighbour_removed')
+  measured.push(
+    'approved escalation cannot move, remove or replace the directories from node state to the workspace'
+  )
 } finally {
   if (detachedEvidence) await ProcessSupervisor.cleanup([detachedEvidence], 100)
   for (const peer of peers) await peer.close()

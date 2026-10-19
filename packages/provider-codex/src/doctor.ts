@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import {
   discoverCodex,
+  CodexDiscoveryError,
   requireManagedFile,
   type CodexDiscoveryOptions,
   type CodexExecutable,
@@ -51,8 +52,26 @@ export function generateAndVerifySchemas(executable: CodexExecutable, directory:
       }
     )
     if (result.status !== 0) throw new Error('codex_schema_generation_failed')
-    verifySchemaDirectory(out, pinnedSchemas(experimental))
   }
+  // Both closures must belong to one reviewed protocol. The handshake alone
+  // cannot establish compatibility of approval and result contracts.
+  const versions = executable.version === '0.160.1' ? ['0.160.1'] : ['0.162.1', '0.160.1']
+  for (const version of versions) {
+    try {
+      for (const experimental of [false, true]) {
+        verifySchemaDirectory(
+          join(directory, experimental ? 'experimental' : 'stable'),
+          pinnedSchemas(experimental, version)
+        )
+      }
+      executable.recheck()
+      return
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'codex_schema_fingerprint_mismatch')
+        throw error
+    }
+  }
+  throw new Error('codex_schema_fingerprint_mismatch')
 }
 export async function inspectCodex(
   executable: CodexExecutable,
@@ -108,10 +127,12 @@ export async function doctorCodex(
   selection = resolveCodexHome(options.home),
   platform: string = process.platform
 ): Promise<CodexDoctorReport> {
+  let version: string | undefined
   let directory: string | undefined
   let home = selection.home
   try {
     const executable = discoverCodex(options)
+    version = executable.version
     requireManagedFile()
     ensureCodexState(options.stateDir)
     home = prepareCodexHome(selection)
@@ -126,7 +147,7 @@ export async function doctorCodex(
     mkdirSync(paths.workspace, { mode: 0o700 })
     generateAndVerifySchemas(executable, directory)
     const { model, ...checks } = await inspectCodex(executable, paths, () => {}, options.model)
-    const gates = codexExecutionGates(platform)
+    const gates = codexExecutionGates(platform, executable.version)
     const error =
       gates.find((g) => g.error)?.error ??
       (!checks.authenticated
@@ -160,6 +181,8 @@ export async function doctorCodex(
     const message = error instanceof Error ? error.message : ''
     return {
       provider: 'codex',
+      provider_version: error instanceof CodexDiscoveryError ? error.version : version,
+      gates: version ? codexExecutionGates(platform, version) : undefined,
       available: false,
       home,
       model: options.model || 'Codex default',

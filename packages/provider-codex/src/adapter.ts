@@ -24,7 +24,8 @@ import {
   assertCodexLayout,
   type CodexHome,
 } from './home.js'
-import { codexExecutionGates, codexExecutionError } from './gates.js'
+import { CodexDiscoveryError } from './discovery.js'
+import { codexExecutionGates, codexExecutionError, codexExecutionEvidence } from './gates.js'
 import { CodexProcessInventory } from './processes.js'
 import { readProcessScope } from './scope.js'
 export interface CodexOptions {
@@ -65,12 +66,14 @@ export class CodexProviderAdapter {
       (options.model && !/^[A-Za-z0-9_.:-]{1,128}$/.test(options.model))
     )
       throw new Error('invalid_codex_configuration')
+    let rejectedVersion: string | undefined
     let diagnostic = 'codex_disabled'
     if (options.enabled !== false) {
       try {
         this.executable = discoverCodex({ executable: options.executable })
-        diagnostic = codexExecutionError() ?? 'codex_preflight_required'
+        diagnostic = codexExecutionError(this.executable?.version) ?? 'codex_preflight_required'
       } catch (error) {
+        if (error instanceof CodexDiscoveryError) rejectedVersion = error.version
         const code = error instanceof Error ? error.message : ''
         diagnostic = /^codex_[a-z_]+$/.test(code) ? code : 'codex_executable_unavailable'
       }
@@ -79,7 +82,7 @@ export class CodexProviderAdapter {
       home: this.homeSelection.home,
       home_mode: this.homeSelection.mode,
       model: this.options.model || null,
-      version: this.executable?.version ?? null,
+      version: this.executable?.version ?? rejectedVersion ?? null,
       deadline_ms: deadline,
       permission_ttl_ms: ttl,
       diagnostic,
@@ -114,6 +117,10 @@ export class CodexProviderAdapter {
       this.ready = report.available
       this.configuration.diagnostic = report.diagnostic
     } catch (error) {
+      if (error instanceof CodexDiscoveryError) {
+        this.executable = undefined
+        this.configuration.version = error.version ?? null
+      }
       const code = error instanceof Error ? error.message : ''
       this.configuration.diagnostic = /^codex_[a-z_]+$/.test(code)
         ? code
@@ -149,7 +156,7 @@ export class CodexProviderAdapter {
   capabilities() {
     return {
       provider: 'codex',
-      provider_version: this.executable?.version ?? 'unavailable',
+      provider_version: this.configuration.version ?? 'unavailable',
       available: this.available,
       diagnostic: this.configuration.diagnostic,
       home: this.configuration.home,
@@ -163,7 +170,7 @@ export class CodexProviderAdapter {
         ? { api_key_login_command: this.preflightReport.api_key_login_command }
         : {}),
       configuration: this.configuration,
-      gates: codexExecutionGates(),
+      gates: codexExecutionGates(process.platform, this.configuration.version ?? 'unknown'),
       capabilities: {
         long_lived_sessions: this.available
           ? { status: 'supported', evidence: 'app-server-thread; turn-steer; thread-compact' }
@@ -177,11 +184,11 @@ export class CodexProviderAdapter {
         execution: {
           status: this.available ? 'supported' : 'unverified',
           evidence: this.available
-            ? '0.160.1-native-replay-sampled-descendants-marker-sweep'
+            ? codexExecutionEvidence(this.executable?.version ?? '')
             : undefined,
           reason: this.available
             ? undefined
-            : (codexExecutionError() ?? this.configuration.diagnostic),
+            : (codexExecutionError(this.executable?.version) ?? this.configuration.diagnostic),
         },
       },
     }
@@ -200,7 +207,7 @@ export class CodexProviderAdapter {
   private async launchPaths(cwd: string) {
     await this.prepare()
     requireManagedFile()
-    const gateError = codexExecutionError()
+    const gateError = codexExecutionError(this.executable?.version)
     if (gateError) throw new Error(gateError)
     if (!this.available || !this.executable) throw new Error(this.configuration.diagnostic)
     const state = realpathSync(this.options.stateDir),
@@ -217,27 +224,34 @@ export class CodexProviderAdapter {
     } finally {
       rmSync(schemas, { recursive: true, force: true })
     }
-    const common = spawnSync('/usr/bin/git', ['rev-parse', '--git-common-dir'], {
-      cwd: workspace,
-      encoding: 'utf8',
-      timeout: 5000,
-      maxBuffer: 4096,
-      env: {
-        PATH: '/usr/bin:/bin',
-        HOME: home,
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-        GIT_OPTIONAL_LOCKS: '0',
-      },
-    })
-    if (common.status !== 0) throw new Error('codex_git_binding_unavailable')
+    const common = spawnSync(
+      '/usr/bin/git',
+      ['rev-parse', '--git-common-dir', '--absolute-git-dir'],
+      {
+        cwd: workspace,
+        encoding: 'utf8',
+        timeout: 5000,
+        maxBuffer: 4096,
+        env: {
+          PATH: '/usr/bin:/bin',
+          HOME: home,
+          GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_OPTIONAL_LOCKS: '0',
+        },
+      }
+    )
+    const [commonDir, gitDir] = common.stdout.trim().split('\n')
+    if (common.status !== 0 || !commonDir || !gitDir)
+      throw new Error('codex_git_binding_unavailable')
     const paths = {
       home,
       isolated: this.homeSelection.mode === 'isolated',
       state,
       workspace,
       sibling: dirname(workspace),
-      repository: realpathSync(resolve(workspace, common.stdout.trim())),
+      repository: realpathSync(resolve(workspace, commonDir)),
+      gitdir: realpathSync(gitDir),
     }
     return paths
   }

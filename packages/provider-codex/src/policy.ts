@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { isAbsolute, join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 export interface PolicyPaths {
   home: string
@@ -6,6 +6,8 @@ export interface PolicyPaths {
   workspace: string
   sibling: string
   repository?: string
+  /** Resolved `git rev-parse --absolute-git-dir` (differs from the common dir in a worktree). */
+  gitdir?: string
   state: string
 }
 export const disabledFeatures = [
@@ -28,15 +30,30 @@ export const disabledFeatures = [
   'in_app_updates',
   'browser_use_external',
 ]
+const within = (root: string, path: string) => {
+  const below = relative(root, path)
+  return below === '' || (below !== '..' && !below.startsWith('..' + sep) && !isAbsolute(below))
+}
 export function filesystem(p: PolicyPaths): Record<string, string> {
   return {
+    // Codex 0.161+ widens an approved escalation to every path that is not denied,
+    // unless the root itself is denied; then the approved command keeps this profile,
+    // as 0.160.1 always does when deny entries exist. Most specific entries still win.
+    '/': 'deny',
     ':minimal': 'read',
     [p.workspace]: 'write',
     [p.home]: 'deny',
     [p.sibling]: 'deny',
     [p.state]: 'deny',
-    ...(p.repository ? { [p.repository]: 'deny' } : {}),
+    // Git metadata is never writable, whatever the layout: <workspace>/.git (a folder
+    // or a gitfile), the resolved gitdir and the common dir are read-only inside the
+    // workspace and denied outside it.
     [join(p.workspace, '.git')]: 'read',
+    ...Object.fromEntries(
+      [p.repository, p.gitdir]
+        .filter((path): path is string => !!path)
+        .map((path) => [path, within(p.workspace, path) ? 'read' : 'deny'])
+    ),
     [join(p.workspace, '.codex')]: 'read',
     '/private/tmp': 'deny',
     '/private/var/tmp': 'deny',

@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest'
-import { spawnSync } from 'node:child_process'
+import { spawnSync, spawn } from 'node:child_process'
 import {
   chmodSync,
   cpSync,
@@ -11,6 +11,7 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  readlinkSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -166,8 +167,96 @@ it('start in a service installation invokes enable and never creates a foregroun
   expect(result.stdout).not.toContain('listening')
   expect(readFileSync(join(f.home, 'actions'), 'utf8')).toBe('enable\n')
 })
+it('announces foreground mode before slow provider preparation', async () => {
+  const f = fixture(),
+    runtime = resolve(f.entry, '../../../..')
+  const preload = join(runtime, 'slow-start.mjs')
+  writeFileSync(
+    preload,
+    `import { CodexProviderAdapter } from '@abele/node-core';
+    CodexProviderAdapter.prototype.prepare = async () => { await new Promise(r => setTimeout(r, 60000)) }`
+  )
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      preload,
+      f.entry,
+      'start',
+      '--state-dir',
+      f.state,
+      '--claude-path',
+      '/nonexistent/claude',
+      '--codex-path',
+      '/nonexistent/codex',
+      '--port',
+      '0',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  )
+  let output = ''
+  child.stdout.on('data', (chunk) => (output += chunk))
+  child.stderr.on('data', (chunk) => (output += chunk))
+  try {
+    for (let i = 0; i < 50 && !output.includes('foreground'); i++)
+      await new Promise((r) => setTimeout(r, 20))
+    expect(output).toContain('foreground')
+    expect(output).toContain('Ctrl-C')
+    expect(output).toContain('abele-node service enable')
+  } finally {
+    const closed = new Promise<void>((done) => child.once('close', () => done()))
+    child.kill('SIGTERM')
+    await closed
+  }
+})
+function activeTransition(f: ReturnType<typeof fixture>) {
+  const runtime = resolve(f.entry, '../../../..'),
+    root = resolve(runtime, '..')
+  // ps is denied in the Mac test sandbox. Supply only process-group inspection;
+  // retain the real recovery guard and lock handling.
+  writeFileSync(
+    join(runtime, 'service-transition.mjs'),
+    `
+    import childProcess from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    const originalSpawnSync = childProcess.spawnSync;
+    childProcess.spawnSync = (command, args, options) => command === '/bin/ps'
+      ? { status: 0, stdout: args.includes('pgid=') ? String(process.pid) : '${process.pid} ${process.pid} S', stderr: '' }
+      : originalSpawnSync(command, args, options);
+    syncBuiltinESMExports();
+  ` + readFileSync('scripts/service-transition.mjs', 'utf8')
+  )
+  // The recovery guard refuses a live owner even without a journal. No real
+  // installer, daemon or service manager is involved in this reproduction.
+  symlinkSync(`service-group:${process.pid}`, join(root, '.install-lock'))
+  return root
+}
+it('service status observes an active transition without recovering or changing it', () => {
+  const f = fixture(),
+    root = activeTransition(f)
+  const before = readFileSync(f.configFile, 'utf8')
+  const result = run(f.entry, f.state, 'service', 'status')
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('Mode: foreground')
+  expect(result.stdout).toContain('transition pending')
+  expect(result.stderr).toBe('')
+  expect(readlinkSync(join(root, '.install-lock'))).toBe(`service-group:${process.pid}`)
+  expect(readFileSync(f.configFile, 'utf8')).toBe(before)
+  const json = run(f.entry, f.state, 'service', 'status', '--json')
+  expect(json.status, json.stderr).toBe(0)
+  expect(JSON.parse(json.stdout)).toMatchObject({ mode: 'foreground', transition_pending: true })
+})
+it.each([false, true])('expected recovery refusals have no raw stack (JSON=%s)', (json) => {
+  const f = fixture()
+  activeTransition(f)
+  const result = run(f.entry, f.state, 'start', ...(json ? ['--json'] : []))
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('Another service transition is active')
+  expect(result.stderr).not.toContain('service-transition.mjs:')
+  expect(result.stderr).not.toMatch(/\bat (?:\w|file:)|asyncRunEntryPointWithESMLoader/)
+})
 it.each([['start'], ['service', 'enable'], ['service', 'status'], ['install']])(
-  'recovers a pending transition before CLI ownership checks: %j',
+  'recovers before mutation, but reports pending state without recovery for status: %j',
   (...args) => {
     const f = fixture(),
       runtime = resolve(f.entry, '../../../..')
@@ -182,7 +271,13 @@ it.each([['start'], ['service', 'enable'], ['service', 'status'], ['install']])(
     )
     const result = run(f.entry, f.state, ...args)
     expect(result.status, result.stderr).toBe(0)
-    expect(JSON.parse(readFileSync(f.configFile, 'utf8')).version).toBe(f.config.version)
+    if (args[0] === 'service' && args[1] === 'status') {
+      expect(result.stdout).toContain('Mode: unknown')
+      expect(result.stdout).toContain('Configuration problem:')
+      expect(result.stdout).toContain('transition pending')
+      expect(JSON.parse(readFileSync(f.configFile, 'utf8')).version).toBe('broken')
+      expect(statSync(pending).isDirectory()).toBe(true)
+    } else expect(JSON.parse(readFileSync(f.configFile, 'utf8')).version).toBe(f.config.version)
   }
 )
 

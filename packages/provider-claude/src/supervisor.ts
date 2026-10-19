@@ -14,7 +14,8 @@ function processState(pid: number): { identity: ProcessIdentity; zombie: boolean
     }
   )
   if (r.error || r.signal) throw new Error('process_probe_unavailable')
-  const match = r.stdout?.trim().match(/^(\d+)\s+([RSDTtZXIWU]\S*)\s+(.+)$/)
+  // macOS prints `?E` for a process that is exiting; it still exists until reaped.
+  const match = r.stdout?.trim().match(/^(\d+)\s+([RSDTtZXIWU?]\S*)\s+(.+)$/)
   if (r.status === 0 && match)
     return {
       identity: { pid, group: Number(match[1]), fingerprint: match[3]! },
