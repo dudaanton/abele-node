@@ -359,6 +359,46 @@ describe('starting a program under the debugger', () => {
     expect(profile.launched.at(-1)!.target.build_identity).toBe('unknown')
   })
 
+  it('admits mapped sources opened later and refuses stale builds per path', async () => {
+    const profile = scriptedProfile(() => ({}))
+    const s = await setup(profile.make())
+    const started = await s.request('debugger.v1.start', {
+      operation_id: 'late-start',
+      conversation_id: s.chat.session_id,
+      program: 'src/page.js',
+    })
+    const source = join(s.folder, 'src/late.ts')
+    writeFileSync(source, 'export const total = 1\n')
+    const add = () =>
+      s.request('debugger.v1.addSources', {
+        operation_id: crypto.randomUUID(),
+        debug_session_id: started.debug_session_id,
+        sources: ['src/late.ts'],
+      })
+    expect((await add()).refused).toEqual([{ path: 'src/late.ts', code: 'debugger_source_no_map' }])
+    const map = { version: 3, sources: ['late.ts'], mappings: '' }
+    const mapPath = join(s.folder, 'src/page.js.map')
+    writeFileSync(mapPath, JSON.stringify(map))
+    const later = new Date(Date.now() + 60000)
+    utimesSync(source, later, later)
+    expect((await add()).refused[0].code).toBe('debugger_source_no_map')
+    writeFileSync(mapPath, JSON.stringify({ ...map, sourcesContent: ['export const total = 1\n'] }))
+    const results = await Promise.all([add(), add()])
+    for (const result of results)
+      expect(result.sources).toEqual([{ source_id: 's2', path: 'src/late.ts' }])
+    const state = s.core.debugger.snapshot(started.debug_session_id).snapshot
+    const receipt = await s.request('debugger.v1.breakpoints.patch', {
+      operation_id: 'late-bp',
+      debug_session_id: started.debug_session_id,
+      incarnation: state.incarnation,
+      expected_state_revision: state.state_revision,
+      expected_breakpoint_revision: state.breakpoint_revision,
+      upsert: [{ breakpoint_id: 'late', source_id: 's2', line: 1 }],
+      remove: [],
+    })
+    expect(receipt.outcome).toBe('completed')
+  })
+
   it('keeps every path inside the chat’s folder', async () => {
     const profile = scriptedProfile(() => ({}))
     const s = await setup(profile.make())

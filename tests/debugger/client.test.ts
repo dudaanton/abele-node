@@ -7,6 +7,16 @@ import { DebuggerClient, parseDebuggerVariables } from '@abele/node-client'
 import { target } from './helpers.js'
 
 afterEach(() => vi.useRealTimers())
+it('adds sources through the typed owner client and validates the response', async () => {
+  const result = { incarnation: 'i', sources: [{ source_id: 's2', path: 'late.js' }], refused: [] }
+  const rpc = vi.fn(async () => result)
+  const client = new DebuggerClient(rpc)
+  const input = { operation_id: 'add', debug_session_id: 'session', sources: ['late.js'] }
+  expect(await client.addSources(input)).toEqual(result)
+  expect(rpc).toHaveBeenCalledExactlyOnceWith('debugger.v1.addSources', input)
+  rpc.mockResolvedValueOnce({ ...result, incarnation: '' })
+  await expect(client.addSources(input)).rejects.toThrow()
+})
 describe('typed debugger client current-state reconciliation', () => {
   it('parses retained explicit child pages without accepting raw adapter references', () => {
     const page = {

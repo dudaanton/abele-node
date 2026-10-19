@@ -115,6 +115,29 @@ export const DebuggerStartResultSchema = z
   })
   .strict()
 export type DebuggerStartResult = z.infer<typeof DebuggerStartResultSchema>
+export const DebuggerAddSourcesSchema = z
+  .object({
+    operation_id: id,
+    debug_session_id: id,
+    sources: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .refine((v) => !v.includes('\0'))
+      )
+      .max(256),
+  })
+  .strict()
+export const DebuggerAddSourcesResultSchema = z
+  .object({
+    incarnation: id,
+    sources: DebuggerStartResultSchema.shape.sources,
+    refused: z.array(z.object({ path: z.string().max(4096), code: id }).strict()).max(256),
+  })
+  .strict()
+export type DebuggerAddSourcesResult = z.infer<typeof DebuggerAddSourcesResultSchema>
 /** The Node.js programs on the node's machine whose inspector listens on loopback, for a chat. */
 export const DebuggerProgramsSchema = z
   .object(DebuggerOwnerShape)
@@ -168,6 +191,7 @@ export const DebuggerControlMethodSchemas = {
   'debugger.v1.grant.delete': z.object({ grant_id: id }).strict(),
   'debugger.v1.profiles': DebuggerMethodSchemas['debugger.v1.profiles'],
   'debugger.v1.start': DebuggerStartSchema,
+  'debugger.v1.addSources': DebuggerAddSourcesSchema,
   'debugger.v1.programs': DebuggerProgramsSchema,
   'debugger.v1.attachProgram': DebuggerAttachProgramSchema,
   'debugger.v1.restart': z.object({ operation_id: id, debug_session_id: id }).strict(),

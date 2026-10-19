@@ -11,6 +11,8 @@ import {
   DebuggerProgramsSchema,
   DebuggerStartSchema,
   DebuggerStartResultSchema,
+  DebuggerAddSourcesSchema,
+  DebuggerAddSourcesResultSchema,
   type DebuggerSnapshot,
   DebuggerVariablesResultSchema,
   DebuggerAccessRequestSchema,
@@ -146,6 +148,12 @@ export class DebuggerClient {
   async start(params: (typeof DebuggerStartSchema)['_input']) {
     return DebuggerStartResultSchema.parse(
       await this.rpc('debugger.v1.start', DebuggerStartSchema.parse(params))
+    )
+  }
+  /** Admits files opened after startup. Owner-only, online-only. */
+  async addSources(params: (typeof DebuggerAddSourcesSchema)['_input']) {
+    return DebuggerAddSourcesResultSchema.parse(
+      await this.rpc('debugger.v1.addSources', DebuggerAddSourcesSchema.parse(params))
     )
   }
   /** Node.js programs on the node's machine waiting for a debugger on loopback, for a chat. */

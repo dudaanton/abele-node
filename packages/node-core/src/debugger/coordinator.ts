@@ -836,6 +836,10 @@ export class DebuggerCoordinator {
     if (method === 'approve') return this.approve(owner, p)
     if (method === 'start') return this.core.debuggerLaunches.start(owner, p as any)
     if (method === 'attachProgram') return this.core.debuggerLaunches.attach(owner, p as any)
+    if (method === 'addSources') {
+      this.checkPublication(human, p.debug_session_id)
+      return this.core.debuggerLaunches.addSources(p as any)
+    }
     // Listing what runs on the machine is the owner's (checked above), as attaching is.
     if (method === 'programs') return this.core.debuggerLaunches.programs(p as any)
     if (method === 'restart') return this.core.debuggerLaunches.restart(owner, p as any)

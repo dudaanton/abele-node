@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
 import type {
   DebuggerProgram,
+  DebuggerAddSourcesResult,
   DebuggerStartResult,
   DebuggerTarget,
   ExecutionTarget,
@@ -62,6 +63,15 @@ type AttachParams = {
 }
 
 const RETAINED_OPERATIONS = 128
+type SourceContext = {
+  root: string
+  program: string
+  pid?: number
+  sources: Map<string, string>
+  recipe?: string
+  tail?: Promise<unknown>
+  pending: number
+}
 
 /** Whether `path` is `root` or under it. */
 function within(root: string, path: string | null) {
@@ -79,6 +89,7 @@ export class DebuggerLaunches {
   private readonly sessionRuns = new Map<string, LaunchedRun>()
   private readonly closing = new WeakMap<LaunchedRun, Promise<void>>()
   private readonly operations = new Map<string, Promise<DebuggerStartResult>>()
+  private readonly sourceContexts = new WeakMap<LaunchedRun, SourceContext>()
   constructor(
     private readonly core: NodeCore,
     private readonly profile: LaunchProfile
@@ -102,6 +113,70 @@ export class DebuggerLaunches {
     return this.once(owner, p.operation_id, () => this.remember('attach', p))
   }
 
+  async addSources(p: {
+    operation_id: string
+    debug_session_id: string
+    sources: string[]
+  }): Promise<DebuggerAddSourcesResult> {
+    const run = this.sessionRuns.get(p.debug_session_id)
+    const context = run && this.sourceContexts.get(run)
+    if (!context || !context.recipe) throw new ChannelError('debugger_configuration_unavailable')
+    if (context.pending >= 128) throw new ChannelError('debugger_busy')
+    context.pending++
+    const work = (context.tail ?? Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        const row = this.core.db
+          .prepare('SELECT body FROM debug_launches WHERE debug_session_id=?')
+          .get(context.recipe!)
+        if (!row) throw new ChannelError('debugger_configuration_unavailable')
+        const recipe = JSON.parse(String(row.body))
+        const { root } = await this.ownerFolder(recipe.params)
+        if ((await realpath(root)) !== context.root)
+          throw new ChannelError('debugger_owner_mismatch')
+        const state = this.core.debugger.snapshot(p.debug_session_id).snapshot
+        if (
+          this.sessions.get(p.debug_session_id)?.dap.closed ||
+          !['active', 'configuring'].includes(state.lifecycle)
+        )
+          throw new ChannelError('debugger_session_inactive')
+        const next = new Map(context.sources)
+        const result = await admitSources(
+          context.root,
+          context.program,
+          next,
+          p.sources,
+          context.pid
+        )
+        // Filesystem checks yield: recheck permission and lifetime before publishing any additions.
+        await this.ownerFolder(recipe.params)
+        const current = this.core.debugger.snapshot(p.debug_session_id).snapshot
+        if (
+          current.incarnation !== state.incarnation ||
+          !['active', 'configuring'].includes(current.lifecycle)
+        )
+          throw new ChannelError('debugger_session_inactive')
+        recipe.params.sources = [...next.values()].map((path) => relative(root, path))
+        recipe.admitted = [...next].map(([source_id, path]) => ({
+          source_id,
+          path: relative(root, path),
+        }))
+        this.core.db
+          .prepare('UPDATE debug_launches SET body=? WHERE debug_session_id=?')
+          .run(JSON.stringify(recipe), context.recipe!)
+        for (const [id, path] of next) context.sources.set(id, path)
+        for (const [id, owner] of this.sessionRuns)
+          if (owner === run) this.sessions.get(id)?.admitSources(next)
+        return { incarnation: state.incarnation, ...result }
+      })
+    context.tail = work
+    try {
+      return await work
+    } finally {
+      context.pending--
+    }
+  }
+
   private async remember(kind: 'start' | 'attach', params: StartParams | AttachParams) {
     const result =
       kind === 'start'
@@ -113,7 +188,13 @@ export class DebuggerLaunches {
       : { kind: 'worktree', worktree_id: target.worktree_id }
     this.core.db
       .prepare('INSERT OR REPLACE INTO debug_launches VALUES(?,?)')
-      .run(result.debug_session_id, JSON.stringify({ kind, params: { ...params, folder } }))
+      .run(
+        result.debug_session_id,
+        JSON.stringify({ kind, params: { ...params, folder }, admitted: result.sources })
+      )
+    const run = this.sessionRuns.get(result.debug_session_id)
+    const context = run && this.sourceContexts.get(run)
+    if (context) context.recipe = result.debug_session_id
     return result
   }
 
@@ -133,8 +214,17 @@ export class DebuggerLaunches {
       const result = await this.remember(recipe.kind, recipe.params)
       if (state.breakpoints.length) {
         const next = this.core.debugger.snapshot(result.debug_session_id).snapshot
-        const requests = state.breakpoints.map(
-          ({ status, resolved_line, resolved_column, message, ...request }) => request
+        const requests = state.breakpoints.flatMap(
+          ({ status, resolved_line, resolved_column, message, ...request }) => {
+            const path = recipe.admitted?.find(
+              (s: { source_id: string }) => s.source_id === request.source_id
+            )?.path
+            const source_id =
+              path === undefined
+                ? request.source_id
+                : result.sources.find((s) => s.path === path)?.source_id
+            return source_id ? [{ ...request, source_id }] : []
+          }
         )
         this.core.debugger.patchBreakpoints(
           result.debug_session_id,
@@ -223,15 +313,14 @@ export class DebuggerLaunches {
 
   private async launch(p: StartParams): Promise<DebuggerStartResult> {
     if (!this.profile.profiles().length) throw new ChannelError('debugger_profile_unavailable')
-    const { root, place } = await this.ownerFolder(p)
-    const program = this.inside(root, p.program)
+    const folder = await this.ownerFolder(p)
+    const root = await realpath(folder.root),
+      place = folder.place
+    const program = await realpath(this.inside(root, p.program))
+    if (!within(root, program)) throw new ChannelError('debugger_path_escape')
     const sources = new Map<string, string>([['s1', program]])
-    const asked = p.sources.map((path) => this.inside(root, path))
-    // A source that is not what runs takes no breakpoints: it is left out, not the whole session.
-    const unproven = await unbuilt(program, asked)
-    for (const full of asked)
-      if (!unproven.has(full) && ![...sources.values()].includes(full))
-        sources.set(`s${sources.size + 1}`, full)
+    for (const path of p.sources) this.inside(root, path)
+    await admitSources(root, program, sources, p.sources)
     const target: DebuggerTarget = {
       ...place,
       target_id: randomUUID(),
@@ -248,6 +337,7 @@ export class DebuggerLaunches {
       target,
       sources
     )
+    this.sourceContexts.set(run, { root, program, sources, pending: 0 })
     return this.adopt(run, root, sources, true)
   }
 
@@ -279,7 +369,9 @@ export class DebuggerLaunches {
   private async attachTo(p: AttachParams): Promise<DebuggerStartResult> {
     if (!this.profile.attach || !this.profile.profiles().length)
       throw new ChannelError('debugger_profile_unavailable')
-    const { root, place } = await this.ownerFolder(p)
+    const folder = await this.ownerFolder(p)
+    const root = await realpath(folder.root),
+      place = folder.place
     // Only what is listening on loopback right now, as the OS says, under this very process: a
     // port named by the caller alone is never trusted to be the program it says.
     const program = (await inspectorPrograms()).find((x) => x.pid === p.pid && x.port === p.port)
@@ -288,13 +380,16 @@ export class DebuggerLaunches {
     // A program of another folder is the owner's to name: the chat's own trust does not reach it.
     if (!inside && !p.outside_folder) throw new ChannelError('debugger_attach_outside_folder')
     const sources = new Map<string, string>()
-    if (program.script && within(root, program.script) && program.script !== root)
-      sources.set('s1', program.script)
-    const asked = p.sources.map((path) => this.inside(root, path))
-    const unproven = await unbuilt(program.script ?? join(root, 'program.js'), asked)
-    for (const full of asked)
-      if (!unproven.has(full) && ![...sources.values()].includes(full))
-        sources.set(`s${sources.size + 1}`, full)
+    const script = program.script ? await realpath(program.script).catch(() => null) : null
+    const programPath = script ?? join(root, 'program.js')
+    for (const path of p.sources) this.inside(root, path)
+    await admitSources(
+      root,
+      programPath,
+      sources,
+      [...(script && within(root, script) ? [relative(root, script)] : []), ...p.sources],
+      program.pid
+    )
     const target: DebuggerTarget = {
       ...place,
       target_id: randomUUID(),
@@ -313,6 +408,13 @@ export class DebuggerLaunches {
       root
     )
     console.debug('[debugger] Attached', program.pid, program.port)
+    this.sourceContexts.set(run, {
+      root,
+      program: programPath,
+      pid: program.pid,
+      sources,
+      pending: 0,
+    })
     return this.adopt(run, root, sources, false)
   }
 
@@ -327,6 +429,8 @@ export class DebuggerLaunches {
     this.runs.add(run)
     const unregister: (() => void)[] = []
     const off = run.onSession((session) => {
+      const context = this.sourceContexts.get(run)
+      if (context) session.admitSources(context.sources)
       this.sessions.set(session.id, session)
       this.sessionRuns.set(session.id, run)
       unregister.push(() => this.sessions.delete(session.id))
@@ -417,6 +521,61 @@ export class DebuggerLaunches {
   }
 }
 
+/** One admission policy for startup, attach and files opened later. Paths returned to the
+ * owner are canonical folder-relative paths; symlink aliases share a source id. */
+async function admitSources(
+  root: string,
+  program: string,
+  admitted: Map<string, string>,
+  asked: string[],
+  pid?: number
+): Promise<Pick<DebuggerAddSourcesResult, 'sources' | 'refused'>> {
+  const sources: DebuggerAddSourcesResult['sources'] = []
+  const refused: DebuggerAddSourcesResult['refused'] = []
+  const started = pid === undefined ? undefined : await processStartedAt(pid)
+  for (const path of asked) {
+    const refuse = (code: string) => refused.push({ path, code })
+    const lexical = resolve(root, path)
+    if (/^([\\/]|[A-Za-z]:)/.test(path) || !within(root, lexical) || lexical === root) {
+      refuse('debugger_source_outside_folder')
+      continue
+    }
+    const full = await realpath(lexical).catch(() => undefined)
+    if (!full) {
+      refuse('debugger_source_unavailable')
+      continue
+    }
+    if (!within(root, full) || full === root) {
+      refuse('debugger_source_outside_folder')
+      continue
+    }
+    const info = await stat(full).catch(() => undefined)
+    if (!info?.isFile()) {
+      refuse('debugger_source_unavailable')
+      continue
+    }
+    if (pid !== undefined && (!started || Math.floor(info.mtimeMs / 1000) * 1000 >= started)) {
+      refuse('debugger_source_changed')
+      continue
+    }
+    let source_id = [...admitted].find(([, existing]) => existing === full)?.[0]
+    if (!source_id && (await unbuilt(program, [full])).size) {
+      refuse('debugger_source_no_map')
+      continue
+    }
+    if (!source_id) {
+      if (admitted.size >= 256) {
+        refuse('debugger_source_limit')
+        continue
+      }
+      source_id = `s${admitted.size + 1}`
+      admitted.set(source_id, full)
+    }
+    sources.push({ source_id, path: relative(root, full) })
+  }
+  return { sources, refused }
+}
+
 /** Whether the program's own file is what it runs: JavaScript not changed since the process
  * started. A file edited after that is not the code in memory, and its lines would lie. */
 async function loadedAsIs(pid: number, script: string | undefined) {
@@ -463,7 +622,8 @@ async function unbuilt(program: string, sources: string[]) {
       const base = resolve(dirname(path), typeof map.sourceRoot === 'string' ? map.sourceRoot : '')
       for (const [i, name] of map.sources.entries()) {
         if (typeof name !== 'string') continue
-        const source = resolve(base, name)
+        const source = await realpath(resolve(base, name)).catch(() => undefined)
+        if (!source) continue
         if (!pending.has(source)) continue
         const text = Array.isArray(map.sourcesContent) ? map.sourcesContent[i] : undefined
         const fresh =

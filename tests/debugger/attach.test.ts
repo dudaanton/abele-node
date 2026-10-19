@@ -31,6 +31,8 @@ afterEach(async () => {
 function folder(files: Record<string, string>) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'debug-attach-')))
   dirs.push(dir)
+  // Keep CommonJS fixtures independent of the package surrounding a custom TMPDIR.
+  writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n')
   for (const [path, text] of Object.entries(files)) {
     mkdirSync(join(dir, path, '..'), { recursive: true })
     writeFileSync(join(dir, path), text)
@@ -193,6 +195,8 @@ describe('attaching the debugger to a running program', () => {
     const dir = folder({ 'app.js': SERVE, 'lib/util.js': 'module.exports = 1\n' })
     const before = new Date(Date.now() - 5000)
     utimesSync(join(dir, 'app.js'), before, before)
+    // Both files must provably predate the process, whose start is known only to the second.
+    utimesSync(join(dir, 'lib/util.js'), before, before)
     const program = await inspected(dir)
     const profile = scriptedProfile()
     const s = await setup(profile.make, dir)

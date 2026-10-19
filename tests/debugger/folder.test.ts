@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
@@ -12,6 +12,10 @@ import { ChannelError } from '@abele/channel-protocol'
 it('starts without a chat, lists chat and folder sessions together, and restarts with breakpoints', async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'debug-folder-')))
   writeFileSync(join(dir, 'app.js'), 'console.log(1)\n')
+  writeFileSync(join(dir, 'late.js'), 'console.log(2)\n')
+  writeFileSync(join(dir, 'late.ts'), 'const n: number = 2\n')
+  symlinkSync('late.js', join(dir, 'alias.js'))
+  symlinkSync('..', join(dir, 'escape'))
   const runs: DapSession[] = []
   const closes: (() => void)[] = []
   const closedSessions = new Set<string>()
@@ -24,7 +28,12 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         configs.push(config)
         const w = wire()
         const fake = adapter(w, () => ({}), dir)
-        const session = new DapSession(core.debugger, core.debugger.create(target), w.dap, sources)
+        const session = new DapSession(
+          core.debugger,
+          core.debugger.create(target),
+          w.dap,
+          new Map(sources)
+        )
         runs.push(session)
         const close = () => {
           closedSessions.add(session.id)
@@ -98,6 +107,51 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       argv: ['one'],
     })
     expect(runs[0]!.snapshot.target.conversation_id).toBeNull()
+    expect(core.debuggerControl.methods()).toContain('debugger.v1.addSources')
+    const added = await request('debugger.v1.addSources', {
+      operation_id: 'add',
+      debug_session_id: first.debug_session_id,
+      sources: ['late.js', 'alias.js', 'late.ts', '../outside.js', 'escape'],
+    })
+    expect(added).toEqual({
+      incarnation: runs[0]!.incarnation,
+      sources: [
+        { source_id: 's2', path: 'late.js' },
+        { source_id: 's2', path: 'late.js' },
+      ],
+      refused: [
+        { path: 'late.ts', code: 'debugger_source_no_map' },
+        { path: '../outside.js', code: 'debugger_source_outside_folder' },
+        { path: 'escape', code: 'debugger_source_outside_folder' },
+      ],
+    })
+    expect(runs[0]!.sources.get('s2')).toBe(join(dir, 'late.js'))
+    expect(
+      (
+        await request('debugger.v1.addSources', {
+          operation_id: 'again',
+          debug_session_id: first.debug_session_id,
+          sources: ['late.js'],
+        })
+      ).sources
+    ).toEqual([{ source_id: 's2', path: 'late.js' }])
+    await request('project.execution', {
+      project_id: project.project_id,
+      target: folder,
+      enabled: false,
+    })
+    await expect(
+      request('debugger.v1.addSources', {
+        operation_id: 'revoked',
+        debug_session_id: first.debug_session_id,
+        sources: ['late.js'],
+      })
+    ).rejects.toThrow('unauthorized')
+    await request('project.execution', {
+      project_id: project.project_id,
+      target: folder,
+      enabled: true,
+    })
     const chat = await request('session.create', { provider: 'fake', target: folder })
     const second = await request('debugger.v1.start', {
       operation_id: 'chat',
@@ -146,7 +200,14 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     expect(() => core.debuggerControl.permissions.authorize(agent, state, 'step')).toThrow(
       'unauthorized'
     )
-    for (const method of ['start', 'attachProgram', 'programs', 'sessions', 'restart']) {
+    for (const method of [
+      'start',
+      'attachProgram',
+      'addSources',
+      'programs',
+      'sessions',
+      'restart',
+    ]) {
       expect(() =>
         core.request({ installation_id: 'unpaired' }, `debugger.v1.${method}`, { folder })
       ).toThrow('unauthorized')
@@ -192,15 +253,17 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     core.debugger.patchBreakpoints(
       first.debug_session_id,
       0,
-      [{ breakpoint_id: 'bp', source_id: 's1', line: 1 }],
+      [{ breakpoint_id: 'bp', source_id: 's2', line: 1 }],
       []
     )
+    await runs[0]!.syncBreakpoints()
     closes[0]!()
     const restarted = await request('debugger.v1.restart', {
       operation_id: 'restart',
       debug_session_id: first.debug_session_id,
     })
     expect(configs[2]).toEqual(configs[0])
+    expect(restarted.sources).toContainEqual({ source_id: 's2', path: 'late.js' })
     expect(core.debugger.snapshot(restarted.debug_session_id).snapshot.breakpoints).toMatchObject([
       { breakpoint_id: 'bp', line: 1 },
     ])
@@ -228,6 +291,17 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     expect(runs[3]!.snapshot.target).toMatchObject({
       conversation_id: null,
       process_ownership: 'external',
+    })
+    utimesSync(join(dir, 'late.js'), new Date(0), new Date(0))
+    expect(
+      await request('debugger.v1.addSources', {
+        operation_id: 'attach-add',
+        debug_session_id: attached.debug_session_id,
+        sources: ['late.js', 'app.js'],
+      })
+    ).toMatchObject({
+      sources: [{ source_id: 's1', path: 'late.js' }],
+      refused: [{ path: 'app.js', code: 'debugger_source_changed' }],
     })
     closes[3]!()
     const reattached = await request('debugger.v1.restart', {

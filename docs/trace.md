@@ -51,13 +51,41 @@ the listeners again and refuses (`debugger_program_not_found`) unless that proce
 port and it answers as an inspector. A program whose file and folder are both outside the chat's
 folder needs `outside_folder: true`, the owner's explicit confirmation, or the call is refused
 with `debugger_attach_outside_folder`. The answer has the shape of `start`'s: the program's own
-file is `s1` when it lies in the chat's folder, and `sources` adds files of that folder by the same
+file is `s1` when it lies in the chat's folder and passes admission, and `sources` adds files of that folder by the same
 rules. Its lines take breakpoints only while the file is unchanged since the process started.
 
 The session is `external`: stopping it is refused, and detaching (`debugger.v1.detach`) lets go
 of the program, which runs on and waits for a debugger again. If the node shuts down while
 attached, the program is let go the same way. Record points record runs as they do for a started
 program. A retried operation answers with the session already attached.
+
+## Adding files to a live session
+
+An owner can admit files opened after starting or attaching:
+
+`debugger.v1.addSources({ operation_id, debug_session_id, sources: string[] })`
+
+The response is `{ incarnation, sources: [{ source_id, path }], refused: [{ path, code }] }`.
+Detect support by looking for `debugger.v1.addSources` in the advertised debugger methods.
+The request accepts at most 256 folder-relative paths; a run admits at most 256 files total.
+Each admitted path is canonical and folder-relative. Symlink aliases return the same existing
+source id, so admitting an already known path is idempotent. A refusal affects only that path.
+Use the returned ids with the usual breakpoint and record-point methods.
+
+Admission rechecks the session folder's trust and execution grant. Resolved symlinks must stay
+inside that folder. JavaScript is admitted directly; other sources need the same source-map
+proof under the program's folder as at startup. Attached programs additionally require each
+file to be unchanged since the process started. Refusal codes are `debugger_source_no_map`,
+`debugger_source_outside_folder`, `debugger_source_changed`, `debugger_source_unavailable`
+(missing, unreadable or not a file), and `debugger_source_limit`. An unknown process start time
+also refuses attached files as changed because their contents cannot be proven.
+
+The returned incarnation identifies the live session. Inactive sessions refuse the call with
+`debugger_session_inactive`; sessions without a retained launch configuration refuse with
+`debugger_configuration_unavailable`. Added paths are retained in the restart recipe on disk:
+`debugger.v1.restart` re-admits them through the current checks, including after a node restart.
+Breakpoints restored on restart follow their file paths if source ids change; a file that no
+longer passes admission does not receive restored breakpoints.
 
 ## Taking a value whole
 

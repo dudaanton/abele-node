@@ -100,12 +100,23 @@ export class DapSession {
       this.admission = undefined
     }
   }
+  private readonly sourcePaths = new Map<string, string>()
+  readonly sources: ReadonlyMap<string, string> = this.sourcePaths
+  /** Trusted launch coordinator admission, shared with future child sessions. */
+  admitSources(sources: ReadonlyMap<string, string>) {
+    for (const [id, path] of sources) {
+      if (this.sourcePaths.has(id) && this.sourcePaths.get(id) !== path)
+        throw new ChannelError('debugger_source_conflict')
+      this.sourcePaths.set(id, path)
+    }
+  }
   constructor(
     private readonly service: DebuggerService,
     state: DebuggerSnapshot,
     readonly dap: DapTransport,
-    readonly sources: ReadonlyMap<string, string>
+    sources: ReadonlyMap<string, string>
   ) {
+    this.admitSources(sources)
     if (!service.enabled) throw new Error('debugger_disabled')
     this.id = state.debug_session_id
     this.incarnation = state.incarnation
