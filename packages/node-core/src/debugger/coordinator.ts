@@ -618,7 +618,18 @@ export class DebuggerCoordinator {
   }
   read(principal: DebuggerPrincipal, method: string, raw: unknown): any {
     this.enabled()
-    if (!['profiles', 'sessions', 'status', 'history', 'replay', 'commandResult'].includes(method))
+    if (
+      ![
+        'profiles',
+        'sessions',
+        'status',
+        'exitInfo',
+        'sessionInfo',
+        'history',
+        'replay',
+        'commandResult',
+      ].includes(method)
+    )
       throw new ChannelError('unsupported_method')
     const parsed =
       DebuggerMethodSchemas[
@@ -637,8 +648,8 @@ export class DebuggerCoordinator {
       return this.core.db
         .prepare(
           p.folder
-            ? "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.worktree_id')=? AND (json_extract(body,'$.target.conversation_id')=? OR ? IS NULL) ORDER BY debug_session_id LIMIT ?"
-            : "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.conversation_id')=? ORDER BY debug_session_id LIMIT ?"
+            ? "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.worktree_id')=? AND (json_extract(body,'$.target.conversation_id')=? OR ? IS NULL) ORDER BY json_extract(body,'$.lifecycle') IN ('active','configuring') DESC, rowid DESC LIMIT ?"
+            : "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.conversation_id')=? ORDER BY json_extract(body,'$.lifecycle') IN ('active','configuring') DESC, rowid DESC LIMIT ?"
         )
         .all(
           ...(p.folder
@@ -657,6 +668,8 @@ export class DebuggerCoordinator {
     const session = method === 'replay' ? p.cursor.debug_session_id : p.debug_session_id
     this.checkPublication(principal, session)
     if (method === 'status') return this.core.debugger.snapshot(session)
+    if (method === 'exitInfo') return this.core.debugger.exitInfo(session)
+    if (method === 'sessionInfo') return this.core.debugger.sessionInfo(session)
     if (method === 'history') {
       const current = this.state(session)
       const r = this.core.debugger.history(session, p.after)
@@ -677,7 +690,7 @@ export class DebuggerCoordinator {
   }
   async inspect(principal: DebuggerPrincipal, method: string, raw: unknown) {
     this.enabled()
-    if (!['threads', 'stack', 'scopes'].includes(method))
+    if (!['threads', 'stack', 'scopes', 'breakpointLocations', 'sourceStatus'].includes(method))
       throw new ChannelError('unsupported_method')
     const parsed =
       DebuggerMethodSchemas[
@@ -801,7 +814,8 @@ export class DebuggerCoordinator {
     if (!schema) throw new ChannelError('unsupported_method')
     const method = full.slice('debugger.v1.'.length)
     if (
-      (effects.has(method) || ['stack', 'scopes', 'threads'].includes(method)) &&
+      (effects.has(method) ||
+        ['stack', 'scopes', 'threads', 'breakpointLocations', 'sourceStatus'].includes(method)) &&
       method !== 'restart' &&
       !this.backends.size
     )
@@ -911,7 +925,8 @@ export class DebuggerCoordinator {
       }
     }
     if (effects.has(method)) return this.command(human, method, p)
-    if (['threads', 'stack', 'scopes'].includes(method)) return this.inspect(human, method, p)
+    if (['threads', 'stack', 'scopes', 'breakpointLocations', 'sourceStatus'].includes(method))
+      return this.inspect(human, method, p)
     return this.read(human, method, p)
   }
   checkRpcPublication(owner: AuthorityContext, full: string, raw: unknown, result: any) {

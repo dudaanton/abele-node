@@ -11,6 +11,7 @@ import {
   realpathSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   readSync,
   watch,
   type FSWatcher,
@@ -1755,11 +1756,46 @@ export class RepositoryService {
       }
     )
     if (paths.size > 250000) throw new ChannelError('scan_limit')
+    // Git's directory mode exposes empty untracked directories, while retaining its
+    // excludes policy. Walk only the untracked directories Git collapses, never symlinks.
+    const pendingDirectories = ['']
+    const directories = new Set<string>()
+    while (pendingDirectories.length) {
+      const parent = pendingDirectories.shift()!
+      if (parent && pathMetadata(join(target.path, parent, '.git')) !== null) continue
+      this.checked(target, parent)
+      const entries = readdirSync(this.checked(target, parent), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && safePath(entry.name))
+        .map((entry) => entry.name)
+      if (entries.length > 4096) throw new ChannelError('scan_limit')
+      let raw = ''
+      for (let offset = 0; offset < entries.length; offset += 100)
+        raw += decodeGit(
+          await this.r.git.run(target.path, {
+            kind: 'visible.directories',
+            path: parent,
+            entries: entries.slice(offset, offset + 100),
+          })
+        )
+      for (const name of raw.split('\0').filter((name) => name.endsWith('/'))) {
+        const path = (parent ? parent + '/' : '') + name.slice(0, -1)
+        if (!safePath(path) || directories.has(path)) continue
+        if (path.split('/').length > 32 || directories.size >= 4096)
+          throw new ChannelError('scan_limit')
+        const full = this.checked(target, path)
+        if (!lstatSync(full).isDirectory()) continue
+        directories.add(path)
+        paths.set(path, { kind: 'directory', oid: null })
+        pendingDirectories.push(path)
+      }
+    }
+    if (paths.size > 250000) throw new ChannelError('scan_limit')
     const files: TreeEntry[] = [],
       stamps = new Map<string, string | null>(),
       byPath = new Map<string, TreeEntry>(),
       children = new Map<string, TreeEntry[]>()
     const add = (entry: TreeEntry) => {
+      if (byPath.has(entry.path)) return
       byPath.set(entry.path, entry)
       const parent = entry.path.includes('/')
         ? entry.path.slice(0, entry.path.lastIndexOf('/'))
@@ -1791,9 +1827,9 @@ export class RepositoryService {
           name: path.split('/').at(-1)!,
           kind: s.isSymbolicLink() ? 'symlink' : data.kind,
           oid: data.oid,
-          size: s.size,
+          size: s.isDirectory() ? null : s.size,
         }
-        files.push(entry)
+        if (entry.kind !== 'directory') files.push(entry)
         add(entry)
       } catch {
         stamps.set(path, null)

@@ -4,7 +4,43 @@ A project's saved HTTP requests live as files in the project, sending them goes 
 and every send is kept beside them. The plugin draws them and resolves what only it knows (its
 keys, its scripts); the node reads and writes the files and sends.
 
-## Files
+## Destination ownership and recording correlation
+
+Detect `http_v1.destination_owner` before using
+`http.v1.destination({project_id, url})` with the fully resolved request URL. Its result is
+`{debug_session_id: string | null, candidates: string[], reason}`. `reason` is `owned`,
+`ambiguous`, `unobserved`, or `remote`. A unique owner requires an observed local listener,
+the same project, a live debugger session and a matching OS process start identity. Discovery
+uses OS reads, not application HTTP requests. Remote destinations and unverified process
+identities are never assigned to the currently selected debugger by inference.
+Only literal loopback addresses and `localhost` are attributed; other aliases/proxies stay
+unassigned. More than 256 candidate sessions fails with `http_destination_too_many_sessions`.
+
+For recording-aware routing, send with `route_by_destination:true`. The node repeats the
+ownership lookup and selects that recording; an explicitly supplied, different
+`debug_session_id` fails with `http_recording_owner_mismatch`. An unknown or ambiguous owner
+fails with `http_destination_unobserved`. Without this opt-in, the existing explicit-session
+send contract is unchanged. Listener ownership is a point-in-time observation, not proof
+that a later request succeeds; captured incoming traffic still confirms recording association.
+
+Detect `http_v1.recording_correlation` / `trace_v1.sent_observation_merge` and use the existing
+`step_header:true` option when sending into a recording. It transmits the send's generated
+`X-Abele-Step` identity. When exactly one captured incoming exchange carries that identity,
+the saved-send result links to that captured row and the row is marked `sent:true`. The node
+does not append another trace HTTP summary. The captured duration, values and chain are kept;
+saved-request response history remains independent. Without exact correlation, observations
+are not merged by URL or time. Clients should preserve those separate observations.
+
+`trace_v1.scalar_briefs` advertises bounded scalar values in newly recorded object briefs,
+including event type. Discriminator fields such as type/kind/status are shown first. Existing
+recordings retain their stored briefs.
+
+`trace_v1.discovery_probe_suppression` indicates that the node's inspector discovery requests
+carry a random process-local marker. The recorder excludes only marked loopback inspector
+discovery paths; ordinary requests to the same paths remain recorded. Dynamically allocated
+inspectors can still be discovered without filling recordings with the node's own probes.
+
+## Request files
 
 Everything is under `.abele/requests/` in the project folder:
 

@@ -13,6 +13,7 @@ export class DapDebuggerBackend implements DebuggerBackend {
   ) {}
   supports(method: string) {
     const caps = this.session.snapshot.adapter_capabilities
+    if (method === 'breakpointLocations') return caps.includes('supportsBreakpointLocationsRequest')
     if (method === 'setVariable') return caps.includes('supportsSetVariable')
     return [
       'step',
@@ -23,6 +24,7 @@ export class DapDebuggerBackend implements DebuggerBackend {
       'threads',
       'stack',
       'scopes',
+      'sourceStatus',
       'variables',
       'evaluate',
       'detach',
@@ -39,6 +41,16 @@ export class DapDebuggerBackend implements DebuggerBackend {
       guard()
       const thread = p.thread_id ?? this.session.snapshot.selected_thread_id
       switch (method) {
+        case 'breakpointLocations':
+          return this.session.breakpointLocations(
+            p.source_id,
+            p.line,
+            p.end_line,
+            p.column,
+            p.end_column
+          )
+        case 'sourceStatus':
+          return this.session.sourceStatus(p.source_id, p.line, p.end_line)
         case 'step':
           return this.session.step(thread, p.kind, p.single_thread)
         case 'continue':

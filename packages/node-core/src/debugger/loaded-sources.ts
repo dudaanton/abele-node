@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { inspectorProbeToken } from '../trace/program-http.js'
 
 /** Read-only evidence from V8, before the adapter attaches. No evaluation, pause,
  * breakpoint, or runIfWaitingForDebugger request is sent. Failure proves nothing. */
@@ -11,6 +12,7 @@ export async function loadedSourceDigests(
   const digests = new Map<string, string>()
   try {
     const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      headers: { 'x-abele-inspector-probe': inspectorProbeToken },
       signal: AbortSignal.timeout(1500),
       redirect: 'error',
     })

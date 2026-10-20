@@ -21,6 +21,24 @@ const contract = JSON.stringify({
 })
 
 describe('what a value is', () => {
+  it('includes bounded scalar values in object briefs when requested', () => {
+    const event = JSON.stringify({ id: 'a', order: {}, type: 'delivered', ok: true })
+    expect(briefOf(event, 'json', true)).toContain('type: "delivered"')
+    expect(briefOf(event, 'json', true)).toContain('ok: true')
+    expect(
+      briefOf(
+        JSON.stringify({
+          ...Object.fromEntries(Array.from({ length: 20 }, (_, i) => ['id' + i, 'x'.repeat(36)])),
+          type: 'delivered',
+        }),
+        'json',
+        true
+      )
+    ).toContain('type: "delivered"')
+    expect(
+      briefOf(JSON.stringify({ value: 'x'.repeat(2000) }), 'json', true).length
+    ).toBeLessThanOrEqual(160)
+  })
   it('tells JSON, XML, numbers and plain text apart', () => {
     expect(formatOf(contract)).toBe('json')
     expect(formatOf('<?xml version="1.0"?><a/>')).toBe('xml')

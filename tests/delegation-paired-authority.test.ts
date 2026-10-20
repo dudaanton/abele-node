@@ -3,9 +3,88 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NodeCore } from '@abele/node-core'
+import type { DelegationCreateRequest } from '@abele/node-protocol'
 import { generateIdentity, type AuthorityContext } from '@abele/channel-protocol'
 
 const cleanup: (() => void)[] = []
+it.each(['local', 'paired'] as const)(
+  'delegates grant-free with retained %s authority',
+  async (profile) => {
+    const f = setup()
+    const actor = profile === 'local' ? f.local() : await f.paired()
+    const params: DelegationCreateRequest = {
+      parent_id: 'chat-parent',
+      delegation_key: 'grant-free',
+      provider: 'fake',
+      title: 'child',
+      text: 'work',
+      script: [{ kind: 'permission' }],
+    }
+    const child = await f.request(actor, 'delegation.create', params)
+    expect(f.core.discovery().supported_capabilities).toContain('delegation_without_grant')
+    expect(child.parent_id).toBe(params.parent_id)
+    expect(await f.request(actor, 'delegation.create', params)).toEqual(child)
+    await expect(
+      f.request(actor, 'delegation.create', { ...params, parent_id: 'another-chat' })
+    ).rejects.toThrow(/idempotency_mismatch/)
+    await expect(
+      f.request(actor, 'delegation.create', { ...params, parent_id: undefined })
+    ).rejects.toThrow(/invalid_params/)
+    await expect(
+      f.request(actor, 'delegation.create', {
+        ...params,
+        delegation_key: 'real-without-project',
+        provider: 'pi',
+        script: [{ kind: 'echo' }],
+      })
+    ).rejects.toThrow(/workspace_required/)
+    const other = f.local()
+    for (const method of ['delegation.status', 'delegation.send', 'delegation.cancel']) {
+      expect(() =>
+        f.request(other, method, {
+          delegation_id: child.delegation_id,
+          ...(method === 'delegation.send' ? { text: 'next', observed_seq: 0 } : {}),
+        })
+      ).toThrow(/unauthorized/)
+    }
+    expect(() =>
+      f.request(other, 'stream.read', { stream_id: child.mailbox_stream_id, after_seq: 0 })
+    ).toThrow(/unauthorized/)
+    f.core.tick()
+    expect(
+      f.request(actor, 'delegation.status', { delegation_id: child.delegation_id })
+        .pending_human_prompts
+    ).toBe(1)
+    expect(
+      f.request(actor, 'stream.read', { stream_id: child.mailbox_stream_id, after_seq: 0 })
+    ).toBeDefined()
+    f.request(actor, 'delegation.cancel', { delegation_id: child.delegation_id })
+    f.request(actor, 'delegation.send', {
+      delegation_id: child.delegation_id,
+      text: 'continue',
+      observed_seq: f.core.head(child.session_id),
+    })
+    f.restart()
+    expect(
+      f.request(actor, 'delegation.status', { delegation_id: child.delegation_id }).parent_id
+    ).toBe(params.parent_id)
+    if (profile === 'paired') {
+      f.core.pairing.revoke(actor.installation_id)
+      const replacement = await f.paired(actor.installation_id)
+      await expect(f.request(replacement, 'delegation.create', params)).rejects.toThrow(
+        /unauthorized/
+      )
+      expect(() =>
+        f.request(replacement, 'stream.read', { stream_id: child.mailbox_stream_id, after_seq: 0 })
+      ).toThrow(/unauthorized/)
+      f.core.tick()
+      expect(f.core.read(child.mailbox_stream_id, 0).at(-1)!.data).toHaveProperty(
+        'state',
+        'cancelled'
+      )
+    }
+  }
+)
 afterEach(() => {
   for (const f of cleanup.splice(0).reverse()) f()
 })

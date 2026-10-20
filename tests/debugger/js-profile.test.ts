@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { NodeCore } from '../../packages/node-core/src/index.js'
 import * as processes from '../../packages/node-core/src/debugger/process.js'
+import * as startup from '../../packages/node-core/src/debugger/js-startup.js'
 import {
   JsDebugProfile,
   validateJsLaunch,
@@ -42,6 +43,52 @@ const archive = () =>
     'js-debug/src/dapDebugServer.js': '/* fake adapter */',
     'js-debug/LICENSE': 'MIT License\nCopyright fixture',
   })
+it.each([undefined, true, false])(
+  'resumes startup only for explicit stop_on_entry=false (%s)',
+  async (stop_on_entry) => {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-entry-'))
+    const core = new NodeCore(join(dir, 'state'), { debuggerEnabled: true })
+    writeFileSync(join(dir, 'app.js'), 'console.log(1)')
+    const release = vi.fn()
+    const resume = vi.fn(async () => {})
+    const session = {
+      snapshot: { selected_thread_id: 1, threads: [{ status: 'stopped' }] },
+      dap: { onEvent: () => () => {}, onClose: () => () => {} },
+      continue: resume,
+      markEntryPause: vi.fn(),
+    }
+    const run = { program: async () => session, close: vi.fn() }
+    const profile = new JsDebugProfile(core.debugger, { stateDirectory: dir, enabled: true })
+    vi.spyOn(processes.OwnedDebugProcess, 'spawn').mockResolvedValue({
+      on: () => {},
+      waitForText: async () => ['ws://127.0.0.1:9229/test', '9229'],
+      evidence: {},
+      terminate: vi.fn(),
+    } as any)
+    vi.spyOn(startup, 'holdJsStartup').mockResolvedValue(release)
+    vi.spyOn(profile as any, 'open').mockResolvedValue(run)
+    try {
+      await profile.launch(
+        {
+          cwd: dir,
+          executable: process.execPath,
+          program: join(dir, 'app.js'),
+          argv: [],
+          env: {},
+          ...(stop_on_entry === undefined ? {} : { stop_on_entry }),
+        },
+        {} as any
+      )
+      expect(resume).toHaveBeenCalledTimes(stop_on_entry === false ? 1 : 0)
+      if (stop_on_entry === false) expect(resume).toHaveBeenCalledWith(1)
+      expect(release).toHaveBeenCalled()
+    } finally {
+      vi.restoreAllMocks()
+      core.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
 it('uses the registered folder as native attach cwd, including the workspace fallback', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'attach-cwd-'))
   const core = new NodeCore(dir, { debuggerEnabled: true })

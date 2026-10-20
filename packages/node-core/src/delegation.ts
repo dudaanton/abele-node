@@ -308,7 +308,7 @@ export class DelegationService {
     })
   }
   checkPublication(actor: AuthorityContext, method: string, p: Params) {
-    if (method === 'delegation.create') this.authorize(actor, String(p.grant_id), 'create')
+    if (method === 'delegation.create') this.creationAuthority(actor, p)
     else if (
       method === 'delegation.send' ||
       method === 'delegation.status' ||
@@ -320,8 +320,34 @@ export class DelegationService {
         method.slice('delegation.'.length) as 'send' | 'status' | 'cancel'
       )
   }
+  private creationAuthority(actor: AuthorityContext, p: Params): DelegationGrant {
+    if (p.grant_id) return this.authorize(actor, String(p.grant_id), 'create')
+    this.core.authority.check(actor, 'delegation', p.project_id as string | undefined)
+    if (!p.parent_id) throw new ChannelError('invalid_params')
+    const existing = this.core.db
+      .prepare('SELECT * FROM delegations WHERE principal_id=? AND delegation_key=?')
+      .get(actor.installation_id, String(p.delegation_key)) as Row | undefined
+    if (existing) return this.authorize(actor, existing.grant_id, 'create')
+    const authority = this.core.authority.snapshot(actor)
+    // Persist ordinary installation authority using the same durable binding as legacy grants.
+    // This is automatic provenance, not a separate approval or a model-controlled policy.
+    return DelegationGrantSchema.parse({
+      grant_id: randomUUID(),
+      installation_id: actor.installation_id,
+      approved_by: actor.installation_id,
+      owner_authority: authority,
+      controller_authority: authority,
+      parent_id: p.parent_id,
+      project_ids: p.project_id ? [p.project_id] : [],
+      providers: ['fake', 'claude', 'pi', 'codex'],
+      actions: ['create', 'send', 'status', 'cancel', 'read'],
+      allow_fake: true,
+      created_at: new Date().toISOString(),
+      revoked: false,
+    })
+  }
   private async create(actor: AuthorityContext, p: Params, operation?: string) {
-    const grant = this.authorize(actor, String(p.grant_id), 'create')
+    const grant = this.creationAuthority(actor, p)
     const previous = this.core.operationReceipt(actor, 'delegation.create', p, operation)
     if (previous) return previous.result
     const find = () => {
@@ -353,9 +379,23 @@ export class DelegationService {
       ? await this.core.resources.prepareWorkspace(String(p.project_id), String(p.base_ref))
       : undefined
     return this.core.commitOperation(actor, 'delegation.create', p, operation, () => {
-      this.authorize(actor, grant.grant_id, 'create')
       const retry = find()
-      if (retry) return retry
+      if (retry) {
+        this.creationAuthority(actor, p)
+        return retry
+      }
+      if (
+        !p.grant_id &&
+        !this.core.db
+          .prepare('SELECT 1 FROM delegation_grants WHERE grant_id=?')
+          .get(grant.grant_id)
+      ) {
+        this.core.authority.checkGrant(grant)
+        this.core.db
+          .prepare('INSERT INTO delegation_grants VALUES(?,?)')
+          .run(grant.grant_id, JSON.stringify(grant))
+      }
+      this.authorize(actor, grant.grant_id, 'create')
       const reserved = prepared
         ? this.core.resources.reserveWorkspace(actor, operation!, prepared)
         : undefined

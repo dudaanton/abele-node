@@ -1,5 +1,6 @@
 import {
   cpSync,
+  mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
@@ -16,7 +17,9 @@ import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { wire } from './dap-wire.js'
 import { adapter } from '../trace/adapter.js'
 import * as programs from '../../packages/node-core/src/debugger/programs.js'
+import * as processIdentity from '../../packages/node-core/src/debugger/process.js'
 import { ChannelError } from '@abele/channel-protocol'
+import { DebuggerClient } from '@abele/node-client'
 
 it('starts without a chat, lists chat and folder sessions together, and restarts with breakpoints', async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'debug-folder-')))
@@ -25,6 +28,7 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
   writeFileSync(join(dir, 'late.ts'), 'const n: number = 2\n')
   writeFileSync(join(dir, 'unit.test.ts'), 'test()\n')
   writeFileSync(join(dir, 'auto.generated.ts'), 'generated()\n')
+  writeFileSync(join(dir, 'types.d.ts'), 'export interface Item { id: string }\n')
   symlinkSync('late.js', join(dir, 'alias.js'))
   symlinkSync('..', join(dir, 'escape'))
   const runs: DapSession[] = []
@@ -97,6 +101,12 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       { pid: 123, port: 9229, command: 'node app.js', cwd: dir, script: join(dir, 'app.js') },
     ])
   const startedAt = vi.spyOn(programs, 'processStartedAt').mockResolvedValue(Date.now() - 10000)
+  const identity = vi
+    .spyOn(processIdentity, 'processStartIdentity')
+    .mockResolvedValue('fixture-identity')
+  const listeners = vi
+    .spyOn(programs, 'applicationListeners')
+    .mockResolvedValue([{ pid: 123, ports: [4399] }])
   const request = async (method: string, p: any) =>
     (await core.request(owner, method, p, p.operation_id ?? crypto.randomUUID())) as any
   try {
@@ -116,7 +126,9 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       folder,
       program: 'app.js',
       argv: ['one'],
+      stop_on_entry: false,
     })
+    expect(configs[0]).toMatchObject({ stop_on_entry: false })
     expect(runs[0]!.snapshot.target.conversation_id).toBeNull()
     expect(core.debuggerControl.methods()).toContain('debugger.v1.addSources')
     const added = await request('debugger.v1.addSources', {
@@ -130,6 +142,7 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         'escape',
         'unit.test.ts',
         'auto.generated.ts',
+        'types.d.ts',
       ],
     })
     expect(added).toEqual({
@@ -144,6 +157,7 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         { path: 'escape', code: 'debugger_source_outside_folder' },
         { path: 'unit.test.ts', code: 'debugger_source_test' },
         { path: 'auto.generated.ts', code: 'debugger_source_generated' },
+        { path: 'types.d.ts', code: 'debugger_source_declaration' },
       ],
     })
     expect(runs[0]!.sources.get('s2')).toBe(join(dir, 'late.js'))
@@ -310,6 +324,45 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     )
     expect(simultaneous.debug_session_id).toBe(attached.debug_session_id)
     expect(runs).toHaveLength(4)
+    expect(
+      await request('http.v1.destination', {
+        project_id: project.project_id,
+        url: 'http://localhost:4399/events',
+      })
+    ).toMatchObject({ debug_session_id: attached.debug_session_id, reason: 'owned' })
+    identity.mockResolvedValue('reused-process-identity')
+    expect(
+      await request('http.v1.destination', {
+        project_id: project.project_id,
+        url: 'http://localhost:4399/events',
+      })
+    ).toMatchObject({ debug_session_id: null, reason: 'unobserved' })
+    identity.mockResolvedValue('fixture-identity')
+    await expect(
+      request('http.v1.send', {
+        project_id: project.project_id,
+        url: 'http://localhost:4399/events',
+        method: 'GET',
+        headers: [],
+        secrets: [],
+        route_by_destination: true,
+        debug_session_id: first.debug_session_id,
+      })
+    ).rejects.toThrow('http_recording_owner_mismatch')
+    expect(
+      await request('http.v1.destination', {
+        project_id: project.project_id,
+        url: 'http://example.invalid:4399/events',
+      })
+    ).toMatchObject({ debug_session_id: null, reason: 'remote' })
+    listeners.mockResolvedValue([{ pid: 999, ports: [4399] }])
+    expect(
+      await request('http.v1.destination', {
+        project_id: project.project_id,
+        url: 'http://localhost:4399/events',
+      })
+    ).toMatchObject({ debug_session_id: null, reason: 'unobserved' })
+    listeners.mockResolvedValue([{ pid: 123, ports: [4399] }])
     const duplicates = await Promise.all(
       ['duplicate-1', 'duplicate-2'].map((operation_id) =>
         request('debugger.v1.attachProgram', { operation_id, folder, pid: 123, port: 9229 })
@@ -329,6 +382,24 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       sources: ['late.ts'],
     })
     expect(mapped.refused).toEqual([])
+    const sourceQuery = {
+      debug_session_id: attached.debug_session_id,
+      source_id: mapped.sources[0].source_id,
+      line: 1,
+      end_line: 2,
+    }
+    const typedDebugger = new DebuggerClient(request)
+    expect(await typedDebugger.sourceStatus(sourceQuery)).toMatchObject({
+      loaded: null,
+      known: false,
+      items: [],
+    })
+    await expect(request('debugger.v1.breakpointLocations', sourceQuery)).rejects.toThrow(
+      'unsupported_operation'
+    )
+    expect(
+      await request('debugger.v1.sessionInfo', { debug_session_id: attached.debug_session_id })
+    ).toMatchObject({ started_at: expect.any(String) })
     writeFileSync(join(dir, 'late.ts'), 'changed\n')
     expect(
       (
@@ -386,6 +457,36 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     })
     expect(reattached.debug_session_id).not.toBe(attached.debug_session_id)
     expect(configs[4]).toEqual(configs[3])
+    const previousAttach = runs[4]!
+    const attachSource = reattached.sources.find((s: any) => s.path === 'late.ts')!
+    core.debugger.patchBreakpoints(
+      previousAttach.id,
+      previousAttach.snapshot.breakpoint_revision,
+      [
+        {
+          breakpoint_id: 'retained-disabled',
+          source_id: attachSource.source_id,
+          line: 1,
+          condition: 'false',
+          enabled: false,
+        },
+      ],
+      []
+    )
+    await previousAttach.syncBreakpoints()
+    closes[4]!()
+    discovery.mockResolvedValue([
+      { pid: 456, port: 9230, command: 'node app.js', cwd: dir, script: join(dir, 'app.js') },
+    ])
+    const nextProcess = await request('debugger.v1.attachProgram', {
+      operation_id: 'new-process',
+      folder,
+      pid: 456,
+      port: 9230,
+    })
+    expect(core.debugger.snapshot(nextProcess.debug_session_id).snapshot.breakpoints).toMatchObject(
+      [{ breakpoint_id: 'retained-disabled', line: 1, condition: 'false', enabled: false }]
+    )
     const running = runs[2]!.snapshot
     core.debugger.observe(running.debug_session_id, running.incarnation, {
       kind: 'lifecycle',
@@ -439,9 +540,61 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       sources: ['typed/src/bin/courier.ts', 'typed/src/services/orders.ts'],
     })
     expect(typedAttach.sources).toEqual(typed.sources)
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src/page.ts'), 'export const answer: number = 42\n')
+    writeFileSync(
+      join(dir, 'caller.js.map'),
+      JSON.stringify({
+        sources: ['src/page.ts'],
+        sourcesContent: ['export const answer: number = 42\n'],
+      })
+    )
+    const callerSession = runs.at(-1)!
+    core.debugger.observe(callerSession.id, callerSession.incarnation, {
+      kind: 'stopped',
+      thread_id: 1,
+      all_threads_stopped: true,
+      reason: 'exception',
+      hit_breakpoint_ids: [],
+    })
+    const callers = await callerSession.stack(1)
+    expect(callers.items[0]).toMatchObject({
+      relative_path: 'src/page.ts',
+      source_id: 's4',
+      line: 4,
+    })
+    expect(callers.items[1]).toMatchObject({ source_id: null })
+    expect(callers.items[1]).not.toHaveProperty('relative_path')
+    const liveId = typedAttach.debug_session_id
+    expect(await request('debugger.v1.exitInfo', { debug_session_id: liveId })).toEqual({
+      exit_code: null,
+    })
+    callerSession.recordExit(9)
+    expect(await request('debugger.v1.exitInfo', { debug_session_id: liveId })).toEqual({
+      exit_code: 9,
+    })
+    expect(
+      (await request('debugger.v1.status', { debug_session_id: liveId })).snapshot
+    ).not.toHaveProperty('exit_code')
+    for (let i = 0; i < 130; i++) {
+      const old = core.debugger.create(runs.at(-1)!.snapshot.target)
+      core.debugger.observe(old.debug_session_id, old.incarnation, {
+        kind: 'lifecycle',
+        lifecycle: 'detached',
+      })
+    }
+    const firstPage = await request('debugger.v1.sessions', { folder, limit: 1 })
+    expect(firstPage[0].lifecycle).not.toBe('detached')
+    expect(
+      (await request('debugger.v1.sessions', { folder })).some(
+        (s: any) => s.debug_session_id === liveId
+      )
+    ).toBe(true)
   } finally {
     discovery.mockRestore()
     startedAt.mockRestore()
+    identity.mockRestore()
+    listeners.mockRestore()
     await core.debuggerLaunches.close()
     for (const close of closes) close()
     await core.resources.stop()

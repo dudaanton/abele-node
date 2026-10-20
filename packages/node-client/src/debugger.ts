@@ -2,6 +2,10 @@ import {
   DebuggerMethodSchemas,
   DebuggerControlMethodSchemas,
   DebuggerSnapshotResultSchema,
+  DebuggerExitInfoResultSchema,
+  DebuggerSessionInfoResultSchema,
+  DebuggerLocationsInspectionSchema,
+  DebuggerSourceStatusInspectionSchema,
   DebuggerSnapshotSchema,
   DebuggerReplayResultSchema,
   DebuggerReceiptSchema,
@@ -134,6 +138,32 @@ export class DebuggerClient {
       })
       throw error
     }
+  }
+  async exitInfo(debug_session_id: string) {
+    return DebuggerExitInfoResultSchema.parse(
+      await this.rpc('debugger.v1.exitInfo', { debug_session_id })
+    )
+  }
+  async sessionInfo(debug_session_id: string) {
+    return DebuggerSessionInfoResultSchema.parse(
+      await this.rpc('debugger.v1.sessionInfo', { debug_session_id })
+    )
+  }
+  async breakpointLocations(params: Input<'debugger.v1.breakpointLocations'>) {
+    return DebuggerLocationsInspectionSchema.parse(
+      await this.rpc(
+        'debugger.v1.breakpointLocations',
+        DebuggerControlMethodSchemas['debugger.v1.breakpointLocations'].parse(params)
+      )
+    ).data
+  }
+  async sourceStatus(params: Input<'debugger.v1.sourceStatus'>) {
+    return DebuggerSourceStatusInspectionSchema.parse(
+      await this.rpc(
+        'debugger.v1.sourceStatus',
+        DebuggerControlMethodSchemas['debugger.v1.sourceStatus'].parse(params)
+      )
+    ).data
   }
   async replay(params: Input<'debugger.v1.replay'>) {
     const result = DebuggerReplayResultSchema.parse(

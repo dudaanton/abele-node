@@ -156,7 +156,11 @@ export class TraceRunWriter {
   value(name: string, text: string, format: TraceFormat = formatOf(text)): TraceStoredValue {
     const bytes = Buffer.byteLength(text)
     const sha256 = createHash('sha256').update(text).digest('hex')
-    const brief = briefOf(text.length > TRACE_PARSE_LIMIT ? text.slice(0, 4096) : text, format)
+    const brief = briefOf(
+      text.length > TRACE_PARSE_LIMIT ? text.slice(0, 4096) : text,
+      format,
+      true
+    )
     if (bytes <= TRACE_INLINE_BYTES) return { name, format, bytes, sha256, brief, inline: text }
     const blobs = join(this.dir, 'blobs')
     const packed = bytes > TRACE_PACK_BYTES

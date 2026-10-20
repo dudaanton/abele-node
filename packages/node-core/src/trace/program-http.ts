@@ -2,6 +2,9 @@
  * Diagnostics channels work on attached Node 22 programs without experimental startup flags.
  * Stream taps observe chunks the application consumes; they never put a stream in flowing mode.
  */
+import { randomBytes } from 'node:crypto'
+export const inspectorProbeToken = randomBytes(24).toString('hex')
+
 export interface ProgramHttpEvent {
   id: string
   direction: 'incoming' | 'outgoing'
@@ -19,7 +22,7 @@ export interface ProgramHttpEvent {
   response_truncated?: boolean
 }
 
-export function installProgramHttp() {
+export function installProgramHttp(probeToken?: string) {
   const dc = process.getBuiltinModule(
     'node:diagnostics_channel'
   ) as typeof import('node:diagnostics_channel')
@@ -235,6 +238,14 @@ export function installProgramHttp() {
     subscriptions.push(() => dc.unsubscribe(name, safe))
   }
   subscribe('http.server.request.start', ({ request: req, response: res }) => {
+    if (
+      probeToken &&
+      req.method === 'GET' &&
+      ['/json/version', '/json/list'].includes(req.url) &&
+      req.headers['x-abele-inspector-probe'] === probeToken &&
+      ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress)
+    )
+      return
     const scheme = req.socket?.encrypted ? 'https' : 'http'
     if (
       !start(
@@ -415,6 +426,7 @@ export function installProgramHttp() {
     }
   }
   const api = {
+    probe_token: probeToken,
     get active() {
       return !stopped
     },
@@ -447,6 +459,6 @@ export function installProgramHttp() {
 }
 
 export const programHttpKey = '__abeleProgramHttpV1'
-export const programHttpInstall = `(() => { if (!globalThis.${programHttpKey} || globalThis.${programHttpKey}.active === false) globalThis.${programHttpKey} = (${installProgramHttp.toString()})(); return 'ok' })()`
+export const programHttpInstall = `(() => { const old = globalThis.${programHttpKey}; if (!old || old.active === false || (old.active === true && old.probe_token !== ${JSON.stringify(inspectorProbeToken)})) { old?.stop(); globalThis.${programHttpKey} = (${installProgramHttp.toString()})(${JSON.stringify(inspectorProbeToken)}); } return 'ok' })()`
 export const programHttpDrain = `Buffer.from(JSON.stringify(globalThis.${programHttpKey}?.drain() ?? [])).toString('base64')`
 export const programHttpStop = `(() => { globalThis.${programHttpKey}?.stop(); delete globalThis.${programHttpKey}; return 'ok' })()`

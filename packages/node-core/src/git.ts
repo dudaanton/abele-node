@@ -47,6 +47,7 @@ export type GitCommand =
   | { kind: 'blob'; object: string }
   | { kind: 'tracked' }
   | { kind: 'visible.untracked' }
+  | { kind: 'visible.directories'; path: string; entries: string[] }
   | { kind: 'history'; commit: string; offset: number; limit: number; path?: string }
   | { kind: 'changes'; base: string; head?: string; staged?: boolean; unstaged?: boolean }
   | {
@@ -289,6 +290,19 @@ export class GitRunner {
         break
       case 'visible.untracked':
         args = ['ls-files', '--others', '--exclude-standard', '-z']
+        break
+      case 'visible.directories':
+        args = [
+          '-C',
+          command.path || '.',
+          'ls-files',
+          '--others',
+          '--directory',
+          '--exclude-standard',
+          '-z',
+          '--',
+          ...command.entries.map((name) => name + '/'),
+        ]
         break
       case 'history':
         args = [

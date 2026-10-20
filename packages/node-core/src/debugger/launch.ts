@@ -7,6 +7,7 @@ import type {
   DebuggerAddSourcesResult,
   DebuggerStartResult,
   DebuggerTarget,
+  DebuggerSnapshot,
   ExecutionTarget,
 } from '@abele/node-protocol'
 import type { NodeCore } from '../index.js'
@@ -16,6 +17,7 @@ import type { JsAttach, JsLaunch } from './js-profile.js'
 import { inspectorPrograms, processStartedAt } from './programs.js'
 import { discoverLaunchTargets, resolveNpmScript } from './launch-targets.js'
 import { loadedSourceDigests } from './loaded-sources.js'
+import { processStartIdentity } from './process.js'
 
 /** What starts a program under a debugger. The native JS profile in production; a scripted one
  * in tests. It refuses while no audited adapter is installed. */
@@ -52,6 +54,7 @@ type StartParams = {
   program: string
   npm_script?: string
   argv: string[]
+  stop_on_entry?: boolean
   sources: string[]
 }
 
@@ -70,6 +73,7 @@ type SourceContext = {
   root: string
   program: string
   pid?: number
+  processIdentity?: string
   sources: Map<string, string>
   digests: Map<string, string>
   recipe?: string
@@ -106,6 +110,33 @@ export class DebuggerLaunches {
 
   profiles() {
     return this.core.debugger.enabled ? this.profile.profiles() : []
+  }
+  async owningSessions(project: string, pids: number[]): Promise<string[]> {
+    const matches: string[] = []
+    for (const [id, session] of this.sessions) {
+      const run = this.sessionRuns.get(id)
+      const context = run && this.sourceContexts.get(run)
+      const state = session.snapshot
+      if (
+        !context?.pid ||
+        !context.processIdentity ||
+        context.recipe !== id ||
+        state.target.project_id !== project ||
+        !['active', 'configuring'].includes(state.lifecycle) ||
+        !pids.includes(context.pid)
+      )
+        continue
+      const current = await processStartIdentity(context.pid).catch(() => undefined)
+      const now = session.snapshot
+      if (
+        current === context.processIdentity &&
+        this.sessions.get(id) === session &&
+        now.incarnation === state.incarnation &&
+        ['active', 'configuring'].includes(now.lifecycle)
+      )
+        matches.push(id)
+    }
+    return matches.sort()
   }
 
   /** A retried operation answers with the program it already started, never a second one. */
@@ -213,14 +244,17 @@ export class DebuggerLaunches {
     const folder: ExecutionTarget = target.workspace_id
       ? { kind: 'workspace', workspace_id: target.workspace_id }
       : { kind: 'worktree', worktree_id: target.worktree_id }
-    this.core.db
-      .prepare('INSERT OR REPLACE INTO debug_launches VALUES(?,?)')
-      .run(
-        result.debug_session_id,
-        JSON.stringify({ kind, params: { ...params, folder }, admitted: result.sources })
-      )
     const run = this.sessionRuns.get(result.debug_session_id)
     const context = run && this.sourceContexts.get(run)
+    this.core.db.prepare('INSERT OR REPLACE INTO debug_launches VALUES(?,?)').run(
+      result.debug_session_id,
+      JSON.stringify({
+        kind,
+        params: { ...params, folder },
+        admitted: result.sources,
+        program_path: context?.program,
+      })
+    )
     if (context) context.recipe = result.debug_session_id
     return result
   }
@@ -365,11 +399,26 @@ export class DebuggerLaunches {
     }
     const digests = await sourceDigests(sources)
     const run = await this.profile.launch(
-      { cwd: root, executable: process.execPath, program, argv: resolved.argv, env: {} },
+      {
+        cwd: root,
+        executable: process.execPath,
+        program,
+        argv: resolved.argv,
+        env: {},
+        ...(p.stop_on_entry === undefined ? {} : { stop_on_entry: p.stop_on_entry }),
+      },
       target,
       sources
     )
-    this.sourceContexts.set(run, { root, program, sources, digests, pending: 0 })
+    const evidence = run.root.snapshot.target.process_evidence
+    this.sourceContexts.set(run, {
+      root,
+      program,
+      sources,
+      digests,
+      pending: 0,
+      ...(evidence ? { pid: evidence.pid, processIdentity: evidence.start_identity } : {}),
+    })
     return this.adopt(run, root, sources, true)
   }
 
@@ -454,6 +503,7 @@ export class DebuggerLaunches {
   ): Promise<DebuggerStartResult> {
     // Only what is listening on loopback right now, as the OS says, under this very process: a
     // port named by the caller alone is never trusted to be the program it says.
+    const identityBefore = await processStartIdentity(p.pid).catch(() => undefined)
     const program = (await inspectorPrograms()).find((x) => x.pid === p.pid && x.port === p.port)
     if (!program) throw new ChannelError('debugger_program_not_found')
     const inside = within(root, program.script) || within(root, program.cwd)
@@ -463,11 +513,37 @@ export class DebuggerLaunches {
     const loaded = await loadedSourceDigests(program.port, root)
     const script = program.script ? await realpath(program.script).catch(() => null) : null
     const programPath = script ?? join(root, 'program.js')
+    // Restore intent only from an ended attachment to this exact script and owner scope.
+    // PID/port are transient; source ids belong to each adapter and must be remapped by path.
+    const retained = script
+      ? (this.core.db
+          .prepare(
+            `
+      SELECT l.body AS recipe, d.body AS snapshot FROM debug_launches l
+      JOIN debug_sessions d USING(debug_session_id)
+      WHERE json_extract(l.body,'$.kind')='attach'
+        AND json_extract(l.body,'$.program_path')=?
+        AND json_extract(d.body,'$.target.project_id')=?
+        AND json_extract(d.body,'$.target.worktree_id')=?
+        AND json_extract(d.body,'$.target.conversation_id') IS ?
+        AND json_extract(d.body,'$.lifecycle') IN ('detached','terminated','failed','connection-lost')
+      ORDER BY d.rowid DESC LIMIT 1
+    `
+          )
+          .get(script, place.project_id, place.worktree_id, place.conversation_id) as
+          { recipe: string; snapshot: string } | undefined)
+      : undefined
+    const previous = (retained && JSON.parse(retained.recipe)) as
+      { admitted: DebuggerStartResult['sources'] } | undefined
     for (const path of p.sources) this.inside(root, path)
     await admitSources(
       root,
       sources,
-      [...(script && within(root, script) ? [relative(root, script)] : []), ...p.sources],
+      [
+        ...(script && within(root, script) ? [relative(root, script)] : []),
+        ...p.sources,
+        ...(previous?.admitted ?? []).map((s: { path: string }) => s.path),
+      ],
       program.pid,
       script ?? undefined,
       loaded
@@ -495,15 +571,44 @@ export class DebuggerLaunches {
       root
     )
     console.debug('[debugger] Attached', program.pid, program.port)
+    const identityAfter = await processStartIdentity(program.pid).catch(() => undefined)
     this.sourceContexts.set(run, {
       root,
       program: programPath,
       pid: program.pid,
+      processIdentity:
+        identityBefore && identityBefore === identityAfter ? identityBefore : undefined,
       sources,
       digests,
       pending: 0,
     })
-    return this.adopt(run, root, sources, false)
+    const result = await this.adopt(run, root, sources, false)
+    try {
+      if (retained) {
+        const old = JSON.parse(retained.snapshot) as DebuggerSnapshot
+        const requests = old.breakpoints.flatMap(
+          ({ status, resolved_line, resolved_column, message, ...request }) => {
+            const path = previous!.admitted.find((s) => s.source_id === request.source_id)?.path
+            const source_id = result.sources.find((s) => s.path === path)?.source_id
+            return source_id ? [{ ...request, source_id }] : []
+          }
+        )
+        if (requests.length) {
+          const next = this.core.debugger.snapshot(result.debug_session_id).snapshot
+          this.core.debugger.patchBreakpoints(
+            result.debug_session_id,
+            next.breakpoint_revision,
+            requests,
+            []
+          )
+          await this.sessions.get(result.debug_session_id)?.syncBreakpoints()
+        }
+      }
+      return result
+    } catch (error) {
+      await this.closeRun(run).catch(() => {})
+      throw error
+    }
   }
 
   /** Puts every session of a run under the coordinator until its root connection ends. A run the
@@ -521,6 +626,29 @@ export class DebuggerLaunches {
       if (context) session.admitSources(context.sources)
       this.sessions.set(session.id, session)
       this.sessionRuns.set(session.id, run)
+      session.resolveFrameSources = async (paths) => {
+        const context = this.sourceContexts.get(run)
+        if (!context?.recipe) return new Map()
+        const candidates = paths.filter((path) => within(root, path) && isAbsolute(path))
+        if (!candidates.length) return new Map()
+        const result = await this.addSources({
+          operation_id: randomUUID(),
+          debug_session_id: session.id,
+          sources: candidates.map((path) => relative(root, path)),
+        })
+        const admitted = new Map(
+          result.sources.map((source) => [resolve(root, source.path), source])
+        )
+        const canonical = await Promise.all(
+          candidates.map((path) => realpath(path).catch(() => undefined))
+        )
+        return new Map(
+          candidates.flatMap((path, i) => {
+            const source = canonical[i] && admitted.get(canonical[i]!)
+            return source ? [[path, source] as const] : []
+          })
+        )
+      }
       unregister.push(() => this.sessions.delete(session.id))
       unregister.push(
         this.core.debuggerControl.registerBackend(
@@ -662,6 +790,10 @@ async function admitSources(
       continue
     }
     const local = relative(root, full).split(sep).join('/')
+    if (/\.d\.[cm]?ts$/.test(local)) {
+      refuse('debugger_source_declaration')
+      continue
+    }
     if (/(^|\/)(__tests__|tests?|spec)(\/|$)|\.(test|spec)\.[^.]+$/.test(local)) {
       refuse('debugger_source_test')
       continue

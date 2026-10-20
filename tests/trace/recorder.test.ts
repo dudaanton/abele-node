@@ -71,6 +71,50 @@ async function fixture(frame: () => Record<string, unknown>) {
 }
 
 describe('a run recorded over a debugger session', () => {
+  it('keeps one sent row only when the captured request has this send exact correlation id', async () => {
+    let traffic: any[] = []
+    const f = await fixture(() => ({
+      Buffer,
+      [programHttpKey]: {
+        drain: () => traffic.splice(0),
+        stop() {},
+      },
+    }))
+    try {
+      await f.breakpoint('point', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'point', take: [] }], [])
+      f.recorder.attach(f.session)
+      const chain = f.recorder.chain(f.session.id, {
+        method: 'POST',
+        url: 'http://localhost/events',
+      })!
+      traffic.push({
+        id: 'n1',
+        direction: 'incoming',
+        method: 'POST',
+        url: 'http://localhost/events',
+        started: Date.now(),
+        ended: Date.now(),
+        status: 201,
+        request_headers: { 'x-abele-step': chain.id },
+        response_headers: {},
+        request_body: '',
+        response_body: 'ok',
+      })
+      await f.recorder.flushHttp(f.session.id)
+      const step = chain.close({ label: 'POST /events', status: 201, values: [] })
+      const rows = f.store.read(chain.runId).steps
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        id: step,
+        sent: true,
+        chain: chain.id,
+        direction: 'incoming',
+      })
+    } finally {
+      f.close()
+    }
+  })
   it('fences automatic continuation again after publishing its execution intent', async () => {
     const f = await fixture(() => ({}))
     try {

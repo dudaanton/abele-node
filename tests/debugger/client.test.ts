@@ -7,6 +7,49 @@ import { DebuggerClient, parseDebuggerVariables } from '@abele/node-client'
 import { target } from './helpers.js'
 
 afterEach(() => vi.useRealTimers())
+it('parses source locations and immutable session metadata through the typed client', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'debug-metadata-client-'))
+  const core = new NodeCore(dir, { debuggerEnabled: true })
+  try {
+    const snapshot = core.debugger.create(target)
+    const page = { items: [{ line: 2, column: 18 }], truncated: false, snapshot }
+    const client = new DebuggerClient(async (method) =>
+      method.endsWith('sessionInfo')
+        ? { started_at: snapshot.observed_at }
+        : method.endsWith('sourceStatus')
+          ? { data: { ...page, loaded: true, known: true }, truncated: false, snapshot }
+          : { data: page, truncated: false, snapshot }
+    )
+    const input = {
+      debug_session_id: snapshot.debug_session_id,
+      source_id: 'source',
+      line: 1,
+      end_line: 5,
+    }
+    expect(await client.sessionInfo(snapshot.debug_session_id)).toEqual({
+      started_at: snapshot.observed_at,
+    })
+    expect((await client.breakpointLocations(input)).items).toEqual(page.items)
+    expect(await client.sourceStatus(input)).toMatchObject({
+      loaded: true,
+      known: true,
+      items: page.items,
+    })
+  } finally {
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+it('reads exit information separately from strict legacy snapshots', async () => {
+  const rpc = vi.fn(async () => ({ exit_code: 7 }))
+  const client = new DebuggerClient(rpc)
+  expect(await client.exitInfo('session')).toEqual({ exit_code: 7 })
+  expect(rpc).toHaveBeenCalledExactlyOnceWith('debugger.v1.exitInfo', {
+    debug_session_id: 'session',
+  })
+  rpc.mockResolvedValueOnce({ exit_code: 'unknown' } as any)
+  await expect(client.exitInfo('session')).rejects.toThrow()
+})
 it('lists launch targets through the typed owner client', async () => {
   const result = {
     targets: [

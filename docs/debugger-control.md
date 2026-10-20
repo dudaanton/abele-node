@@ -22,6 +22,40 @@ B5 extends the gated subset with wait/sleep and caller-scoped cancellation. Ther
 
 ### Folder ownership (node protocol 0.1)
 
+See [executable source locations and session metadata](debugger-source-locations.md) for
+loaded-source/breakable-line checks, inline locations, step reasons and retained start time.
+
+Additive debugger capability flags for acceptance reruns:
+
+- `launch_stop_on_entry`: `start` accepts optional `stop_on_entry`. Omission and `true`
+  preserve the startup hold; `false` continues after the adapter has observed that hold.
+  Startup holds have reason `entry`, rather than an apparent user `debugger` statement.
+- `exit_code`: `exitInfo({debug_session_id})` returns `{exit_code: integer | null}`; the
+  client helper has the same name. Null means unknown. Existing snapshots keep their schema
+  so older strict decoders continue to work. DAP exit
+  reports are diagnostic metadata, never process ownership or proof of termination. Native
+  owned-process exit evidence can arrive after the adapter terminates. A signal-only exit
+  leaves the code unknown. Lifecycle and ownership keep their existing meanings.
+- `stop_exception_text`: stop descriptions retain adapter exception text. When supported by
+  the adapter, `exceptionInfo` enriches the description with type and message. A late reply
+  is fenced by incarnation and stop epoch; `stop_details` updates metadata without a new stop.
+- `frame_source_paths`: stack items may include `relative_path`, a canonical path under the
+  session's folder, alongside the existing adapter `path`. The node reuses source admission
+  checks and source maps for caller frames, returns their admitted `source_id`, and retains
+  the added sources for restart. Clients can open `relative_path` directly and register the
+  new ID/path mapping. Its absence means the source was not admitted (including runtime or
+  external-library frames); show a source-unavailable explanation instead of a missing-node-
+  capability error. No arbitrary adapter source export or outside-folder read is introduced.
+- `attach_breakpoint_restore`: a fresh attachment to the same canonical script and exact
+  project/worktree/conversation scope restores the most recent ended attachment's points,
+  including disabled state, conditions, columns, hit conditions and log messages. Sources
+  are re-admitted and IDs remapped by path; points on refused sources are not installed.
+  Changed PID/port do not discard intent. Older recipes without script identity cannot be
+  matched automatically; explicit `restart` remains available.
+
+Session listing puts active/configuring sessions before ended ones, newest first within each
+group, before applying the requested limit. A client reload does not detach an adapter.
+
 `start`, `attachProgram`, `programs` and `sessions` accept `folder`, an existing
 execution target (`{kind: 'workspace', workspace_id}` or `{kind: 'worktree', worktree_id}`),
 with an optional `conversation_id`. At least one owner is required. When both are

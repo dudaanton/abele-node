@@ -10,6 +10,9 @@ const path = z.string().min(1).max(1024)
 
 export const TRACE_VERSION = 1 as const
 export const TRACE_V1_CAPABILITY = {
+  scalar_briefs: true,
+  sent_observation_merge: true,
+  discovery_probe_suppression: true,
   status: 'supported' as const,
   evidence:
     'record-points-stop-and-continue; runs-on-disk; shape-slice-diff-find-follow; owner-only; bounded-views',

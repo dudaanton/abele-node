@@ -25,6 +25,8 @@ const sendId = z.string().regex(/^s[0-9a-z]{6,40}$/)
 
 export const HTTP_VERSION = 1 as const
 export const HTTP_V1_CAPABILITY = {
+  recording_correlation: true,
+  destination_owner: true,
   status: 'supported' as const,
   evidence:
     'requests-as-files; environments; send-and-poll; history-on-node; keys-per-send-never-written; optional-into-recording; owner-only',
@@ -168,6 +170,7 @@ export const HttpSendStatusSchema = z
 const project = { project_id: id }
 
 export const HttpMethodSchemas = {
+  'http.v1.destination': z.object({ ...project, url: z.string().url().max(8192) }).strict(),
   'http.v1.list': z.object(project).strict(),
   'http.v1.request.get': z.object({ ...project, id: requestId }).strict(),
   /** Writes the request at `id`; `from` moves it there from another path (a rename). */
@@ -220,6 +223,7 @@ export const HttpMethodSchemas = {
       /** Into the recording of this debugger session. */
       debug_session_id: id.optional(),
       step_header: z.boolean().optional(),
+      route_by_destination: z.boolean().optional(),
     })
     .strict(),
   'http.v1.send.status': z.object({ ...project, send_id: sendId }).strict(),
@@ -231,6 +235,13 @@ export const HttpMethodSchemas = {
     .object({ ...project, send_id: sendId, from: z.number().int().min(0).optional() })
     .strict(),
 } as const
+export const HttpDestinationResultSchema = z
+  .object({
+    debug_session_id: id.nullable(),
+    candidates: z.array(id).max(256),
+    reason: z.enum(['remote', 'owned', 'ambiguous', 'unobserved']),
+  })
+  .strict()
 export type HttpMethodNameV1 = keyof typeof HttpMethodSchemas
 
 export const HttpListResultSchema = z

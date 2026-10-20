@@ -7,6 +7,18 @@ approval, and a listed external worktree is not a managed workspace.
 
 ## Folder and picker
 
+`node_path_v2.empty_directories` advertises empty directory entries in working filesystem
+tree pages. Git commit trees remain unchanged. Nested empty directories are listed under
+their parents; ignored directories, metadata, symlink traversal and nested repository
+contents are excluded. Enumeration is bounded and returns `scan_limit` when its directory
+budget is exhausted. Workspace filesystem listings already include direct empty directories.
+
+New managed worktree folders use readable branch slugs. Branch names requiring sanitization
+receive a stable hash suffix to distinguish names such as `feature/files` and `feature-files`.
+The branch remains unchanged in Git and the workspace record. Existing URL-encoded and
+UUID-based managed folders remain recognized; no upgrade moves them. Clients should display
+the branch field instead of treating the folder basename as a branch name.
+
 `client.nodePath.directories({path?, cursor?, limit?})` returns a bounded directory
 page and a short-lived, installation-bound `directory_id`. An omitted path starts
 at the node user's home. Symlink entries are not followed. `mkdir({directory_id,

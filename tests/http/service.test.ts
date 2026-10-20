@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { createServer, type Server } from 'node:http'
+import { createServer, type Server, type IncomingMessage } from 'node:http'
 import {
   existsSync,
   mkdirSync,
@@ -49,12 +49,12 @@ async function setup(enabled = false) {
 }
 
 /** A small service to send to: it echoes what came, answers slowly or never when asked. */
-async function service(onRequest?: () => void) {
+async function service(onRequest?: (request: IncomingMessage) => void) {
   const server = createServer((req, res) => {
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
-      onRequest?.()
+      onRequest?.(req)
       if (req.url?.startsWith('/never')) return
       const answer = () => {
         res.writeHead(req.url?.startsWith('/missing') ? 404 : 201, {
@@ -440,8 +440,8 @@ describe('saved requests on the node', () => {
   it('sends into a recording: the request heads the code steps taken while it was out', async () => {
     const s = await setup(true)
     const w = wire()
-    let hit: () => void = () => {}
-    const base = await service(() => hit())
+    let hit: (request: IncomingMessage) => void = () => {}
+    const base = await service((request) => hit(request))
     let traffic: ProgramHttpEvent[] = []
     const fake = adapter(
       w,
@@ -492,7 +492,7 @@ describe('saved requests on the node', () => {
       )
       const dapId = fake.lastBreakpointId()
       // The service's code reaches the record point while it answers.
-      hit = () => {
+      hit = (request) => {
         traffic.push({
           id: 'n1',
           direction: 'incoming',
@@ -501,7 +501,7 @@ describe('saved requests on the node', () => {
           started: Date.now(),
           ended: Date.now() + 100,
           status: 201,
-          request_headers: {},
+          request_headers: { 'x-abele-step': String(request.headers['x-abele-step']) },
           response_headers: {},
           request_body: '{"qty":2}',
           response_body: 'answer',
@@ -535,7 +535,6 @@ describe('saved requests on the node', () => {
       })
       expect(run.steps.map((x: any) => [x.kind, x.label])).toEqual([
         ['http', 'POST /slow/orders'],
-        ['http', 'POST /slow/orders'],
         ['probe', 'Order read'],
       ])
       expect(run.steps[0]).toMatchObject({
@@ -544,9 +543,8 @@ describe('saved requests on the node', () => {
         status: 201,
         host: expect.any(String),
       })
-      expect(run.steps[1]).toMatchObject({ direction: 'incoming', chain: 'n1' })
-      expect(run.steps[2]).toMatchObject({ by_time: true, chain: run.steps[0].chain })
-      expect(run.steps[0].values.map((v: any) => v.name)).toEqual(['request', 'response'])
+      expect(run.steps[1]).toMatchObject({ by_time: true, chain: run.steps[0].chain })
+      expect(run.steps[0].values.map((v: any) => v.name)).toEqual(['request', 'response', 'http'])
       hit = () => {}
       const unrelated = s.request('http.v1.send', {
         ...p,
@@ -560,7 +558,7 @@ describe('saved requests on the node', () => {
       expect(
         s.request('http.v1.send.status', { ...p, send_id: unrelated.send_id }).send.run
       ).toBeUndefined()
-      expect(s.request('trace.v1.run', { ...p, run_id: sent.run_id }).steps).toHaveLength(3)
+      expect(s.request('trace.v1.run', { ...p, run_id: sent.run_id }).steps).toHaveLength(2)
       const flush = s.core.trace.recorder.flushHttp
       s.core.trace.recorder.flushHttp = async () => {
         throw new Error('fixture capture unavailable')

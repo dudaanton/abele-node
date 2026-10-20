@@ -489,7 +489,7 @@ export class NodeClient {
   async revokeDelegationGrant(grant_id: string): Promise<DelegationGrant> {
     return DelegationGrantSchema.parse(await this.mutation('delegation.grant.revoke', { grant_id }))
   }
-  /** A stable delegation_key survives even retries using a fresh operation ID. */
+  /** A stable delegation_key survives retries. With delegation_without_grant, supply parent_id instead of grant_id. */
   async createDelegation(params: DelegationCreateRequest): Promise<Delegation> {
     return DelegationSchema.parse(await this.mutation('delegation.create', params))
   }

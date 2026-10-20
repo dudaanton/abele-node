@@ -67,6 +67,7 @@ type Frame = {
   name: string
   source_id: string | null
   path?: string
+  relative_path?: string
   line: number
   column: number
 }
@@ -116,6 +117,10 @@ export class DapSession {
   }
   private readonly sourcePaths = new Map<string, string>()
   readonly sources: ReadonlyMap<string, string> = this.sourcePaths
+  private readonly stepping = new Set<number>()
+  resolveFrameSources?: (
+    paths: string[]
+  ) => Promise<Map<string, { source_id: string; path: string }>>
   /** Trusted launch coordinator admission, shared with future child sessions. */
   admitSources(sources: ReadonlyMap<string, string>) {
     for (const [id, path] of sources) {
@@ -153,6 +158,22 @@ export class DapSession {
   }
   get snapshot() {
     return this.service.snapshot(this.id).snapshot
+  }
+  /** Host process evidence may arrive after the adapter's terminated event. */
+  recordExit(code: number) {
+    if (!Number.isSafeInteger(code)) return
+    this.observe({ kind: 'exited', exit_code: code })
+  }
+  markEntryPause() {
+    const before = this.current()
+    if (before.selected_thread_id !== null)
+      this.observe({
+        kind: 'stop_details',
+        thread_id: before.selected_thread_id,
+        stop_epoch: before.stop_epoch,
+        reason: 'entry',
+        description: 'Paused at program startup',
+      })
   }
   private observe(event: DebuggerObservation) {
     const state = this.service.observe(this.id, this.incarnation, event)
@@ -471,6 +492,15 @@ export class DapSession {
     this.fence(before)
     const frames = list(body.stackFrames, 1024),
       items: Frame[] = []
+    const resolved = await this.resolveFrameSources?.([
+      ...new Set(
+        frames
+          .slice(0, count)
+          .map((f) => f.source?.path)
+          .filter((p): p is string => typeof p === 'string')
+      ),
+    ])
+    this.fence(before)
     let truncated =
       frames.length > count ||
       (typeof body.totalFrames === 'number' &&
@@ -484,11 +514,17 @@ export class DapSession {
         typeof frame.name !== 'string'
       )
         throw new Error('dap_invalid_body')
-      const source = [...this.sources].find(([, path]) => path === frame.source?.path)?.[0] ?? null
+      const source =
+        resolved?.get(frame.source?.path)?.source_id ??
+        [...this.sources].find(([, path]) => path === frame.source?.path)?.[0] ??
+        null
       const item: Frame = {
         handle: 'a'.repeat(48),
         name: boundedText(frame.name, 256),
         source_id: source,
+        ...(resolved?.has(frame.source?.path)
+          ? { relative_path: resolved.get(frame.source.path)!.path }
+          : {}),
         ...(typeof frame.source?.path === 'string'
           ? { path: boundedText(frame.source.path, 4096) }
           : {}),
@@ -537,6 +573,68 @@ export class DapSession {
       items.push(item)
     }
     return { items, truncated, snapshot: this.snapshot }
+  }
+  async breakpointLocations(
+    source: string,
+    line: number,
+    endLine: number,
+    column?: number,
+    endColumn?: number
+  ) {
+    const before = this.current()
+    const path = this.sources.get(source)
+    if (!path) throw new ChannelError('unknown_source')
+    if (!positive(line) || !positive(endLine) || endLine < line || endLine - line > 1000)
+      throw new ChannelError('invalid_params')
+    if (!this.capabilities.supportsBreakpointLocationsRequest)
+      throw new ChannelError('unsupported_operation')
+    const body = await this.request('breakpointLocations', {
+      source: { path },
+      line,
+      endLine,
+      ...(column === undefined ? {} : { column }),
+      ...(endColumn === undefined ? {} : { endColumn }),
+    })
+    this.fence(before)
+    const raw = list(body.breakpoints, 4096)
+    const items = raw.slice(0, 256).map((point) => {
+      if (
+        !positive(point.line) ||
+        (point.column !== undefined && !positive(point.column)) ||
+        point.line < line ||
+        point.line > endLine
+      )
+        throw new Error('dap_invalid_body')
+      return {
+        line: point.line as number,
+        ...(point.column === undefined ? {} : { column: point.column as number }),
+        ...(positive(point.endLine) ? { end_line: point.endLine as number } : {}),
+        ...(positive(point.endColumn) ? { end_column: point.endColumn as number } : {}),
+      }
+    })
+    while (Buffer.byteLength(JSON.stringify(items)) > 7000) items.pop()
+    return { items, truncated: items.length < raw.length, snapshot: this.snapshot }
+  }
+  async sourceStatus(source: string, line: number, endLine: number) {
+    const before = this.current()
+    const path = this.sources.get(source)
+    if (!path) throw new ChannelError('unknown_source')
+    let loaded: boolean | null = null
+    if (this.capabilities.supportsLoadedSourcesRequest) {
+      const body = await this.request('loadedSources')
+      this.fence(before)
+      loaded = list(body.sources, 16384).some((s) => s.path === path)
+    }
+    if (loaded === false || !this.capabilities.supportsBreakpointLocationsRequest)
+      return {
+        loaded,
+        known: loaded === false,
+        items: [],
+        truncated: false,
+        snapshot: this.snapshot,
+      }
+    const page = await this.breakpointLocations(source, line, endLine)
+    return { ...page, loaded, known: true }
   }
   private objectHandle(reference: number, thread: number) {
     if (!reference) return null
@@ -821,11 +919,20 @@ export class DapSession {
     this.admission?.advanceIntent()
     this.frameThreads.clear()
     this.objectThreads.clear()
-    await this.request(command, { threadId: toDap(thread), singleThread }, { beforeDispatch })
+    if (action === 'step') this.stepping.add(thread)
+    else if (singleThread) this.stepping.delete(thread)
+    else this.stepping.clear()
+    try {
+      await this.request(command, { threadId: toDap(thread), singleThread }, { beforeDispatch })
+    } catch (error) {
+      this.stepping.delete(thread)
+      throw error
+    }
     return this.snapshot
   }
   async pause(thread?: number | null) {
     this.current()
+    this.stepping.clear()
     if (thread == null) {
       // Discover a target without publishing an inventory change mid-command:
       // that would invalidate the coordinator's physical dispatch fence.
@@ -899,7 +1006,7 @@ export class DapSession {
       case 'initialized':
         this.initialized = true
         break
-      case 'stopped':
+      case 'stopped': {
         this.deferredStops.delete(body.threadId)
         if (
           this.breakpointSyncs &&
@@ -913,17 +1020,65 @@ export class DapSession {
           })
           break
         }
+        const stepped =
+          dapThread(body.threadId) &&
+          this.stepping.delete(fromDap(body.threadId)) &&
+          ['breakpoint', 'step', 'pause'].includes(body.reason) &&
+          !body.hitBreakpointIds?.length
+        if (body.allThreadsStopped === true) this.stepping.clear()
         this.observe({
           kind: 'stopped',
           ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
           all_threads_stopped: body.allThreadsStopped === true,
-          reason: typeof body.reason === 'string' ? boundedText(body.reason, 256) : 'unknown',
-          ...(typeof body.description === 'string'
-            ? { description: boundedText(body.description, 4096) }
-            : {}),
+          reason: stepped
+            ? 'step'
+            : typeof body.reason === 'string'
+              ? boundedText(body.reason, 256)
+              : 'unknown',
+          ...(stepped
+            ? { description: 'Paused after a step' }
+            : typeof body.text === 'string' || typeof body.description === 'string'
+              ? {
+                  description: boundedText(
+                    typeof body.text === 'string' ? body.text : body.description,
+                    4096
+                  ),
+                }
+              : {}),
           hit_breakpoint_ids: this.hitBreakpoints(body.hitBreakpointIds),
         })
+        if (
+          this.capabilities.supportsExceptionInfoRequest &&
+          dapThread(body.threadId) &&
+          ['exception', 'promise rejection'].includes(body.reason)
+        ) {
+          const before = this.snapshot
+          void this.request('exceptionInfo', { threadId: body.threadId })
+            .then((info) => {
+              const now = this.snapshot
+              if (
+                now.incarnation !== this.incarnation ||
+                now.stop_epoch !== before.stop_epoch ||
+                !live(now)
+              )
+                return
+              const type = info.details?.typeName ?? info.exceptionId
+              const message = info.details?.message ?? info.description
+              const description = [type, message]
+                .filter((part) => typeof part === 'string' && part)
+                .join(': ')
+              if (description)
+                this.observe({
+                  kind: 'stop_details',
+                  thread_id: fromDap(body.threadId),
+                  stop_epoch: before.stop_epoch,
+                  description: boundedText(description, 4096),
+                })
+            })
+            .catch(() => {})
+        }
         break
+      }
       case 'continued':
         if (body.allThreadsContinued === true || body.threadId === undefined)
           this.deferredStops.clear()
@@ -935,6 +1090,8 @@ export class DapSession {
         })
         break
       case 'thread':
+        if (body.reason === 'exited' && dapThread(body.threadId))
+          this.stepping.delete(fromDap(body.threadId))
         if (body.reason === 'exited') this.deferredStops.delete(body.threadId)
         if (!dapThread(body.threadId) || !['started', 'exited'].includes(body.reason))
           throw new Error('dap_invalid_body')
@@ -952,7 +1109,12 @@ export class DapSession {
         this.deferredStops.clear()
         this.observe({ kind: 'invalidated' })
         break
+      case 'exited':
+        if (Number.isSafeInteger(body.exitCode))
+          this.observe({ kind: 'exited', exit_code: body.exitCode })
+        break
       case 'terminated':
+        this.stepping.clear()
         this.deferredStops.clear()
         this.observe({ kind: 'lifecycle', lifecycle: 'terminated' })
         if (this.onTerminated) this.onTerminated()
@@ -987,7 +1149,7 @@ export class DapSession {
           })
         }
         break
-      // process/exited events are not execution or OS ownership proof.
+      // A process event is not execution or OS ownership proof.
     }
   }
 }

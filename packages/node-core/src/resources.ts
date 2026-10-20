@@ -39,11 +39,19 @@ import { NodeLsp } from './lsp/node.js'
 
 type Params = Record<string, unknown>
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
-const worktreeName = (branch: string) => {
+const legacyWorktreeName = (branch: string) => {
   const encoded = encodeURIComponent(branch)
   return encoded.length <= 200
     ? encoded
     : encoded.slice(0, 180) + '-' + createHash('sha256').update(branch).digest('hex').slice(0, 16)
+}
+const worktreeName = (branch: string) => {
+  if (/^[a-zA-Z0-9_-][a-zA-Z0-9._-]{0,199}$/.test(branch)) return branch
+  const slug = branch
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^[.-]+/, '')
+    .slice(0, 180)
+  return (slug || 'branch') + '-' + createHash('sha256').update(branch).digest('hex').slice(0, 16)
 }
 const now = () => new Date().toISOString()
 const nodeActor = { kind: 'node' } as const
@@ -230,7 +238,9 @@ export class WorkspaceService {
       workspace.kind !== 'managed' ||
       !uuid.test(workspace.project_id) ||
       !uuid.test(workspace.workspace_id) ||
-      (workspace.path !== legacy && workspace.path !== join(root, worktreeName(workspace.branch!)))
+      (workspace.path !== legacy &&
+        workspace.path !== join(root, worktreeName(workspace.branch!)) &&
+        workspace.path !== join(root, legacyWorktreeName(workspace.branch!)))
     )
       throw new ChannelError('unmanaged_workspace')
     try {

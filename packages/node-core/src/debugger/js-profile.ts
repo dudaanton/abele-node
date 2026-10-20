@@ -17,6 +17,7 @@ export type JsLaunch = {
   program: string
   argv: string[]
   env: Record<string, string>
+  stop_on_entry?: boolean
   runtime_argv?: ('--test' | '--enable-source-maps' | '--test-concurrency=1')[]
 }
 export type JsAttach = { address: '127.0.0.1'; port: number; target_pid: number }
@@ -39,8 +40,9 @@ async function confined(root: string, path: string) {
   return physical
 }
 export async function validateJsLaunch(config: JsLaunch): Promise<JsLaunch> {
-  exact(config, ['cwd', 'executable', 'program', 'argv', 'env', 'runtime_argv'])
+  exact(config, ['cwd', 'executable', 'program', 'argv', 'env', 'runtime_argv', 'stop_on_entry'])
   if (
+    (config.stop_on_entry !== undefined && typeof config.stop_on_entry !== 'boolean') ||
     typeof config.cwd !== 'string' ||
     typeof config.executable !== 'string' ||
     !isAbsolute(config.cwd) ||
@@ -157,8 +159,18 @@ export class JsDebugProfile {
       ['--inspect-brk=127.0.0.1:0', ...(config.runtime_argv ?? []), config.program, ...config.argv],
       { cwd: config.cwd, env: config.env }
     )
+    let programSession: DapSession | undefined
     owner.on('close', (diagnostics) => {
       debuggerLog('Program exited', () => ({ target: target.target_id, ...diagnostics }))
+      try {
+        if (Number.isSafeInteger(diagnostics.exit_code))
+          programSession?.recordExit(diagnostics.exit_code)
+      } catch (error) {
+        debuggerLog('Program exit could not be recorded', () => ({
+          target: target.target_id,
+          reason: error instanceof Error ? error.message : 'unknown',
+        }))
+      }
     })
     try {
       const match = await owner.waitForText(/ws:\/\/127\.0\.0\.1:(\d+)\/[^\s]+/)
@@ -187,6 +199,7 @@ export class JsDebugProfile {
         )
         try {
           const session = await run.program()
+          programSession = session
           await new Promise<void>((resolve, reject) => {
             const timer = setTimeout(
               () => finish(new Error('debugger_startup_handoff_timeout')),
@@ -207,6 +220,12 @@ export class JsDebugProfile {
             offClose = session.dap.onClose(() => finish(new Error('debugger_startup_handoff_lost')))
             if (session.snapshot.threads.some((t) => t.status === 'stopped')) finish()
           })
+          session.markEntryPause()
+          if (config.stop_on_entry === false) {
+            releaseStartup()
+            if (!session.snapshot.selected_thread_id) await session.threads()
+            await session.continue(session.snapshot.selected_thread_id!)
+          }
           return run
         } catch (error) {
           await run.close().catch(() => {})

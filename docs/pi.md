@@ -1,5 +1,14 @@
 # Pi SDK provider
 
+`pi_dependency_diagnostics.status === 'supported'` advertises normalization of explicit
+missing-dependency diagnostics from `session_start` extension hooks. A durable session receives
+one plain `missing_dependencies` warning, even across turns and node restarts: install the
+worktree's dependencies before running builds or tests. The diagnostic retains the original
+extension, hook and error data in the journal. Duplicate raw diagnostics are marked as mapped
+so replay does not recreate notices. Arbitrary extension failures, missing files within an
+installed package, and failures from other hooks remain errors. An extension merely named
+`node_modules` is not enough to classify an error as dependency absence.
+
 AbeleNode includes a supervised pi SDK provider alongside Claude Code and the
 non-executing fake provider. It uses the same sessions, journal, durable input
 queue, approval service and authenticated client API. There is no separate pi

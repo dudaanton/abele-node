@@ -116,6 +116,7 @@ export async function serveChannel(
     watches.delete(stream)
   }
   const connection = new AbortController()
+  let selfDisconnectReply: string | undefined
   const timerRequests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
     receive: () => transport.receive(),
@@ -123,8 +124,18 @@ export async function serveChannel(
     send: async (bytes) => {
       // Authority may change while a previous record is in flight. Fence the
       // actual publication boundary, including already queued responses/events.
-      if (actor) core.authority.check(actor, 'publish')
+      const frame = selfDisconnectReply === undefined ? undefined : FrameCodec.decode(bytes)
+      const acknowledgement =
+        frame?.kind === 'response' &&
+        frame.request_id === selfDisconnectReply &&
+        !frame.error &&
+        JSON.stringify(frame.result) === '{"disconnected":true}'
+      if (actor && !acknowledgement) core.authority.check(actor, 'publish')
       await transport.send(bytes)
+      if (acknowledgement) {
+        selfDisconnectReply = undefined
+        await close('device_disconnected')
+      }
     },
   })
   const send = (frame: unknown, priority = 0, authorize?: () => void) =>
@@ -273,6 +284,11 @@ export async function serveChannel(
             ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
             result,
           }
+          if (
+            frame.method === 'node.disconnect' &&
+            (result as { disconnected?: unknown })?.disconnected === true
+          )
+            selfDisconnectReply = frame.request_id
         } catch (error) {
           // Internal/storage failures can occur after commit. Do not manufacture a
           // terminal rejection: disconnect so the durable outbox retries its receipt.

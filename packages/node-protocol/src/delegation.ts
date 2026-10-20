@@ -125,7 +125,8 @@ export type DelegationGrantRequest = z.input<typeof DelegationGrantRequestSchema
 // Fake scripts are added by schemas.ts, to keep the reporter/grant contracts independent.
 export const DelegationCreateSchema = z
   .object({
-    grant_id: Id,
+    grant_id: Id.optional(),
+    parent_id: Id.optional(),
     delegation_key: Id,
     project_id: Id.optional(),
     base_ref: z.string().min(1).max(256).default('HEAD'),

@@ -8,11 +8,31 @@ normal node session. The node owns the workspace, queue, transcript, human
 prompts and a separate durable mailbox. Disconnecting the parent does not stop
 the child. This is not a scheduler, a task board or a filesystem sandbox.
 
-## Owner approval and the trusted controller
+## Installation authority and the trusted controller
 
-An owner must explicitly approve a `DelegationGrant` through an owner UI before
-exposing delegation tools to a model. Current enrolled installations have owner
-authority; enrollment alone does **not** create a delegation grant.
+Discovery advertises `capabilities.delegation_without_grant.status: "supported"`.
+When present, local and paired owner installations can omit `grant_id` from
+`delegation.create` and supply `parent_id`, a stable opaque chat identifier.
+The plugin selects projects from the chat's owner-configured node scope. The node
+applies the installation's ordinary authority, trusted-folder rules, provider
+availability and workspace confinement. Current installations have owner authority;
+the plugin enforces chat scope. No separate grant approval is needed.
+
+Defaults are all delegation actions (`create`, `send`, `status`, `cancel`, `read`)
+and ordinary session providers (`claude`, `pi`, `codex`, plus non-executing `fake`
+fixtures with `allow_fake: true`, as for ordinary fake sessions). Real providers
+must be available and require a trusted project. The node automatically stores a
+binding for the requested project, calling installation and parent using existing
+grant storage. The returned `grant_id` identifies this internal binding; plugins
+need not supply or store it. Exact installation authority is retained, including
+the paired device key. Revocation or replacement fences retries, mailbox access
+and execution and cancels active children. Other installations cannot drive or
+read the child's mailbox. Permission prompts still require the owner.
+
+The following explicit grant flow remains supported unchanged for older clients:
+
+For legacy clients using explicit grants, an owner approves a `DelegationGrant`
+through an owner UI before exposing delegation tools to a model.
 
 `approveDelegationGrant` and `revokeDelegationGrant` are **owner actions, not model
 tools**. A grant binds a controller installation, an opaque stable `parent_id`,
@@ -28,8 +48,8 @@ usable only for installations with no paired-device history; ambiguous paired
 grants require a new explicit owner approval.
 Revocation cancels active delegations and prevents subsequent controller access.
 
-Credentials stay in the connection/secret adapter. The trusted controller selects
-the approved grant and adds `grant_id` to requests; the model receives task and
+Credentials stay in the connection/secret adapter. In the legacy flow, the trusted
+controller selects the approved grant and adds `grant_id` to requests; the model receives task and
 child references, not credentials or owner APIs. Grants restrict the delegation
 API, not the installation's other owner APIs. Do not expose generic requests,
 ordinary session control, grant approval or credential storage as model tools.
@@ -50,16 +70,10 @@ and lets the agent continue with another approach.
 ## Client API for a plugin integration
 
 ```ts
-// Owner UI only; persist the grant selection in installation-local controller storage.
-const grant = await client.approveDelegationGrant({
-  parent_id: parentChatId,
-  project_ids: [projectId],
-  providers: ['claude', 'pi'],
-})
-
-// Model-facing create tool: the trusted controller supplies grant_id and a stable key.
+// Check delegation_without_grant before omitting grant_id.
+// The trusted controller supplies the parent and selects an allowed project.
 const child = await client.createDelegation({
-  grant_id: grant.grant_id,
+  parent_id: parentChatId,
   delegation_key: stableTaskKey,
   project_id: projectId,
   provider: 'pi', // or 'claude'
@@ -180,7 +194,7 @@ and run/report deduplication. Mailboxes reuse the existing event/stream journal;
 no new transcript or credential store exists. Preserve node state and
 provider-native resume state with the normal backup process. Complete child
 history remains available via normal session streams and authorized artifacts.
-The plugin should store parent/task keys, grant selection and mailbox cursors in
+The plugin should store parent/task keys, optional legacy grant selection and mailbox cursors in
 its installation-local transactional store, not vault Markdown or transferable
 settings. No vault storage changes are needed on the node side.
 

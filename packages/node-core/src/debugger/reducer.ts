@@ -125,6 +125,14 @@ export function reduceDebugger(
       }
       executionChanged()
       break
+    case 'stop_details': {
+      const stopped = state.threads.find((t) => t.thread_id === event.thread_id)
+      if (event.stop_epoch === state.stop_epoch && stopped?.status === 'stopped' && stopped.stop) {
+        stopped.stop.description = event.description
+        if (event.reason !== undefined) stopped.stop.reason = event.reason
+      }
+      break
+    }
     case 'stopped': {
       state.lifecycle = 'active'
       if (event.thread_id === undefined && !event.all_threads_stopped) unknown()
@@ -177,6 +185,8 @@ export function reduceDebugger(
       inventoryChanged()
       unknown()
       executionChanged()
+      break
+    case 'exited':
       break
     case 'lifecycle':
       state.lifecycle = event.lifecycle

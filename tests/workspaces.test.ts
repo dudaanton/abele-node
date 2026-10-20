@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   chmodSync,
   cpSync,
@@ -72,7 +73,19 @@ it('places branch-named worktrees beside the repository by default', async () =>
   const workspace = (await s.request('workspace.get', {
     workspace_id: created.workspace_id,
   })) as any
-  expect(workspace.path).toBe(join(s.dir, 'repo with spaces.worktrees', 'feature%2Ffiles'))
+  const suffix = createHash('sha256').update('feature/files').digest('hex').slice(0, 16)
+  expect(workspace.path).toBe(join(s.dir, 'repo with spaces.worktrees', 'feature-files-' + suffix))
+  expect(
+    await s.request('workspace.status', { workspace_id: workspace.workspace_id })
+  ).toBeDefined()
+  // Existing node-created folders remain managed after upgrading the naming policy.
+  const legacyPath = join(s.dir, 'repo with spaces.worktrees', 'feature%2Ffiles')
+  git(s.repo, 'worktree', 'move', workspace.path, legacyPath)
+  workspace.path = legacyPath
+  s.core.resources.workspaces.save(workspace)
+  expect(
+    await s.request('workspace.status', { workspace_id: workspace.workspace_id })
+  ).toBeDefined()
 })
 it.each([false, true])('Open preserves a trusted plain folder (removed=%s)', async (removed) => {
   const s = setup()

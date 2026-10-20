@@ -586,7 +586,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     return this.db.prepare('SELECT installation_id,label,revoked FROM installations').all()
   }
   revokeToken(id: string) {
-    this.db.prepare('UPDATE installations SET revoked=1 WHERE installation_id=?').run(id)
+    this.transaction(() => {
+      this.db.prepare('UPDATE installations SET revoked=1 WHERE installation_id=?').run(id)
+      this.db.prepare("UPDATE paired_devices SET state='revoked' WHERE installation_id=?").run(id)
+      this.authority.invalidatePairedGrants(id)
+    })
     this.debuggerControl.notifyPermissions()
     this.resources.repository.revoked(id)
     this.manager.notifyPermissions()
@@ -713,6 +717,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.claude.capabilities('codex'),
       ],
       capabilities: {
+        device_disconnect: {
+          status: 'supported' as const,
+          evidence: 'authenticated-self-revocation',
+        },
+        pi_dependency_diagnostics: {
+          status: 'supported' as const,
+          evidence: 'explicit-startup-dependency-warning-once-per-session',
+        },
         ...this.provider.capabilities().capabilities,
         ...this.debugger.capabilities(),
         ...(this.debugger.enabled
@@ -738,6 +750,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         expected_target: {
           status: 'supported',
           evidence: 'atomic-target-admission: session.send; delegation.send; review.submit',
+        },
+        delegation_without_grant: {
+          status: 'supported',
+          evidence: 'installation-authority; parent_id-required; retained-controller-binding',
         },
         'session.rename': {
           status: 'supported',
@@ -786,6 +802,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
             'workspace.watch changes cursor; workspace.files_changed numbered plain folder batches; explicit incomplete',
         },
         node_path_v2: {
+          empty_directories: true,
           status: 'supported',
           evidence:
             'exact-folders; owner-picker; durable-init; observed-status; divergence; watch-selection',
@@ -929,6 +946,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   /** Recheck the exact resource of a successful response at the actual transport boundary. */
   checkPublication(actor: AuthorityContext, method: string, raw: unknown, result?: unknown) {
+    // The sole response allowed after self-revocation contains no protected data.
+    if (
+      method === 'node.disconnect' &&
+      (result as { disconnected?: unknown } | undefined)?.disconnected === true
+    )
+      return
     this.authority.check(actor, 'publish')
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.checkRpcPublication(actor, method, raw, result)
@@ -1046,6 +1069,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   private query(actor: AuthorityContext, method: string, p: Record<string, unknown>): unknown {
     this.authority.check(actor, 'discover', String(p.session_id ?? p.stream_id ?? ''))
     switch (method) {
+      case 'node.disconnect':
+        this.revokeToken(actor.installation_id)
+        return { disconnected: true }
       case 'node.describe':
         return {
           node_id: this.node_id,

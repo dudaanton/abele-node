@@ -31,6 +31,15 @@ export const DEBUGGER_V1_CAPABILITY = Object.freeze({
   status: 'supported' as const,
   breakpoint_hit_condition: true,
   breakpoint_enabled: true,
+  launch_stop_on_entry: true,
+  exit_code: true,
+  stop_exception_text: true,
+  frame_source_paths: true,
+  attach_breakpoint_restore: true,
+  step_stop_reason: true,
+  session_started_at: true,
+  breakpoint_locations: true,
+  source_breakable_lines: true,
   evidence:
     'debugger.v1-contracts; bounded-state-and-history; bounded-dap; js-profile-pinned; authorized-shared-control',
 })
@@ -101,6 +110,16 @@ export type DebuggerBreakpointRequest = z.infer<typeof DebuggerBreakpointRequest
 
 /** Internal normalized driver seam, not a public DAP request API. */
 export const DebuggerObservationSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('stop_details'),
+      thread_id: threadId,
+      stop_epoch: seq,
+      description: z.string().max(4096),
+      reason: z.string().min(1).max(256).optional(),
+    })
+    .strict(),
+  z.object({ kind: z.literal('exited'), exit_code: z.number().int().safe() }).strict(),
   z
     .object({
       kind: z.literal('build_identity'),
@@ -243,6 +262,48 @@ export const DebuggerSnapshotSchema = z
   })
   .strict()
 export type DebuggerSnapshot = z.infer<typeof DebuggerSnapshotSchema>
+export const DebuggerExitInfoResultSchema = z
+  .object({ exit_code: z.number().int().safe().nullable() })
+  .strict()
+export const DebuggerSessionInfoResultSchema = z
+  .object({ started_at: z.string().datetime().nullable() })
+  .strict()
+export const DebuggerLocationsResultSchema = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            line,
+            column: line.optional(),
+            end_line: line.optional(),
+            end_column: line.optional(),
+          })
+          .strict()
+      )
+      .max(256),
+    truncated: z.boolean(),
+    snapshot: DebuggerSnapshotSchema,
+  })
+  .strict()
+export const DebuggerSourceStatusResultSchema = DebuggerLocationsResultSchema.extend({
+  loaded: z.boolean().nullable(),
+  known: z.boolean(),
+}).strict()
+export const DebuggerLocationsInspectionSchema = z
+  .object({
+    data: DebuggerLocationsResultSchema,
+    truncated: z.boolean(),
+    snapshot: DebuggerSnapshotSchema,
+  })
+  .strict()
+export const DebuggerSourceStatusInspectionSchema = z
+  .object({
+    data: DebuggerSourceStatusResultSchema,
+    truncated: z.boolean(),
+    snapshot: DebuggerSnapshotSchema,
+  })
+  .strict()
 export const DebuggerCursorSchema = z
   .object({ ...session, incarnation: id, event_seq: seq })
   .strict()
@@ -393,6 +454,23 @@ export const DebuggerVariablesResultSchema = z
 export type DebuggerVariablesResult = z.infer<typeof DebuggerVariablesResultSchema>
 
 export const DebuggerMethodSchemas = {
+  'debugger.v1.sessionInfo': z.object(session).strict(),
+  'debugger.v1.breakpointLocations': z
+    .object({
+      ...session,
+      source_id: id,
+      line,
+      end_line: line,
+      column: line.optional(),
+      end_column: line.optional(),
+    })
+    .strict()
+    .refine((p) => p.end_line >= p.line && p.end_line - p.line <= 1000, 'invalid line range'),
+  'debugger.v1.sourceStatus': z
+    .object({ ...session, source_id: id, line, end_line: line })
+    .strict()
+    .refine((p) => p.end_line >= p.line && p.end_line - p.line <= 1000, 'invalid line range'),
+  'debugger.v1.exitInfo': z.object(session).strict(),
   'debugger.v1.profiles': z.object({}).strict(),
   'debugger.v1.sessions': z
     .object({ ...DebuggerOwnerShape, limit: z.number().int().min(1).max(128).default(128) })

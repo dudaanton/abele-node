@@ -4,6 +4,7 @@ import { statSync } from 'node:fs'
 import { readdir, readFile, readlink } from 'node:fs/promises'
 import { basename, isAbsolute, resolve } from 'node:path'
 import { ownedDebugPids } from './process.js'
+import { inspectorProbeToken } from '../trace/program-http.js'
 
 /** A Node.js program on this machine whose inspector listens on loopback: what attach takes. */
 export type InspectorProgram = {
@@ -66,8 +67,14 @@ type Listening = {
   joined?: boolean
 }
 
-async function darwinListening(): Promise<Listening[]> {
-  const out = await run('/usr/sbin/lsof', ['-nP', '-a', '-iTCP@127.0.0.1', '-sTCP:LISTEN', '-Fpcn'])
+async function darwinListening(wildcard = false): Promise<Listening[]> {
+  const out = await run('/usr/sbin/lsof', [
+    '-nP',
+    '-a',
+    wildcard ? '-iTCP' : '-iTCP@127.0.0.1',
+    '-sTCP:LISTEN',
+    '-Fpcn',
+  ])
   const found = new Map<number, Set<number>>()
   let pid = 0,
     node = false
@@ -76,7 +83,11 @@ async function darwinListening(): Promise<Listening[]> {
     if (line[0] === 'p') pid = Number(value)
     else if (line[0] === 'c') node = NODE_NAME.test(value)
     else if (line[0] === 'n' && node && pid > 0) {
-      const port = Number(/^127\.0\.0\.1:(\d+)$/.exec(value)?.[1])
+      const port = Number(
+        (wildcard ? /^(?:127\.0\.0\.1|\*|\[::1\]|\[::\]):(\d+)$/ : /^127\.0\.0\.1:(\d+)$/).exec(
+          value
+        )?.[1]
+      )
       if (port) found.set(pid, (found.get(pid) ?? new Set()).add(port))
     }
   }
@@ -101,14 +112,28 @@ async function darwinListening(): Promise<Listening[]> {
   )
 }
 
-async function linuxListening(): Promise<Listening[]> {
+async function linuxListening(wildcard = false): Promise<Listening[]> {
   const ports = new Map<string, number>()
-  const table = await readFile('/proc/net/tcp', 'utf8').catch(() => '')
+  const table =
+    (await readFile('/proc/net/tcp', 'utf8').catch(() => '')) +
+    (wildcard ? '\n' + (await readFile('/proc/net/tcp6', 'utf8').catch(() => '')) : '')
   for (const line of table.split('\n').slice(1)) {
     const f = line.trim().split(/\s+/)
     // Local address 127.0.0.1 is 0100007F as the kernel prints it; 0A is LISTEN.
     const [address, port] = (f[1] ?? '').split(':')
-    if (address === '0100007F' && f[3] === '0A' && port && f[9]) ports.set(f[9], parseInt(port, 16))
+    if (
+      (address === '0100007F' ||
+        (wildcard &&
+          [
+            '00000000',
+            '00000000000000000000000000000000',
+            '00000000000000000000000001000000',
+          ].includes(address ?? ''))) &&
+      f[3] === '0A' &&
+      port &&
+      f[9]
+    )
+      ports.set(f[9], parseInt(port, 16))
   }
   if (!ports.size) return []
   const result: Listening[] = []
@@ -174,7 +199,16 @@ export async function processStartedAt(pid: number): Promise<number | null> {
 export function isInspector(port: number, timeout = 1000): Promise<boolean> {
   return new Promise((done) => {
     const req = request(
-      { host: '127.0.0.1', port, path: '/json/version', timeout, headers: { host: 'localhost' } },
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/json/version',
+        timeout,
+        headers: {
+          host: 'localhost',
+          'x-abele-inspector-probe': inspectorProbeToken,
+        },
+      },
       (res) => {
         let body = ''
         res.setEncoding('utf8')
@@ -274,4 +308,14 @@ export async function inspectorPrograms(): Promise<InspectorProgram[]> {
       script: scriptOf(p.argv, p.cwd, p.joined ? isFile : undefined),
     }))
   return programs.sort((a, b) => a.pid - b.pid || a.port - b.port)
+}
+/** OS listener ownership only. Never sends application requests or inspector probes. */
+export async function applicationListeners(): Promise<{ pid: number; ports: number[] }[]> {
+  const rows =
+    process.platform === 'darwin'
+      ? await darwinListening(true)
+      : process.platform === 'linux'
+        ? await linuxListening(true)
+        : []
+  return rows.map((row) => ({ pid: row.pid, ports: [...row.ports] }))
 }

@@ -315,6 +315,15 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
           code: type === 'pi.extension.warning' ? 'extension_warning' : 'extension_error',
         },
       ]
+    case 'pi.dependencies.warning':
+      return [
+        {
+          kind: 'notice',
+          level: 'warning',
+          code: 'missing_dependencies',
+          text: 'This worktree has no installed dependencies. Install them before running builds or tests.',
+        },
+      ]
   }
   return []
 }

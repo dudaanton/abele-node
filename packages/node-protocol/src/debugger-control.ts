@@ -104,6 +104,7 @@ export const DebuggerStartSchema = z
     ...DebuggerOwnerShape,
     program: relativePath,
     npm_script: z.string().min(1).max(256).optional(),
+    stop_on_entry: z.boolean().optional(),
     argv: z.array(z.string().max(8192)).max(256).default([]),
     sources: z.array(relativePath).max(255).default([]),
   })
@@ -213,6 +214,10 @@ export const DebuggerControlMethodSchemas = {
   'debugger.v1.restart': z.object({ operation_id: id, debug_session_id: id }).strict(),
   'debugger.v1.sessions': DebuggerMethodSchemas['debugger.v1.sessions'],
   'debugger.v1.status': DebuggerMethodSchemas['debugger.v1.status'],
+  'debugger.v1.exitInfo': DebuggerMethodSchemas['debugger.v1.exitInfo'],
+  'debugger.v1.sessionInfo': DebuggerMethodSchemas['debugger.v1.sessionInfo'],
+  'debugger.v1.breakpointLocations': DebuggerMethodSchemas['debugger.v1.breakpointLocations'],
+  'debugger.v1.sourceStatus': DebuggerMethodSchemas['debugger.v1.sourceStatus'],
   'debugger.v1.commandResult': DebuggerMethodSchemas['debugger.v1.commandResult'],
   'debugger.v1.history': DebuggerMethodSchemas['debugger.v1.history'],
   'debugger.v1.replay': DebuggerMethodSchemas['debugger.v1.replay'],

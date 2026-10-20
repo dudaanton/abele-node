@@ -96,10 +96,11 @@ interface Live {
   queue: Promise<void>
   off: () => void
   /** Requests out now, sent into this run: what the points take meanwhile stands under them. */
-  chains: Map<string, { steps: number }>
+  chains: Map<string, { steps: number; request?: { method: string; url: string } }>
   httpOff?: () => void
   httpPoll?: () => void
   http: ProgramHttpEvent[]
+  httpSteps: Map<string, string>
   configuration: number
 }
 
@@ -153,6 +154,7 @@ export class TraceRecorder {
       off: () => {},
       chains: new Map(),
       http: [],
+      httpSteps: new Map(),
       configuration: 0,
     }
     this.live.set(session.id, l)
@@ -180,7 +182,7 @@ export class TraceRecorder {
     const writer = l?.writer
     if (!l || !writer) return undefined
     const id = `h${randomBytes(6).toString('hex')}`
-    const entry = { steps: 0 }
+    const entry = { steps: 0, request }
     l.chains.set(id, entry)
     const at = this.now() - writer.startedAt
     let closed = false
@@ -221,6 +223,9 @@ export class TraceRecorder {
           )
             return undefined
           confirmed = true
+          const exact = matches.filter((e) => e.request_headers['x-abele-step'] === id)
+          if (exact.length === 1 && l.httpSteps.has(exact[0]!.id))
+            return l.httpSteps.get(exact[0]!.id)
         }
         return writer.append({
           kind: 'http',
@@ -326,6 +331,7 @@ export class TraceRecorder {
     l.httpOff = undefined
     l.httpPoll = undefined
     l.http = []
+    l.httpSteps.clear()
     l.chains.clear()
     if (writer)
       l.queue = l.queue
@@ -347,13 +353,18 @@ export class TraceRecorder {
           l.http.push(e)
           if (l.http.length > 256) l.http.shift()
           const url = new URL(e.url)
-          writer.append({
+          const correlation = e.request_headers['x-abele-step']
+          const pending =
+            typeof correlation === 'string' ? l.chains.get(correlation)?.request : undefined
+          const sent = e.direction === 'incoming' && pending?.method === e.method
+          const recorded = writer.append({
             kind: 'http',
             at: e.started - writer.startedAt,
             label: `${e.method} ${url.pathname}${url.search}`,
             host: url.host,
             ...(e.status !== undefined ? { status: e.status } : {}),
-            chain: e.id,
+            chain: sent ? correlation! : e.id,
+            ...(sent ? { sent: true } : {}),
             direction: e.direction,
             duration_ms: Math.max(0, e.ended - e.started),
             values: [
@@ -381,6 +392,8 @@ export class TraceRecorder {
               ),
             ],
           })
+          l.httpSteps.set(e.id, recorded.id)
+          if (l.httpSteps.size > 256) l.httpSteps.delete(l.httpSteps.keys().next().value!)
         }
       }
     }

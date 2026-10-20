@@ -72,6 +72,12 @@ export class DebuggerService {
     private readonly core: NodeCore,
     readonly enabled = false
   ) {
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS debug_exit_codes(debug_session_id TEXT PRIMARY KEY, exit_code INTEGER NOT NULL)'
+    )
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS debug_session_times(debug_session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL)'
+    )
     this.historyStore = new DebuggerHistoryStore(core)
     this.recover()
   }
@@ -121,11 +127,14 @@ export class DebuggerService {
       pending_approvals: [],
       pending_commands: [],
     })
-    this.core.transaction(() =>
+    this.core.transaction(() => {
+      this.core.db
+        .prepare('INSERT INTO debug_session_times VALUES(?,?)')
+        .run(snapshot.debug_session_id, snapshot.observed_at)
       this.core.db
         .prepare('INSERT INTO debug_sessions(debug_session_id,body) VALUES(?,?)')
         .run(snapshot.debug_session_id, JSON.stringify(snapshot))
-    )
+    })
     return snapshot
   }
   snapshot(session: string): { snapshot: DebuggerSnapshot; cursor: DebuggerCursor } {
@@ -139,6 +148,22 @@ export class DebuggerService {
       },
     }
   }
+  exitInfo(session: string): { exit_code: number | null } {
+    this.requireEnabled()
+    this.load(session)
+    const row = this.core.db
+      .prepare('SELECT exit_code FROM debug_exit_codes WHERE debug_session_id=?')
+      .get(session) as { exit_code: number } | undefined
+    return { exit_code: row?.exit_code ?? null }
+  }
+  sessionInfo(session: string): { started_at: string | null } {
+    this.requireEnabled()
+    this.load(session)
+    const row = this.core.db
+      .prepare('SELECT started_at FROM debug_session_times WHERE debug_session_id=?')
+      .get(session) as { started_at: string } | undefined
+    return { started_at: row?.started_at ?? null }
+  }
   observe(
     session: string,
     incarnation: string,
@@ -147,7 +172,10 @@ export class DebuggerService {
     this.requireEnabled()
     const previous = this.load(session)
     if (previous.incarnation !== incarnation) throw new DebuggerStateError('stale_state', previous)
-    if (['terminated', 'detached', 'failed', 'connection-lost'].includes(previous.lifecycle))
+    if (
+      observation.kind !== 'exited' &&
+      ['terminated', 'detached', 'failed', 'connection-lost'].includes(previous.lifecycle)
+    )
       throw new ChannelError('session_not_live')
     // Lifecycle/target replacement/recovery/intent are node-owned signals, not
     // arbitrary public requests. Only trusted internal drivers call this seam.
@@ -190,6 +218,14 @@ export class DebuggerService {
       truncated: payload.truncated,
     })
     this.core.transaction(() => {
+      if (observation.kind === 'exited')
+        this.core.db
+          .prepare('INSERT OR REPLACE INTO debug_exit_codes VALUES(?,?)')
+          .run(state.debug_session_id, observation.exit_code)
+      if (observation.kind === 'target_replaced')
+        this.core.db
+          .prepare('DELETE FROM debug_exit_codes WHERE debug_session_id=?')
+          .run(state.debug_session_id)
       this.core.db
         .prepare('UPDATE debug_sessions SET body=? WHERE debug_session_id=?')
         .run(JSON.stringify(state), state.debug_session_id)

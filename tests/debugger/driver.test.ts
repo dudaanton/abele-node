@@ -61,6 +61,214 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('reports source uncertainty instead of inventing executable lines when the adapter cannot tell', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      expect(await f.session.sourceStatus('source', 1, 10)).toMatchObject({
+        loaded: null,
+        known: false,
+        items: [],
+      })
+      await expect(f.session.sourceStatus('unknown', 1, 10)).rejects.toThrow('unknown_source')
+      await expect(f.session.breakpointLocations('source', 1, 10)).rejects.toThrow(
+        'unsupported_operation'
+      )
+    }))
+  it('reports adapter-confirmed loaded state and inline breakpoint locations', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.w.send({
+        type: 'event',
+        event: 'capabilities',
+        body: {
+          capabilities: {
+            supportsLoadedSourcesRequest: true,
+            supportsBreakpointLocationsRequest: true,
+          },
+        },
+      })
+      const pending = f.session.sourceStatus('source', 1, 10)
+      expect(f.w.messages.at(-1).command).toBe('loadedSources')
+      f.w.reply(f.w.messages.at(-1), { sources: [{ path: f.path }] })
+      await new Promise((r) => setImmediate(r))
+      expect(f.w.messages.at(-1).command).toBe('breakpointLocations')
+      f.w.reply(f.w.messages.at(-1), {
+        breakpoints: [
+          { line: 2, column: 4 },
+          { line: 2, column: 18 },
+        ],
+      })
+      expect(await pending).toMatchObject({
+        loaded: true,
+        known: true,
+        items: [
+          { line: 2, column: 4 },
+          { line: 2, column: 18 },
+        ],
+      })
+      const unloaded = f.session.sourceStatus('source', 1, 10)
+      f.w.reply(f.w.messages.at(-1), { sources: [] })
+      expect(await unloaded).toMatchObject({ loaded: false, known: true, items: [] })
+    }))
+  it('publishes a fresh step reason with its stop epoch without masking actual breakpoint hits', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const oldEpoch = f.session.snapshot.stop_epoch
+      const step = f.session.step(1, 'in')
+      f.w.reply(f.w.messages.at(-1))
+      stopped(f.w)
+      await step
+      expect(f.session.snapshot.stop_epoch).toBeGreaterThan(oldEpoch)
+      expect(f.session.snapshot.threads[0]?.stop?.reason).toBe('step')
+      expect(f.session.snapshot.threads[0]?.stop?.description).toBe('Paused after a step')
+      const next = f.session.step(1, 'over')
+      f.w.reply(f.w.messages.at(-1))
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: {
+          threadId: 1,
+          allThreadsStopped: true,
+          reason: 'breakpoint',
+          hitBreakpointIds: [123],
+        },
+      })
+      await next
+      expect(f.session.snapshot.threads[0]?.stop?.reason).toBe('breakpoint')
+      const runningStep = f.session.step(1, 'out')
+      f.w.reply(f.w.messages.at(-1))
+      await runningStep
+      const pause = f.session.pause(1)
+      f.w.reply(f.w.messages.at(-1))
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: {
+          threadId: 1,
+          allThreadsStopped: true,
+          reason: 'pause',
+        },
+      })
+      await pause
+      expect(f.session.snapshot.threads[0]?.stop?.reason).toBe('pause')
+    }))
+  it('fences source admission that finishes after the program continues', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      let release!: () => void
+      let started!: () => void
+      const admitted = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      f.session.resolveFrameSources = async () => {
+        started()
+        await new Promise<void>((resolve) => {
+          release = resolve
+        })
+        return new Map()
+      }
+      const pending = f.session.stack(1)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [{ id: 1, name: 'caller', source: { path: f.path }, line: 1, column: 1 }],
+      })
+      await admitted
+      f.w.send({
+        type: 'event',
+        event: 'continued',
+        body: { threadId: 1, allThreadsContinued: true },
+      })
+      release()
+      await expect(pending).rejects.toThrow('stale_state')
+    }))
+  it('reads exception details at the pause and ignores a reply after continue', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.w.send({
+        type: 'event',
+        event: 'capabilities',
+        body: {
+          capabilities: { supportsExceptionInfoRequest: true },
+        },
+      })
+      const pause = () =>
+        f.w.send({
+          type: 'event',
+          event: 'stopped',
+          body: {
+            threadId: 1,
+            allThreadsStopped: true,
+            reason: 'exception',
+          },
+        })
+      pause()
+      expect(f.w.messages.at(-1).command).toBe('exceptionInfo')
+      f.w.reply(f.w.messages.at(-1), {
+        exceptionId: 'Error',
+        details: {
+          typeName: 'AppError',
+          message: '404 Missing item',
+        },
+      })
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(f.session.snapshot.threads[0]?.stop?.description).toBe('AppError: 404 Missing item')
+      pause()
+      const request = f.w.messages.at(-1)
+      f.w.send({
+        type: 'event',
+        event: 'continued',
+        body: { threadId: 1, allThreadsContinued: true },
+      })
+      f.w.reply(request, { exceptionId: 'stale error' })
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(f.session.snapshot.threads[0]?.stop).toBeNull()
+      expect(f.session.snapshot.execution).toBe('running')
+    }))
+  it('resolves caller sources before returning a stack and keeps external frames unmapped', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.resolveFrameSources = async (paths) => {
+        expect(paths).toEqual([f.path, '/runtime/internal.js'])
+        return new Map([[f.path, { source_id: 'source', path: 'fixture.cjs' }]])
+      }
+      const pending = f.session.stack(1)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [
+          { id: 1, name: 'caller', source: { path: f.path }, line: 1, column: 1 },
+          { id: 2, name: 'runtime', source: { path: '/runtime/internal.js' }, line: 1, column: 1 },
+        ],
+      })
+      const page = await pending
+      expect(page.items[0]).toMatchObject({ source_id: 'source', relative_path: 'fixture.cjs' })
+      expect(page.items[1]).toMatchObject({ source_id: null })
+      expect(page.items[1]).not.toHaveProperty('relative_path')
+    }))
+  it('retains exception text and the reported exit code without claiming process ownership', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.markEntryPause()
+      expect(f.session.snapshot.threads[0]?.stop?.reason).toBe('entry')
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: {
+          threadId: 1,
+          allThreadsStopped: true,
+          reason: 'exception',
+          text: 'AppError: Missing item',
+        },
+      })
+      expect(f.session.snapshot.threads[0]?.stop?.description).toBe('AppError: Missing item')
+      f.w.send({ type: 'event', event: 'exited', body: { exitCode: 7 } })
+      expect(f.core.debugger.exitInfo(f.session.id)).toEqual({ exit_code: 7 })
+      expect(f.session.snapshot.lifecycle).toBe('active')
+      expect(f.session.snapshot).not.toHaveProperty('exit_code')
+      f.w.send({ type: 'event', event: 'terminated' })
+      expect(f.core.debugger.exitInfo(f.session.id)).toEqual({ exit_code: 7 })
+      expect(f.session.snapshot.lifecycle).toBe('terminated')
+      f.session.recordExit(0)
+      expect(f.core.debugger.exitInfo(f.session.id)).toEqual({ exit_code: 0 })
+      expect(f.session.snapshot.lifecycle).toBe('terminated')
+    }))
   it('retains confirmed ids for an unchanged source when adding a point in another source', async () =>
     fixture(async (f) => {
       await ready(f)

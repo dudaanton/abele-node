@@ -253,6 +253,7 @@ export const MethodSchemas = {
   ...ChatMethodSchemas,
   'session.detach': z.object(session).strict(),
   'node.describe': z.object({}).strict(),
+  'node.disconnect': z.object({}).strict(),
   'session.list': z
     .object({ after_id: id.optional(), limit: z.number().int().min(1).max(256).default(256) })
     .strict(),

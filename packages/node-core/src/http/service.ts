@@ -11,6 +11,7 @@ import {
   type HttpSendSummary,
 } from '@abele/node-protocol'
 import type { NodeCore } from '../index.js'
+import { applicationListeners } from '../debugger/programs.js'
 import type { TraceChain } from '../trace/recorder.js'
 import { masker, sendRequest, MASK } from './send.js'
 import { HttpStore, newSendId, type HttpSendRecord } from './store.js'
@@ -97,6 +98,8 @@ export class HttpService {
 
   private handle(method: HttpMethodNameV1, p: Record<string, any>): unknown {
     switch (method) {
+      case 'http.v1.destination':
+        return this.destination(p.project_id, p.url)
       case 'http.v1.list': {
         const store = this.store(p.project_id)
         return {
@@ -122,7 +125,7 @@ export class HttpService {
         this.store(p.project_id).deleteEnvironment(p.name)
         return { deleted: true }
       case 'http.v1.send':
-        return this.send(p)
+        return p.route_by_destination ? this.routeSend(p) : this.send(p)
       case 'http.v1.send.status':
         return this.status(p.project_id, p.send_id)
       case 'http.v1.history': {
@@ -263,6 +266,38 @@ export class HttpService {
         entry.endedAt = Date.now()
       })
     return { send_id: id, ...(chain ? { run_id: chain.runId } : {}) }
+  }
+  async destination(project: string, raw: string) {
+    this.root(project)
+    const url = new URL(raw)
+    if (!['http:', 'https:'].includes(url.protocol)) throw new ChannelError('invalid_params')
+    if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+      return { debug_session_id: null, candidates: [], reason: 'remote' as const }
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
+    const pids = (await applicationListeners())
+      .filter((row) => row.ports.includes(port))
+      .map((row) => row.pid)
+    const candidates = this.core.debugger.enabled
+      ? await this.core.debuggerLaunches.owningSessions(project, pids)
+      : []
+    if (candidates.length > 256) throw new ChannelError('http_destination_too_many_sessions')
+    return {
+      debug_session_id: candidates.length === 1 ? candidates[0]! : null,
+      candidates,
+      reason:
+        candidates.length === 1
+          ? ('owned' as const)
+          : candidates.length
+            ? ('ambiguous' as const)
+            : ('unobserved' as const),
+    }
+  }
+  private async routeSend(p: Record<string, any>) {
+    const owner = await this.destination(p.project_id, p.url)
+    if (!owner.debug_session_id) throw new ChannelError('http_destination_unobserved')
+    if (p.debug_session_id && p.debug_session_id !== owner.debug_session_id)
+      throw new ChannelError('http_recording_owner_mismatch')
+    return this.send({ ...p, debug_session_id: owner.debug_session_id })
   }
 
   private status(project: string, sendId: string) {

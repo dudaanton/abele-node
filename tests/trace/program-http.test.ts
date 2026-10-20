@@ -1,5 +1,5 @@
 import { createServer, request } from 'node:http'
-import { once } from 'node:events'
+import { once, EventEmitter } from 'node:events'
 import { afterEach, expect, it } from 'vitest'
 import {
   installProgramHttp,
@@ -14,6 +14,36 @@ import { Session } from 'node:inspector'
 
 let stop: (() => void) | undefined
 afterEach(() => stop?.())
+it('does not record marked loopback inspector discovery traffic', async () => {
+  const capture = installProgramHttp('fixture-token')
+  stop = capture.stop
+  const req = {
+    method: 'GET',
+    url: '/json/version',
+    headers: {
+      host: 'localhost',
+      'x-abele-inspector-probe': 'fixture-token',
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+  }
+  const res = Object.assign(new EventEmitter(), {
+    write() {},
+    end() {},
+    getHeaders() {
+      return {}
+    },
+    statusCode: 404,
+  })
+  channel('http.server.request.start').publish({ request: req, response: res })
+  channel('http.server.response.finish').publish({ request: req, response: res })
+  res.emit('finish')
+  expect(drainAll(capture)).toEqual([])
+  req.headers['x-abele-inspector-probe'] = 'wrong-token'
+  channel('http.server.request.start').publish({ request: req, response: res })
+  channel('http.server.response.finish').publish({ request: req, response: res })
+  res.emit('finish')
+  expect(drainAll(capture)).toHaveLength(1)
+})
 
 it('installs and drains the serialized hook over a real inspector channel', async () => {
   const session = new Session()

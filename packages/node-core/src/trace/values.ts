@@ -49,7 +49,7 @@ export function formatOf(text: string): TraceFormat {
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 
-export function briefOf(text: string, format: TraceFormat): string {
+export function briefOf(text: string, format: TraceFormat, scalars = false): string {
   if (format === 'number') return text.trim()
   if (format === 'xml') {
     for (const t of xmlTokens(text))
@@ -62,11 +62,22 @@ export function briefOf(text: string, format: TraceFormat): string {
       const v: unknown = JSON.parse(text)
       if (Array.isArray(v)) return `[${v.length} items]`
       if (v && typeof v === 'object') {
-        const keys = Object.entries(v as Record<string, unknown>).map(([k, x]) =>
-          Array.isArray(x) ? `${k}: ${x.length}` : k
+        const entries = Object.entries(v as Record<string, unknown>)
+        if (scalars)
+          entries.sort(
+            ([a], [b]) =>
+              Number(/^(type|kind|event|eventType|status)$/i.test(b)) -
+              Number(/^(type|kind|event|eventType|status)$/i.test(a))
+          )
+        const keys = entries.map(([k, x]) =>
+          Array.isArray(x)
+            ? `${k}: ${x.length}`
+            : scalars && (x === null || typeof x !== 'object')
+              ? `${clip(k.replace(/\s+/g, ' '), 24)}: ${clip(JSON.stringify(x), 40)}`
+              : k
         )
         const shown = keys.slice(0, 6).join(', ')
-        return clip(`{ ${shown}${keys.length > 6 ? ', …' : ''} }`, 60)
+        return clip(`{ ${shown}${keys.length > 6 ? ', …' : ''} }`, scalars ? 160 : 60)
       }
       return clip(JSON.stringify(v), 60)
     } catch {

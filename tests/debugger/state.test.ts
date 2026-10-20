@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { NodeCore } from '@abele/node-core'
 import { DEBUGGER_LIMITS } from '@abele/node-protocol'
 import { target, withCore } from './helpers.js'
@@ -20,6 +20,54 @@ const stopped = {
 }
 
 describe('debugger reducer, handles, replay and persistence', () => {
+  it('retains a creation timestamp separately from observed_at', () =>
+    withCore((core) => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        vi.setSystemTime(new Date('2030-01-01T00:00:00Z'))
+        const state = core.debugger.create(target)
+        expect(core.debugger.sessionInfo(state.debug_session_id)).toEqual({
+          started_at: state.observed_at,
+        })
+        vi.setSystemTime(new Date('2030-01-01T00:01:00Z'))
+        const changed = core.debugger.observe(state.debug_session_id, state.incarnation, {
+          kind: 'output',
+          text: 'later',
+          category: 'console',
+        })
+        expect(core.debugger.sessionInfo(state.debug_session_id)).toEqual({
+          started_at: state.observed_at,
+        })
+        expect(changed.observed_at).not.toBe(state.observed_at)
+      } finally {
+        vi.useRealTimers()
+      }
+    }, true))
+  it('retains exit information beyond replay rotation and node recovery without extending snapshots', () =>
+    withCore((core, dir) => {
+      const state = core.debugger.create(target)
+      expect(core.debugger.exitInfo(state.debug_session_id)).toEqual({ exit_code: null })
+      core.debugger.observe(state.debug_session_id, state.incarnation, {
+        kind: 'exited',
+        exit_code: 3,
+      })
+      for (let i = 0; i <= DEBUGGER_LIMITS.replay_events; i++)
+        core.debugger.observe(state.debug_session_id, state.incarnation, {
+          kind: 'output',
+          category: 'console',
+          text: 'output',
+        })
+      core.close()
+      const next = new NodeCore(dir, { debuggerEnabled: true })
+      try {
+        expect(next.debugger.exitInfo(state.debug_session_id)).toEqual({ exit_code: 3 })
+        expect(next.debugger.snapshot(state.debug_session_id).snapshot).not.toHaveProperty(
+          'exit_code'
+        )
+      } finally {
+        next.close()
+      }
+    }, true))
   it('tracks partial stops, execution revision and independent output sequence', () =>
     withCore((core) => {
       const service = core.debugger

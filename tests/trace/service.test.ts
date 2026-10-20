@@ -193,7 +193,7 @@ describe('recorded runs through the node', () => {
       expect(run.steps[0].values[0]).toMatchObject({
         name: 'result',
         format: 'json',
-        brief: '{ id, items: 3 }',
+        brief: '{ id: "C-100", items: 3 }',
       })
 
       const shape = s.request('trace.v1.value', {

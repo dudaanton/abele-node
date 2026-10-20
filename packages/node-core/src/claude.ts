@@ -17,6 +17,7 @@ import type {
   ProviderAction as PiAction,
 } from '@abele/provider-contract'
 import { canonical, type NodeCore } from './index.js'
+import { missingPiDependencies } from './pi-diagnostics.js'
 import type { ProviderAdapter } from './providers.js'
 import { updateInProgress, tryRunAdmission } from './update-lock.js'
 import { DebuggerRunBinding } from './debugger/run.js'
@@ -611,9 +612,24 @@ export class ProviderSessions {
   /** Inside a transaction. Large and raw records go to artifacts; the journal keeps a reference. */
   appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
     const provider = this.core.session(session_id).provider
+    const dependencies = provider === 'pi' && missingPiDependencies(event.type, event.data)
+    if (dependencies)
+      event = {
+        type: 'pi.dependencies.warning',
+        data: { ...event.data, diagnostic_id: 'missing_dependencies' },
+      }
     // Mapped from the whole record, before a large one is moved to an artifact.
     const turn_id = this.live.state(session_id).turn?.turn_id
     let updates = providerSessionUpdates(provider, event.type, { ...event.data, run_id })
+    if (
+      dependencies &&
+      this.core.db
+        .prepare(
+          "SELECT 1 FROM events WHERE stream_id=? AND json_extract(body,'$.type')='pi.dependencies.warning' LIMIT 1"
+        )
+        .get(session_id)
+    )
+      updates = []
     const rateLimit = provider === 'claude' && event.type === 'claude.rate_limit'
     // Read durable session state, rather than process/turn state. Keep every raw record,
     // including recovery to allowed, so a later warning is a new transition.
@@ -638,7 +654,7 @@ export class ProviderSessions {
       }
     }
     // Suppressed records must also be marked mapped, or clients replay them as notices.
-    const mapped = updates.length || rateLimit ? { mapped: true } : {}
+    const mapped = updates.length || rateLimit || dependencies ? { mapped: true } : {}
     let data: Record<string, unknown> = {
       ...event.data,
       ...(event.data.run_id !== undefined && event.data.run_id !== run_id

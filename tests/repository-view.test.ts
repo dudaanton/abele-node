@@ -44,6 +44,24 @@ async function setup() {
   const catalog = () => request('repository.v1.worktrees', { project_id: project.project_id })
   return { dir, repo, linked, core, actor, request, project, catalog }
 }
+it('lists nested empty directories without ignored directories or symlink traversal', async () => {
+  const s = await setup()
+  const worktree_id = (await s.catalog()).entries.find((e: any) => e.kind === 'root').worktree_id
+  mkdirSync(join(s.repo, 'empty/nested'), { recursive: true })
+  mkdirSync(join(s.repo, 'new'))
+  writeFileSync(join(s.repo, 'new/child.txt'), 'child')
+  mkdirSync(join(s.repo, 'ignored'), { recursive: true })
+  symlinkSync('empty', join(s.repo, 'alias'))
+  const { revision } = await s.request('repository.v1.observe', { worktree_id })
+  const root = await s.request('repository.v1.tree', { worktree_id, revision })
+  expect(root.entries).toContainEqual(expect.objectContaining({ path: 'empty', kind: 'directory' }))
+  expect(root.entries.filter((e: any) => e.path === 'new')).toHaveLength(1)
+  expect(root.entries.some((e: any) => e.path === 'ignored')).toBe(false)
+  const nested = await s.request('repository.v1.tree', { worktree_id, revision, path: 'empty' })
+  expect(nested.entries).toContainEqual(
+    expect.objectContaining({ path: 'empty/nested', kind: 'directory' })
+  )
+})
 afterEach(async () => {
   vi.restoreAllMocks()
   for (const core of cores.splice(0)) {
