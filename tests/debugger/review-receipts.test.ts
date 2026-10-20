@@ -30,7 +30,7 @@ it.each(['history', 'receipt'] as const)(
         operation_id: expect.any(String),
       })
       expect(result.operation_id.length).toBeGreaterThan(0)
-      const receipt = await binding.call('debug_commandResult', {
+      const receipt = await binding.call('debug_command_result', {
         debug_session_id: f.id,
         operation_id: result.operation_id,
       })

@@ -1,4 +1,13 @@
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import {
+  cpSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
@@ -323,6 +332,46 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       { breakpoint_id: 'bp', line: 1 },
     ])
     expect(closedSessions.has(running.debug_session_id)).toBe(true)
+    cpSync(new URL('../fixtures/debugger-outdir/', import.meta.url), join(dir, 'typed'), {
+      recursive: true,
+    })
+    execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', '-p', join(dir, 'typed')])
+    const typed = await request('debugger.v1.start', {
+      operation_id: 'typed-start',
+      folder,
+      program: 'typed/dist/bin/courier.js',
+      sources: ['typed/src/bin/courier.ts', 'typed/src/services/orders.ts'],
+    })
+    expect(typed.sources.map((s: any) => s.path)).toEqual([
+      'typed/dist/bin/courier.js',
+      'typed/src/bin/courier.ts',
+      'typed/src/services/orders.ts',
+    ])
+    const late = await request('debugger.v1.addSources', {
+      operation_id: 'typed-add',
+      debug_session_id: typed.debug_session_id,
+      sources: ['typed/src/services/late.ts'],
+    })
+    expect(late.refused).toEqual([])
+    expect(late.sources).toEqual([{ source_id: 's4', path: 'typed/src/services/late.ts' }])
+    discovery.mockResolvedValue([
+      {
+        pid: 123,
+        port: 9229,
+        command: 'node dist/bin/courier.js',
+        cwd: join(dir, 'typed'),
+        script: join(dir, 'typed/dist/bin/courier.js'),
+      },
+    ])
+    startedAt.mockResolvedValue(Date.now() + 10000)
+    const typedAttach = await request('debugger.v1.attachProgram', {
+      operation_id: 'typed-attach',
+      folder,
+      pid: 123,
+      port: 9229,
+      sources: ['typed/src/bin/courier.ts', 'typed/src/services/orders.ts'],
+    })
+    expect(typedAttach.sources).toEqual(typed.sources)
   } finally {
     discovery.mockRestore()
     startedAt.mockRestore()

@@ -27,9 +27,21 @@ function bridge() {
 }
 
 describe('trusted provider debugger bindings (no inference)', () => {
+  it('registers the full debugger tool set in pi and preserves call names', async () => {
+    const b = bridge()
+    b.tools = debuggerToolDefinitions
+    const registered: any[] = []
+    registerDebuggerTools({ registerTool: (tool: any) => registered.push(tool) }, b)
+    expect(registered.map((t) => t.name)).toEqual(debuggerToolDefinitions.map((t) => t.name))
+    for (const tool of registered) {
+      await tool.execute('call', {})
+      expect(b.call).toHaveBeenLastCalledWith(tool.name, {}, undefined)
+    }
+  })
   it('Claude lists and calls node debugger MCP tools during its single input invocation', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'debug-claude-'))
     const debuggerBridge = bridge()
+    debuggerBridge.tools = debuggerToolDefinitions
     const permission = vi.fn(async () => ({ choice: 'deny' as const, delivered: () => false }))
     const executable = join(cwd, 'fake-provider.mjs')
     copyFileSync(fileURLToPath(new URL('../fixtures/claude.mjs', import.meta.url)), executable)
@@ -48,7 +60,7 @@ describe('trusted provider debugger bindings (no inference)', () => {
       )
       expect(await run.done).toMatchObject({ result: { subtype: 'success' } })
       const output = JSON.parse(readFileSync(join(cwd, 'debugger-results.json'), 'utf8'))
-      expect(output.tools.map((t: any) => t.name)).toEqual(['debug_status'])
+      expect(output.tools).toEqual(debuggerToolDefinitions)
       expect(output.results.map((r: any) => r.snapshot.state_revision)).toEqual([1, 2])
       expect(debuggerBridge.call).toHaveBeenCalledTimes(2)
       expect(debuggerBridge.publish).toHaveBeenCalledTimes(2)

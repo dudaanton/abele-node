@@ -141,13 +141,7 @@ export class DebuggerLaunches {
         )
           throw new ChannelError('debugger_session_inactive')
         const next = new Map(context.sources)
-        const result = await admitSources(
-          context.root,
-          context.program,
-          next,
-          p.sources,
-          context.pid
-        )
+        const result = await admitSources(context.root, next, p.sources, context.pid)
         // Filesystem checks yield: recheck permission and lifetime before publishing any additions.
         await this.ownerFolder(recipe.params)
         const current = this.core.debugger.snapshot(p.debug_session_id).snapshot
@@ -320,7 +314,7 @@ export class DebuggerLaunches {
     if (!within(root, program)) throw new ChannelError('debugger_path_escape')
     const sources = new Map<string, string>([['s1', program]])
     for (const path of p.sources) this.inside(root, path)
-    await admitSources(root, program, sources, p.sources)
+    await admitSources(root, sources, p.sources)
     const target: DebuggerTarget = {
       ...place,
       target_id: randomUUID(),
@@ -330,7 +324,7 @@ export class DebuggerLaunches {
       process_ownership: 'owned',
       // Node runs a JavaScript file as it is on disk, so a line of it is the line that runs. Any
       // other source matches only through a source map of the build that is not older than it.
-      build_identity: (await unbuilt(program, [program])).size ? 'unknown' : 'matched',
+      build_identity: (await unbuilt(root, [program])).size ? 'unknown' : 'matched',
     }
     const run = await this.profile.launch(
       { cwd: root, executable: process.execPath, program, argv: p.argv, env: {} },
@@ -385,7 +379,6 @@ export class DebuggerLaunches {
     for (const path of p.sources) this.inside(root, path)
     await admitSources(
       root,
-      programPath,
       sources,
       [...(script && within(root, script) ? [relative(root, script)] : []), ...p.sources],
       program.pid
@@ -525,7 +518,6 @@ export class DebuggerLaunches {
  * owner are canonical folder-relative paths; symlink aliases share a source id. */
 async function admitSources(
   root: string,
-  program: string,
   admitted: Map<string, string>,
   asked: string[],
   pid?: number
@@ -559,7 +551,7 @@ async function admitSources(
       continue
     }
     let source_id = [...admitted].find(([, existing]) => existing === full)?.[0]
-    if (!source_id && (await unbuilt(program, [full])).size) {
+    if (!source_id && (await unbuilt(root, [full])).size) {
       refuse('debugger_source_no_map')
       continue
     }
@@ -591,9 +583,9 @@ async function loadedAsIs(pid: number, script: string | undefined) {
 const MAP_SCAN = { entries: 4096, depth: 8, bytes: 8 * 1024 * 1024 }
 
 /** The sources that are not proven to be what runs. JavaScript is, as it is on disk; anything else
- * only when a source map under the program's own folder lists it and carries its text or was
+ * only when a source map under the registered folder lists it and carries its text or was
  * written after it last changed. */
-async function unbuilt(program: string, sources: string[]) {
+async function unbuilt(root: string, sources: string[]) {
   const pending = new Set(sources.filter((path) => !/\.[cm]?js$/.test(path)))
   if (!pending.size) return pending
   let budget = MAP_SCAN.entries
@@ -636,6 +628,6 @@ async function unbuilt(program: string, sources: string[]) {
       // An unreadable map proves nothing.
     }
   }
-  await visit(dirname(program), 0)
+  await visit(root, 0)
   return pending
 }

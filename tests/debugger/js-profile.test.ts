@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { NodeCore } from '../../packages/node-core/src/index.js'
+import * as processes from '../../packages/node-core/src/debugger/process.js'
 import {
   JsDebugProfile,
   validateJsLaunch,
@@ -41,6 +42,37 @@ const archive = () =>
     'js-debug/src/dapDebugServer.js': '/* fake adapter */',
     'js-debug/LICENSE': 'MIT License\nCopyright fixture',
   })
+it('uses the registered folder as native attach cwd, including the workspace fallback', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'attach-cwd-'))
+  const core = new NodeCore(dir, { debuggerEnabled: true })
+  const profile = new JsDebugProfile(core.debugger, {
+    stateDirectory: dir,
+    enabled: true,
+    workspaceRoot: dir,
+  })
+  const open = vi.spyOn(profile as any, 'open').mockResolvedValue({})
+  const identity = vi.spyOn(processes, 'processStartIdentity').mockResolvedValue('fixture')
+  try {
+    await profile.attach(
+      { address: '127.0.0.1', port: 9229, target_pid: process.pid },
+      {} as any,
+      new Map(),
+      dir
+    )
+    expect(open.mock.calls[0]![0]).toMatchObject({ cwd: dir })
+    await profile.attach(
+      { address: '127.0.0.1', port: 9229, target_pid: process.pid },
+      {} as any,
+      new Map()
+    )
+    expect(open.mock.calls[1]![0]).toMatchObject({ cwd: dir })
+  } finally {
+    identity.mockRestore()
+    open.mockRestore()
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 const pin = (bytes: Buffer) => ({
   version: '0.0.0-fixture',
   sha256: createHash('sha256').update(bytes).digest('hex'),

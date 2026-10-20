@@ -235,6 +235,7 @@ export class JsDebugProfile {
       {
         type: 'pwa-node',
         address: config.address,
+        cwd: root ?? this.options.workspaceRoot,
         port: config.port,
         sourceMaps: true,
         restart: false,

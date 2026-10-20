@@ -92,6 +92,26 @@ it('lists directories with bounded owner handles, creates one child idempotently
     'stale_resource'
   )
 })
+it('lists directory links by resolved path and browses a link with a trailing slash', async () => {
+  const s = setup()
+  const destination = join(s.dir, 'destination')
+  mkdirSync(destination)
+  const link = join(s.folder, 'linked')
+  symlinkSync(destination, link)
+  const page = await s.request('filesystem.v1.directories', { path: s.folder })
+  expect(page.entries).toContainEqual({ name: 'linked', path: destination })
+  const opened = await s.request('filesystem.v1.directories', { path: link + '/' })
+  expect(opened.path).toBe(destination)
+  mkdirSync(join(destination, 'a'))
+  mkdirSync(join(destination, 'b'))
+  const first = await s.request('filesystem.v1.directories', { path: link + '/', limit: 1 })
+  const next = await s.request('filesystem.v1.directories', {
+    path: link + '/',
+    cursor: first.cursor,
+    limit: 1,
+  })
+  expect(next.entries.map((e: any) => e.name)).toEqual(['b'])
+})
 it('initializes a registered plain folder explicitly and retains project/root IDs without a first commit', async () => {
   const s = setup()
   const project = await s.request('project.register', {

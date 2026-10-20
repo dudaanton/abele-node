@@ -112,7 +112,13 @@ export class NodePathService {
       id = c.directory
       offset = c.offset
       d = this.directory(actor, id)
-      if (p.path !== undefined && String(p.path) !== d.path) throw new ChannelError('stale_cursor')
+      if (p.path !== undefined) {
+        try {
+          if (realpathSync(String(p.path)) !== d.path) throw new Error()
+        } catch {
+          throw new ChannelError('stale_cursor')
+        }
+      }
     } else {
       if (this.directories.size >= 64) throw new ChannelError('resource_busy')
       let path: string
@@ -130,8 +136,10 @@ export class NodePathService {
         try {
           const full = join(path, name),
             s = lstatSync(full)
-          if (!s.isSymbolicLink() && s.isDirectory() && !name.includes('\ufffd'))
-            entries.push({ name, path: full })
+          if (!name.includes('\ufffd')) {
+            const resolved = s.isSymbolicLink() ? realpathSync(full) : full
+            if (lstatSync(resolved).isDirectory()) entries.push({ name, path: resolved })
+          }
         } catch {
           omissions.push('inaccessible entry')
         }

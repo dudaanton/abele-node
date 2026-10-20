@@ -40,7 +40,8 @@ const effects = new Set([
   'detach',
   'terminate',
 ])
-const toolName = (method: string) => 'debug_' + method.replaceAll('.', '_')
+const toolName = (method: string) =>
+  'debug_' + method.replace(/[A-Z]/g, (letter) => '_' + letter.toLowerCase()).replaceAll('.', '_')
 // Only the existing bounded Zod contract subset is converted. Admission ALWAYS
 // uses the strict Zod parser, never this provider-facing descriptive schema.
 function jsonSchema(schema: any): Record<string, any> {

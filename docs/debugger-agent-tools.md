@@ -20,13 +20,13 @@ RPC client or a model-created principal.
 
 Implemented tools:
 
-| Group                        | Tools                                                                                                                                         |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Observation / reconciliation | `debug_status`, `debug_commandResult`, `debug_history`, `debug_replay`                                                                        |
-| Explicit inspection          | `debug_threads`, `debug_stack`, `debug_scopes`, `debug_variables`                                                                             |
-| Shared controls              | `debug_pause`, `debug_continue`, `debug_step`, `debug_breakpoints_patch`, `debug_exceptionBreakpoints_set`, `debug_detach`, `debug_terminate` |
-| Explicit expressions         | `debug_evaluate`, `debug_setVariable` (and variable inspection / expression breakpoints)                                                      |
-| Passive waits                | `debug_wait`, `debug_sleep`, `debug_cancelWait`                                                                                               |
+| Group                        | Tools                                                                                                                                          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Observation / reconciliation | `debug_status`, `debug_command_result`, `debug_history`, `debug_replay`                                                                        |
+| Explicit inspection          | `debug_threads`, `debug_stack`, `debug_scopes`, `debug_variables`                                                                              |
+| Shared controls              | `debug_pause`, `debug_continue`, `debug_step`, `debug_breakpoints_patch`, `debug_exception_breakpoints_set`, `debug_detach`, `debug_terminate` |
+| Explicit expressions         | `debug_evaluate`, `debug_set_variable` (and variable inspection / expression breakpoints)                                                      |
+| Passive waits                | `debug_wait`, `debug_sleep`, `debug_cancel_wait`                                                                                               |
 
 Owner grants/policy/approvals, launch/attach/create/restart and source export are
 not model tools. Unsupported backend capabilities remain explicit rejections.
@@ -101,7 +101,7 @@ Select a stopped thread with `debug_stack`, a frame with `debug_scopes`, then an
 opaque object handle with `debug_variables`. References do not grant read access.
 Variable inspection is conservatively effectful. In ask mode it returns a pending
 exact approval receipt; in allow-all it executes without a prompt. After dispatch,
-`debug_commandResult` returns current control state plus the bounded, scoped
+`debug_command_result` returns current control state plus the bounded, scoped
 requested-data citation if still retained. History
 is the source of those bytes, not an unbounded receipt cache; eviction remains
 explicit in history. No unrelated values are automatically fetched/exported.
@@ -145,7 +145,7 @@ labelled fresh object state.
 - `debug_sleep(session, duration_ms, wake_on?)` uses a node timer only. Omitted
   `wake_on` uses owner policy; an empty array is a pure timer.
 - An optional caller-scoped `wait_id` names either wait so a parallel
-  `debug_cancelWait` can cancel it. It is a cancellation reference, not an effect
+  `debug_cancel_wait` can cancel it. It is a cancellation reference, not an effect
   operation ID or grant. Abort signals, MCP cancellation, IPC/socket loss and run
   settlement also remove timers/listeners. A different principal cannot cancel it.
 

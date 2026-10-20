@@ -227,8 +227,12 @@ export class DapSession {
       )
       const configure = this.configure(controller.signal)
       await Promise.all([start, configure])
-      if (this.snapshot.lifecycle === 'configuring')
-        this.observe({ kind: 'lifecycle', lifecycle: 'active' })
+      if (this.snapshot.lifecycle === 'configuring') {
+        // A completed attach is running unless the adapter already reported a stop.
+        // Do not overwrite stopped/continued events received during configuration.
+        if (mode === 'attach') this.observe({ kind: 'continued', all_threads_continued: true })
+        else this.observe({ kind: 'lifecycle', lifecycle: 'active' })
+      }
       return this.snapshot
     } catch (error) {
       controller.abort()

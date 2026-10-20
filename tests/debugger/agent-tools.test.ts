@@ -227,7 +227,7 @@ describe('debugger active-turn tools and node timers', () => {
         )
       ).toThrow('not_found')
       expect(
-        await f.binding.call('debug_cancelWait', { debug_session_id: f.id, wait_id: 'known-wait' })
+        await f.binding.call('debug_cancel_wait', { debug_session_id: f.id, wait_id: 'known-wait' })
       ).toMatchObject({ cancelled: true, snapshot: { execution: 'stopped' } })
       expect(await sleep).toMatchObject({ reason: 'cancelled', snapshot: { execution: 'stopped' } })
       const pending = f.control.wait(f.principal, 'sleep', { ...args, wait_id: 'node-loss' })
@@ -540,7 +540,7 @@ describe('debugger active-turn tools and node timers', () => {
         proposal_hash: object.proposal_hash,
         decision: 'approve',
       })
-      const receipt = await f.binding.call('debug_commandResult', {
+      const receipt = await f.binding.call('debug_command_result', {
         debug_session_id: f.id,
         operation_id: object.operation_id,
       })

@@ -10,7 +10,8 @@ import { target } from './helpers.js'
 async function fixture(
   work: (f: any) => Promise<void>,
   options: Parameters<typeof wire>[0] = {},
-  initiallyStopped = true
+  initiallyStopped = true,
+  stoppedDuringStart = false
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'control-driver-'))
   const core = new NodeCore(dir, { debuggerEnabled: true })
@@ -32,6 +33,12 @@ async function fixture(
       }
       await Promise.resolve()
     }
+    if (stoppedDuringStart)
+      w.send({
+        type: 'event',
+        event: 'stopped',
+        body: { threadId: 1, allThreadsStopped: true, reason: 'pause' },
+      })
     await start
     if (initiallyStopped)
       w.send({
@@ -67,6 +74,35 @@ async function request(w: ReturnType<typeof wire>, command: string) {
   throw new Error('missing_request_' + command)
 }
 describe('authorized typed DAP backend', () => {
+  it('reports running after attach without a continued event', () =>
+    fixture(
+      async ({ session }) => {
+        expect(session.snapshot.execution).toBe('running')
+      },
+      {},
+      false
+    ))
+  it('preserves a stop reported before attach completes', () =>
+    fixture(
+      async ({ session }) => {
+        expect(session.snapshot.execution).toBe('stopped')
+      },
+      {},
+      false,
+      true
+    ))
+  it('replays a fresh attachment from cursor zero without an output gap', () =>
+    fixture(
+      async ({ session, core }) => {
+        const cursor = { ...core.debugger.snapshot(session.id).cursor, event_seq: 0 }
+        const replay = core.debugger.replay(cursor)
+        expect(replay.kind).toBe('events')
+        if (replay.kind === 'events')
+          expect(replay.events.filter((e: any) => e.kind === 'output')).toEqual([])
+      },
+      {},
+      false
+    ))
   it.each([[[7]], [[7, 8]], [[0]]])(
     'pauses a never-stopped program using adapter threads %j',
     (ids) =>
