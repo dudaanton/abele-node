@@ -52,7 +52,9 @@ export async function createHost(config, ask, signal, emit, hooks) {
       event,
       prompt: async (text, options) => {
         // Route the fake task independently of the node reporting instruction.
-        text = text.split('\n\nWorker reporting:')[0]
+        text = text.split(
+          /\n\n(?:The node has already created your dedicated worktree|Worker reporting:)/
+        )[0]
         if (text === '/unsupported') {
           // SDK 0.87.0 registered commands swallow exceptions and report them
           // through the bound listener, then acknowledge handled preflight.

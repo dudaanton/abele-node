@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { ChatMethodSchemas } from './chat.js'
+import { ManagerMethodSchemas } from './manager.js'
 import { LspMethodSchemas, LspDiagnosticsSchema } from './lsp.js'
 import {
   DelegationMethodSchemas,
@@ -233,6 +234,7 @@ export const NodeEventSchema = EventSchema.superRefine((event, ctx) => {
 })
 const session = { session_id: id }
 export const MethodSchemas = {
+  ...ManagerMethodSchemas,
   ...LspMethodSchemas,
   ...DelegationMethodSchemas,
   'delegation.create': DelegationCreateSchema.extend({
@@ -335,6 +337,9 @@ export type SessionSendRequest = z.input<(typeof MethodSchemas)['session.send']>
 export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
+  'command.v1.run',
+  'command.v1.cancel',
+  'git.v1.integrate',
   'chat.restore',
   ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,

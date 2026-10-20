@@ -66,6 +66,21 @@ async function fixture() {
     },
   }
 }
+it('allows a different node chat to execute after the delegated developer has settled', async () => {
+  const f = await fixture()
+  const child = await f.create()
+  await f.core.resources.jobs.drain()
+  const instruction = f.core.delegations.turnText(child.session_id, 'Implement the fix')
+  expect(instruction).toContain(f.core.resources.workspaces.get(child.workspace_id).path)
+  expect(instruction).toContain('Do not create another worktree')
+  f.core.tick()
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id }).state).toBe(
+    'completed'
+  )
+  const target = await f.core.resources.targets.runtime(child.session_id)
+  expect(f.core.resources.targets.canLease(target, 'another-node-chat')).toBe(true)
+  expect(f.core.delegations.turnText(child.session_id, 'continue')).toBe('continue')
+})
 it('leases the workspace atomically with child creation and retains it through readiness and provisioning cancellation', async () => {
   const f = await fixture(),
     child = await f.create()

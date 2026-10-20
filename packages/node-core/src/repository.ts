@@ -957,6 +957,7 @@ export class RepositoryService {
     )
     const records = parseWorktrees(await this.r.git.run(project.root_path, { kind: 'worktrees' }))
     if (records.length > 1024) throw new ChannelError('scan_limit')
+    this.r.workspaces.reconcile(project.project_id, new Set(records.map((r) => r.path)))
     const entries: WorktreeEntry[] = []
     let dirtyChecks = 0
     const seen = new Set<string>()

@@ -5,6 +5,113 @@ import { join } from 'node:path'
 import { NodeCore } from '@abele/node-core'
 
 const cleanup: (() => void)[] = []
+it('reports a deadline as stopped with a resumable time-limit reason', async () => {
+  const f = fixture()
+  const child = await f.create('deadline', [{ kind: 'hang' }])
+  f.core.tick()
+  const input = f.core.db
+    .prepare('SELECT * FROM inputs WHERE session_id=?')
+    .get(child.session_id) as any
+  f.core.transaction(() => {
+    f.core.transition(input, 'delivery_unknown')
+    f.core.append(
+      child.session_id,
+      'run.interrupted',
+      { kind: 'node' },
+      { run_id: input.run_id, reason: 'deadline' }
+    )
+  })
+  f.core.tick()
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toMatchObject({
+    state: 'stopped',
+    reason: 'time_limit',
+  })
+})
+it('keeps delegated prompts waiting and announces them in the parent mailbox', async () => {
+  const f = fixture()
+  const child = await f.create('prompt', [{ kind: 'permission', ttl_ms: 1 }])
+  f.core.tick()
+  expect(f.core.prompts(child.session_id)[0]!.expires_at).toBe(Number.MAX_SAFE_INTEGER)
+  const status = f.request('delegation.status', { delegation_id: child.delegation_id })
+  expect(status.pending_prompts[0].prompt_id).toBe(f.core.prompts(child.session_id)[0]!.prompt_id)
+  expect(
+    f.core
+      .read(child.mailbox_stream_id, 0)
+      .some(
+        (e) => e.type === 'delegation.question' && (e.data as any).report_id.startsWith('prompt:')
+      )
+  ).toBe(true)
+})
+it.each(['completed', 'failed', 'cancelled', 'unknown', 'stopped'] as const)(
+  'continues a %s child in the same session',
+  async (state) => {
+    const f = fixture()
+    const child = await f.create()
+    f.core.tick()
+    f.core.db
+      .prepare('UPDATE inputs SET state=? WHERE session_id=?')
+      .run(
+        state === 'unknown' ? 'delivery_unknown' : state === 'stopped' ? 'interrupted' : state,
+        child.session_id
+      )
+    f.core.db
+      .prepare('UPDATE delegations SET body=? WHERE delegation_id=?')
+      .run(JSON.stringify({ ...child, state }), child.delegation_id)
+    const params = {
+      delegation_id: child.delegation_id,
+      text: 'review follow-up',
+      observed_seq: f.core.head(child.session_id),
+    }
+    const sent = f.request('delegation.send', params, 'follow-up')
+    expect(sent.input_id).toBeTruthy()
+    f.restart()
+    expect(f.request('delegation.send', params, 'follow-up')).toEqual(sent)
+    f.core.tick()
+    expect(f.request('delegation.status', { delegation_id: child.delegation_id }).state).toBe(
+      'completed'
+    )
+    const results = f.core
+      .read(child.mailbox_stream_id, 0)
+      .filter((e) => e.type === 'delegation.result')
+    expect((results.at(-1)?.data as any)?.text).toBe('review follow-up')
+  }
+)
+it('advertises Codex alongside the other providers', () => {
+  const f = fixture()
+  expect(f.core.capabilities().providers.map((p) => p.provider)).toContain('codex')
+  expect(f.request('node.describe', {}).providers.map((p: any) => p.provider)).toContain('codex')
+})
+it('does not reuse an earlier explicit result for a queued follow-up', async () => {
+  const f = fixture()
+  const child = await f.create('queued', [{ kind: 'permission' }, { kind: 'echo' }])
+  f.core.tick()
+  const prompt = f.core.prompts(child.session_id)[0]!
+  f.core.delegations
+    .reporter(child.session_id, prompt.run_id)
+    .report({ report_id: 'first', kind: 'result', text: 'Earlier report' })
+  f.request('delegation.send', {
+    delegation_id: child.delegation_id,
+    text: 'New result',
+    observed_seq: f.core.head(child.session_id),
+  })
+  f.request('prompt.answer', {
+    session_id: child.session_id,
+    prompt_id: prompt.prompt_id,
+    run_id: prompt.run_id,
+    revision: prompt.revision,
+    action_digest: prompt.action_digest,
+    choice: 'allow',
+  })
+  f.core.tick()
+  f.core.tick()
+  expect(
+    f.core
+      .read(child.mailbox_stream_id, 0)
+      .filter((e) => e.type === 'delegation.result')
+      .map((e) => e.data as any)
+      .at(-1)?.text
+  ).toBe('New result')
+})
 afterEach(() => {
   for (const f of cleanup.splice(0).reverse()) f()
 })

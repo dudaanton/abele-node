@@ -3,6 +3,22 @@ import { piSessionUpdates, sessionUpdatesOf } from '@abele/node-protocol'
 
 // pi's records in the shared transcript vocabulary.
 const provider = { kind: 'provider', provider: 'pi' }
+it('shows a post-answer hook failure as a named warning', () => {
+  expect(
+    piSessionUpdates('pi.extension.warning', {
+      extension: '/extensions/status.ts',
+      event: 'agent_end',
+      error: 'status unavailable',
+    })
+  ).toEqual([
+    {
+      kind: 'notice',
+      level: 'warning',
+      code: 'extension_warning',
+      text: 'pi extension /extensions/status.ts failed (agent_end): status unavailable',
+    },
+  ])
+})
 
 it('maps streamed and final text and reasoning by message and block', () => {
   const d = { message_id: 'ab-1', runtime_generation: 1 }

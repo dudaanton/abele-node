@@ -304,14 +304,15 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
         },
       ]
     case 'pi.extension.error':
+    case 'pi.extension.warning':
       return [
         {
           kind: 'notice',
-          level: 'error',
+          level: type === 'pi.extension.warning' ? 'warning' : 'error',
           text: str(d.extension)
             ? `pi extension ${line(str(d.extension)!, 256)} failed${str(d.event) ? ` (${line(str(d.event)!, 128)})` : ''}: ${line(str(d.error) ?? 'Unknown error', 2048)}`
             : 'A pi extension failed',
-          code: 'extension_error',
+          code: type === 'pi.extension.warning' ? 'extension_warning' : 'extension_error',
         },
       ]
   }

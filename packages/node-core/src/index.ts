@@ -66,6 +66,7 @@ export { LiveSessions, DEFAULT_CONTINUATION, type LiveOptions } from './live-ses
 export { acquireUpdateLock } from './update-lock.js'
 import { ResourceServices } from './resources.js'
 import type { GitRunner } from './git.js'
+import { ManagerService } from './manager.js'
 import type { ResolvedExecutionTarget } from './execution-targets.js'
 import { DelegationService } from './delegation.js'
 export { DelegationService, DelegationMailbox, WorkerReporter } from './delegation.js'
@@ -281,6 +282,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   readonly trace: TraceService
   /** The project's saved requests and sending them. */
   readonly http: HttpService
+  readonly manager: ManagerService
   readonly node_id: string
   readonly provider = new FakeProvider()
   readonly resources: ResourceServices
@@ -477,6 +479,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         if (!this.closed) this.debuggerControl.notifyPermissions()
       })
       this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
+      this.manager = new ManagerService(this)
       this.resources.mutations.recover()
       this.debuggerLaunches = new DebuggerLaunches(
         this,
@@ -559,6 +562,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       void this.resources?.lsp.stop()
       this.trace.close()
       this.http.close()
+      this.manager.close()
       void this.debuggerLaunches
         ?.close()
         .catch((error) => console.debug('[debugger] Closing started programs failed', error))
@@ -585,6 +589,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.db.prepare('UPDATE installations SET revoked=1 WHERE installation_id=?').run(id)
     this.debuggerControl.notifyPermissions()
     this.resources.repository.revoked(id)
+    this.manager.notifyPermissions()
   }
   /** Fence external effects after any audit transaction failure, across sessions. */
   assertAuditStorageAvailable() {
@@ -660,6 +665,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           .run(stream, event.seq, JSON.stringify(update.commands))
     }
     this.resources?.lsp.observe(stream, type, data)
+    if (type === 'run.started') this.delegations?.runStarted(stream)
+    if (type === 'prompt.opened') this.delegations?.promptOpened(stream, data as Prompt)
     if (userUpdate) this.append(stream, 'session.update', actor, { update: userUpdate })
     return event
   }
@@ -703,6 +710,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         claude,
         this.claude.capabilities('pi'),
         this.claude.capabilities('acp'),
+        this.claude.capabilities('codex'),
       ],
       capabilities: {
         ...this.provider.capabilities().capabilities,
@@ -717,6 +725,16 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           : {}),
         ...this.trace.capabilities(),
         ...this.http.capabilities(),
+        command_run_v1: {
+          status: 'supported',
+          evidence:
+            'command.v1.run/status/cancel; exact-durable-owner-prompt; trusted-target; bounded-streaming-output',
+        },
+        git_integrate_v1: {
+          status: 'supported',
+          evidence:
+            'git.v1.integrate; exact-durable-owner-prompt; expected-heads; ff-only; optional-conflict-aborting-rebase',
+        },
         expected_target: {
           status: 'supported',
           evidence: 'atomic-target-admission: session.send; delegation.send; review.submit',
@@ -889,12 +907,15 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return this.resources.targets.request(actor, method, params, operation)
     if (method.startsWith('delegation.'))
       return this.delegations.request(actor, method, params, operation)
+    if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
+      return this.manager.request(actor, method, params, operation)
     if (/^(project|workspace|job|review|repository|filesystem)\./.test(method))
       return this.resources.request(actor, method, params, operation)
     if (!MUTATIONS.has(method as Method)) return this.query(actor, method, params)
     const result = this.commitOperation(actor, method, params, operation, () =>
       this.mutate(actor, method, params)
     )
+    if (method === 'prompt.answer') this.manager.answered(result as Prompt, actor)
     if (method === 'session.interrupt') this.debuggerControl.interruptedRun(String(params.run_id))
     return result
   }
@@ -917,6 +938,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (method.startsWith('http.v1.')) return
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
+    if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
+      return this.manager.checkPublication(actor, p)
     this.authority.check(
       actor,
       'publish',
@@ -1033,6 +1056,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
             this.claude.capabilities(),
             this.claude.capabilities('pi'),
             this.claude.capabilities('acp'),
+            this.claude.capabilities('codex'),
           ],
         }
       case 'session.list':
@@ -1529,7 +1553,9 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
                 run_id: input.run_id,
                 revision: 1,
                 action_digest,
-                expires_at: now + action.ttl_ms,
+                expires_at: this.delegations.isActive(String(input.session_id))
+                  ? Number.MAX_SAFE_INTEGER
+                  : now + action.ttl_ms,
                 state: 'pending',
                 choice: null,
                 installation_id: null,

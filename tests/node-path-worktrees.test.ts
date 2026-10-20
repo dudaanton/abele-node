@@ -40,6 +40,34 @@ afterEach(async () => {
   }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
+it('reconciles managed worktrees removed outside the node when listing', async () => {
+  const s = await setup()
+  const created = await s.request('workspace.create', {
+    project_id: s.project.project_id,
+    branch: 'removed-outside',
+  })
+  await s.core.resources.jobs.drain()
+  const work = await s.request('workspace.get', { workspace_id: created.workspace_id })
+  git(s.folder, 'worktree', 'remove', work.path)
+  const listed = await s.request('workspace.list', { project_id: s.project.project_id })
+  expect(listed.some((w: any) => w.workspace_id === work.workspace_id)).toBe(false)
+  expect(s.core.resources.workspaces.get(work.workspace_id).state).toBe('removed')
+})
+it('allows a controller to read two diffs and a directory in parallel', async () => {
+  const s = await setup()
+  const created = await s.request('workspace.create', {
+    project_id: s.project.project_id,
+    branch: 'parallel-reads',
+  })
+  await s.core.resources.jobs.drain()
+  const params = { workspace_id: created.workspace_id }
+  const results = await Promise.allSettled([
+    s.request('workspace.diff', params),
+    s.request('workspace.diff', params),
+    s.request('workspace.files', { ...params, path: '' }),
+  ])
+  expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled'])
+})
 it('creates a named branch from base, attaches an existing branch at its own tip and refuses checked-out names', async () => {
   const s = await setup()
   const created = await s.request('workspace.create', {

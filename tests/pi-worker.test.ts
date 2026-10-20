@@ -7,6 +7,15 @@ import {
 } from '../packages/provider-pi/src/host.js'
 
 const action = { tool_use_id: 'call', tool_name: 'bash', input: { command: 'printf safe' } }
+it('lets the agent work around a refused or expired permission', async () => {
+  const policy = new PiApprovalPolicy(
+    async () => ({ choice: 'deny', delivered: () => false }),
+    new AbortController().signal
+  )
+  const refused = await policy.intercept(action)
+  expect(refused).toMatchObject({ block: true })
+  expect(refused?.terminate).not.toBe(true)
+})
 it('fails closed on absent, aborted, duplicate, undelivered and changed tool approvals', async () => {
   let delivered = 0
   const controller = new AbortController()

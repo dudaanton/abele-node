@@ -34,12 +34,11 @@ it('reports swallowed SDK shutdown errors only after disposal, before bounded co
     await host.dispose()
     expect(state.shutdowns).toBe(1)
     expect(host.completionResult(result)).toMatchObject({
-      subtype: 'error',
-      is_error: true,
-      terminal_reason: 'extension_error',
+      subtype: 'success',
+      is_error: false,
     })
     const types = events.map((event) => event.type)
-    expect(types.indexOf('pi.agent_settled')).toBeLessThan(types.indexOf('pi.extension.error'))
+    expect(types.indexOf('pi.agent_settled')).toBeLessThan(types.indexOf('pi.extension.warning'))
     expect(JSON.stringify(events)).not.toContain('FAKE_SHUTDOWN_SECRET')
   } finally {
     if (!state.shutdowns) await host.dispose()

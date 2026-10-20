@@ -758,16 +758,17 @@ export class ProviderSessions {
           run_id,
           revision: 1,
           action_digest,
-          expires_at:
-            Date.now() +
-            (owner.ttl_ms ??
-              Math.min(
-                Number(
-                  this.adapterFor(this.core.session(session_id).provider)!.configuration
-                    .permission_ttl_ms
-                ),
-                action.ttl_ms ?? 3600000
-              )),
+          expires_at: this.core.delegations.isActive(session_id)
+            ? Number.MAX_SAFE_INTEGER
+            : Date.now() +
+              (owner.ttl_ms ??
+                Math.min(
+                  Number(
+                    this.adapterFor(this.core.session(session_id).provider)!.configuration
+                      .permission_ttl_ms
+                  ),
+                  action.ttl_ms ?? 3600000
+                )),
           state: 'pending',
           choice: null,
           installation_id: null,

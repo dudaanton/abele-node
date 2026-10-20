@@ -35,12 +35,11 @@ export class PiApprovalPolicy {
   async intercept(
     action: PiAction,
     actionSignal?: AbortSignal
-  ): Promise<{ block: true; reason: string; terminate: true } | undefined> {
+  ): Promise<{ block: true; reason: string; terminate?: true } | undefined> {
     const signal = AbortSignal.any([this.signal, ...(actionSignal ? [actionSignal] : [])])
     const deny = {
       block: true,
       reason: 'Node denied, expired or lost this exact approval',
-      terminate: true,
     } as const
     const key = `${action.native_session_id ?? ''}:${action.tool_use_id}`
     if (signal.aborted || this.claimed.has(key)) return deny
@@ -300,6 +299,27 @@ export class PiSdkWorker {
     await session.bindExtensions({
       ...bindings,
       onError: (error: unknown) => {
+        const detail = error as { extensionPath?: unknown; event?: unknown; error?: unknown }
+        if (
+          this.lastStop === 'stop' &&
+          ['agent_end', 'session_shutdown'].includes(String(detail?.event))
+        ) {
+          this.emit({
+            type: 'pi.extension.warning',
+            data: {
+              extension:
+                typeof detail.extensionPath === 'string'
+                  ? detail.extensionPath.slice(0, 1024)
+                  : 'unknown extension',
+              event: String(detail.event).slice(0, 128),
+              error:
+                typeof detail.error === 'string'
+                  ? detail.error.slice(0, 2048)
+                  : 'Extension hook failed',
+            },
+          })
+          return
+        }
         // The SDK swallows registered command/hook exceptions. Acceptance is
         // not completion evidence; keep this failure across runtime replacement.
         this.extensionFailure = true
@@ -340,8 +360,8 @@ export class PiSdkWorker {
             : undefined,
     }
   }
-  /** Prompt completion is provisional until SDK session_shutdown/dispose has
-   * finished. A swallowed late extension error must never upgrade to success. */
+  /** Errors without a successful final answer remain failures through disposal.
+   * Post-answer shutdown-hook warnings are emitted separately by onError. */
   completionResult(result: PiTurnResult): PiTurnResult {
     return this.extensionFailure
       ? { ...result, subtype: 'error', is_error: true, terminal_reason: 'extension_error' }

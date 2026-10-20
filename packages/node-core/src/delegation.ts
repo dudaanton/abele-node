@@ -44,6 +44,7 @@ export class DelegationMailbox {
       delegation_id: d.delegation_id,
       session_id: d.session_id,
       state: d.state,
+      ...(d.reason ? { reason: d.reason } : {}),
     })
   }
 }
@@ -178,6 +179,29 @@ export class DelegationService {
   reporter(session_id: string, run_id: string) {
     return new WorkerReporter(this, session_id, run_id)
   }
+  runStarted(session_id: string) {
+    this.core.db
+      .prepare('UPDATE delegations SET result_text=NULL WHERE session_id=?')
+      .run(session_id)
+  }
+  promptOpened(session_id: string, prompt: { prompt_id: string }) {
+    const row = this.core.db
+      .prepare('SELECT * FROM delegations WHERE session_id=?')
+      .get(session_id) as Row | undefined
+    if (!row) return
+    const d = DelegationSchema.parse(JSON.parse(row.body))
+    if (active(d))
+      this.mailbox.message(
+        d,
+        'question',
+        'prompt:' + prompt.prompt_id,
+        'Waiting for owner approval. Open child session ' +
+          session_id +
+          ' to answer prompt ' +
+          prompt.prompt_id +
+          '. The controller cannot approve it.'
+      )
+  }
   private save(d: Delegation) {
     this.core.db
       .prepare('UPDATE delegations SET body=? WHERE delegation_id=?')
@@ -192,6 +216,10 @@ export class DelegationService {
         mailbox_head_seq: this.core.head(d.mailbox_stream_id),
         pending_human_prompts: this.core.prompts(d.session_id).filter((p) => p.state === 'pending')
           .length,
+        pending_prompts: this.core
+          .prompts(d.session_id)
+          .filter((p) => p.state === 'pending')
+          .map((p) => ({ prompt_id: p.prompt_id, run_id: p.run_id, expires_at: p.expires_at })),
       })
     }
     if (method === 'delegation.create') return this.create(actor, p, operation)
@@ -258,7 +286,15 @@ export class DelegationService {
           p.expected_target as ExpectedExecutionTarget | undefined
         )
         if (refusal) return refusal
-        if (!active(d)) throw new ChannelError('resource_busy')
+        if (!active(d)) {
+          // A terminal state describes the last turn, not a closed conversation.
+          d.state = 'running'
+          delete d.reason
+          this.save(d)
+          this.core.db
+            .prepare('UPDATE delegations SET result_text=NULL WHERE delegation_id=?')
+            .run(d.delegation_id)
+        }
         this.checkExecution(d.session_id)
         return this.core.acceptInput(actor, {
           session_id: d.session_id,
@@ -427,31 +463,45 @@ export class DelegationService {
         this.save(d)
       }
       const states = this.core.db
-        .prepare('SELECT state FROM inputs WHERE session_id=? ORDER BY ordinal')
-        .all(d.session_id) as { state: string }[]
+        .prepare(
+          'SELECT state FROM inputs WHERE session_id=? AND ordinal=(SELECT MAX(ordinal) FROM inputs WHERE session_id=?)'
+        )
+        .all(d.session_id, d.session_id) as { state: string }[]
       if (
         !states.length ||
-        states.some((s) => ['accepted', 'queued', 'dispatching', 'delivered'].includes(s.state))
+        this.core.db
+          .prepare(
+            "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
+          )
+          .get(d.session_id)
       )
         continue
-      const state = states.some((s) => s.state === 'delivery_unknown')
-        ? 'unknown'
-        : states.some((s) => ['failed', 'interrupted', 'cancelled'].includes(s.state))
-          ? 'failed'
-          : 'completed'
+      const deadline = this.core.db
+        .prepare(
+          "SELECT 1 FROM events WHERE stream_id=? AND json_extract(body,'$.data.reason')='deadline' AND json_extract(body,'$.data.run_id')=(SELECT run_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1)"
+        )
+        .get(d.session_id, d.session_id)
+      const state = deadline
+        ? 'stopped'
+        : states.some((s) => s.state === 'delivery_unknown')
+          ? 'unknown'
+          : states.some((s) => ['failed', 'interrupted', 'cancelled'].includes(s.state))
+            ? 'failed'
+            : 'completed'
       if (state === 'completed') {
         const result = row.result_text ?? this.fallback(d.session_id)
-        this.mailbox.message(d, 'result', 'node-final', result)
+        this.mailbox.message(d, 'result', 'node-final-' + this.core.head(d.session_id), result)
       }
+      if (deadline) d.reason = 'time_limit'
       this.finish(d, state)
     }
   }
   private fallback(session_id: string) {
     const rows = this.core.db
       .prepare(
-        "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type')='content.delta' ORDER BY seq DESC LIMIT 32"
+        "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type')='content.delta' AND json_extract(body,'$.data.run_id')=(SELECT run_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1) ORDER BY seq DESC LIMIT 32"
       )
-      .all(session_id) as { body: string }[]
+      .all(session_id, session_id) as { body: string }[]
     return (
       boundedText(
         rows
@@ -461,7 +511,7 @@ export class DelegationService {
       ) || 'Child completed. Open the child session for its full transcript.'
     )
   }
-  private finish(d: Delegation, state: 'completed' | 'failed' | 'unknown') {
+  private finish(d: Delegation, state: 'completed' | 'failed' | 'unknown' | 'stopped') {
     if (d.state === 'provisioning') {
       for (const input of this.core.db
         .prepare("SELECT * FROM inputs WHERE session_id=? AND state IN ('accepted','queued')")
@@ -557,15 +607,25 @@ export class DelegationService {
     } else if (
       !this.core.db
         .prepare(
-          "SELECT 1 FROM delegation_reports WHERE delegation_id=? AND json_extract(body,'$.kind')='result'"
+          "SELECT 1 FROM delegation_reports WHERE delegation_id=? AND run_id=? AND json_extract(body,'$.kind')='result'"
         )
-        .get(row.delegation_id)
+        .get(row.delegation_id, run_id)
     )
       this.core.db
         .prepare('UPDATE delegations SET result_text=? WHERE delegation_id=?')
         .run(boundedText(text), row.delegation_id)
   }
   turnText(session_id: string, text: string) {
-    return this.isActive(session_id) ? text + WorkerReporter.instruction : text
+    if (!this.isActive(session_id)) return text
+    const workspace = this.core.session(session_id).workspace_id
+    return (
+      text +
+      (workspace
+        ? '\n\nThe node has already created your dedicated worktree at ' +
+          this.core.resources.workspaces.get(workspace).path +
+          '. Perform implementation there. Do not create another worktree or move to a different workspace.'
+        : '') +
+      WorkerReporter.instruction
+    )
   }
 }

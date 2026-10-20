@@ -150,8 +150,17 @@ export class WorkspaceService {
     if (!row) throw new ChannelError('not_found')
     return WorkspaceSchema.parse(JSON.parse(row.body))
   }
-  list(p: Params): Workspace[] {
-    this.resources.projects.get(String(p.project_id))
+  async list(p: Params): Promise<Workspace[]> {
+    const project = this.resources.projects.get(String(p.project_id))
+    // A successful Git observation distinguishes removed worktrees from an
+    // unavailable project. Never infer deletion from a failed command.
+    if (project.git_common_dir) {
+      await this.resources.projects.available(project)
+      const records = parseWorktrees(
+        await this.resources.git.run(project.root_path, { kind: 'worktrees' })
+      )
+      this.reconcile(project.project_id, new Set(records.map((r) => r.path)))
+    }
     return boundedPage(
       (
         this.resources.core.db
@@ -163,6 +172,21 @@ export class WorkspaceService {
         }[]
       ).map((r) => WorkspaceSchema.parse(JSON.parse(r.body)))
     )
+  }
+  reconcile(project_id: string, paths: Set<string>) {
+    this.resources.core.transaction(() => {
+      for (const row of this.resources.core.db
+        .prepare("SELECT body FROM workspaces WHERE project_id=? AND state='ready'")
+        .all(project_id) as { body: string }[]) {
+        const workspace = WorkspaceSchema.parse(JSON.parse(row.body))
+        if (workspace.kind === 'managed' && !paths.has(workspace.path)) {
+          this.save({ ...workspace, state: 'removed' })
+          this.resources.core.db
+            .prepare('DELETE FROM workspace_leases WHERE workspace_id=?')
+            .run(workspace.workspace_id)
+        }
+      }
+    })
   }
   save(
     workspace: Workspace,
@@ -711,6 +735,7 @@ export class ResourceServices {
       : Promise.resolve([])
   }
   async stop() {
+    await this.core.manager?.stop()
     await this.lsp.stop()
     this.nodePath.stop()
     await this.ready

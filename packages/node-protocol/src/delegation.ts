@@ -10,6 +10,7 @@ export const DelegationStateSchema = z.enum([
   'failed',
   'cancelled',
   'unknown',
+  'stopped',
 ])
 export const WorkerReportSchema = z
   .object({
@@ -62,6 +63,7 @@ export const DelegationSchema = z
     workspace_id: Id.nullable(),
     job_id: Id.nullable(),
     state: DelegationStateSchema,
+    reason: z.enum(['time_limit']).optional(),
     created_at: z.string().datetime(),
   })
   .strict()
@@ -70,6 +72,17 @@ export const DelegationStatusSchema = DelegationSchema.extend({
   session_head_seq: Sequence,
   mailbox_head_seq: Sequence,
   pending_human_prompts: Sequence,
+  pending_prompts: z
+    .array(
+      z
+        .object({
+          prompt_id: Id,
+          run_id: Id,
+          expires_at: Sequence,
+        })
+        .strict()
+    )
+    .default([]),
 })
 export type DelegationStatus = z.infer<typeof DelegationStatusSchema>
 export const DelegationSendResultSchema = TurnAdmissionResultSchema
@@ -78,7 +91,8 @@ export const DelegationTerminalSchema = z
   .object({
     delegation_id: Id,
     session_id: Id,
-    state: z.enum(['completed', 'failed', 'cancelled', 'unknown']),
+    state: z.enum(['completed', 'failed', 'cancelled', 'unknown', 'stopped']),
+    reason: z.enum(['time_limit']).optional(),
   })
   .strict()
 export const DelegationMessageSchema = z

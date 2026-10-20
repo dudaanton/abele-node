@@ -5,7 +5,7 @@ import { NodeCore } from '@abele/node-core'
 import { NodeClient, MemoryClientStore } from '../packages/node-client/src/index.js'
 import { RecordQueue, LocalChannelConnector } from '@abele/channel-client'
 import { serveChannel } from '../packages/channel-server/src/index.js'
-import { FrameCodec, type RecordTransport } from '@abele/channel-protocol'
+import { FrameCodec, LIMITS, type RecordTransport } from '@abele/channel-protocol'
 import { SessionSchema } from '@abele/node-protocol'
 
 const cores: NodeCore[] = [],
@@ -198,6 +198,12 @@ it('advertises the same metadata in the handshake; clients can ignore it and sti
   expect(welcome.capabilities.node_version).toBe(description.node_version)
   expect(welcome.capabilities.supported_capabilities).toEqual(description.supported_capabilities)
   expect(welcome).not.toHaveProperty('node_version')
+  // The handshake bounds the welcome; provider configuration is read from node.describe.
+  expect(FrameCodec.encode(welcome).length).toBeLessThanOrEqual(LIMITS.auth_bytes)
+  expect(welcome.capabilities.providers.map((p: any) => p.provider)).toEqual(
+    description.providers.map((p: any) => p.provider)
+  )
+  expect(welcome.capabilities.providers.every((p: any) => !('configuration' in p))).toBe(true)
   expect(welcome).not.toHaveProperty('supported_capabilities')
   expect(welcome.methods).toEqual(expect.arrayContaining(['session.rename', 'session.delete']))
   // A client using only existing fields continues without consulting feature discovery.

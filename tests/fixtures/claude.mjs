@@ -22,7 +22,9 @@ appendFileSync(
   JSON.stringify({ text, resume, args: process.argv.slice(2) }) + '\n'
 )
 // Delegation adds a provider-neutral reporting instruction; route on the original task.
-text = text.split('\n\nWorker reporting:')[0]
+text = text.split(
+  /\n\n(?:The node has already created your dedicated worktree|Worker reporting:)/
+)[0]
 emit({
   type: 'system',
   subtype: 'init',

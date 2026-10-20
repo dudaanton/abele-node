@@ -10,6 +10,28 @@ import {
 } from '@abele/channel-protocol'
 import { MethodSchemas, PairingMethodSchemas } from '@abele/node-protocol'
 import { NodeCore } from '@abele/node-core'
+
+/**
+ * The welcome travels inside the handshake, which clients bound to `LIMITS.auth_bytes`, so it
+ * names each provider and its feature gates only. Configuration and gate evidence stay in
+ * `node.describe`, which has no such bound and grows with every provider the node learns.
+ */
+function welcomeCapabilities(core: NodeCore) {
+  const capabilities = core.capabilities()
+  return {
+    ...capabilities,
+    providers: capabilities.providers.map((p) => {
+      const { provider, provider_version, available, diagnostic } = p as Record<string, unknown>
+      return {
+        provider,
+        provider_version,
+        ...(available !== undefined ? { available } : {}),
+        ...(diagnostic !== undefined ? { diagnostic } : {}),
+        capabilities: p.capabilities,
+      }
+    }),
+  }
+}
 type Scheduled = {
   bytes: Uint8Array
   priority: number
@@ -194,7 +216,7 @@ export async function serveChannel(
           limits: LIMITS,
           // 0.4.2 welcome readers are strict at the envelope, but this
           // existing map is extensible. Never add unnegotiated top-level keys.
-          capabilities: { ...core.capabilities(), ...core.discovery() },
+          capabilities: { ...welcomeCapabilities(core), ...core.discovery() },
         })
         continue
       }

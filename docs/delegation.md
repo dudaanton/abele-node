@@ -1,5 +1,8 @@
 # Delegating work to node sessions
 
+For approval-backed commands/tests and fast-forward branch integration from a
+manager session, see [Manager APIs](manager-apis.md).
+
 Delegation is a controller API for a plugin agent to assign a bounded task to a
 normal node session. The node owns the workspace, queue, transcript, human
 prompts and a separate durable mailbox. Disconnecting the parent does not stop
@@ -35,7 +38,14 @@ Provider authentication stays in the installed provider's local runtime.
 Execution permissions and extension questions requiring human answers still use
 normal node prompts. A worker mailbox question is informational: it neither
 approves a tool nor answers a prompt. `pending_human_prompts` in status lets the
-controller direct a human to the child session.
+controller direct a human to the child session. Status also returns
+`pending_prompts: [{ prompt_id, run_id, expires_at }]`. A newly opened child
+prompt posts a durable `delegation.question` with `report_id: "prompt:<id>"`
+and a child-session link in its text. This does not grant the controller
+permission-answer authority. Delegated prompts wait for the owner until the run
+ends; their `expires_at` is `Number.MAX_SAFE_INTEGER`. Ending the run invalidates
+unanswered prompts. A refused or expired pi tool approval blocks that tool call
+and lets the agent continue with another approach.
 
 ## Client API for a plugin integration
 
@@ -100,12 +110,24 @@ that every process has already exited.
 
 Status includes `session_head_seq`, `mailbox_head_seq`,
 `pending_human_prompts` and a state: `provisioning`, `running`, `completed`,
-`failed`, `cancelled` or `unknown`. `session_head_seq` supplies an observed child
+`failed`, `cancelled`, `stopped` or `unknown`. A deadline produces `stopped` with
+`reason: "time_limit"` in status and `delegation.terminal`; display this as
+"Stopped: time limit". Work and native session context are retained.
+`session_head_seq` supplies an observed child
 revision for send without subscribing to every child tool event. Send returns
 an input receipt (`input_id`, `accepted_seq`). Followups are serialized, not
-steering. A terminal delegation cannot be sent more controller inputs; a human
-can continue the retained child as an ordinary session without reopening its
-mailbox lifecycle.
+steering. `delegation.send` can continue a completed, stopped, failed, cancelled,
+or unknown child. It revalidates the grant and execution target, queues a new
+input in the same session/worktree, and returns the ordinary input receipt.
+The state returns to `running`; the previous time-limit reason and cached report
+are cleared. Cleanup of a previous process must finish before dispatch. Deleted
+sessions, revoked grants, changed targets and unavailable workspaces still
+refuse execution. Retries with the same operation ID return the same receipt.
+After the outstanding queue settles, the latest turn publishes a fresh terminal
+event and, on success, a fresh result with a distinct report ID. Refresh status
+after a successful send to display `running`. Earlier failed/unknown inputs do not determine
+the new turn's outcome or get replayed. Subscribe to the existing mailbox across
+all follow-ups; a terminal event ends a turn, not the controller relationship.
 
 ## Mailbox and reporting
 
@@ -167,3 +189,25 @@ tests. They cover offline completion, client/daemon restart, one durable result,
 creation retries, mailbox isolation, human transcript access, human approval,
 report fencing, grant revocation and provisioning ordering/failure. Real CLI/SDK
 model behavior and plugin UI/tool-registry integration require separate testing.
+
+The node advertises Codex in both discovery provider lists. The plugin must allow
+`codex` in its delegatable-provider filter as well as its chat picker. After a
+successful final pi answer, `agent_end` and `session_shutdown` hook failures emit
+`pi.extension.warning` with `extension`, `event`, and bounded `error` fields;
+they do not fail the run or suppress its mailbox result. Extension-command
+failures without a successful answer remain failures.
+
+An inactive delegated child's retained workspace reservation does not block a
+different node chat from acquiring the execution lease. Active child work and
+all execution leases remain exclusive. The child is explicitly told that its
+dedicated worktree already exists. Workspace and repository worktree lists
+reconcile managed entries against a successful Git worktree observation;
+externally removed entries become `removed` without deleting any files.
+
+The controller-read regression issues two `workspace.diff` calls and one
+`workspace.files` call concurrently. All three succeed on this tip. There is no
+per-principal request rate limiter in this checkout to adjust; existing bounded
+Git execution, output, page and transport budgets remain in force. Investigating
+acceptance M9 further requires the failing raw RPC error code and the plugin or
+proxy trace. Worktree-location instructions are advisory; shell approval display
+and enforcement of writes outside the worktree remain separate concerns.

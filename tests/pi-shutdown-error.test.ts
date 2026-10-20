@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { NodeCore } from '@abele/node-core'
 import { PiProviderAdapter } from '@abele/provider-pi'
-it('fails the durable turn after a successful prompt when SDK dispose swallows a session_shutdown error', async () => {
+it('completes the durable turn with a warning when SDK shutdown hooks fail after a final answer', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-pi-shutdown-')),
     repo = join(dir, 'repo'),
     stateDir = join(dir, 'state')
@@ -61,16 +61,13 @@ it('fails the durable turn after a successful prompt when SDK dispose swallows a
     }, 'shutdown terminal evidence')
     expect(
       core.db.prepare('SELECT state FROM inputs WHERE input_id=?').get(input.input_id)
-    ).toMatchObject({ state: 'failed' })
+    ).toMatchObject({ state: 'completed' })
     const events = core.read(session.session_id, 0)
-    expect(events.find((e) => e.type === 'run.failed')?.data).toHaveProperty(
-      'reason',
-      'extension_error'
-    )
-    expect(events.some((e) => e.type === 'run.completed')).toBe(false)
+    expect(events.some((e) => e.type === 'run.failed')).toBe(false)
+    expect(events.some((e) => e.type === 'run.completed')).toBe(true)
     const order = events.map((e) => e.type)
-    expect(order.indexOf('pi.agent_settled')).toBeLessThan(order.indexOf('pi.extension.error'))
-    expect(order.indexOf('pi.extension.error')).toBeLessThan(order.indexOf('run.failed'))
+    expect(order.indexOf('pi.agent_settled')).toBeLessThan(order.indexOf('pi.extension.warning'))
+    expect(order.indexOf('pi.extension.warning')).toBeLessThan(order.indexOf('run.completed'))
     expect(JSON.stringify(events)).not.toContain('FAKE_SHUTDOWN_SECRET')
   } finally {
     await core.execution.stop()
