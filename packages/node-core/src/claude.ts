@@ -612,7 +612,8 @@ export class ProviderSessions {
   appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
     const provider = this.core.session(session_id).provider
     // Mapped from the whole record, before a large one is moved to an artifact.
-    let updates = providerSessionUpdates(provider, event.type, event.data)
+    const turn_id = this.live.state(session_id).turn?.turn_id
+    let updates = providerSessionUpdates(provider, event.type, { ...event.data, run_id })
     const rateLimit = provider === 'claude' && event.type === 'claude.rate_limit'
     // Read durable session state, rather than process/turn state. Keep every raw record,
     // including recovery to allowed, so a later warning is a new transition.
@@ -644,6 +645,7 @@ export class ProviderSessions {
         ? { provider_run_id: event.data.run_id }
         : {}),
       run_id,
+      ...(turn_id ? { turn_id } : {}),
       ...(late ? { late: true } : {}),
       ...mapped,
     }
@@ -665,7 +667,11 @@ export class ProviderSessions {
     const author = { kind: 'provider', provider, session_id } as const
     const appended = this.core.append(session_id, event.type, author, data)
     for (const update of updates)
-      this.core.append(session_id, 'session.update', author, { run_id, update })
+      this.core.append(session_id, 'session.update', author, {
+        run_id,
+        ...(turn_id ? { turn_id } : {}),
+        update,
+      })
     return appended
   }
   invalidate(run_id: string) {

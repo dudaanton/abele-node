@@ -58,6 +58,22 @@ async function registered(s: ReturnType<typeof setup>) {
     project_id: string
   }
 }
+it('places branch-named worktrees beside the repository by default', async () => {
+  const s = setup()
+  const p = await registered(s)
+  const created = (await s.request('workspace.create', {
+    project_id: p.project_id,
+    branch: 'feature/files',
+  })) as any
+  await s.core.resources.jobs.drain()
+  expect(await s.request('job.get', { job_id: created.job_id })).toMatchObject({
+    state: 'succeeded',
+  })
+  const workspace = (await s.request('workspace.get', {
+    workspace_id: created.workspace_id,
+  })) as any
+  expect(workspace.path).toBe(join(s.dir, 'repo with spaces.worktrees', 'feature%2Ffiles'))
+})
 it.each([false, true])('Open preserves a trusted plain folder (removed=%s)', async (removed) => {
   const s = setup()
   const folder = join(s.dir, 'sample-folder')
@@ -335,9 +351,9 @@ it('allocates concurrent isolated branches, reuses original jobs and leaves the 
   const managed = workspaces.filter((w) => w.kind === 'managed')
   expect(managed).toHaveLength(2)
   expect(new Set(managed.map((w) => w.branch)).size).toBe(2)
-  expect(managed.every((w) => w.path.startsWith(join(s.state, 'worktrees', p.project_id)))).toBe(
-    true
-  )
+  expect(
+    managed.every((w) => w.path.startsWith(join(s.dir, 'repo with spaces.worktrees') + '/'))
+  ).toBe(true)
   expect(git(s.repo, 'status', '--porcelain')).toBe(before)
   expect(git(s.repo, 'branch', '--show-current')).toBe('main')
   await expect(
@@ -387,6 +403,12 @@ it('refuses active leases, dirty/untracked/ignored content, roots and changed ma
     'resource_busy'
   )
   await expect(
+    s.request('workspace.remove', { workspace_id: w.workspace_id })
+  ).rejects.toMatchObject({
+    code: 'resource_busy',
+    details: { holder: 'session', session_id: session.session_id, title: 'attached' },
+  })
+  await expect(
     s.request('session.create', { title: 'second', workspace_id: w.workspace_id })
   ).rejects.toThrow('resource_busy')
   await s.request('session.detach', { session_id: session.session_id })
@@ -426,6 +448,28 @@ it('refuses active leases, dirty/untracked/ignored content, roots and changed ma
     state: 'succeeded',
   })
   expect(await s.request('project.register', { path: s.repo, trust: 'untrusted' })).toMatchObject(p)
+})
+it('releases a stopped session lease when deleting its worktree', async () => {
+  const s = setup(),
+    p = await registered(s),
+    w = await provision(s, p.project_id)
+  const session = (await s.request('session.create', {
+    provider: 'fake',
+    title: 'Stopped chat',
+    workspace_id: w.workspace_id,
+  })) as any
+  s.core.append(
+    session.session_id,
+    'session.stop_requested',
+    { kind: 'installation', installation_id: s.actor.installation_id },
+    { session_id: session.session_id }
+  )
+  const removed = (await s.request('workspace.remove', { workspace_id: w.workspace_id })) as any
+  await s.core.resources.jobs.drain()
+  expect(await s.request('job.get', { job_id: removed.job_id })).toMatchObject({
+    state: 'succeeded',
+  })
+  expect(s.core.session(session.session_id).workspace_id).toBeNull()
 })
 it.each(['branch_created', 'worktree_created'] as const)(
   'reconciles crash after %s without a second branch/worktree/job',
@@ -787,7 +831,7 @@ it('does not follow a symlink substituted for the node-owned worktree directory'
   const outside = join(s.dir, 'outside')
   mkdirSync(outside)
   mkdirSync(join(s.state, 'worktrees'), { recursive: true })
-  symlinkSync(outside, join(s.state, 'worktrees', p.project_id))
+  symlinkSync(outside, join(s.dir, 'repo with spaces.worktrees'))
   const created = (await s.request('workspace.create', { project_id: p.project_id })) as {
     job_id: string
   }

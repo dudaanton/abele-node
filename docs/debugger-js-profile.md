@@ -76,7 +76,22 @@ authority boundary. It requires all of:
 
 The owner's `debugger.v1.start` reaches it under `--debugger` (see
 [recorded runs](trace.md#starting-a-program)); it refuses until the adapter is installed. Existing
-clients remain compatible, and all `debugger.v1.*` RPC methods remain unsupported.
+clients remain compatible.
+
+The read-only owner method `debugger.v1.launchTargets` accepts the same `folder`
+and/or `conversation_id` as `start`. It returns up to 256 path-only targets:
+`{ program: 'dist/main.js', source: 'src/main.ts' }` from adjacent source maps,
+and `{ program: 'package.json', npm_script: 'start' }` from the root package's
+scripts. The bounded filesystem walk includes git-ignored output folders, excludes
+hidden folders and node_modules, and never traverses directory symlinks.
+
+`start` optionally accepts `npm_script` with `program: 'package.json'`. Direct
+`node <program.js> <arguments>` scripts support quoted arguments; request `argv`
+is appended as with `npm run <name> -- <argv>`. Node owns and debugs the resolved
+program directly, so npm adds no wrapper process. Shell operators, preparation
+steps, runtime switches, alternate runtimes and lifecycle hooks are unsupported
+(`debugger_npm_script_unsupported`). Startup failures include the owned process's
+bounded stderr tail in `ChannelError.details.stderr`, after cleanup completes.
 
 Launch configurations use typed executable/program paths, argv and an explicit
 string environment, with no shell, inherited environment, preparation commands,

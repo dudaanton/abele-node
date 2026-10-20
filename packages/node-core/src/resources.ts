@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -8,7 +8,7 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join, resolve, dirname, basename } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
 import {
   ProjectSchema,
@@ -39,6 +39,12 @@ import { NodeLsp } from './lsp/node.js'
 
 type Params = Record<string, unknown>
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+const worktreeName = (branch: string) => {
+  const encoded = encodeURIComponent(branch)
+  return encoded.length <= 200
+    ? encoded
+    : encoded.slice(0, 180) + '-' + createHash('sha256').update(branch).digest('hex').slice(0, 16)
+}
 const now = () => new Date().toISOString()
 const nodeActor = { kind: 'node' } as const
 export interface WorkspaceLease {
@@ -191,19 +197,20 @@ export class WorkspaceService {
   }
   /** Canonical node-owned parents, no symlinks, no caller-controlled paths. Never rm -rf. */
   managed(workspace: Workspace, createParents = false) {
+    const legacy = join(this.resources.worktreeRoot, workspace.project_id, workspace.workspace_id)
+    const root =
+      workspace.path === legacy
+        ? join(this.resources.worktreeRoot, workspace.project_id)
+        : this.resources.workspaceRoot(this.resources.projects.get(workspace.project_id))
     if (
       workspace.kind !== 'managed' ||
       !uuid.test(workspace.project_id) ||
       !uuid.test(workspace.workspace_id) ||
-      workspace.path !==
-        join(this.resources.worktreeRoot, workspace.project_id, workspace.workspace_id)
+      (workspace.path !== legacy && workspace.path !== join(root, worktreeName(workspace.branch!)))
     )
       throw new ChannelError('unmanaged_workspace')
     try {
-      for (const path of [
-        this.resources.worktreeRoot,
-        join(this.resources.worktreeRoot, workspace.project_id),
-      ]) {
+      for (const path of [dirname(root), root]) {
         if (createParents && !existsSync(path)) mkdirSync(path, { mode: 0o700 })
         if (
           lstatSync(path).isSymbolicLink() ||
@@ -407,9 +414,10 @@ export class JobReconciler {
     if (record || existsSync(workspace.path)) {
       await r.workspaces.clean(workspace) // recheck just before Git; never force
       r.jobs.phase(job, 'remove_intent')
-      await r.git.run(project.root_path, { kind: 'worktree.remove', path: workspace.path }, () =>
+      await r.git.run(project.root_path, { kind: 'worktree.remove', path: workspace.path }, () => {
         r.core.authority.check({ installation_id: job.installation_id }, 'provision')
-      )
+        r.repository.releaseWatchers(workspace.path)
+      })
       boundary('worktree_removed')
     } else if (job.phase !== 'remove_intent') throw new ChannelError('unmanaged_workspace')
     r.core.transaction(() => {
@@ -582,6 +590,65 @@ export class ResourceServices {
   readonly jobs = new JobService(this)
   readonly reconciler = new JobReconciler(this)
   readonly worktreeRoot: string
+  private readonly customWorktreeRoot: boolean
+  workspaceRoot(project: Project) {
+    return this.customWorktreeRoot
+      ? join(this.worktreeRoot, project.project_id)
+      : join(dirname(project.root_path), basename(project.root_path) + '.worktrees')
+  }
+  /** A catalog binding is not execution. Preserve the chat, release idle bindings only. */
+  async releaseWorktree(actor: AuthorityContext, path: string) {
+    const lease = this.core.db
+      .prepare('SELECT session_id FROM execution_target_leases WHERE path=?')
+      .get(path) as { session_id: string } | undefined
+    if (lease)
+      throw new ChannelError(
+        'resource_busy',
+        'resource_busy: execution session ' + this.core.session(lease.session_id).title,
+        {
+          holder: 'execution',
+          session_id: lease.session_id,
+          title: this.core.session(lease.session_id).title,
+        }
+      )
+    const sessions = (
+      this.core.db
+        .prepare(
+          'SELECT session_id FROM sessions WHERE session_id NOT IN (SELECT session_id FROM deleted_sessions)'
+        )
+        .all() as { session_id: string }[]
+    ).filter(({ session_id }) => this.targets.pathForSession(session_id) === path)
+    const release: string[] = []
+    for (const { session_id } of sessions) {
+      const last = this.core.db
+        .prepare(
+          "SELECT json_extract(body,'$.type') AS type FROM events WHERE stream_id=? AND json_extract(body,'$.type') IN ('session.stop_requested','input.accepted') ORDER BY seq DESC LIMIT 1"
+        )
+        .get(session_id) as { type: string } | undefined
+      const persistent = this.core.db
+        .prepare('SELECT 1 FROM workspace_leases WHERE session_id=?')
+        .get(session_id)
+      if (!persistent && last?.type !== 'session.stop_requested') continue
+      if (
+        last?.type !== 'session.stop_requested' ||
+        this.targets.busy(session_id) ||
+        this.core.delegations.isActive(session_id)
+      )
+        throw new ChannelError(
+          'resource_busy',
+          'resource_busy: session ' + this.core.session(session_id).title,
+          {
+            holder: 'session',
+            session_id,
+            title: this.core.session(session_id).title,
+          }
+        )
+      release.push(session_id)
+    }
+    for (const session_id of release)
+      await this.core.request(actor, 'session.detach', { session_id }, randomUUID())
+    await this.lsp.releaseRoot(path)
+  }
   constructor(
     readonly core: NodeCore,
     configuredRoot?: string,
@@ -595,6 +662,14 @@ export class ResourceServices {
     this.targets = new ExecutionTargetService(this)
     const stored = core.db.prepare("SELECT value FROM meta WHERE key='worktree_root'").get() as
       { value: string } | undefined
+    const layout = core.db
+      .prepare("SELECT value FROM meta WHERE key='worktree_root_custom'")
+      .get() as { value: string } | undefined
+    this.customWorktreeRoot =
+      !!configuredRoot ||
+      (layout
+        ? layout.value === '1'
+        : !!(stored && stored.value !== join(realpathSync(core.stateDir), 'worktrees')))
     this.worktreeRoot = resolve(
       configuredRoot ?? stored?.value ?? join(realpathSync(core.stateDir), 'worktrees')
     )
@@ -626,6 +701,11 @@ export class ResourceServices {
         "INSERT INTO meta VALUES('worktree_root',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
       )
       .run(this.worktreeRoot)
+    core.db
+      .prepare(
+        "INSERT INTO meta VALUES('worktree_root_custom',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+      )
+      .run(this.customWorktreeRoot ? '1' : '0')
     this.ready = core.db.prepare('SELECT 1 FROM repository_deletions LIMIT 1').get()
       ? Promise.resolve().then(() => this.repository.recoverDeletions())
       : Promise.resolve([])
@@ -686,7 +766,10 @@ export class ResourceServices {
       workspace_id,
       project_id: project.project_id,
       kind: 'managed',
-      path: join(this.worktreeRoot, project.project_id, workspace_id),
+      path: join(
+        this.workspaceRoot(project),
+        worktreeName(prepared.branch ?? 'abele/' + workspace_id)
+      ),
       branch: prepared.branch ?? 'abele/' + workspace_id,
       base_commit: prepared.base,
       state: 'provisioning',
@@ -918,6 +1001,7 @@ export class ResourceServices {
         const workspace = this.workspaces.get(String(p.workspace_id)),
           project = this.projects.get(workspace.project_id)
         if (workspace.kind !== 'managed') throw new ChannelError('unmanaged_workspace')
+        await this.releaseWorktree(actor, workspace.path)
         if (workspace.state !== 'ready' || this.workspaces.leased(workspace.workspace_id))
           throw new ChannelError('resource_busy')
         return this.git.serialize(project.git_common_dir!, async () => {

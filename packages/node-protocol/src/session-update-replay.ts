@@ -47,6 +47,21 @@ export function sessionUpdatesOf(event: JournalEvent): SessionUpdate[] {
     return parsed.success && isKnownSessionUpdate(parsed.data.update) ? [parsed.data.update] : []
   }
   const data = event.data as Record<string, unknown> | null
+  if (
+    event.type === 'input.accepted' &&
+    data &&
+    data.mapped !== true &&
+    typeof data.input_id === 'string' &&
+    typeof data.text === 'string'
+  )
+    return [
+      {
+        kind: 'user_message',
+        message_id: data.input_id,
+        text: data.text.slice(0, 65536),
+        ...(data.text.length > 65536 ? { truncated: true } : {}),
+      },
+    ]
   if (event.actor.kind === 'node') return nodeUpdates(event.type, data ?? {})
   if (event.actor.kind !== 'provider' || !data || typeof data !== 'object' || data.mapped === true)
     return []

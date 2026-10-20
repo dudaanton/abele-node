@@ -477,6 +477,13 @@ export class NodePathService {
     if (Object.hasOwn(FileOperationMethodSchemas, method))
       return this.r.mutations.fileOperation(actor, method as FileOperationMethod, p, operation)
     switch (method) {
+      case 'workspace.file.directory':
+      case 'repository.v1.file.directory': {
+        const id = String(p.worktree_id ?? p.workspace_id)
+        this.r.core.authority.check(actor, 'resource', id)
+        if (p.worktree_id) await this.r.repository.readableTarget(actor, id)
+        return this.r.mutations.directory(id, String(p.path), !!p.worktree_id)
+      }
       case 'filesystem.v1.directories':
         return this.browse(actor, p)
       case 'filesystem.v1.mkdir': {

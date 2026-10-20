@@ -9,6 +9,8 @@ import {
 import { LocalChannelConnector, RequestChannel, reconnect } from '@abele/channel-client'
 import { DebuggerClient } from './debugger.js'
 import { LspClient } from './lsp.js'
+import { ChatClient } from './chat.js'
+export { ChatClient } from './chat.js'
 export { LspClient, type LspRoot } from './lsp.js'
 export { DebuggerClient, parseDebuggerVariables } from './debugger.js'
 export { TraceClient } from './trace.js'
@@ -169,6 +171,10 @@ export class MemoryClientStore implements ClientStore {
 }
 export class NodeClient {
   readonly lsp = new LspClient((method, params) => this.request(method, params))
+  readonly chat = new ChatClient((method, params, operation) => {
+    if (!this.channel) return Promise.reject(new ChannelError('disconnected'))
+    return this.channel.request(method, params, operation)
+  })
   readonly nodePath = new NodePathClient(
     (method, params) => this.request(method, params),
     (method, params, operation) => this.mutation(method, params, operation)

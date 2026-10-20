@@ -16,6 +16,7 @@ import {
 import { WorkerMessageSchema } from './wire.js'
 import type { PiAction, Answer } from './host.js'
 import { startPiLiveSession } from './live.js'
+import { nodeToolFailure } from './tool-error.js'
 import type {
   LiveSession,
   LiveSessionContext,
@@ -53,7 +54,7 @@ export interface PiOptions {
 }
 export const PI_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 const validModel = (m: unknown): m is string =>
-  typeof m === 'string' && /^[A-Za-z0-9_.[\]-]{1,128}$/.test(m) && !m.startsWith('-')
+  typeof m === 'string' && /^[A-Za-z0-9_./:[\]-]{1,256}$/.test(m) && !m.startsWith('-')
 export interface PiSink extends ProviderEventSink {
   question?(action: PiAction, signal: AbortSignal): Promise<Answer>
   reaped?(leader: ProcessIdentity): void
@@ -257,6 +258,14 @@ export class PiProviderAdapter {
           ? supported('sdk-0.87.0-native-file-interrupt-resume-v1')
           : unsupported('Pinned and prepared SDK required'),
         queued_followups: supported('node-queue-session-idle-v1'),
+        model_catalog: supported(
+          'pi.model.catalog; worker-local SDK available snapshot and provider account label'
+        ),
+        conversation_checkpoints: this.liveAvailable
+          ? unverified(
+              'chat.checkpoints; chat.preview; chat.restore; filesystem/database tests passed; live host acceptance pending'
+            )
+          : unsupported('Requires long-lived pi sessions'),
         extension_prompts: unverified(
           'Durable select/confirm/input/trust bridge passed fake SDK tests; real inherited extension compatibility is not yet accepted'
         ),
@@ -451,6 +460,9 @@ export class PiProviderAdapter {
                 id: m.id,
                 result: sink.debugger.publish(m.args, result),
               })
+          } catch (error) {
+            if (!signal.aborted)
+              send({ kind: 'debugger_result', id: m.id, result: nodeToolFailure(m.name, error) })
           } finally {
             debuggerCalls.delete(m.id)
           }

@@ -16,8 +16,8 @@ export const SessionSettingsSchema = z
     model: z
       .string()
       .min(1)
-      .max(128)
-      .regex(/^[A-Za-z0-9_.[\]-]+$/)
+      .max(256)
+      .regex(/^[A-Za-z0-9_./:[\]-]+$/)
       .refine((m) => !m.startsWith('-'))
       .optional(),
     effort: z.enum(SESSION_EFFORTS).optional(),

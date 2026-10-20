@@ -86,7 +86,7 @@ it('retains added paths across node recovery and restores breakpoints by path af
       0,
       [
         { breakpoint_id: 'unbuilt', source_id: 's2', line: 1 },
-        { breakpoint_id: 'kept', source_id: 's3', line: 1 },
+        { breakpoint_id: 'kept', source_id: 's3', line: 1, enabled: false, hit_condition: '3' },
       ],
       []
     )
@@ -104,7 +104,9 @@ it('retains added paths across node recovery and restores breakpoints by path af
     ])
     expect(
       current.core.debugger.snapshot(restarted.debug_session_id).snapshot.breakpoints
-    ).toMatchObject([{ breakpoint_id: 'kept', source_id: 's2' }])
+    ).toMatchObject([
+      { breakpoint_id: 'kept', source_id: 's2', enabled: false, hit_condition: '3' },
+    ])
     expect(
       current.core.debugger.snapshot(restarted.debug_session_id).snapshot.breakpoints
     ).toHaveLength(1)

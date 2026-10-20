@@ -24,7 +24,7 @@ async function fixture(
   const path = join(dir, 'fixture.cjs')
   writeFileSync(path, 'setInterval(() => {}, 1000)\n')
   const w = wire(wireOptions),
-    state = core.debugger.create({ ...target, adapter_profile: profile })
+    state = core.debugger.create({ ...target, build_identity: 'matched', adapter_profile: profile })
   const session = new DapSession(core.debugger, state, w.dap, new Map([['source', path]]))
   try {
     await work({ core, session, w, path })
@@ -61,6 +61,135 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('retains confirmed ids for an unchanged source when adding a point in another source', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const first = f.session.patchBreakpoints(
+        0,
+        [{ breakpoint_id: 'one', source_id: 'source', line: 1 }],
+        []
+      )
+      f.w.reply(f.w.messages.at(-1), { breakpoints: [{ id: 11, verified: true, line: 1 }] })
+      await first
+      f.session.admitSources(new Map([['second', '/project/second.cjs']]))
+      const at = f.w.messages.length
+      const second = f.session.patchBreakpoints(
+        1,
+        [{ breakpoint_id: 'two', source_id: 'second', line: 2 }],
+        []
+      )
+      void second.catch(() => {})
+      const sent = f.w.messages.slice(at).filter((m) => m.command === 'setBreakpoints')
+      expect(sent.map((m) => m.arguments.source.path)).toEqual(['/project/second.cjs'])
+      f.w.reply(sent[0], { breakpoints: [{ id: 12, verified: true, line: 2 }] })
+      await second
+      expect(f.session.snapshot.breakpoints.map((bp) => bp.status)).toEqual([
+        'verified',
+        'verified',
+      ])
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: {
+          threadId: 1,
+          allThreadsStopped: true,
+          reason: 'breakpoint',
+          hitBreakpointIds: [11],
+        },
+      })
+      expect(f.session.snapshot.threads[0]!.stop!.hit_breakpoint_ids).toEqual(['one'])
+    }))
+  it('preserves bounded mapped paths for non-admitted project callers and node internals', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const pending = f.session.stack(1)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [
+          { id: 1, name: 'price', source: { path: '/project/src/pricing.ts' }, line: 7, column: 1 },
+          { id: 2, name: 'run', source: { path: 'node:internal/timers' }, line: 10, column: 1 },
+          {
+            id: 3,
+            name: 'long',
+            source: { path: '/project/' + 'я'.repeat(4096) },
+            line: 1,
+            column: 1,
+          },
+        ],
+      })
+      const page = await pending
+      expect(page.items[0]).toMatchObject({
+        source_id: null,
+        path: '/project/src/pricing.ts',
+        line: 7,
+      })
+      expect(page.items[1]).toMatchObject({ source_id: null, path: 'node:internal/timers' })
+      expect(Buffer.byteLength(page.items[2]!.path!)).toBeLessThanOrEqual(4096)
+      expect(page.items[2]!.path).not.toContain('\uFFFD')
+    }))
+  it('sends native hit counts and retains disabled points', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      ;(f.session as any).capabilities.supportsHitConditionalBreakpoints = true
+      const pending = f.session.patchBreakpoints(
+        0,
+        [
+          { breakpoint_id: 'on', source_id: 'source', line: 1, hit_condition: '3', enabled: true },
+          { breakpoint_id: 'off', source_id: 'source', line: 2, enabled: false },
+        ],
+        []
+      )
+      const request = f.w.messages.at(-1)
+      expect(request.arguments.breakpoints).toEqual([{ line: 1, hitCondition: '3' }])
+      f.w.reply(request, { breakpoints: [{ verified: true, line: 1 }] })
+      await pending
+      expect(f.core.debugger.snapshot(f.session.id).snapshot.breakpoints).toMatchObject([
+        { breakpoint_id: 'on', hit_condition: '3', enabled: true },
+        { breakpoint_id: 'off', enabled: false },
+      ])
+    }))
+  it('reconciles paused evaluation and expires old handles', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const frame = f.core.debugger.issueHandle(f.session.id, 'frame', 42, 1)
+      ;(f.session as any).frameThreads.set(frame, 1)
+      const pending = f.session.evaluate(frame, '1 + 1')
+      f.w.reply(f.w.messages.at(-1), { result: '2' })
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      const probe = f.w.messages.at(-1)
+      expect(probe.command).toBe('stackTrace')
+      f.w.reply(probe, { stackFrames: [{ id: 42, name: 'main', line: 1, column: 1 }] })
+      await pending
+      expect(f.core.debugger.snapshot(f.session.id).snapshot.execution).toBe('stopped')
+      expect(() => f.core.debugger.resolveHandle(f.session.id, frame, 'frame')).toThrow()
+      const stack = f.session.stack(1)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [{ id: 43, name: 'main', line: 1, column: 1 }],
+      })
+      expect((await stack).items[0]?.handle).toEqual(expect.any(String))
+      const step = f.session.step(1, 'over')
+      expect(f.w.messages.at(-1).command).toBe('next')
+      f.w.reply(f.w.messages.at(-1))
+      await step
+    }))
+  it('does not overwrite a continued event with evaluation reconciliation', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const frame = f.core.debugger.issueHandle(f.session.id, 'frame', 42, 1)
+      ;(f.session as any).frameThreads.set(frame, 1)
+      const pending = f.session.evaluate(frame, '1')
+      f.w.reply(f.w.messages.at(-1), { result: '1' })
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      const probe = f.w.messages.at(-1)
+      expect(probe.command).toBe('stackTrace')
+      f.w.send({
+        type: 'event',
+        event: 'continued',
+        body: { threadId: 1, allThreadsContinued: true },
+      })
+      f.w.reply(probe, { stackFrames: [{ id: 42 }] })
+      await pending
+      expect(f.session.snapshot.execution).toBe('running')
+    }))
   it('never exports a lazy getter reference or evaluates it while inspecting native objects', async () =>
     fixture(
       async (f) => {

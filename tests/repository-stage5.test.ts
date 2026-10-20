@@ -66,6 +66,40 @@ async function wait(predicate: () => boolean) {
     await new Promise((r) => setTimeout(r, 20))
   }
 }
+it('detects local master as the comparison base without a remote', async () => {
+  const s = await setup()
+  git(s.repo, 'branch', 'master')
+  const refs = await s.request('repository.v1.refs', { worktree_id: s.external })
+  expect(refs.default_branch).toBe('refs/heads/master')
+})
+it('finds nested filenames across the whole tree including large files, respecting gitignore', async () => {
+  const s = await setup()
+  mkdirSync(join(s.repo, 'deep', 'nested'), { recursive: true })
+  writeFileSync(join(s.repo, '.gitignore'), 'hidden.ts\n')
+  writeFileSync(join(s.repo, 'deep', 'nested', 'large.ts'), 'x'.repeat(2 * 1024 * 1024))
+  writeFileSync(join(s.repo, 'deep', 'hidden.ts'), 'hidden')
+  const observed = await s.request('repository.v1.observe', { worktree_id: s.root })
+  const found = await s.request('repository.v1.search', {
+    worktree_id: s.root,
+    revision: observed.revision,
+    mode: 'filename',
+    query: '.ts',
+  })
+  expect(found.entries.map((entry: any) => entry.path)).toEqual(['deep/nested/large.ts'])
+})
+it('revalidates an unchanged observation after an unreliable watcher hint', async () => {
+  const s = await setup()
+  const observed = await s.request('repository.v1.observe', { worktree_id: s.external })
+  const monitor = (s.core.resources.repository as any).monitors.get(s.external)
+  monitor.reliable = false
+  monitor.generation++
+  expect(
+    await s.request('repository.v1.status', {
+      worktree_id: s.external,
+      revision: observed.revision,
+    })
+  ).toMatchObject({ entries: [] })
+})
 it('requires identity-bound owner approval for external durable saves and restore', async () => {
   const s = await setup(),
     p = {

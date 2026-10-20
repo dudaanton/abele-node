@@ -29,6 +29,8 @@ export const DEBUGGER_LIMITS = Object.freeze({
 })
 export const DEBUGGER_V1_CAPABILITY = Object.freeze({
   status: 'supported' as const,
+  breakpoint_hit_condition: true,
+  breakpoint_enabled: true,
   evidence:
     'debugger.v1-contracts; bounded-state-and-history; bounded-dap; js-profile-pinned; authorized-shared-control',
 })
@@ -90,6 +92,8 @@ export const DebuggerBreakpointRequestSchema = z
     line,
     column: line.optional(),
     condition: z.string().min(1).max(8192).optional(),
+    hit_condition: z.string().min(1).max(8192).optional(),
+    enabled: z.boolean().optional(),
     log_message: z.string().min(1).max(8192).optional(),
   })
   .strict()
@@ -97,6 +101,12 @@ export type DebuggerBreakpointRequest = z.infer<typeof DebuggerBreakpointRequest
 
 /** Internal normalized driver seam, not a public DAP request API. */
 export const DebuggerObservationSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('build_identity'),
+      build_identity: z.enum(['unknown', 'matched', 'mismatched']),
+    })
+    .strict(),
   z
     .object({
       kind: z.literal('threads'),

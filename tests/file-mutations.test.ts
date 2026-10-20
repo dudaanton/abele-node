@@ -79,6 +79,115 @@ type Receipt = {
   recovery_path: string | null
   predecessor_content_id: string | null
 }
+it('moves and deletes a confirmed directory tree without following links or overwriting destinations', async () => {
+  const s = await setup()
+  const request = (method: string, params: object, operation?: string) =>
+    s.core.request(
+      s.actor,
+      method,
+      { workspace_id: s.params.workspace_id, ...params },
+      operation
+    ) as Promise<any>
+  mkdirSync(join(s.repo, 'src', 'nested'), { recursive: true })
+  writeFileSync(join(s.repo, 'src', 'nested', 'file'), 'keep')
+  const seen = await request('workspace.file.directory', { path: 'src' })
+  const move = { from: 'src', to: 'renamed', directory: true, expected_content_id: seen.content_id }
+  expect(await request('workspace.file.move', move, 'move-folder')).toMatchObject({
+    state: 'applied',
+  })
+  expect(await request('workspace.file.move', move, 'move-folder')).toMatchObject({
+    state: 'applied',
+  })
+  expect(readFileSync(join(s.repo, 'renamed', 'nested', 'file'), 'utf8')).toBe('keep')
+  const remove = { path: 'renamed', directory: true, expected_content_id: seen.content_id }
+  writeFileSync(join(s.repo, 'renamed', 'nested', 'file'), 'changed')
+  expect(await request('workspace.file.remove', remove, 'stale-folder')).toMatchObject({
+    state: 'conflict',
+  })
+  const current = await request('workspace.file.directory', { path: 'renamed' })
+  expect(
+    await request(
+      'workspace.file.remove',
+      { ...remove, expected_content_id: current.content_id },
+      'delete-folder'
+    )
+  ).toMatchObject({ state: 'applied', recovery_path: expect.any(String) })
+  expect(existsSync(join(s.repo, 'renamed'))).toBe(false)
+  mkdirSync(join(s.repo, 'linked'))
+  symlinkSync(s.dir, join(s.repo, 'linked', 'escape'))
+  await expect(request('workspace.file.directory', { path: 'linked' })).rejects.toThrow(
+    'unsafe_path'
+  )
+})
+it('bounds directory manifests and refuses Git metadata and occupied destinations', async () => {
+  const s = await setup()
+  let op = 0
+  const request = async (method: string, params: object) =>
+    s.core.request(
+      s.actor,
+      method,
+      { workspace_id: s.params.workspace_id, ...params },
+      'directory-' + ++op
+    ) as Promise<any>
+  mkdirSync(join(s.repo, 'many'))
+  for (let i = 0; i < 256; i++) writeFileSync(join(s.repo, 'many', String(i)), '')
+  await expect(request('workspace.file.directory', { path: 'many' })).rejects.toThrow(
+    'output_limit'
+  )
+  mkdirSync(join(s.repo, 'submodule', '.git'), { recursive: true })
+  await expect(request('workspace.file.directory', { path: 'submodule' })).rejects.toThrow(
+    'unsafe_path'
+  )
+  mkdirSync(join(s.repo, 'source'))
+  mkdirSync(join(s.repo, 'occupied'))
+  const seen = await request('workspace.file.directory', { path: 'source' })
+  expect(
+    await request('workspace.file.move', {
+      from: 'source',
+      to: 'occupied',
+      directory: true,
+      expected_content_id: seen.content_id,
+    })
+  ).toMatchObject({ state: 'conflict' })
+  await expect(
+    request('workspace.file.remove', {
+      path: '../escape',
+      directory: true,
+      expected_content_id: seen.content_id,
+    })
+  ).rejects.toThrow('invalid_params')
+})
+it('never replays an interrupted directory deletion and retains its complete recovery manifest', async () => {
+  const s = await setup()
+  const request = async (method: string, params: object, operation?: string) =>
+    s.core.request(
+      s.actor,
+      method,
+      { workspace_id: s.params.workspace_id, ...params },
+      operation
+    ) as Promise<any>
+  mkdirSync(join(s.repo, 'folder'))
+  writeFileSync(join(s.repo, 'folder', 'file'), 'valuable')
+  const seen = await request('workspace.file.directory', { path: 'folder' })
+  const params = { path: 'folder', directory: true, expected_content_id: seen.content_id }
+  s.core.resources.mutations.operationFault = (point) => {
+    if (point === 'source_removed') throw new Error('lost reply')
+  }
+  await expect(request('workspace.file.remove', params, 'interrupted-directory')).rejects.toThrow(
+    'lost reply'
+  )
+  mkdirSync(join(s.repo, 'folder'))
+  writeFileSync(join(s.repo, 'folder', 'replacement'), 'new content')
+  s.core.resources.mutations.operationFault = undefined
+  const receipt = await request('workspace.file.remove', params, 'interrupted-directory')
+  expect(receipt).toMatchObject({ state: 'outcome_unknown', recovery_path: expect.any(String) })
+  expect(readFileSync(join(s.repo, 'folder', 'replacement'), 'utf8')).toBe('new content')
+  const manifest = JSON.parse(readFileSync(join(s.dir, 'state', receipt.recovery_path), 'utf8'))
+  expect(manifest).toMatchObject({ format: 'directory-v1' })
+  expect(manifest.entries.find((entry: any) => entry.path === 'file').bytes).toBe(
+    Buffer.from('valuable').toString('base64')
+  )
+})
 function recovery(s: Awaited<ReturnType<typeof setup>>, receipt: Receipt) {
   return join(s.dir, 'state', receipt.recovery_path!)
 }

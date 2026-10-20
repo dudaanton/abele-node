@@ -9,6 +9,8 @@ import {
   DebuggerAttachProgramSchema,
   DebuggerProgramsResultSchema,
   DebuggerProgramsSchema,
+  DebuggerLaunchTargetsSchema,
+  DebuggerLaunchTargetsResultSchema,
   DebuggerStartSchema,
   DebuggerStartResultSchema,
   DebuggerAddSourcesSchema,
@@ -156,6 +158,18 @@ export class DebuggerClient {
       await this.rpc('debugger.v1.addSources', DebuggerAddSourcesSchema.parse(params))
     )
   }
+  /** Paths of compiled programs and root npm scripts available in the owner's folder. */
+  async launchTargets(owner: string | (typeof DebuggerLaunchTargetsSchema)['_input']) {
+    return DebuggerLaunchTargetsResultSchema.parse(
+      await this.rpc(
+        'debugger.v1.launchTargets',
+        DebuggerLaunchTargetsSchema.parse(
+          typeof owner === 'string' ? { conversation_id: owner } : owner
+        )
+      )
+    )
+  }
+
   /** Node.js programs on the node's machine waiting for a debugger on loopback, for a chat. */
   async programs(owner: string | (typeof DebuggerProgramsSchema)['_input']) {
     return DebuggerProgramsResultSchema.parse(

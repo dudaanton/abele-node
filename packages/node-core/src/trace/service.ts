@@ -229,6 +229,24 @@ export class TraceService {
     // A sent request is written when its answer is in, at the time it went: in time it heads the
     // steps it caused. The sort is stable, so everything else keeps the order it was written in.
     const steps = [...written].sort((a, b) => a.at - b.at)
+    const requests = steps.filter(
+      (s) => s.kind === 'http' && s.direction && s.duration_ms !== undefined
+    )
+    const parents = new Set(steps.filter((s) => s.kind === 'http').map((s) => s.chain))
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i]!
+      if (step.kind !== 'probe' || (step.chain && parents.has(step.chain))) continue
+      const request = requests
+        .filter((r) => r.at <= step.at && r.at + r.duration_ms! >= step.at)
+        .sort((a, b) =>
+          a.direction === b.direction ? b.at - a.at : a.direction === 'incoming' ? -1 : 1
+        )[0]
+      if (request?.chain) steps[i] = { ...step, chain: request.chain, by_time: true }
+      else if (step.chain) {
+        const { chain: _chain, by_time: _byTime, ...unlinked } = step
+        steps[i] = unlinked
+      }
+    }
     const marks = store.marks(id)
     const marked = new Set(marks.map((m) => m.step))
     const lastBy = new Map<string, string>()
@@ -441,6 +459,8 @@ function stepOut(s: TraceStoredStep, lastBy: Map<string, string>): TraceStep {
     ...(s.paused_ms !== undefined ? { paused_ms: s.paused_ms } : {}),
     ...(s.status !== undefined ? { status: s.status } : {}),
     ...(s.host ? { host: s.host } : {}),
+    ...(s.direction ? { direction: s.direction } : {}),
+    ...(s.duration_ms !== undefined ? { duration_ms: s.duration_ms } : {}),
     ...(s.chain ? { chain: s.chain } : {}),
     ...(s.by_time ? { by_time: true } : {}),
     ...(s.sent ? { sent: true } : {}),

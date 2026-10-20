@@ -76,6 +76,8 @@ export const TraceStepSchema = z
     paused_ms: z.number().optional(),
     status: z.number().int().optional(),
     host: z.string().optional(),
+    direction: z.enum(['incoming', 'outgoing']).optional(),
+    duration_ms: z.number().nonnegative().optional(),
     chain: z.string().optional(),
     /** Under its request only because it ran while the request was out. */
     by_time: z.boolean().optional(),

@@ -20,6 +20,10 @@ import { HttpSendStatusSchema } from '../../packages/node-protocol/src/http.js'
 import { wire } from '../debugger/dap-wire.js'
 import { target } from '../debugger/helpers.js'
 import { adapter } from '../trace/adapter.js'
+import {
+  programHttpKey,
+  type ProgramHttpEvent,
+} from '../../packages/node-core/src/trace/program-http.js'
 
 const dirs: string[] = []
 const servers: Server[] = []
@@ -438,7 +442,19 @@ describe('saved requests on the node', () => {
     const w = wire()
     let hit: () => void = () => {}
     const base = await service(() => hit())
-    const fake = adapter(w, () => ({ order: { qty: 2 } }), s.repo)
+    let traffic: ProgramHttpEvent[] = []
+    const fake = adapter(
+      w,
+      () => ({
+        order: { qty: 2 },
+        Buffer,
+        [programHttpKey]: {
+          drain: () => traffic.splice(0, 1),
+          stop: () => {},
+        },
+      }),
+      s.repo
+    )
     const state = s.core.debugger.create({
       ...target,
       project_id: s.project_id,
@@ -476,7 +492,22 @@ describe('saved requests on the node', () => {
       )
       const dapId = fake.lastBreakpointId()
       // The service's code reaches the record point while it answers.
-      hit = () => fake.hit([dapId])
+      hit = () => {
+        traffic.push({
+          id: 'n1',
+          direction: 'incoming',
+          method: 'POST',
+          url: `${base}/slow/orders`,
+          started: Date.now(),
+          ended: Date.now() + 100,
+          status: 201,
+          request_headers: {},
+          response_headers: {},
+          request_body: '{"qty":2}',
+          response_body: 'answer',
+        })
+        fake.hit([dapId])
+      }
       const sent = s.request('http.v1.send', {
         ...p,
         request_id: 'Orders/Create order.http',
@@ -494,17 +525,62 @@ describe('saved requests on the node', () => {
         (v) => v.outcome.state !== 'sending'
       )
       expect(status.code_steps).toBe(1)
-      expect(status.send.run).toEqual({ run_id: sent.run_id, step: 't0002' })
+      expect(status.send.run).toEqual({ run_id: sent.run_id, step: expect.any(String) })
       expect(JSON.parse(status.outcome.response.body).step).toMatch(/^h[0-9a-f]{12}$/)
       await s.core.trace.recorder.settled(session.id)
       const run = s.request('trace.v1.run', { ...p, run_id: sent.run_id })
+      expect(status.send.run).toEqual({
+        run_id: sent.run_id,
+        step: run.steps.find((step: any) => step.sent).id,
+      })
       expect(run.steps.map((x: any) => [x.kind, x.label])).toEqual([
+        ['http', 'POST /slow/orders'],
         ['http', 'POST /slow/orders'],
         ['probe', 'Order read'],
       ])
-      expect(run.steps[0]).toMatchObject({ sent: true, status: 201, host: expect.any(String) })
-      expect(run.steps[1]).toMatchObject({ by_time: true, chain: run.steps[0].chain })
+      expect(run.steps[0]).toMatchObject({
+        sent: true,
+        direction: 'incoming',
+        status: 201,
+        host: expect.any(String),
+      })
+      expect(run.steps[1]).toMatchObject({ direction: 'incoming', chain: 'n1' })
+      expect(run.steps[2]).toMatchObject({ by_time: true, chain: run.steps[0].chain })
       expect(run.steps[0].values.map((v: any) => v.name)).toEqual(['request', 'response'])
+      hit = () => {}
+      const unrelated = s.request('http.v1.send', {
+        ...p,
+        method: 'GET',
+        url: `${base}/missing/sink`,
+        headers: [],
+        secrets: [],
+        debug_session_id: session.id,
+      })
+      await s.core.http.settled()
+      expect(
+        s.request('http.v1.send.status', { ...p, send_id: unrelated.send_id }).send.run
+      ).toBeUndefined()
+      expect(s.request('trace.v1.run', { ...p, run_id: sent.run_id }).steps).toHaveLength(3)
+      const flush = s.core.trace.recorder.flushHttp
+      s.core.trace.recorder.flushHttp = async () => {
+        throw new Error('fixture capture unavailable')
+      }
+      try {
+        const failedCapture = s.request('http.v1.send', {
+          ...p,
+          method: 'GET',
+          url: `${base}/missing/capture`,
+          headers: [],
+          secrets: [],
+          debug_session_id: session.id,
+        })
+        await s.core.http.settled()
+        expect(
+          s.request('http.v1.send.status', { ...p, send_id: failedCapture.send_id }).outcome.state
+        ).toBe('answered')
+      } finally {
+        s.core.trace.recorder.flushHttp = flush
+      }
     } finally {
       off()
       fake.stop()

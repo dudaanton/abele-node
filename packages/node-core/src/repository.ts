@@ -781,6 +781,16 @@ export class RepositoryService {
     this.snapshots.delete(id + ':false')
     this.snapshots.delete(id + ':true')
   }
+  releaseWatchers(path: string) {
+    const rows = this.r.core.db
+      .prepare('SELECT worktree_id FROM repository_targets WHERE path=?')
+      .all(path) as { worktree_id: string }[]
+    for (const { worktree_id } of rows) {
+      for (const [id, subscription] of this.subscriptions)
+        if (subscription.target.worktree_id === worktree_id) this.unwatch(id)
+      this.dropMonitor(worktree_id)
+    }
+  }
   private leaseSize(value: object): number {
     // Index-owned arrays are charged once to the separate working-index budget.
     if (this.rowSnapshots.has(value)) return 0
@@ -1219,6 +1229,7 @@ export class RepositoryService {
           .run(result.worktree_id)
         for (const [id, lease] of this.subscriptions)
           if (lease.target.worktree_id === result.worktree_id) this.unwatch(id)
+        this.dropMonitor(result.worktree_id)
         core.append(
           'catalog',
           'project.worktree.deleted',
@@ -1326,6 +1337,8 @@ export class RepositoryService {
           if (pending.request_hash !== request_hash) throw new ChannelError('idempotency_mismatch')
           return this.reconcileDeletion(pending)
         }
+        this.checkPublication(actor, p)
+        await this.r.releaseWorktree(actor, target.path)
         const releaseReservation = this.r.targets.reserveDeletion(
           actor,
           target.project_id,
@@ -1352,8 +1365,11 @@ export class RepositoryService {
             throw new ChannelError('unmanaged_workspace')
           if (this.registrationIdentity(record) !== observed.registration)
             throw new ChannelError('stale_revision')
+          if (record.locked)
+            throw new ChannelError('resource_busy', 'resource_busy: Git worktree lock', {
+              holder: 'git_lock',
+            })
           if (
-            record.locked ||
             this.r.targets.leasedPath(target.path) ||
             (target.workspace_id && this.r.workspaces.leased(target.workspace_id))
           )
@@ -1852,7 +1868,17 @@ export class RepositoryService {
       ignoreStamps,
       started,
       boundaries,
-      fingerprint: hash(JSON.stringify([head, status, [...stamps], [...ignoreStamps], signature])),
+      // A hint invalidates the fast cache, but is not itself a filesystem change.
+      // Unreliable watchers must compare the rescan's metadata, not its hint counter.
+      fingerprint: hash(
+        JSON.stringify([
+          head,
+          status,
+          [...stamps],
+          [...ignoreStamps],
+          JSON.parse(signature).slice(1),
+        ])
+      ),
     }
     const footprint =
       this.retainedSizes.get(files)! +
@@ -1864,7 +1890,11 @@ export class RepositoryService {
       this.restoreBaseline(monitor)
       throw new ChannelError('scan_limit')
     }
-    if (cached?.fingerprint === snapshot.fingerprint) {
+    if (cached?.fingerprint === snapshot.fingerprint && cached.monitor === monitor) {
+      // The fingerprint leaves out the hint counter, so the rescan that proved nothing visible
+      // changed also re-arms the reused snapshot: its signature and capture time are this scan's.
+      cached.signature = snapshot.signature
+      cached.started = snapshot.started
       this.restoreBaseline(monitor, cached)
       return cached
     }
@@ -2223,8 +2253,16 @@ export class RepositoryService {
           .map((e) => e.symbolic!)
       ),
     ]
+    const localDefaults = entries.filter((e) =>
+      ['refs/heads/main', 'refs/heads/master'].includes(e.name)
+    )
     const default_branch =
-      this.config(target.project_id).default_branch ?? (defaults.length === 1 ? defaults[0]! : null)
+      this.config(target.project_id).default_branch ??
+      (defaults.length === 1
+        ? defaults[0]!
+        : defaults.length === 0 && localDefaults.length === 1
+          ? localDefaults[0]!.name
+          : null)
     if (continued) {
       const saved = this.cursors.get(String(p.cursor))!
       if (
@@ -2639,7 +2677,7 @@ export class RepositoryService {
           omissions.add('scan limit; continue with cursor to cover remaining files')
           break
         }
-        if (file.size !== null && file.size > 1024 * 1024) {
+        if (p.mode !== 'filename' && file.size !== null && file.size > 1024 * 1024) {
           omissions.add('files over 1 MiB skipped')
           continue
         }

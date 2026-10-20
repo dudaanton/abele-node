@@ -1,4 +1,5 @@
 import { createConnection } from 'node:net'
+import { ChannelError } from '@abele/channel-protocol'
 import { realpath } from 'node:fs/promises'
 import { isAbsolute, relative, sep } from 'node:path'
 import type { DebuggerTarget } from '@abele/node-protocol'
@@ -208,15 +209,19 @@ export class JsDebugProfile {
           })
           return run
         } catch (error) {
-          await run.close()
+          await run.close().catch(() => {})
           throw error
         }
       } finally {
         releaseStartup()
       }
     } catch (error) {
-      await owner.terminate()
-      throw error
+      await owner.terminate().catch(() => {})
+      const message = error instanceof Error ? error.message : String(error)
+      throw new ChannelError(error instanceof ChannelError ? error.code : message, message, {
+        ...(error instanceof ChannelError ? error.details : {}),
+        stderr: owner.diagnostics.stderr,
+      })
     }
   }
   async attach(

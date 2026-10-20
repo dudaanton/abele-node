@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ChatMethodSchemas } from './chat.js'
 import { LspMethodSchemas, LspDiagnosticsSchema } from './lsp.js'
 import {
   DelegationMethodSchemas,
@@ -133,7 +134,12 @@ export const SessionSchema = z
   })
 export const SessionDeletedSchema = z.object({ session_id: id, deleted: z.literal(true) }).strict()
 export const CapabilitySchema = z.discriminatedUnion('status', [
-  z.object({ status: z.literal('supported'), evidence: z.string() }),
+  z.object({
+    status: z.literal('supported'),
+    evidence: z.string(),
+    breakpoint_hit_condition: z.boolean().optional(),
+    breakpoint_enabled: z.boolean().optional(),
+  }),
   z.object({ status: z.literal('unsupported'), reason: z.string() }),
   z.object({ status: z.literal('unverified'), reason: z.string() }),
 ])
@@ -242,6 +248,7 @@ export const MethodSchemas = {
   ...RepositoryGitMethodSchemas,
   ...FileMethodSchemas,
   ...LiveMethodSchemas,
+  ...ChatMethodSchemas,
   'session.detach': z.object(session).strict(),
   'node.describe': z.object({}).strict(),
   'session.list': z
@@ -328,6 +335,7 @@ export type SessionSendRequest = z.input<(typeof MethodSchemas)['session.send']>
 export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
+  'chat.restore',
   ...DELEGATION_MUTATIONS,
   ...RESOURCE_MUTATIONS,
   ...NODE_PATH_MUTATIONS,

@@ -8,7 +8,8 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { OwnedDebugProcess } from '../../packages/node-core/src/debugger/process.js'
 import ts from 'typescript'
 import { NodeCore } from '../../packages/node-core/src/index.js'
 import { JS_DEBUG_PIN, unpackJsAdapter } from '../../packages/node-core/src/debugger/js-install.js'
@@ -31,6 +32,7 @@ afterEach(async () => {
     core.close()
   }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
+  vi.restoreAllMocks()
 })
 
 async function setup(files: Record<string, string>) {
@@ -142,6 +144,136 @@ const valueOf = async (s: any, runId: string, step: string, name: string) =>
     .join('\n')
 
 describe.skipIf(!enabled)('real programs under the pinned js-debug', () => {
+  it('adds a second-source point during an active recording and keeps the program running', async () => {
+    // Match local-scopes.test.ts: restricted runners can replace ps identity
+    // discovery while still exercising real direct children and the real adapter.
+    if (process.env.ABELE_DEBUGGER_TEST_IDENTITY === 'fixture') {
+      const spawn = OwnedDebugProcess.spawn.bind(OwnedDebugProcess)
+      vi.spyOn(OwnedDebugProcess, 'spawn').mockImplementation((exe, argv, options) =>
+        spawn(
+          exe,
+          argv,
+          {
+            ...options,
+            env: { ...options.env, ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) },
+          },
+          async () => 'trace-second-point-fixture'
+        )
+      )
+    }
+    const s = await setup({
+      'app.cjs': [
+        "const { second } = require('./second.cjs')",
+        'function first(n) {',
+        '  return n',
+        '}',
+        'let n = 0',
+        'const timer = setInterval(() => { first(n); second(n++); if (n === 200) clearInterval(timer) }, 50)',
+      ].join('\n'),
+      'second.cjs': ['exports.second = function second(n) {', '  return n * 2', '}'].join('\n'),
+    })
+    const started = await s.request('debugger.v1.start', {
+      operation_id: crypto.randomUUID(),
+      conversation_id: s.chat.session_id,
+      program: 'app.cjs',
+      sources: ['second.cjs'],
+    })
+    const id = started.debug_session_id
+    const snapshot = async () =>
+      (await s.request('debugger.v1.status', { debug_session_id: id })).snapshot
+    await s.until(async () => (await snapshot()).execution === 'stopped')
+    const point = async (breakpoint_id: string, path: string, line: number) => {
+      await s.request('trace.v1.points.set', {
+        debug_session_id: id,
+        upsert: [{ breakpoint_id, take: ['n'] }],
+        remove: [],
+      })
+      await s.until(async () => {
+        const state = await snapshot()
+        const result = await s.request('debugger.v1.breakpoints.patch', {
+          debug_session_id: id,
+          incarnation: state.incarnation,
+          expected_state_revision: state.state_revision,
+          expected_breakpoint_revision: state.breakpoint_revision,
+          operation_id: crypto.randomUUID(),
+          remove: [],
+          upsert: [
+            {
+              breakpoint_id,
+              source_id: started.sources.find((x: any) => x.path === path).source_id,
+              line,
+            },
+          ],
+        })
+        if (result.outcome === 'completed') return true
+        expect(result.code).toBe('stale_state')
+        return false
+      })
+    }
+    await point('first', 'app.cjs', 3)
+    const paused = await snapshot()
+    await s.request('debugger.v1.continue', {
+      debug_session_id: id,
+      incarnation: paused.incarnation,
+      expected_state_revision: paused.state_revision,
+      operation_id: crypto.randomUUID(),
+      thread_id: paused.selected_thread_id,
+    })
+    let runId = ''
+    const read = async () => {
+      const runs = (await s.request('trace.v1.runs', { project_id: s.project.project_id })).runs
+      if (!runs.length) return undefined
+      runId = runs[0].id
+      return s.request('trace.v1.run', { project_id: s.project.project_id, run_id: runId })
+    }
+    await s.until(
+      async () => ((await read())?.steps.filter((x: any) => x.point === 'first').length ?? 0) >= 2
+    )
+    const prior = (await read()).steps[0]
+    const originalRun = runId
+    await point('second', 'second.cjs', 2)
+    await s.until(
+      async () => ((await read())?.steps.filter((x: any) => x.point === 'second').length ?? 0) >= 3
+    )
+    await s.until(async () => (await snapshot()).execution === 'running')
+    const run = await read()
+    expect(runId).toBe(originalRun)
+    expect(run.steps[0]).toEqual(prior)
+    expect(run.points.map((p: any) => p.breakpoint_id)).toEqual(['first', 'second'])
+    expect(run.run.state).toBe('recording')
+  }, 30000)
+  it('records the debugged server and its fetch, linking handler steps in the requests contract', async () => {
+    const s = await setup({
+      'server.cjs': [
+        "const http = require('node:http')",
+        'const server = http.createServer((req, res) => {',
+        "  const answer = 'recorded-response'",
+        '  res.end(answer)',
+        '})',
+        "server.listen(0, '127.0.0.1', async () => {",
+        '  const response = await fetch(`http://127.0.0.1:${server.address().port}/api`)',
+        '  await response.text()',
+        '  setTimeout(() => server.close(), 1200)',
+        '})',
+      ].join('\n'),
+    })
+    const { run, runId } = await record(s, 'server.cjs', 'server.cjs', 4, ['answer'])
+    const requests = run.steps.filter((step: any) => step.kind === 'http')
+    expect(requests.map((r: any) => r.direction).sort()).toEqual(['incoming', 'outgoing'])
+    const incoming = requests.find((r: any) => r.direction === 'incoming')
+    expect(run.steps.find((step: any) => step.kind === 'probe')).toMatchObject({
+      chain: incoming.chain,
+      by_time: true,
+    })
+    expect(await valueOf(s, runId, incoming.id, 'response')).toBe('recorded-response')
+    const filtered = await s.request('trace.v1.run', {
+      project_id: s.project.project_id,
+      run_id: runId,
+      kind: ['http'],
+    })
+    expect(filtered.steps).toHaveLength(2)
+  }, 60000)
+
   it('records a changing function argument at repeated timer hits', async () => {
     const s = await setup({
       'inspect.js': [

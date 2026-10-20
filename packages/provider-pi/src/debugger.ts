@@ -15,7 +15,9 @@ export function registerDebuggerTools(
  * to make its next already-scheduled request. Never append chat input, persist a
  * synthetic message, alter an inference in flight or request a continuation. */
 export function registerDebuggerContext(pi: Pick<ExtensionAPI, 'on'>, bridge: DebuggerToolBridge) {
-  const names = new Set(bridge.tools.map((tool) => tool.name))
+  const names = new Set(
+    bridge.tools.filter((tool) => tool.name.startsWith('debug_')).map((tool) => tool.name)
+  )
   return pi.on('context', async (event, ctx) => {
     const fresh = new Map<string, any>()
     const messages = []

@@ -52,6 +52,8 @@ export interface TraceStoredStep {
   paused_ms?: number
   status?: number
   host?: string
+  direction?: 'incoming' | 'outgoing'
+  duration_ms?: number
   chain?: string
   /** Under its request only because it ran while the request was out. */
   by_time?: boolean
@@ -97,9 +99,9 @@ const SHA = /^[a-f0-9]{64}$/
 
 const pad = (n: number, w = 2) => String(n).padStart(w, '0')
 const runId = (d: Date) =>
-  `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(
-    d.getUTCMinutes()
-  )}${pad(d.getUTCSeconds())}-${randomBytes(3).toString('hex')}`
+  `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(
+    d.getMinutes()
+  )}${pad(d.getSeconds())}-${randomBytes(3).toString('hex')}`
 
 function writeAtomic(path: string, text: string | Buffer) {
   const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
@@ -139,6 +141,17 @@ export class TraceRunWriter {
     return Date.parse(this.meta.started_at)
   }
 
+  /** Refresh configuration in place; the timeline, values and run identity stay intact. */
+  updatePoints(points: TracePointCopy[]) {
+    if (
+      this.meta.state !== 'recording' ||
+      JSON.stringify(points) === JSON.stringify(this.meta.points)
+    )
+      return
+    this.meta.points = structuredClone(points)
+    writeAtomic(join(this.dir, 'run.json'), JSON.stringify(this.meta, null, 2))
+  }
+
   /** Stores a value whole and says how a step refers to it. */
   value(name: string, text: string, format: TraceFormat = formatOf(text)): TraceStoredValue {
     const bytes = Buffer.byteLength(text)
@@ -172,6 +185,15 @@ export class TraceRunWriter {
     return full
   }
 
+  discardEmpty() {
+    // Only the recorder's own empty writer can be discarded, never a nonempty run.
+    if (!this.count) {
+      rmSync(this.dir, { recursive: true, force: true })
+      return true
+    }
+    return false
+  }
+
   close(state: 'done' | 'cut', lengthMs: number) {
     this.meta.state = state
     this.meta.length_ms = lengthMs
@@ -200,7 +222,9 @@ export class TraceStore {
     const meta: TraceRunMeta = {
       version: TRACE_RUN_VERSION,
       id,
-      name: input.name ?? started.toISOString().replace('T', ' ').slice(0, 19),
+      name:
+        input.name ??
+        `${started.getFullYear()}-${pad(started.getMonth() + 1)}-${pad(started.getDate())} ${pad(started.getHours())}:${pad(started.getMinutes())}:${pad(started.getSeconds())}`,
       session: input.session,
       started_at: started.toISOString(),
       state: 'recording',

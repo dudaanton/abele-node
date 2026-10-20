@@ -489,4 +489,18 @@ export class LspService {
     await Promise.all([...this.slots.values()].map((s) => this.remove(s)))
     this.diagnostics.clear()
   }
+  async releaseRoot(root: string) {
+    // Slots hold canonical roots; the folder may already be gone, so fall back to the name given.
+    let canonical = root
+    try {
+      canonical = realpathSync(root)
+    } catch {}
+    this.activity.delete(root)
+    this.activity.delete(canonical)
+    await Promise.all(
+      [...this.slots.values()]
+        .filter((s) => s.root === root || s.root === canonical)
+        .map((s) => this.remove(s))
+    )
+  }
 }

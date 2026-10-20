@@ -59,26 +59,40 @@ export function createWorkerCore(send: WorkerSend, abort: AbortSignal, connected
     return new Promise((resolve) => {
       const id = randomUUID(),
         started = Date.now()
-      const lost = () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cleanup = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const lost = (timeout = false) => {
         debuggerPending.delete(id)
-        signal?.removeEventListener('abort', lost)
+        cleanup()
         if (connected() && !abort.aborted) send({ kind: 'debugger_cancel', id })
         resolve({
-          reason: 'cancelled',
+          reason: timeout ? 'lsp_timeout' : 'cancelled',
+          ...(timeout
+            ? {
+                code: 'lsp_timeout',
+                message:
+                  'Language intelligence did not respond within 30 seconds. Check the language server and project dependencies, or use file search.',
+              }
+            : {}),
           elapsed_ms: Math.max(0, Date.now() - started),
           snapshot: null,
           observation: 'unknown',
         })
       }
+      const onAbort = () => lost()
       if (signal?.aborted || abort.aborted || debuggerPending.size >= 64) return lost()
       debuggerPending.set(id, {
         name,
         args,
         started,
         resolve,
-        cleanup: () => signal?.removeEventListener('abort', lost),
+        cleanup,
       })
-      signal?.addEventListener('abort', lost, { once: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (name === 'lsp') timer = setTimeout(() => lost(true), 30000)
       send({ kind: 'debugger_call', id, name, args })
     })
   }

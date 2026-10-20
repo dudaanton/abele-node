@@ -66,8 +66,25 @@ const file = RelativePathSchema.refine(
   (p) => p.length > 0 && !p.split('/').some((s) => s.toLowerCase() === '.git')
 )
 const contentId = z.string().regex(/^[a-f0-9]{64}$/)
+export const DirectoryManifestSchema = z
+  .object({
+    content_id: contentId,
+    entries: z
+      .array(
+        z
+          .object({
+            path: RelativePathSchema,
+            kind: z.enum(['file', 'directory']),
+            content_id: contentId.nullable(),
+          })
+          .strict()
+      )
+      .max(256),
+  })
+  .strict()
 const moveCopy = { from: file, to: file, expected_content_id: contentId }
-const remove = { path: file, expected_content_id: contentId }
+const move = { ...moveCopy, directory: z.boolean().optional() }
+const remove = { path: file, expected_content_id: contentId, directory: z.boolean().optional() }
 export const FileOperationResultSchema = z
   .object({
     operation_id: id,
@@ -76,11 +93,11 @@ export const FileOperationResultSchema = z
   })
   .strict()
 export const FileOperationMethodSchemas = {
-  'workspace.file.move': z.object({ workspace_id: id, ...moveCopy }).strict(),
+  'workspace.file.move': z.object({ workspace_id: id, ...move }).strict(),
   'workspace.file.copy': z.object({ workspace_id: id, ...moveCopy }).strict(),
   'workspace.file.remove': z.object({ workspace_id: id, ...remove }).strict(),
   'workspace.file.mkdir': z.object({ workspace_id: id, path: file }).strict(),
-  'repository.v1.file.move': z.object({ worktree_id: id, ...moveCopy }).strict(),
+  'repository.v1.file.move': z.object({ worktree_id: id, ...move }).strict(),
   'repository.v1.file.copy': z.object({ worktree_id: id, ...moveCopy }).strict(),
   'repository.v1.file.remove': z.object({ worktree_id: id, ...remove }).strict(),
   'repository.v1.file.mkdir': z.object({ worktree_id: id, path: file }).strict(),
@@ -123,6 +140,8 @@ export const ExecutionMethodSchemas = {
 export const NodePathMethodSchemas = {
   ...ExecutionMethodSchemas,
   ...FileOperationMethodSchemas,
+  'workspace.file.directory': z.object({ workspace_id: id, path: file }).strict(),
+  'repository.v1.file.directory': z.object({ worktree_id: id, path: file }).strict(),
   'filesystem.v1.directories': z
     .object({
       path: AbsolutePathSchema.optional(),

@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
+import { ChatCheckpoints } from './chat-checkpoints.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -265,6 +266,10 @@ export class FakeProvider {
   }
 }
 export class NodeCore implements JournalStore, OperationStore, SessionQueue, PromptService {
+  private checkpoints?: ChatCheckpoints
+  get chatCheckpoints() {
+    return (this.checkpoints ??= new ChatCheckpoints(this))
+  }
   readonly db: DatabaseSync
   readonly stateDir: string
   readonly authority: AuthorityService
@@ -450,6 +455,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS session_commands(session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, body TEXT NOT NULL)'
     )
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS chat_restore_attempts(principal_id TEXT NOT NULL, operation_id TEXT NOT NULL, request_hash TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(principal_id,operation_id))'
+    )
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS chat_checkpoints(checkpoint_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, body TEXT NOT NULL)'
+    )
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -604,6 +615,22 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     return result
   }
   append(stream: string, type: string, actor: JournalEvent['actor'], data: unknown) {
+    // The node's own inputs (a continuation after compaction) stay derived on replay, like its
+    // other events: the journal's session updates come from people and providers only.
+    const input =
+      type === 'input.accepted' && actor.kind !== 'node'
+        ? (data as { input_id?: string; text?: string })
+        : undefined
+    const userUpdate =
+      input && typeof input.input_id === 'string' && typeof input.text === 'string'
+        ? {
+            kind: 'user_message',
+            message_id: input.input_id,
+            text: input.text.slice(0, 65536),
+            ...(input.text.length > 65536 ? { truncated: true } : {}),
+          }
+        : undefined
+    if (userUpdate) data = { ...input, mapped: true }
     const row = this.db
       .prepare('UPDATE streams SET head_seq=head_seq+1 WHERE stream_id=? RETURNING head_seq')
       .get(stream) as Row | undefined
@@ -633,6 +660,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           .run(stream, event.seq, JSON.stringify(update.commands))
     }
     this.resources?.lsp.observe(stream, type, data)
+    if (userUpdate) this.append(stream, 'session.update', actor, { update: userUpdate })
     return event
   }
   head(stream: string): number {
@@ -751,7 +779,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         node_path_file_operations: {
           status: 'supported',
           evidence:
-            'single-regular-file-durable-coordinator; plain-root-workspaces-only; git-targets-repository-only; exclusive-destinations; recovery; unknown-outcomes',
+            'regular-files-and-confirmed-bounded-directory-trees; plain-root-workspaces-only; git-targets-repository-only; recovery; unknown-outcomes',
         },
         node_path_execution: {
           status: 'supported',
@@ -824,6 +852,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     signal?: AbortSignal
   ): unknown {
     this.authority.check(actor, 'request')
+    if (method.startsWith('chat.'))
+      return this.chatCheckpoints.request(actor, method, raw, operation)
     if (method.startsWith('lsp.v1.')) return this.resources.lsp.request(actor, method, raw, signal)
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.request(actor, method, raw, operation, signal)
@@ -928,7 +958,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         `SELECT request_hash FROM file_mutations WHERE principal_id=?1 AND operation_id=?2
       UNION ALL SELECT request_hash FROM node_path_effects WHERE principal_id=?1 AND operation_id=?2
       UNION ALL SELECT request_hash FROM repository_deletions WHERE principal_id=?1 AND operation_id=?2
-      UNION ALL SELECT request_hash FROM repository_git_effects WHERE principal_id=?1 AND operation_id=?2`
+      UNION ALL SELECT request_hash FROM repository_git_effects WHERE principal_id=?1 AND operation_id=?2
+      UNION ALL SELECT request_hash FROM chat_restore_attempts WHERE principal_id=?1 AND operation_id=?2`
       )
       .all(principal, operation) as Row[]
   }
@@ -1229,6 +1260,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       })
     }
     if (method === 'session.send') {
+      if (this.chatCheckpoints.busy.has(session)) throw new ChannelError('resource_busy')
       const refusal = this.resources.targets.refusal(
         session,
         p.expected_target as ExpectedExecutionTarget | undefined

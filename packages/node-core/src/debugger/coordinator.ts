@@ -71,7 +71,11 @@ const exact = (m: string, p: Params, effective?: DebuggerBreakpointRequest[]) =>
   ['evaluate', 'setVariable', 'variables'].includes(m) ||
   (m === 'breakpoints.patch' &&
     (effective ?? p.upsert).some(
-      (bp: DebuggerBreakpointRequest) => bp.condition !== undefined || bp.log_message !== undefined
+      (bp: DebuggerBreakpointRequest) =>
+        bp.enabled !== false &&
+        (bp.condition !== undefined ||
+          bp.log_message !== undefined ||
+          bp.hit_condition !== undefined)
     ))
 /** The adapter receives a complete source set, not just the incoming delta.
  * In ask mode (and for human expressions), approval covers THIS complete set,
@@ -725,8 +729,26 @@ export class DebuggerCoordinator {
           })
         )
         this.checkPublication(principal, session)
-        const bounded = boundedPayload(data, 8192)
-        const result = JSON.parse(bounded.json!)
+        // Snapshots have their own schema limits. Including them in the page budget
+        // used to replace valid stack/scopes pages with an incompatible preview.
+        let result = data
+        let truncated = false
+        if (method !== 'threads') {
+          const { snapshot, ...page } = data as Record<string, any>
+          if (Array.isArray(page.items)) {
+            page.items = [...page.items]
+            while (Buffer.byteLength(JSON.stringify(page)) > 8192 && page.items.length) {
+              page.items.pop()
+              page.truncated = true
+            }
+            truncated = page.truncated === true
+            result = { ...page, ...(snapshot === undefined ? {} : { snapshot }) }
+          } else {
+            const bounded = boundedPayload(data, 8192)
+            result = JSON.parse(bounded.json!)
+            truncated = bounded.truncated
+          }
+        }
         this.core.debugger.recordHistory(session, {
           actor: this.actor(principal),
           operation_id: null,
@@ -734,7 +756,7 @@ export class DebuggerCoordinator {
           outcome: 'completed',
           requested_data: data,
         })
-        return { data: result, truncated: bounded.truncated, snapshot: this.state(session) }
+        return { data: result, truncated, snapshot: this.state(session) }
       })
     this.tails.set(session, work)
     const cleanup = () => {
@@ -842,6 +864,7 @@ export class DebuggerCoordinator {
     }
     // Listing what runs on the machine is the owner's (checked above), as attaching is.
     if (method === 'programs') return this.core.debuggerLaunches.programs(p as any)
+    if (method === 'launchTargets') return this.core.debuggerLaunches.launchTargets(p as any)
     if (method === 'restart') return this.core.debuggerLaunches.restart(owner, p as any)
     if (method === 'approvals') {
       this.checkPublication(human, p.debug_session_id)

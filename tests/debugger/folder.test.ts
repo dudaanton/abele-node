@@ -23,6 +23,8 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
   writeFileSync(join(dir, 'app.js'), 'console.log(1)\n')
   writeFileSync(join(dir, 'late.js'), 'console.log(2)\n')
   writeFileSync(join(dir, 'late.ts'), 'const n: number = 2\n')
+  writeFileSync(join(dir, 'unit.test.ts'), 'test()\n')
+  writeFileSync(join(dir, 'auto.generated.ts'), 'generated()\n')
   symlinkSync('late.js', join(dir, 'alias.js'))
   symlinkSync('..', join(dir, 'escape'))
   const runs: DapSession[] = []
@@ -120,7 +122,15 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     const added = await request('debugger.v1.addSources', {
       operation_id: 'add',
       debug_session_id: first.debug_session_id,
-      sources: ['late.js', 'alias.js', 'late.ts', '../outside.js', 'escape'],
+      sources: [
+        'late.js',
+        'alias.js',
+        'late.ts',
+        '../outside.js',
+        'escape',
+        'unit.test.ts',
+        'auto.generated.ts',
+      ],
     })
     expect(added).toEqual({
       incarnation: runs[0]!.incarnation,
@@ -132,6 +142,8 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         { path: 'late.ts', code: 'debugger_source_no_map' },
         { path: '../outside.js', code: 'debugger_source_outside_folder' },
         { path: 'escape', code: 'debugger_source_outside_folder' },
+        { path: 'unit.test.ts', code: 'debugger_source_test' },
+        { path: 'auto.generated.ts', code: 'debugger_source_generated' },
       ],
     })
     expect(runs[0]!.sources.get('s2')).toBe(join(dir, 'late.js'))
@@ -291,12 +303,52 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     expect((await request('debugger.v1.programs', { folder })).programs).toMatchObject([
       { pid: 123, in_chat_folder: true },
     ])
-    const attached = await request('debugger.v1.attachProgram', {
-      operation_id: 'attach',
-      folder,
-      pid: 123,
-      port: 9229,
+    const [attached, simultaneous] = await Promise.all(
+      ['attach', 'attach-simultaneous'].map((operation_id) =>
+        request('debugger.v1.attachProgram', { operation_id, folder, pid: 123, port: 9229 })
+      )
+    )
+    expect(simultaneous.debug_session_id).toBe(attached.debug_session_id)
+    expect(runs).toHaveLength(4)
+    const duplicates = await Promise.all(
+      ['duplicate-1', 'duplicate-2'].map((operation_id) =>
+        request('debugger.v1.attachProgram', { operation_id, folder, pid: 123, port: 9229 })
+      )
+    )
+    expect(duplicates.map((x) => x.debug_session_id)).toEqual([
+      attached.debug_session_id,
+      attached.debug_session_id,
+    ])
+    writeFileSync(
+      join(dir, 'late.js.map'),
+      JSON.stringify({ sources: ['late.ts'], sourcesContent: ['const n: number = 2\n'] })
+    )
+    const mapped = await request('debugger.v1.addSources', {
+      operation_id: 'mapped',
+      debug_session_id: attached.debug_session_id,
+      sources: ['late.ts'],
     })
+    expect(mapped.refused).toEqual([])
+    writeFileSync(join(dir, 'late.ts'), 'changed\n')
+    expect(
+      (
+        await request('debugger.v1.addSources', {
+          operation_id: 'mapped-changed',
+          debug_session_id: attached.debug_session_id,
+          sources: ['late.ts'],
+        })
+      ).refused
+    ).toEqual([{ path: 'late.ts', code: 'debugger_source_changed' }])
+    writeFileSync(join(dir, 'late.ts'), 'const n: number = 2\n')
+    expect(
+      (
+        await request('debugger.v1.addSources', {
+          operation_id: 'mapped-restored',
+          debug_session_id: attached.debug_session_id,
+          sources: ['late.ts'],
+        })
+      ).refused
+    ).toEqual([])
     expect(runs[3]!.snapshot.target).toMatchObject({
       conversation_id: null,
       process_ownership: 'external',
@@ -309,9 +361,24 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         sources: ['late.js', 'app.js'],
       })
     ).toMatchObject({
-      sources: [{ source_id: 's1', path: 'late.js' }],
+      sources: [{ source_id: 's2', path: 'late.js' }],
       refused: [{ path: 'app.js', code: 'debugger_source_changed' }],
     })
+    for (const [operation_id, text, refused] of [
+      ['identical-js', 'console.log(2)\n', false],
+      ['changed-js', 'console.log(3)\n', true],
+      ['restored-js', 'console.log(2)\n', false],
+    ] as const) {
+      writeFileSync(join(dir, 'late.js'), text)
+      const result = await request('debugger.v1.addSources', {
+        operation_id,
+        debug_session_id: attached.debug_session_id,
+        sources: ['late.js'],
+      })
+      expect(result.refused).toEqual(
+        refused ? [{ path: 'late.js', code: 'debugger_source_changed' }] : []
+      )
+    }
     closes[3]!()
     const reattached = await request('debugger.v1.restart', {
       operation_id: 'reattach',

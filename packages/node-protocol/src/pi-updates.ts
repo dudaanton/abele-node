@@ -185,6 +185,41 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
         }))
       return [{ kind: 'available_commands_update', commands }]
     }
+    case 'pi.model.catalog': {
+      const model = str(d.model_id)
+      if (!model) return []
+      const models = (Array.isArray(d.models) ? d.models : [])
+        .map(obj)
+        .filter((m) => str(m.value) && str(m.name))
+        .slice(0, 256)
+        .map((m) => ({ value: String(m.value).slice(0, 256), name: String(m.name).slice(0, 256) }))
+      return [
+        {
+          kind: 'config_option_update',
+          options: [
+            {
+              id: 'model',
+              name: 'Model',
+              category: 'model',
+              current_value: model.slice(0, 256),
+              options: models,
+            },
+            {
+              id: 'account',
+              name: 'Account',
+              category: 'other',
+              current_value: 'default',
+              options: [
+                {
+                  value: 'default',
+                  name: (str(d.account_label) ?? 'pi credentials on this node').slice(0, 256),
+                },
+              ],
+            },
+          ],
+        },
+      ]
+    }
     case 'pi.model.selected': {
       const model = str(d.model_id)
       return model
@@ -270,7 +305,14 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
       ]
     case 'pi.extension.error':
       return [
-        { kind: 'notice', level: 'error', text: 'A pi extension failed', code: 'extension_error' },
+        {
+          kind: 'notice',
+          level: 'error',
+          text: str(d.extension)
+            ? `pi extension ${line(str(d.extension)!, 256)} failed${str(d.event) ? ` (${line(str(d.event)!, 128)})` : ''}: ${line(str(d.error) ?? 'Unknown error', 2048)}`
+            : 'A pi extension failed',
+          code: 'extension_error',
+        },
       ]
   }
   return []

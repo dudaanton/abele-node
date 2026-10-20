@@ -5,6 +5,14 @@ stops on record points only, the node takes each value whole, writes a step to t
 the program go on. A stop on any ordinary breakpoint stays a stop. There is no separate record
 switch: a debugger session records a run whenever it has a record point.
 
+Changing record-point configuration updates the active run's `run.json` points in
+place, retaining its identity and earlier steps. Newly installed breakpoint ids
+are correlated before their hits are published; unchanged source sets retain
+their confirmed adapter ids. Unknown or mixed adapter hits stay ordinary stops.
+Captures and automatic continuation are fenced by the stop, breakpoint revision,
+and record-point configuration: a mutation cancels stale work and leaves the stop
+available for explicit control.
+
 This sits on the [gated debugger infrastructure](debugger-v1.md) and needs `--debugger`. While no
 audited JS adapter pin exists (see [the JS profile](debugger-js-profile.md)), `debugger.v1.start`
 refuses with `debugger_profile_unavailable`; the launch path and the recorder are exercised with a
@@ -136,6 +144,74 @@ written, `done` when the program ended or was detached and `cut` when the connec
 line cut by a crash at the end of the timeline is skipped; everything before it stays readable. A
 run being recorded cannot be deleted.
 
+New run IDs and default names use local calendar components. `started_at` remains an ISO
+instant; existing IDs and folders are never renamed. Removing the final record point (including
+converting it to a normal breakpoint) clears `trace.v1.status.recording` immediately. Queued
+captures finish before closing the run. A run with no steps is discarded at that point or at
+session end; nonempty runs are retained.
+
+## HTTP from the debugged Node program
+
+While record points are set, the recorder installs bounded instrumentation through the existing
+DAP session's global `evaluate` operation. No additional inspector port, package in the program,
+or `--experimental-network-inspection` restart is required. Each connected process is observed
+independently. Node's diagnostics channels identify incoming HTTP/HTTPS server requests and
+outgoing `http`/`https` and Undici requests. Stream taps observe application reads and writes
+without putting streams into flowing mode. A bounded clone captures `fetch` responses, including
+on Node versions whose bundled Undici does not publish response chunks.
+
+The existing `trace.v1.run` filter `kind: ["http"]` includes these requests. No method or new
+screen is required. Two optional fields were added to `TraceStep`: `direction` (`incoming` or
+`outgoing`) and `duration_ms` (nonnegative milliseconds). Clients validating steps with an older
+strict schema must refresh that schema. Existing `status`, `host`, `chain`, and `by_time` fields
+keep their meaning. Program requests do not set `sent`, which is reserved for saved requests.
+
+Selecting a debugger session for a saved request is a proposed association, not proof that the
+destination belongs to that process. Before persisting its saved-send summary, the node flushes
+that session's program HTTP capture and requires incoming evidence with the same method and
+URL in the send interval (a unique candidate), or the matching explicit `X-Abele-Step` header.
+Unconfirmed sends remain in request history, but do not create recording steps and their final
+send status has no `run` association. Confirmed summaries have `sent: true, direction: "incoming"`;
+the program's own incoming observation remains a separate step. No extra marker header is sent
+unless the caller requested `step_header`. Unsupported capture or ambiguous/masked URL matching
+may omit the saved summary; it must never claim traffic from a different process.
+
+The probe's proposed saved-request chain is frozen when its stop is observed, before capture or
+Continue can race with the response. Run views remove chains whose HTTP parent was not confirmed,
+or re-associate them with observed incoming traffic by time. See the
+[folder journey contract](trace-journey-contract.md) for a combined view across sessions.
+
+Each program HTTP step contains these ordinary recorded values:
+
+- `request`: JSON `{method, url, headers, body, truncated}`, with headers as a string dictionary.
+- `response`: the observed response body as text.
+- `http`: JSON `{direction, started_at, duration_ms, headers, truncated, error?}`; `headers` are
+  response headers, and `error` describes a failure, timeout, or interrupted capture.
+
+Each body is capped at 32 KiB of UTF-8, each header set at 16 KiB and 128 headers. Header names
+are capped at 256 bytes and values at 4 KiB. Authorization, proxy authorization, cookies,
+set-cookie, and API-key header values use the existing `••••` mask before leaving the program;
+known header secrets echoed elsewhere are masked too. URL credentials are removed and sensitive
+query parameters are masked. The program keeps at most 64 active captures and 128 completed
+requests; excess captures are dropped. Requests exceeding 60 seconds are finalized as partial
+when polled. Drains carry one request per DAP response to stay below its frame ceiling, and
+recorded-value paging keeps the existing panel/channel bounds.
+
+Handler steps link to requests whose time intervals contain the step. Incoming requests take
+precedence over outgoing requests, and the newest overlapping request wins; existing saved-send
+links are retained. `by_time: true` explicitly denotes temporal association, not proof of causal
+ownership under concurrent traffic. Links are also derived when reading a run, so a response
+that finishes after the handler step still groups that step. The raw timeline is append-only.
+
+Hooks and polling are removed on recording end; buffered/unfinished captures are flushed before
+the empty-run check. A normal debugger detach also removes hooks before disconnecting. If the
+transport disappears, an unreferenced lease timer removes hooks from a surviving program after
+10 seconds without a poll. A hard process exit or abrupt transport loss can lose undrained HTTP
+events. Capture starts after the instrumentation evaluation completes, so earlier traffic is
+not recovered. HTTP/2, WebSockets, arbitrary custom transports, unread application streams, and
+multipart fetch uploads are not guaranteed complete. Binary data is a
+bounded UTF-8 preview. Direct Undici chunk capture depends on the client's diagnostics support.
+
 ## Methods
 
 | Method                                | What it answers                                                    |
@@ -161,5 +237,5 @@ The capability `trace_v1` is advertised only where the debugger is enabled.
 ## Not here yet
 
 Recording without stopping the program, browser requests over the DevTools protocol or from a HAR
-file, masking of headers, canvas and comparing runs are later stages. A [saved request](http.md) can be
+file, canvas and comparing runs are later stages. A [saved request](http.md) can be
 sent into the run being recorded: it heads the steps taken while it was out, linked by time.

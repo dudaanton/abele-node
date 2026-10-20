@@ -79,6 +79,69 @@ async function live(s: Awaited<ReturnType<typeof setup>>) {
 }
 
 describe('recorded runs through the node', () => {
+  it('links a handler step when its request completes later, including the HTTP-only view', async () => {
+    const s = await setup(() => ({}))
+    try {
+      const store = s.core.trace.store(s.project_id)
+      const writer = store.create({ session: 'fixture', points: [] })
+      writer.append({ kind: 'probe', at: 20, label: 'handler', values: [] })
+      writer.append({
+        kind: 'probe',
+        at: 1000,
+        label: 'unrelated',
+        chain: 'unconfirmed-send',
+        by_time: true,
+        values: [],
+      })
+      writer.append({
+        kind: 'http',
+        at: 10,
+        label: 'GET /api',
+        direction: 'incoming',
+        duration_ms: 50,
+        chain: 'n1',
+        status: 200,
+        values: [],
+      })
+      writer.close('done', 100)
+      const p = { project_id: s.project_id, run_id: writer.id }
+      const run = s.request('trace.v1.run', p)
+      expect(run.steps.find((step: any) => step.kind === 'probe')).toMatchObject({
+        chain: 'n1',
+        by_time: true,
+      })
+      expect(run.steps.find((step: any) => step.label === 'unrelated').chain).toBeUndefined()
+      expect(s.request('trace.v1.run', { ...p, kind: ['http'] }).steps).toEqual([
+        expect.objectContaining({ kind: 'http', direction: 'incoming', status: 200 }),
+      ])
+    } finally {
+      s.core.close()
+    }
+  })
+
+  it('returns recording null immediately after the last point becomes a normal breakpoint', async () => {
+    const s = await setup(() => ({}))
+    const l = await live(s)
+    try {
+      await l.point('bp-1', 4, [])
+      expect(
+        s.request('trace.v1.status', { debug_session_id: l.session.id }).recording
+      ).not.toBeNull()
+      s.request('trace.v1.points.set', {
+        debug_session_id: l.session.id,
+        upsert: [],
+        remove: ['bp-1'],
+      })
+      expect(s.request('trace.v1.status', { debug_session_id: l.session.id }).recording).toBeNull()
+      expect(l.session.snapshot.breakpoints).toHaveLength(1)
+      await s.core.trace.recorder.settled(l.session.id)
+      expect(s.request('trace.v1.runs', { project_id: s.project_id }).runs).toEqual([])
+    } finally {
+      l.close()
+      s.core.close()
+    }
+  })
+
   it('is not offered where the debugger is off', async () => {
     const s = await setup(() => ({}), false)
     try {

@@ -10,6 +10,7 @@ import type { DebuggerService } from '../debugger/index.js'
 import type { DapSession, RecordedStop } from '../debugger/driver.js'
 import { parseTake } from './capture.js'
 import type { TracePointCopy, TraceRunWriter, TraceStore } from './store.js'
+import type { ProgramHttpEvent } from './program-http.js'
 
 export interface TracePoint {
   breakpoint_id: string
@@ -96,6 +97,10 @@ interface Live {
   off: () => void
   /** Requests out now, sent into this run: what the points take meanwhile stands under them. */
   chains: Map<string, { steps: number }>
+  httpOff?: () => void
+  httpPoll?: () => void
+  http: ProgramHttpEvent[]
+  configuration: number
 }
 
 /** A request sent into a recording while it is out: steps taken meanwhile go under it, and it
@@ -127,7 +132,11 @@ export class TraceRecorder {
   constructor(private readonly host: TraceRecorderHost) {
     this.offPoints = host.points.onChange((session) => {
       const l = this.live.get(session)
-      if (l) this.ensureRun(l)
+      if (l) {
+        l.configuration++
+        if (!host.points.list(session).length) this.finish(l, 'done')
+        else this.ensureRun(l)
+      }
     })
   }
   private now() {
@@ -143,6 +152,8 @@ export class TraceRecorder {
       queue: Promise.resolve(),
       off: () => {},
       chains: new Map(),
+      http: [],
+      configuration: 0,
     }
     this.live.set(session.id, l)
     l.off = this.host.service.subscribe(session.id, () => this.observe(l))
@@ -164,7 +175,7 @@ export class TraceRecorder {
   }
 
   /** Opens a request's chain in the run this session writes; none when nothing is recorded. */
-  chain(session: string): TraceChain | undefined {
+  chain(session: string, request?: { method: string; url: string }): TraceChain | undefined {
     const l = this.live.get(session)
     const writer = l?.writer
     if (!l || !writer) return undefined
@@ -173,11 +184,12 @@ export class TraceRecorder {
     l.chains.set(id, entry)
     const at = this.now() - writer.startedAt
     let closed = false
+    let confirmed = !request
     return {
       id,
       runId: writer.id,
       get steps() {
-        return entry.steps
+        return closed && !confirmed ? 0 : entry.steps
       },
       close: (step) => {
         if (closed) return undefined
@@ -185,6 +197,31 @@ export class TraceRecorder {
         l.chains.delete(id)
         // The run may have ended while the request was out: it is written no more.
         if (l.writer !== writer || this.live.get(session) !== l) return undefined
+        // Selecting a recording is not evidence that this program served the send.
+        // Confirm against traffic observed inside this session's own debuggee.
+        if (request) {
+          let address: URL
+          try {
+            address = new URL(request.url)
+          } catch {
+            return undefined
+          }
+          address.hash = ''
+          const matches = l.http.filter(
+            (e) =>
+              e.direction === 'incoming' &&
+              e.method === request.method &&
+              (e.url === address.href || e.request_headers['x-abele-step'] === id) &&
+              e.started >= writer.startedAt + at - 5 &&
+              e.started <= this.now()
+          )
+          if (
+            !matches.some((e) => e.request_headers['x-abele-step'] === id) &&
+            matches.length !== 1
+          )
+            return undefined
+          confirmed = true
+        }
         return writer.append({
           kind: 'http',
           at,
@@ -193,6 +230,7 @@ export class TraceRecorder {
           ...(step.host ? { host: step.host } : {}),
           chain: id,
           sent: true,
+          ...(request ? { direction: 'incoming' as const } : {}),
           values: step.values.map((v) =>
             v.text !== undefined
               ? writer.value(v.name, v.text)
@@ -211,6 +249,14 @@ export class TraceRecorder {
   /** Lets queued captures finish; for tests and shutdown. */
   async settled(session: string) {
     await this.live.get(session)?.queue
+  }
+
+  async flushHttp(session: string) {
+    const l = this.live.get(session)
+    if (!l) return
+    await l.queue
+    l.httpPoll?.()
+    await l.queue
   }
 
   close() {
@@ -245,17 +291,22 @@ export class TraceRecorder {
   }
 
   private ensureRun(l: Live) {
-    if (l.writer) return
     const snapshot = l.session.snapshot
     if (terminal[snapshot.lifecycle]) return
     const points = this.pointCopies(l, snapshot)
-    if (!points.length) return
     try {
+      if (l.writer) {
+        l.writer.updatePoints(points)
+        return
+      }
+      if (!points.length) return
+      l.startedAt = this.now()
       l.writer = this.host.storeFor(snapshot).create({
         session: l.session.id,
         started: new Date(l.startedAt),
         points,
       })
+      this.startHttp(l, l.writer)
     } catch (error) {
       this.host.log?.('[trace] Could not start a run', error)
     }
@@ -265,11 +316,114 @@ export class TraceRecorder {
     if (this.live.get(l.session.id) !== l) return
     this.live.delete(l.session.id)
     l.off()
+    this.finish(l, state)
+  }
+
+  private finish(l: Live, state: 'done' | 'cut') {
     const writer = l.writer
+    l.writer = undefined
+    l.httpOff?.()
+    l.httpOff = undefined
+    l.httpPoll = undefined
+    l.http = []
+    l.chains.clear()
     if (writer)
-      void l.queue
-        .then(() => writer.close(state, this.now() - writer.startedAt))
+      l.queue = l.queue
+        .then(() => {
+          if (!writer.discardEmpty()) writer.close(state, this.now() - writer.startedAt)
+        })
         .catch((error) => this.host.log?.('[trace] Could not close the run', error))
+  }
+
+  private startHttp(l: Live, writer: TraceRunWriter) {
+    let stopped = false
+    let installed = false
+    let busy = false
+    const drain = async (count: number) => {
+      for (let i = 0; i < count; i++) {
+        const events = await l.session.traceHttp('drain')
+        if (!events.length) break
+        for (const e of events) {
+          l.http.push(e)
+          if (l.http.length > 256) l.http.shift()
+          const url = new URL(e.url)
+          writer.append({
+            kind: 'http',
+            at: e.started - writer.startedAt,
+            label: `${e.method} ${url.pathname}${url.search}`,
+            host: url.host,
+            ...(e.status !== undefined ? { status: e.status } : {}),
+            chain: e.id,
+            direction: e.direction,
+            duration_ms: Math.max(0, e.ended - e.started),
+            values: [
+              writer.value(
+                'request',
+                JSON.stringify({
+                  method: e.method,
+                  url: e.url,
+                  headers: e.request_headers,
+                  body: e.request_body,
+                  truncated: !!e.request_truncated,
+                })
+              ),
+              writer.value('response', e.response_body),
+              writer.value(
+                'http',
+                JSON.stringify({
+                  direction: e.direction,
+                  started_at: new Date(e.started).toISOString(),
+                  duration_ms: e.ended - e.started,
+                  headers: e.response_headers,
+                  truncated: !!e.response_truncated,
+                  ...(e.error ? { error: e.error } : {}),
+                })
+              ),
+            ],
+          })
+        }
+      }
+    }
+    const poll = () => {
+      if (busy || stopped) return
+      busy = true
+      l.queue = l.queue
+        .then(async () => {
+          if (stopped) return
+          if (!installed) {
+            await l.session.traceHttp('install')
+            installed = true
+          }
+          await drain(16)
+        })
+        .catch((error) => {
+          installed = false
+          this.host.log?.('[trace] Program HTTP capture unavailable', error)
+        })
+        .finally(() => {
+          busy = false
+        })
+    }
+    const timer = setInterval(poll, 200)
+    timer.unref()
+    l.httpPoll = poll
+    l.httpOff = () => {
+      stopped = true
+      clearInterval(timer)
+      l.queue = l.queue
+        .then(async () => {
+          if (installed && !l.session.dap.closed) {
+            try {
+              await l.session.traceHttp('finish')
+              await drain(128)
+            } finally {
+              await l.session.traceHttp('stop')
+            }
+          }
+        })
+        .catch((error) => this.host.log?.('[trace] Could not remove HTTP hooks', error))
+    }
+    poll()
   }
 
   private observe(l: Live) {
@@ -278,7 +432,7 @@ export class TraceRecorder {
     const end = terminal[snapshot.lifecycle]
     if (end) return this.detach(l, end)
     // A breakpoint that arrives after its record point starts the run too.
-    if (!l.writer) this.ensureRun(l)
+    this.ensureRun(l)
     for (const thread of snapshot.threads) {
       if (thread.status !== 'stopped' || !thread.stop) continue
       const key = `${snapshot.incarnation}:${snapshot.stop_epoch}:${thread.thread_id}`
@@ -290,7 +444,28 @@ export class TraceRecorder {
       if (hits.length && points.every(Boolean)) {
         const stoppedAt = this.now()
         const id = thread.thread_id
-        l.queue = l.queue.then(() => this.capture(l, id, points as TracePoint[], stoppedAt))
+        const writer = l.writer
+        const chain = [...l.chains.entries()].pop()
+        if (chain) chain[1].steps++
+        const configuration = l.configuration
+        const current = (resuming = false) => {
+          const now = l.session.snapshot
+          return (
+            this.live.get(l.session.id) === l &&
+            l.configuration === configuration &&
+            now.incarnation === snapshot.incarnation &&
+            now.stop_epoch === snapshot.stop_epoch + (resuming ? 1 : 0) &&
+            now.breakpoint_revision === snapshot.breakpoint_revision &&
+            now.threads.some(
+              (t) => t.thread_id === id && t.status === (resuming ? 'unknown' : 'stopped')
+            )
+          )
+        }
+        l.queue = l.queue
+          .then(() =>
+            this.capture(l, id, points as TracePoint[], stoppedAt, current, writer, chain)
+          )
+          .catch((error) => this.host.log?.('[trace] Could not record the stop', error))
       } else if (thread.stop.reason === 'exception' && l.writer) {
         l.writer.append({
           kind: 'error',
@@ -302,9 +477,20 @@ export class TraceRecorder {
     }
   }
 
-  private async capture(l: Live, thread: number, points: TracePoint[], stoppedAt: number) {
-    this.ensureRun(l)
-    const writer = l.writer
+  private async capture(
+    l: Live,
+    thread: number,
+    points: TracePoint[],
+    stoppedAt: number,
+    current: (resuming?: boolean) => boolean,
+    writer?: TraceRunWriter,
+    chain?: [string, { steps: number }]
+  ) {
+    if (!current()) return
+    if (!writer) {
+      this.ensureRun(l)
+      writer = l.writer
+    }
     const takes = new Map<string, string>()
     for (const p of points)
       for (const t of p.take) {
@@ -316,15 +502,22 @@ export class TraceRecorder {
     try {
       stop = await l.session.recordStop(
         thread,
-        [...takes].map(([name, expression]) => ({ name, expression }))
+        [...takes].map(([name, expression]) => ({ name, expression })),
+        10,
+        () => {
+          if (!current()) throw new Error('trace_capture_stale')
+        }
       )
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error)
       this.host.log?.('[trace] Record point could not be read', error)
     }
     const resumedAt = this.now()
+    if (!current()) return
     try {
-      await l.session.continue(thread)
+      await l.session.continue(thread, false, () => {
+        if (!current(true)) throw new Error('trace_capture_stale')
+      })
     } catch (error) {
       // Left stopped: whoever looks at the session sees where it stands.
       this.host.log?.('[trace] Could not let the program go on', error)
@@ -345,12 +538,15 @@ export class TraceRecorder {
         )
       : [...takes.keys()].map((name) => writer.failed(name, failure ?? 'Not taken'))
     // Under the request out now, the newest when several are: placed by time, not proven.
-    const chain = [...l.chains.entries()].pop()
-    if (chain) chain[1].steps++
+    const http = l.http
+      .filter((e) => e.started <= stoppedAt && e.ended >= stoppedAt)
+      .sort((a, b) =>
+        a.direction === b.direction ? b.started - a.started : a.direction === 'incoming' ? -1 : 1
+      )[0]
     writer.append({
       kind: 'probe',
       at: stoppedAt - writer.startedAt,
-      ...(chain ? { chain: chain[0], by_time: true } : {}),
+      ...(chain || http ? { chain: chain?.[0] ?? http!.id, by_time: true } : {}),
       ...(points[0] ? { point: points[0].breakpoint_id } : {}),
       label:
         points.map((p) => p.note).find(Boolean) ??

@@ -2,7 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import * as programs from '../../packages/node-core/src/debugger/programs.js'
 import { NodeCore, type LaunchProfile } from '../../packages/node-core/src/index.js'
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import {
@@ -299,9 +300,14 @@ describe('attaching the debugger to a running program', () => {
   })
 
   it('does not trust the lines of a program file changed after the program started', async () => {
-    const dir = folder({ 'app.js': SERVE })
-    const program = await inspected(dir)
+    const dir = folder({ 'app.js': 'console.log("app ready")\n' + SERVE })
+    const program = await node(
+      dir,
+      ['--inspect=127.0.0.1:0', 'app.js'],
+      /ws:\/\/127\.0\.0\.1:(\d+)\/[\s\S]*app ready/
+    )
     const later = new Date(Date.now() + 5000)
+    writeFileSync(join(dir, 'app.js'), 'console.log("changed")\n' + SERVE)
     utimesSync(join(dir, 'app.js'), later, later)
     const profile = scriptedProfile()
     const s = await setup(profile.make, dir)
@@ -313,4 +319,62 @@ describe('attaching the debugger to a running program', () => {
     })
     expect(profile.attached[0]!.target.build_identity).toBe('unknown')
   })
+  it.each(['identical', 'restored', 'diverged'])(
+    'checks a %s rebuild against the script actually loaded by Node',
+    async (mode) => {
+      const original = 'console.log("app ready")\n' + SERVE
+      const dir = folder({ 'app.js': original })
+      const program = await node(
+        dir,
+        ['--inspect=127.0.0.1:0', 'app.js'],
+        /ws:\/\/127\.0\.0\.1:(\d+)\/[\s\S]*app ready/
+      )
+      const discovery = vi.spyOn(programs, 'inspectorPrograms').mockResolvedValue([
+        {
+          pid: program.pid,
+          port: program.port,
+          command: 'node app.js',
+          cwd: dir,
+          script: join(dir, 'app.js'),
+        },
+      ])
+      const started = vi.spyOn(programs, 'processStartedAt').mockResolvedValue(Date.now() - 5000)
+      try {
+        writeFileSync(
+          join(dir, 'app.js'),
+          mode === 'identical' ? original : 'console.log("changed")\n' + SERVE
+        )
+        if (mode === 'restored') writeFileSync(join(dir, 'app.js'), original)
+        const profile = scriptedProfile()
+        const s = await setup(profile.make, dir)
+        const attached = await s.request('debugger.v1.attachProgram', {
+          operation_id: 'attach-rebuilt',
+          conversation_id: s.chat.session_id,
+          pid: program.pid,
+          port: program.port,
+        })
+        expect(attached.sources).toEqual(
+          mode === 'diverged' ? [] : [{ source_id: 's1', path: 'app.js' }]
+        )
+        expect(profile.attached[0]!.target.build_identity).toBe(
+          mode === 'diverged' ? 'unknown' : 'matched'
+        )
+        if (mode === 'diverged') {
+          writeFileSync(join(dir, 'app.js'), original)
+          const added = await s.request('debugger.v1.addSources', {
+            operation_id: 'restored-after-attach',
+            debug_session_id: attached.debug_session_id,
+            sources: ['app.js'],
+          })
+          expect(added.refused).toEqual([])
+          expect(
+            s.core.debugger.snapshot(attached.debug_session_id).snapshot.target.build_identity
+          ).toBe('matched')
+        }
+      } finally {
+        discovery.mockRestore()
+        started.mockRestore()
+      }
+    }
+  )
 })

@@ -109,11 +109,22 @@ post-admission outcome.
 
 `nodePath.createWorkspace({project_id, branch?, base_ref?}, operationId)` uses a
 named new branch from the base, or an existing branch's own tip. A checked-out
-branch is refused. Omitting `branch` preserves generated legacy names. Managed
-removal still uses `workspace.remove` and durable jobs. External owner deletion
+branch is refused. Omitting `branch` preserves generated branch names. Managed
+worktrees default to `<repository-parent>/<repository-name>.worktrees/<branch>`;
+the branch is percent-encoded as one directory name (for example `feature%2Ffiles`).
+The existing `worktreeRoot` setting overrides the parent, with a project-ID namespace.
+Previously provisioned UUID paths remain valid and are never moved automatically.
+Local `main` or `master` is used as the comparison base when exactly one exists
+and there is no remote default or explicit project override.
+Managed removal still uses `workspace.remove` and durable jobs. External owner deletion
 uses `nodePath.deleteWorktree({worktree_id, expected_head,
 expected_observation_id}, operationId)` after a separate exact-target confirmation.
 Root, locked, missing, leased, dirty, untracked and ignored targets are refused.
+An owner-stopped session whose work has settled releases its persistent workspace
+binding on deletion, while preserving the chat. Active execution and other bound
+sessions return `resource_busy` with `holder`, `session_id`, and `title` details;
+Git locks identify `holder: 'git_lock'`. Language servers and repository watchers
+are released as part of worktree removal.
 There is no force, prune, recursive deletion or branch deletion. A lost effect
 reply is never blindly replayed. Removal runs behind a gated process group whose
 identity is durably recorded before Git can start. Startup and retained-ID retry
@@ -147,10 +158,26 @@ not traversed. These checks do not claim filesystem CAS against arbitrary extern
 editors; a fully interleaved same-user pathname attack remains an existing limitation
 of platforms without descriptor-relative filesystem primitives.
 
+Create a file with `workspace.write` or `repository.v1.write`, passing
+`expected_content_id: null`; the existing text bound and editing rules apply.
+For directories, first call `nodePath.fileDirectory({workspace_id|worktree_id, path})`
+and pass its `content_id` to `fileMove` or `fileRemove` with `directory: true`.
+The manifest covers the entire subtree, including empty directories, and is limited
+to 256 entries, depth 32 and 8 MiB of file bytes. Changed contents return `conflict`.
+Symlinks, special files, nested repositories and submodules are refused. Directory
+moves rename on the same filesystem after checking the destination is absent;
+they share the platform pathname-race limitation above. Deletion removes only the
+confirmed entries, without recursive `rm`, and retains a private `directory-v1`
+JSON recovery manifest with base64 file contents. Partial effects and interrupted
+operations retain an `outcome_unknown` receipt and must not be blindly retried.
+
 `nodePath.search({workspace_id, query, mode?, case_sensitive?, path_glob?,
 cursor?, limit?})` searches plain roots with the same killable bounded matcher as
 repository search. Continuations bind owner, target and query; omissions are explicit.
 Search never traverses symlinks or Git metadata.
+For Git trees, `repository.v1.search` with `mode: 'filename'` and a fresh working
+observation searches the whole gitignore-aware tree without expanding directories.
+Filename searches do not read file content or omit files because of content size.
 
 ## Status, divergence and refresh
 

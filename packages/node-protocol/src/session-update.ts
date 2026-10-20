@@ -180,9 +180,10 @@ export type PlanEntry = z.infer<typeof PlanEntrySchema>
 /** The data of a `session.update` event. `run_id` is absent only for updates made outside a run. */
 export const SessionUpdateEventSchema = z.object({
   run_id: z.string().min(1).max(128).optional(),
+  turn_id: z.string().min(1).max(128).optional(),
   update: SessionUpdateSchema,
 })
-export type SessionUpdateEvent = { run_id?: string; update: SessionUpdate }
+export type SessionUpdateEvent = { run_id?: string; turn_id?: string; update: SessionUpdate }
 export const SessionCommandsSchema = z.object({
   session_id: z.string().min(1).max(128),
   commands: z.array(SessionCommandSchema).max(512),

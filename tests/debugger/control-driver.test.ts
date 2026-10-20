@@ -6,6 +6,7 @@ import { NodeCore, DapDebuggerBackend } from '../../packages/node-core/src/index
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { wire } from './dap-wire.js'
 import { target } from './helpers.js'
+import { z } from 'zod'
 
 async function fixture(
   work: (f: any) => Promise<void>,
@@ -24,6 +25,7 @@ async function fixture(
       supportsSetVariable: true,
       supportsConditionalBreakpoints: true,
       supportsLogPoints: true,
+      supportsHitConditionalBreakpoints: true,
     })
     w.send({ type: 'event', event: 'initialized' })
     for (let i = 0; i < 20; i++) {
@@ -74,6 +76,34 @@ async function request(w: ReturnType<typeof wire>, command: string) {
   throw new Error('missing_request_' + command)
 }
 describe('authorized typed DAP backend', () => {
+  it('keeps inspection pages structured when recording state makes snapshots large', () =>
+    fixture(async ({ core, session, human, w }) => {
+      core.debugger.patchBreakpoints(
+        session.id,
+        0,
+        Array.from({ length: 100 }, (_, i) => ({
+          breakpoint_id: `bp${i}`,
+          source_id: 'source',
+          line: i + 1,
+        })),
+        []
+      )
+      const pending = core.debuggerControl.inspect(human, 'stack', {
+        debug_session_id: session.id,
+        incarnation: session.incarnation,
+        expected_state_revision: session.snapshot.state_revision,
+        thread_id: 1,
+      })
+      w.reply(await request(w, 'stackTrace'), {
+        stackFrames: [{ id: 1, name: 'main', line: 1, column: 1 }],
+      })
+      const result = await pending
+      expect(
+        z
+          .object({ data: z.object({ items: z.array(z.object({ name: z.string() })) }) })
+          .safeParse(result).success
+      ).toBe(true)
+    }))
   it('reports running after attach without a continued event', () =>
     fixture(
       async ({ session }) => {
@@ -194,7 +224,7 @@ describe('authorized typed DAP backend', () => {
       false
     )
   )
-  it.each(['condition', 'log_message'])(
+  it.each(['condition', 'log_message', 'hit_condition'])(
     'does not replay an undispatched %s through a basic patch',
     (expressionKind) =>
       fixture(
@@ -304,7 +334,12 @@ describe('authorized typed DAP backend', () => {
           })
           const m = await request(f.w, 'setBreakpoints')
           expect(m.arguments.breakpoints).toEqual([
-            { line: 2, [expressionKind === 'condition' ? 'condition' : 'logMessage']: 'counter++' },
+            {
+              line: 2,
+              [{ condition: 'condition', log_message: 'logMessage', hit_condition: 'hitCondition' }[
+                expressionKind
+              ]!]: 'counter++',
+            },
           ])
           f.w.reply(m, { breakpoints: [{ verified: true, line: 2 }] })
           expect((await sent).outcome).toBe('completed')

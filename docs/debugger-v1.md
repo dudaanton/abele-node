@@ -13,6 +13,36 @@ pins and experimental opt-in are not production dependencies.
 
 ## Contracts and availability
 
+Breakpoint requests and snapshot breakpoints accept optional `hit_condition: string`
+(1–8192 characters) and `enabled: boolean` (omitted means enabled). Both survive
+patches, approval normalization and recovery. Disabled points remain durable intent
+and are omitted from DAP `setBreakpoints`; hit counts use DAP `hitCondition` and
+require the session capability `supportsHitConditionalBreakpoints`. Node advertises
+`debugger_v1.breakpoint_hit_condition: true` and `debugger_v1.breakpoint_enabled: true`.
+Hit conditions on enabled points require exact approval like conditions and logpoints.
+
+After evaluation, old handles expire. A successful, fenced stack probe confirms that
+the evaluated thread remains stopped; clients can request fresh stack/scopes handles
+and step again. A newer execution event takes precedence over that probe.
+
+Stack items also return optional `path`, the adapter's mapped source path bounded
+to 4096 UTF-8 bytes. It is retained for callers outside the admitted source set,
+whose `source_id` stays null. Real internal paths retain their `node:` prefix.
+
+`addSources` distinguishes `debugger_source_test` and `debugger_source_generated`
+from `debugger_source_no_map`. Test/spec paths and generated/build output paths are
+classified separately (the program's own entry script remains admissible). Source
+identity uses retained digests, source-map content, and bounded read-only V8 source
+evidence at attach. Timestamp checks remain a fallback when content evidence is
+unavailable. Identical rebuilds and restored bytes retain their source identity.
+A repeated attach to the same live process in the same folder returns its existing
+session, including concurrent requests with different operation IDs.
+
+Inspection responses retain structured `data.items` and their snapshot even when
+recording state grows. Snapshot metadata is bounded separately from the inspection
+page; page truncation removes trailing items and sets `truncated`, never substitutes
+a preview object for a typed page.
+
 `packages/node-protocol/src/debugger.ts` declares strict, versioned Zod contracts
 for debugger requests, session snapshots, replay cursors, receipts and history.
 Debugger session IDs are distinct from provider/chat and adapter connection IDs.

@@ -7,6 +7,7 @@ export function createSdkDouble({
   shutdownError = false,
   defaultProvider = 'fixture',
   defaultModel = 'tiny',
+  availableModels = [],
 } = {}) {
   const state = {
     reads: [],
@@ -16,6 +17,7 @@ export function createSdkDouble({
     shutdowns: 0,
     settingsOptions: [],
     selectedModels: [],
+    extensionError: undefined,
   }
   class Manager {
     constructor(cwd, root) {
@@ -135,6 +137,7 @@ export function createSdkDouble({
     SessionManager: Manager,
     ModelRuntime: {
       create: async () => ({
+        getAvailableSnapshot: () => availableModels,
         getModel: (provider, id) => {
           state.selectedModels.push({ provider, id })
           return { provider, id, maxTokens: 4096 }
@@ -166,7 +169,7 @@ export function createSdkDouble({
         : append
       return { ...options, diagnostics: [], resourceLoader: { systemPrompt, appendSystemPrompt } }
     },
-    createAgentSessionFromServices: async ({ services, sessionManager }) => {
+    createAgentSessionFromServices: async ({ services, sessionManager, model }) => {
       const listeners = new Set()
       let bindings
       sessionManager.appendCustomEntry('sdk-initialization', { provider: 'fixture' })
@@ -174,6 +177,10 @@ export function createSdkDouble({
         for (const fn of listeners) fn(event)
       }
       const session = {
+        model,
+        setModel: async (next) => {
+          session.model = next
+        },
         sessionManager,
         get sessionId() {
           return sessionManager.getSessionId()
@@ -187,6 +194,7 @@ export function createSdkDouble({
         },
         bindExtensions: async (b) => {
           bindings = b
+          state.extensionError = b.onError
         },
         waitForIdle: async () => {},
         abort: async () => {},

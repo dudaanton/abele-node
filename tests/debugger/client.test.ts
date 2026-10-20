@@ -7,6 +7,24 @@ import { DebuggerClient, parseDebuggerVariables } from '@abele/node-client'
 import { target } from './helpers.js'
 
 afterEach(() => vi.useRealTimers())
+it('lists launch targets through the typed owner client', async () => {
+  const result = {
+    targets: [
+      { program: 'dist/main.js', source: 'src/main.ts' },
+      { program: 'package.json', npm_script: 'start' },
+    ],
+  }
+  const rpc = vi.fn(async () => result)
+  const client = new DebuggerClient(rpc)
+  expect(await client.launchTargets('chat')).toEqual(result)
+  expect(rpc).toHaveBeenCalledExactlyOnceWith('debugger.v1.launchTargets', {
+    conversation_id: 'chat',
+  })
+  rpc.mockResolvedValueOnce({
+    targets: [{ program: 'dist/main.js', source: 'src/main.ts', content: 'secret' }],
+  } as any)
+  await expect(client.launchTargets('chat')).rejects.toThrow()
+})
 it('adds sources through the typed owner client and validates the response', async () => {
   const result = { incarnation: 'i', sources: [{ source_id: 's2', path: 'late.js' }], refused: [] }
   const rpc = vi.fn(async () => result)

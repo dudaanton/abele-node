@@ -13,6 +13,10 @@ it('resolves omitted model selection from user-only SDK settings, including isol
   const { sdk, state } = createSdkDouble({
     defaultProvider: 'example-provider',
     defaultModel: 'example-model',
+    availableModels: [
+      { provider: 'example-provider', id: 'another/model', name: 'Another model' },
+      { provider: 'different-provider', id: 'wrong-account', name: 'Other account' },
+    ],
   })
   const config: HostConfiguration = {
     cwd,
@@ -23,6 +27,7 @@ it('resolves omitted model selection from user-only SDK settings, including isol
     profile: 'isolated',
     maxTokens: 512,
   }
+  const events: any[] = []
   let host: Awaited<ReturnType<typeof createSdkHost>> | undefined
   try {
     host = await createSdkHost(
@@ -30,11 +35,42 @@ it('resolves omitted model selection from user-only SDK settings, including isol
       config,
       async () => ({ choice: 'deny', delivered: () => true }),
       new AbortController().signal,
-      () => {}
+      (event) => events.push(event)
     )
     expect(state.selectedModels).toEqual([{ provider: 'example-provider', id: 'example-model' }])
     expect(state.settingsOptions).toContainEqual({ projectTrusted: false })
     expect(state.reads).toEqual([])
+    expect(events).toContainEqual({
+      type: 'pi.model.catalog',
+      data: {
+        provider: 'example-provider',
+        model_id: 'example-model',
+        account: 'default',
+        account_label: 'pi · example-provider',
+        models: [
+          { value: 'another/model', name: 'Another model' },
+          { value: 'example-model', name: 'example-model' },
+        ],
+      },
+    })
+    state.extensionError({
+      extensionPath: 'pi-mcp-adapter',
+      event: 'session_start',
+      error: 'server unavailable',
+    })
+    expect(events).toContainEqual({
+      type: 'pi.extension.error',
+      data: {
+        extension: 'pi-mcp-adapter',
+        event: 'session_start',
+        error: 'server unavailable',
+      },
+    })
+    await host.setModel('another/model')
+    expect(events.at(-1)).toMatchObject({
+      type: 'pi.model.catalog',
+      data: { model_id: 'another/model' },
+    })
   } finally {
     await host?.dispose()
     rmSync(cwd, { recursive: true, force: true })

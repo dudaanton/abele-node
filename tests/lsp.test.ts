@@ -31,6 +31,24 @@ function temp() {
   cleanups.push(() => rmSync(root, { recursive: true, force: true }))
   return root
 }
+it('releases servers and diagnostics for a removed worktree without stopping other roots', async () => {
+  const root = temp(),
+    other = temp()
+  for (const path of [root, other]) writeFileSync(join(path, 'a.ts'), '')
+  const service = new LspService(root, {
+    trusted: () => true,
+    check: (base, path) => join(base, path),
+    command: () => ({ command: process.execPath, args: [fixture] }),
+  })
+  cleanups.push(() => service.stop())
+  expect(await service.open(root, 'a.ts')).toEqual({ servers: ['typescript'] })
+  expect(await service.open(other, 'a.ts')).toEqual({ servers: ['typescript'] })
+  await service.releaseRoot(root)
+  expect([...(service as any).slots.values()].map((slot: any) => slot.root)).toEqual([
+    realpathSync(other),
+  ])
+  expect(await service.query(other, 'a.ts', 'hover', { line: 0, character: 0 })).toBeDefined()
+})
 it('does not start project-code servers without trust, including implicit queries and refresh', async () => {
   const root = temp()
   for (const path of ['a.ts', 'a.py', 'a.sh', 'a.go', 'a.rs', 'a.json'])

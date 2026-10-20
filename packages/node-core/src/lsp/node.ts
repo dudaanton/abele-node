@@ -8,6 +8,10 @@ import { LspService } from './service.js'
 import { install, status, servers } from './servers.js'
 
 export class NodeLsp {
+  async releaseRoot(root: string) {
+    this.roots.delete(root)
+    await this.service.releaseRoot(root)
+  }
   readonly service: LspService
   private roots = new Map<string, { id: string; repository: boolean; project: string }>()
   private requests = new Map<string, AbortController>()

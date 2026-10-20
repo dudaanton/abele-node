@@ -103,6 +103,7 @@ export const DebuggerStartSchema = z
     operation_id: id,
     ...DebuggerOwnerShape,
     program: relativePath,
+    npm_script: z.string().min(1).max(256).optional(),
     argv: z.array(z.string().max(8192)).max(256).default([]),
     sources: z.array(relativePath).max(255).default([]),
   })
@@ -143,6 +144,20 @@ export const DebuggerProgramsSchema = z
   .object(DebuggerOwnerShape)
   .strict()
   .refine(hasDebuggerOwner, 'debugger owner required')
+export const DebuggerLaunchTargetsSchema = DebuggerProgramsSchema
+export const DebuggerLaunchTargetsResultSchema = z
+  .object({
+    targets: z
+      .array(
+        z.union([
+          z.object({ program: relativePath, source: relativePath }).strict(),
+          z.object({ program: relativePath, npm_script: z.string().min(1).max(256) }).strict(),
+        ])
+      )
+      .max(256),
+  })
+  .strict()
+export type DebuggerLaunchTargetsResult = z.infer<typeof DebuggerLaunchTargetsResultSchema>
 const absolute = z.string().min(1).max(4096)
 export const DebuggerProgramSchema = z
   .object({
@@ -193,6 +208,7 @@ export const DebuggerControlMethodSchemas = {
   'debugger.v1.start': DebuggerStartSchema,
   'debugger.v1.addSources': DebuggerAddSourcesSchema,
   'debugger.v1.programs': DebuggerProgramsSchema,
+  'debugger.v1.launchTargets': DebuggerLaunchTargetsSchema,
   'debugger.v1.attachProgram': DebuggerAttachProgramSchema,
   'debugger.v1.restart': z.object({ operation_id: id, debug_session_id: id }).strict(),
   'debugger.v1.sessions': DebuggerMethodSchemas['debugger.v1.sessions'],

@@ -10,11 +10,15 @@ import {
   lstatSync,
   realpathSync,
   readFileSync,
+  readSync,
+  opendirSync,
   readdirSync,
   unlinkSync,
   mkdirSync,
   chmodSync,
   linkSync,
+  renameSync,
+  rmdirSync,
 } from 'node:fs'
 import { dirname, join, basename } from 'node:path'
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
@@ -75,6 +79,109 @@ const sameInode = (a: { dev: number; ino: number }, b: { dev: number; ino: numbe
 
 /** API writes serialize, but ordinary external editors can interleave. No filesystem CAS is claimed. */
 export class FileMutationCoordinator {
+  /** A confirmation manifest, bounded independently of the ordinary file editor. */
+  directory(id: string, path: string, repository = false) {
+    const { content_id, entries } = this.directorySnapshot(id, path, repository)
+    return {
+      content_id,
+      entries: entries.map(({ path, kind, content_id }) => ({ path, kind, content_id })),
+    }
+  }
+  private directorySnapshot(id: string, path: string, repository: boolean) {
+    if (!repository) this.plainFileTarget(id)
+    const root = this.r.files.childTarget(id, path, repository)
+    const entries: {
+      path: string
+      kind: 'file' | 'directory'
+      content_id: string | null
+      bytes: string | null
+      dev: number
+      ino: number
+    }[] = []
+    let size = 0
+    const visit = (relative: string, depth: number) => {
+      if (entries.length >= 256 || depth > 32) throw new ChannelError('output_limit')
+      const absolute = join(root, relative),
+        before = lstatSync(absolute)
+      if (
+        before.isSymbolicLink() ||
+        realpathSync(absolute) !== absolute ||
+        (!before.isFile() && !before.isDirectory())
+      )
+        throw new ChannelError('unsafe_path')
+      if (!relative && !before.isDirectory()) throw new ChannelError('unsafe_path')
+      let bytes: Buffer | null = null
+      if (before.isFile()) {
+        size += before.size
+        if (size > 8 * 1024 * 1024) throw new ChannelError('file_too_large')
+        const fd = openSync(
+          absolute,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+        )
+        try {
+          const opened = fstatSync(fd)
+          if (!opened.isFile() || !sameInode(before, opened) || opened.size !== before.size)
+            throw new ChannelError('stale_revision')
+          bytes = Buffer.alloc(opened.size)
+          let offset = 0
+          while (offset < bytes.length) {
+            const n = readSync(fd, bytes, offset, bytes.length - offset, offset)
+            if (!n) throw new ChannelError('stale_revision')
+            offset += n
+          }
+          const after = fstatSync(fd)
+          if (
+            after.size !== opened.size ||
+            after.mtimeMs !== opened.mtimeMs ||
+            after.ctimeMs !== opened.ctimeMs ||
+            !sameInode(after, lstatSync(absolute))
+          )
+            throw new ChannelError('stale_revision')
+        } finally {
+          closeSync(fd)
+        }
+      }
+      entries.push({
+        path: relative,
+        kind: before.isDirectory() ? 'directory' : 'file',
+        content_id: bytes ? hash(bytes) : null,
+        bytes: bytes?.toString('base64') ?? null,
+        dev: before.dev,
+        ino: before.ino,
+      })
+      if (before.isDirectory()) {
+        const directory = opendirSync(absolute),
+          names: string[] = []
+        try {
+          for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+            if (names.length + entries.length >= 256) throw new ChannelError('output_limit')
+            names.push(entry.name)
+          }
+        } finally {
+          directory.closeSync()
+        }
+        for (const name of names.sort()) {
+          if (name.toLowerCase() === '.git') throw new ChannelError('unsafe_path')
+          visit(relative ? relative + '/' + name : name, depth + 1)
+        }
+        const after = lstatSync(absolute)
+        if (
+          !sameInode(before, after) ||
+          before.mtimeMs !== after.mtimeMs ||
+          before.ctimeMs !== after.ctimeMs
+        )
+          throw new ChannelError('stale_revision')
+      }
+    }
+    visit('', 0)
+    return {
+      root,
+      entries,
+      content_id: hash(
+        canonical(entries.map(({ path, kind, content_id }) => ({ path, kind, content_id })))
+      ),
+    }
+  }
   fault?: (point: 'before_check' | 'after_intent' | 'after_truncate' | 'after_write') => void
   operationFault?: (point: 'after_intent' | 'destination_created' | 'source_removed') => void
   private serial: Promise<unknown> = Promise.resolve()
@@ -211,6 +318,18 @@ export class FileMutationCoordinator {
       request_hash: hash(canonical({ method, params })),
       body: '',
     }
+    if (params.directory === true)
+      return this.applyDirectory(
+        actor,
+        id,
+        repository,
+        sourcePath,
+        destPath,
+        kind,
+        params,
+        row,
+        intent
+      )
     const initial = kind === 'mkdir' ? null : this.current(id, sourcePath, repository)
     if (initial?.too_large) throw new ChannelError('file_too_large')
     if (kind !== 'mkdir' && initial?.content_id !== params.expected_content_id)
@@ -375,6 +494,127 @@ export class FileMutationCoordinator {
     const task = this.serial.then(work)
     this.serial = task.catch(() => {})
     return task
+  }
+  private applyDirectory(
+    actor: AuthorityContext,
+    id: string,
+    repository: boolean,
+    sourcePath: string,
+    destPath: string,
+    kind: string,
+    params: Record<string, unknown>,
+    row: IntentRow,
+    intent: OperationIntent
+  ) {
+    if (kind !== 'move' && kind !== 'remove') throw new ChannelError('invalid_params')
+    const snapshot = this.directorySnapshot(id, sourcePath, repository)
+    if (snapshot.content_id !== params.expected_content_id)
+      return this.finishOperation(row, intent, 'conflict')
+    const destination = kind === 'move' ? this.r.files.childTarget(id, destPath, repository) : null
+    const exists = (path: string) => {
+      try {
+        lstatSync(path)
+        return true
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw e
+      }
+    }
+    if (
+      destination &&
+      (destination === snapshot.root ||
+        destination.startsWith(snapshot.root + '/') ||
+        exists(destination))
+    )
+      return this.finishOperation(row, intent, 'conflict')
+    const parents = new Map<string, number>()
+    const checkParents = () => {
+      this.r.core.authority.check(actor, 'mutate', id)
+      this.r.files.root(id, repository)
+      for (const [path, fd] of parents)
+        if (realpathSync(path) !== path || !sameInode(fstatSync(fd), lstatSync(path)))
+          throw new ChannelError('unsafe_path')
+    }
+    try {
+      for (const path of new Set([
+        dirname(snapshot.root),
+        ...(destination ? [dirname(destination)] : []),
+      ])) {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+        parents.set(path, fd)
+        if (!fstatSync(fd).isDirectory()) throw new ChannelError('unsafe_path')
+      }
+      checkParents()
+      if (
+        destination &&
+        fstatSync(parents.get(dirname(destination))!).dev !==
+          fstatSync(parents.get(dirname(snapshot.root))!).dev
+      )
+        throw new ChannelError('unsafe_path')
+      // Keep a bounded, complete manifest and file bytes before any destructive effect.
+      intent.recovery_path = this.retainCopy(
+        id,
+        sourcePath,
+        Buffer.from(JSON.stringify({ format: 'directory-v1', entries: snapshot.entries })),
+        repository
+      )
+      row.body = JSON.stringify(intent)
+      const reserved = this.r.core.reserveOperation(
+        actor,
+        intent.method,
+        params,
+        row.operation_id,
+        () => {
+          this.r.core.db
+            .prepare('INSERT INTO file_mutations VALUES(?,?,?,?)')
+            .run(row.principal_id, row.operation_id, row.request_hash, row.body)
+        }
+      )
+      if (reserved) return reserved.result
+      this.operationFault?.('after_intent')
+      try {
+        checkParents()
+        const current = this.directorySnapshot(id, sourcePath, repository)
+        if (
+          current.content_id !== snapshot.content_id ||
+          canonical(current.entries) !== canonical(snapshot.entries)
+        )
+          return this.finishOperation(row, intent, 'conflict')
+        if (destination) {
+          if (exists(destination)) return this.finishOperation(row, intent, 'conflict')
+          renameSync(snapshot.root, destination)
+          this.operationFault?.('destination_created')
+          if (!sameInode(snapshot.entries[0]!, lstatSync(destination)))
+            throw new ChannelError('stale_revision')
+        } else {
+          for (const entry of [...snapshot.entries].reverse()) {
+            checkParents()
+            const absolute = join(snapshot.root, entry.path)
+            if (realpathSync(absolute) !== absolute || !sameInode(entry, lstatSync(absolute)))
+              throw new ChannelError('unsafe_path')
+            if (entry.kind === 'directory') rmdirSync(absolute)
+            else {
+              // Check each file again immediately before unlinking; never recurse through a link.
+              if (
+                this.current(id, sourcePath + '/' + entry.path, repository)?.content_id !==
+                entry.content_id
+              )
+                throw new ChannelError('stale_revision')
+              unlinkSync(absolute)
+            }
+          }
+        }
+        this.operationFault?.('source_removed')
+        for (const fd of parents.values()) fsyncSync(fd)
+        checkParents()
+        return this.finishOperation(row, intent, 'applied')
+      } catch (e) {
+        if (e instanceof Error && !('code' in e) && !(e instanceof ChannelError)) throw e
+        return this.finishOperation(row, intent, 'outcome_unknown')
+      }
+    } finally {
+      for (const fd of parents.values()) closeSync(fd)
+    }
   }
   private syncDirectory(path: string) {
     const fd = openSync(dirname(path), constants.O_RDONLY)

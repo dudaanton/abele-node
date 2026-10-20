@@ -54,6 +54,38 @@ it('opens, watches, creates and initializes a folder over the existing channel w
     workspace_id: workspace.workspace_id,
     subscription_id: lease.subscription_id,
   })
+  await client.nodePath.fileMkdir({ workspace_id: workspace.workspace_id, path: 'new-folder' })
+  const createdFile = await client.writeFile({
+    workspace_id: workspace.workspace_id,
+    path: 'new-folder/new.txt',
+    expected_content_id: null,
+    text: 'created',
+  })
+  expect(await client.fileMutationResult(createdFile.operation_id)).toMatchObject({
+    state: 'saved',
+  })
+  const manifest = await client.nodePath.fileDirectory({
+    workspace_id: workspace.workspace_id,
+    path: 'new-folder',
+  })
+  expect(manifest.entries.map((entry) => entry.path)).toEqual(['', 'new.txt'])
+  expect(
+    await client.nodePath.fileMove({
+      workspace_id: workspace.workspace_id,
+      from: 'new-folder',
+      to: 'renamed-folder',
+      directory: true,
+      expected_content_id: manifest.content_id,
+    })
+  ).toMatchObject({ state: 'applied' })
+  expect(
+    await client.nodePath.fileRemove({
+      workspace_id: workspace.workspace_id,
+      path: 'renamed-folder',
+      directory: true,
+      expected_content_id: manifest.content_id,
+    })
+  ).toMatchObject({ state: 'applied' })
   const initialized = await client.nodePath.gitInit(
     { project_id: project.project_id, initial_branch: 'trunk' },
     'init-one'
@@ -207,6 +239,28 @@ it('awaits real file/worktree mutation receipts and does not confuse operation I
   expect(
     (await client.nodePath.fileMkdir({ worktree_id: root.worktree_id, path: 'child' })).state
   ).toBe('applied')
+  const directory = await client.nodePath.fileDirectory({
+    worktree_id: root.worktree_id,
+    path: 'child',
+  })
+  expect(directory.entries).toEqual([{ path: '', kind: 'directory', content_id: null }])
+  expect(
+    await client.nodePath.fileMove({
+      worktree_id: root.worktree_id,
+      from: 'child',
+      to: 'renamed',
+      directory: true,
+      expected_content_id: directory.content_id,
+    })
+  ).toMatchObject({ state: 'applied' })
+  expect(
+    await client.nodePath.fileRemove({
+      worktree_id: root.worktree_id,
+      path: 'renamed',
+      directory: true,
+      expected_content_id: directory.content_id,
+    })
+  ).toMatchObject({ state: 'applied' })
   await client.setRepositorySettings({ project_id: project.project_id, external_read: true })
   const target = (
     await client.repository.worktrees({ project_id: project.project_id })

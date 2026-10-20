@@ -26,6 +26,7 @@ import type {
   LiveSessionSink,
 } from '@abele/provider-contract'
 import { LiveWorkerMessageSchema } from './wire.js'
+import { nodeToolFailure } from './tool-error.js'
 import type { HostConfiguration } from './sdk-runtime.js'
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -144,6 +145,9 @@ export async function startPiLiveSession(
       const result = await sink.debugger.call(name, args, signal)
       if (!signal.aborted)
         write({ kind: 'debugger_result', id, result: sink.debugger.publish(args, result) })
+    } catch (error) {
+      if (!signal.aborted)
+        write({ kind: 'debugger_result', id, result: nodeToolFailure(name, error) })
     } finally {
       debuggerCalls.delete(id)
     }

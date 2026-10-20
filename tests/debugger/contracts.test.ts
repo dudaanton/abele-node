@@ -7,6 +7,7 @@ import {
   DebuggerPolicySchema,
   DebuggerControlMethodSchemas,
   validateParams,
+  CapabilitySchema,
 } from '@abele/node-protocol'
 import { withCore, target } from './helpers.js'
 
@@ -23,6 +24,10 @@ describe('debugger.v1 contracts and compatibility', () => {
   it('advertises only the enabled infrastructure, never a real profile', () =>
     withCore((core) => {
       expect(core.capabilities().capabilities.debugger_v1?.status).toBe('supported')
+      expect(CapabilitySchema.parse(core.capabilities().capabilities.debugger_v1)).toMatchObject({
+        breakpoint_hit_condition: true,
+        breakpoint_enabled: true,
+      })
       expect(core.debugger.profiles()).toEqual([])
       expect(core.debugger.enabled).toBe(true)
     }, true))

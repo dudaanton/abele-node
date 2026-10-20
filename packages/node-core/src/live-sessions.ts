@@ -610,6 +610,8 @@ export class LiveSessions {
     })
     if (!ready) return
     try {
+      if (slot.state === 'idle' && !slot.turn)
+        this.core.chatCheckpoints.capture(slot.session_id, input_id)
       slot.live!.send({ input_id, content: this.content(input) })
     } catch {
       // Never written: the next process takes it.

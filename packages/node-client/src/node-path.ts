@@ -7,6 +7,7 @@ import {
   ExecutionGrantSchema,
   DirectoryPageSchema,
   FileOperationResultSchema,
+  DirectoryManifestSchema,
   DirectoryCreatedSchema,
   DivergenceSchema,
   WorktreeDeletionSchema,
@@ -105,6 +106,17 @@ export class NodePathClient {
         'worktree_id' in params ? 'repository.v1.file.move' : 'workspace.file.move',
         params,
         operation
+      )
+    )
+  }
+  async fileDirectory(
+    params:
+      NodePathParams<'workspace.file.directory'> | NodePathParams<'repository.v1.file.directory'>
+  ) {
+    return DirectoryManifestSchema.parse(
+      await this.call(
+        'worktree_id' in params ? 'repository.v1.file.directory' : 'workspace.file.directory',
+        params
       )
     )
   }

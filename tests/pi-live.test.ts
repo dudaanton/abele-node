@@ -1,4 +1,4 @@
-import { expect, afterEach } from 'vitest'
+import { expect, afterEach, it as expectedFailureIt } from 'vitest'
 import { processIt as it } from './process-test.js'
 import { waitForProcessCondition } from '../scripts/process-test-budget.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
@@ -176,6 +176,63 @@ it('keeps one pi process across turns and journals turns, inputs, context and co
     })
   ).toThrow(/invalid_params/)
 })
+
+expectedFailureIt.fails(
+  'BUG: legacy leased workspace chats need an explicit execution target before branching',
+  { timeout: 150000 },
+  async () => {
+    const s = await setup()
+    const id = s.session()
+    const first = s.send(id, 'checkpoint me')
+    await until(() => s.input(first).state === 'completed')
+    const checkpoints = await s.request('chat.checkpoints', { session_id: id })
+    expect(checkpoints).toHaveLength(1)
+    expect(checkpoints[0].input_id).toBe(first)
+    const checkpoint_id = checkpoints[0].checkpoint_id
+    const root = s.core.resources.lsp.sessionRoot(id)
+    writeFileSync(join(root, 'file'), 'owner edit')
+    const preview = await s.request('chat.preview', { session_id: id, checkpoint_id })
+    expect(readFileSync(join(root, 'file'), 'utf8')).toBe('owner edit')
+    await s.restart()
+    await s.request('chat.restore', { session_id: id, checkpoint_id, action: 'rewind' })
+    expect(readFileSync(join(root, 'file'), 'utf8')).toBe('owner edit')
+    const fresh = await s.request('chat.preview', { session_id: id, checkpoint_id })
+    writeFileSync(join(root, 'file'), 'later edit')
+    await expect(
+      s.request('chat.restore', {
+        session_id: id,
+        checkpoint_id,
+        action: 'rewind',
+        restore_files: { preview_id: fresh.preview_id, changes: fresh.changes },
+      })
+    ).rejects.toThrow('stale_revision')
+    expect(readFileSync(join(root, 'file'), 'utf8')).toBe('later edit')
+    const latest = await s.request('chat.preview', { session_id: id, checkpoint_id })
+    await s.request('chat.restore', {
+      session_id: id,
+      checkpoint_id,
+      action: 'rewind',
+      restore_files: { preview_id: latest.preview_id, changes: latest.changes },
+    })
+    expect(readFileSync(join(root, 'file'), 'utf8')).toBe('original')
+    expect(preview.changes.some((c: any) => c.path === 'file')).toBe(true)
+    const branch = await s.request('chat.restore', {
+      session_id: id,
+      checkpoint_id,
+      action: 'branch',
+    })
+    expect(branch.session_id).not.toBe(id)
+    expect(readFileSync(join(root, 'file'), 'utf8')).toBe('original')
+    const edited = await s.request('chat.restore', {
+      session_id: id,
+      checkpoint_id,
+      action: 'edit',
+      text: 'edited prompt',
+    })
+    await until(() => s.input(edited.input.input_id).state === 'completed')
+    expect(s.replies(id)).toContain('reply:edited prompt')
+  }
+)
 
 it('takes a message written during a turn into that turn', async () => {
   const s = await setup()

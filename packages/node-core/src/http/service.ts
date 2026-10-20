@@ -150,7 +150,7 @@ export class HttpService {
     let chain: TraceChain | undefined
     if (p.debug_session_id) {
       if (!this.core.debugger.enabled) throw new ChannelError('http_not_recording')
-      chain = this.core.trace.recorder.chain(p.debug_session_id)
+      chain = this.core.trace.recorder.chain(p.debug_session_id, { method: p.method, url: p.url })
       if (!chain) throw new ChannelError('http_not_recording')
       if (p.step_header) headers.push({ key: 'X-Abele-Step', value: chain.id })
     }
@@ -192,7 +192,7 @@ export class HttpService {
       },
       abort.signal
     )
-      .then((result) => {
+      .then(async (result) => {
         const outcome = maskOutcome(result.outcome, mask)
         const body = result.body === undefined ? undefined : mask(result.body)
         const done: HttpSendSummary = {
@@ -205,6 +205,10 @@ export class HttpService {
               : { unknown: true }),
         }
         if (chain) {
+          // Recording availability must not turn a received answer into an unknown send.
+          await this.core.trace.recorder.flushHttp(p.debug_session_id).catch((error) => {
+            console.debug('[http] Could not confirm the recording association', error)
+          })
           let host = ''
           try {
             host = new URL(p.url).host
@@ -226,6 +230,7 @@ export class HttpService {
             ],
           })
           if (step) done.run = { run_id: chain.runId, step }
+          else delete done.run
         }
         const record: HttpSendRecord = {
           summary: done,

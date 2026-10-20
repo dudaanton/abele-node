@@ -65,6 +65,12 @@ export function reduceDebugger(
     return found
   }
   switch (event.kind) {
+    case 'build_identity':
+      if (state.target.build_identity !== event.build_identity) {
+        state.target.build_identity = event.build_identity
+        executionChanged()
+      }
+      break
     case 'control_pending':
       state.pending_commands = event.commands
       state.pending_approvals = event.approvals

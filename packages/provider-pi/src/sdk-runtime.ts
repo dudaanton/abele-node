@@ -235,10 +235,21 @@ export async function createSdkHost(
       abortHandler: () => {
         void runtime.session.abort()
       },
-      onError: () =>
+      onError: (error: PiSdk.ExtensionError) =>
         emit({
           type: 'pi.extension.error',
-          data: { reason: 'extension_failed (details local only)' },
+          data: {
+            extension:
+              typeof error.extensionPath === 'string'
+                ? error.extensionPath.slice(0, 1024)
+                : 'unknown extension',
+            event: String(error.event ?? 'unknown hook').slice(0, 128),
+            // SDK ExtensionError carries a string; never serialize arbitrary Error objects/stacks.
+            error:
+              typeof error.error === 'string'
+                ? error.error.slice(0, 2048)
+                : 'Extension hook failed',
+          },
         }),
       commandContextActions: {
         waitForIdle: () => runtime.session.waitForIdle(),
@@ -254,6 +265,30 @@ export async function createSdkHost(
     })
   )
   await worker.bind()
+  const announceModels = () => {
+    const selected = runtime.session.model
+    const available = modelRuntime.getAvailableSnapshot?.() ?? []
+    const models = new Map(
+      available
+        .filter((m) => m.provider === selectedProvider)
+        .map((m) => [m.id, { value: m.id, name: m.name || m.id }])
+    )
+    if (selected)
+      models.set(selected.id, { value: selected.id, name: selected.name || selected.id })
+    // Minimal SDK embeddings may expose only getModel().
+    if (!models.size) models.set(initialModel, { value: initialModel, name: initialModel })
+    emit({
+      type: 'pi.model.catalog',
+      data: {
+        provider: selectedProvider,
+        model_id: selected?.id ?? initialModel,
+        account: 'default',
+        account_label: `pi · ${selectedProvider}`,
+        models: [...models.values()].slice(0, 256),
+      },
+    })
+  }
+  announceModels()
   emit({
     type: 'pi.project.trust',
     data: { source: 'node_project_registration', trusted: true, extensions_sandboxed: false },
@@ -296,6 +331,7 @@ export async function createSdkHost(
         modelRuntime.getModel(selectedProvider, id === 'default' ? initialModel : id)
       if (!model) throw new Error('pi_model_unavailable')
       await session().setModel({ ...model, maxTokens: Math.min(model.maxTokens, config.maxTokens) })
+      announceModels()
     },
     setEffort: (effort: string) => {
       const level = THINKING[effort]

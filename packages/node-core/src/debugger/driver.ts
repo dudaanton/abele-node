@@ -12,6 +12,12 @@ import type { DebugProcessOwner } from './process.js'
 import { boundedText } from './storage.js'
 import { debuggerLog } from './log.js'
 import {
+  programHttpInstall,
+  programHttpDrain,
+  programHttpStop,
+  type ProgramHttpEvent,
+} from '../trace/program-http.js'
+import {
   CAPTURE_MAX_CHARS,
   captureChunk,
   captureEnd,
@@ -60,6 +66,7 @@ type Frame = {
   handle: string
   name: string
   source_id: string | null
+  path?: string
   line: number
   column: number
 }
@@ -79,6 +86,12 @@ export class DapSession {
   readonly incarnation: string
   private capabilities: Record<string, any> = {}
   private readonly breakpointIds = new Map<number, { id: string; revision: number }>()
+  private readonly installedBreakpoints = new Map<string, { signature: string; results: any[] }>()
+  private breakpointSyncs = 0
+  private readonly deferredStops = new Map<
+    number | undefined,
+    { event: DebugProtocol.Event; revision: number }
+  >()
   private readonly frameThreads = new Map<string, number>()
   private readonly objectThreads = new Map<string, number>()
   private lastEpoch = -1
@@ -89,6 +102,7 @@ export class DapSession {
   onTerminated?: () => void
   private started = false
   private initialized = false
+  private traceHttpInstalled = false
   private admission: DebuggerDispatchGuard | undefined
   /** Only the shared coordinator may install this trusted dispatch fence. */
   async coordinated<T>(guard: DebuggerDispatchGuard, work: () => Promise<T>): Promise<T> {
@@ -285,6 +299,9 @@ export class DapSession {
     if (s.target.build_identity !== 'matched') throw new ChannelError('build_identity_unverified')
     for (const bp of upsert) {
       if (!this.sources.has(bp.source_id)) throw new ChannelError('unknown_source')
+      if (bp.enabled === false) continue
+      if (bp.hit_condition !== undefined && !this.capabilities.supportsHitConditionalBreakpoints)
+        throw new ChannelError('unsupported_operation')
       if (bp.condition !== undefined && !this.capabilities.supportsConditionalBreakpoints)
         throw new ChannelError('unsupported_operation')
       if (bp.log_message !== undefined && !this.capabilities.supportsLogPoints)
@@ -311,31 +328,49 @@ export class DapSession {
         const next = sources.next()
         if (next.done) return
         const source = next.value
-        const requested = state.breakpoints.filter((bp) => bp.source_id === source)
-        this.sentSources.add(source)
-        const body = await this.dap.requestWhenAvailable(
-          'setBreakpoints',
-          {
-            source: { path: this.sources.get(source) },
-            breakpoints: requested.map((bp) => ({
-              line: bp.line,
-              ...(bp.column === undefined ? {} : { column: bp.column }),
-              ...(bp.condition === undefined ? {} : { condition: bp.condition }),
-              ...(bp.log_message === undefined ? {} : { logMessage: bp.log_message }),
-            })),
-            sourceModified: false,
-          },
-          {
-            signal: controller.signal,
-            beforeDispatch: () => {
-              this.current()
-            },
-          }
+        const requested = state.breakpoints.filter(
+          (bp) => bp.source_id === source && bp.enabled !== false
         )
-        const results = list(body.breakpoints)
+        const breakpoints = requested.map((bp) => ({
+          line: bp.line,
+          ...(bp.column === undefined ? {} : { column: bp.column }),
+          ...(bp.condition === undefined ? {} : { condition: bp.condition }),
+          ...(bp.hit_condition === undefined ? {} : { hitCondition: bp.hit_condition }),
+          ...(bp.log_message === undefined ? {} : { logMessage: bp.log_message }),
+        }))
+        const signature = JSON.stringify(breakpoints)
+        const installed = this.installedBreakpoints.get(source)
+        this.sentSources.add(source)
+        // Keep a confirmed source set installed when only another source changes.
+        // Besides preserving ids, this avoids js-debug's empty reply for an identical set.
+        let results: any[]
+        if (installed?.signature === signature) results = installed.results
+        else {
+          this.installedBreakpoints.delete(source)
+          const body = await this.dap.requestWhenAvailable(
+            'setBreakpoints',
+            {
+              source: { path: this.sources.get(source) },
+              breakpoints,
+              sourceModified: false,
+            },
+            {
+              signal: controller.signal,
+              beforeDispatch: () => {
+                this.current()
+              },
+            }
+          )
+          results = list(body.breakpoints)
+        }
         if (results.length !== requested.length) throw new Error('dap_breakpoint_count')
+        results = results.map((result, i) => ({
+          ...this.breakpointResult(requested[i]!.breakpoint_id, result),
+          ...(nonnegative(result.id) ? { id: result.id } : {}),
+        }))
         if (!live(this.snapshot)) return
         if (this.snapshot.breakpoint_revision === revision) {
+          this.installedBreakpoints.set(source, { signature, results })
           for (const [id, bp] of this.breakpointIds)
             if (
               state.breakpoints.find((r) => r.breakpoint_id === bp.id)?.source_id === source ||
@@ -357,6 +392,7 @@ export class DapSession {
     }
     // Do not materialize 256 simultaneous requests. Capacity admission is shared
     // by the connection, including an outstanding launch and overlapping batches.
+    this.breakpointSyncs++
     const workers = Array.from(
       { length: Math.min(4, this.dap.pendingLimit, sourceIds.size) },
       worker
@@ -369,6 +405,22 @@ export class DapSession {
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
+      if (--this.breakpointSyncs === 0) {
+        const stops = [...this.deferredStops.values()]
+        this.deferredStops.clear()
+        for (const { event, revision: stoppedRevision } of stops) {
+          // A stop from superseded intent stays a user-visible stop, never an
+          // automatic recording hit correlated through a newer adapter id.
+          this.event(
+            stoppedRevision === this.snapshot.breakpoint_revision
+              ? event
+              : {
+                  ...event,
+                  body: { ...event.body, hitBreakpointIds: [] },
+                }
+          )
+        }
+      }
     }
     return this.snapshot
   }
@@ -437,6 +489,9 @@ export class DapSession {
         handle: 'a'.repeat(48),
         name: boundedText(frame.name, 256),
         source_id: source,
+        ...(typeof frame.source?.path === 'string'
+          ? { path: boundedText(frame.source.path, 4096) }
+          : {}),
         line: frame.line,
         column: frame.column,
       }
@@ -551,9 +606,39 @@ export class DapSession {
   }
   async evaluate(frameHandle: string, expression: string) {
     const frameId = this.service.resolveHandle(this.id, frameHandle, 'frame')
+    const thread = this.frameThreads.get(frameHandle)
     const before = this.expressionIntent()
     const body = await this.request('evaluate', { frameId, expression, context: 'repl' })
     if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
+    // A successful stack read is positive evidence that this thread remains paused.
+    // Never overwrite a stop/continue event that overtook the evaluation or probe.
+    const intent = this.current()
+    if (thread && intent.execution === 'unknown' && intent.stop_epoch === before.stop_epoch + 1) {
+      try {
+        const probe = await this.request('stackTrace', {
+          threadId: toDap(thread),
+          startFrame: 0,
+          levels: 1,
+        })
+        const now = this.current()
+        if (
+          list(probe.stackFrames, 1024).length &&
+          now.stop_epoch === intent.stop_epoch &&
+          now.thread_inventory_revision === intent.thread_inventory_revision &&
+          now.execution === 'unknown'
+        ) {
+          this.observe({
+            kind: 'stopped',
+            thread_id: thread,
+            all_threads_stopped: before.all_threads_status === 'stopped',
+            reason: before.threads.find((t) => t.thread_id === thread)?.stop?.reason ?? 'pause',
+            hit_breakpoint_ids: [],
+          })
+        }
+      } catch {
+        // A failed probe proves neither running nor stopped; keep execution unknown.
+      }
+    }
     return {
       value: boundedText(body.result, 4096),
       truncated: Buffer.byteLength(body.result) > 4096,
@@ -561,6 +646,32 @@ export class DapSession {
       source_identity: before.target.build_identity,
     }
   }
+  /** Trusted recording infrastructure, never a client-supplied expression or an issued handle. */
+  async traceHttp(operation: 'install' | 'drain' | 'finish' | 'stop'): Promise<ProgramHttpEvent[]> {
+    const expression =
+      operation === 'install'
+        ? programHttpInstall
+        : operation === 'drain'
+          ? programHttpDrain
+          : operation === 'finish'
+            ? `globalThis.__abeleProgramHttpV1?.stop(); 'ok'`
+            : programHttpStop
+    const body = await this.request(
+      'evaluate',
+      { expression, context: 'repl' },
+      { timeoutMs: 2000 }
+    )
+    if (operation === 'install') this.traceHttpInstalled = true
+    if (operation === 'stop') this.traceHttpInstalled = false
+    if (operation !== 'drain') return []
+    if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
+    const encoded = body.result.trim().replace(/^['"`]|['"`]$/g, '')
+    if (!/^[A-Za-z0-9+/=]*$/.test(encoded)) throw new Error('trace_http_invalid_data')
+    const events = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))
+    if (!Array.isArray(events) || events.length > 1) throw new Error('trace_http_invalid_data')
+    return events as ProgramHttpEvent[]
+  }
+
   /** Trusted node-internal recording of a record point's stop, never routed to clients: the
    * top frames and each take evaluated whole in the top frame, in chunks the transport can carry.
    * The takes were approved when the point was set. No client handles are issued. Only what the
@@ -568,15 +679,23 @@ export class DapSession {
   async recordStop(
     thread: number,
     takes: { name: string; expression: string }[],
-    levels = 10
+    levels = 10,
+    guard?: () => void
   ): Promise<RecordedStop> {
+    guard?.()
     const before = this.stopped(thread)
+    const check = () => {
+      const now = this.fence(before)
+      if (now.breakpoint_revision !== before.breakpoint_revision)
+        throw new DebuggerStateError('stale_state', now)
+      guard?.()
+    }
     const body = await this.request('stackTrace', {
       threadId: toDap(thread),
       startFrame: 0,
       levels,
     })
-    this.fence(before)
+    check()
     const raw = list(body.stackFrames, 1024).slice(0, levels)
     const frames = raw.map((f) => ({
       name: boundedText(typeof f.name === 'string' ? f.name : '', 256),
@@ -590,9 +709,10 @@ export class DapSession {
     // rejects these evaluations in that context; repl also preserves their string results.
     const context = 'repl'
     const evaluate = async (expression: string) => {
+      check()
       const r = await this.request('evaluate', { frameId, expression, context })
       // Someone else moved the session meanwhile: the frame is no longer the one recorded.
-      this.fence(before)
+      check()
       if (typeof r.result !== 'string') throw new Error('dap_invalid_body')
       return r.result as string
     }
@@ -681,8 +801,8 @@ export class DapSession {
       observation_stop_epoch: before.stop_epoch,
     }
   }
-  async continue(thread: number, singleThread = false) {
-    return this.execute(thread, 'continue', 'continue', singleThread)
+  async continue(thread: number, singleThread = false, beforeDispatch?: () => void) {
+    return this.execute(thread, 'continue', 'continue', singleThread, beforeDispatch)
   }
   async step(thread: number, kind: 'over' | 'in' | 'out', singleThread = false) {
     const command = { over: 'next', in: 'stepIn', out: 'stepOut' }[kind]
@@ -693,14 +813,15 @@ export class DapSession {
     thread: number,
     command: string,
     action: 'continue' | 'step',
-    singleThread: boolean
+    singleThread: boolean,
+    beforeDispatch?: () => void
   ) {
     const before = this.stopped(thread)
     this.service.executionIntent(this.id, this.incarnation, before.state_revision, action)
     this.admission?.advanceIntent()
     this.frameThreads.clear()
     this.objectThreads.clear()
-    await this.request(command, { threadId: toDap(thread), singleThread })
+    await this.request(command, { threadId: toDap(thread), singleThread }, { beforeDispatch })
     return this.snapshot
   }
   async pause(thread?: number | null) {
@@ -737,6 +858,8 @@ export class DapSession {
     this.current(true)
     this.ending = lifecycle
     try {
+      // An externally owned program can keep running after disconnect.
+      if (this.traceHttpInstalled) await this.traceHttp('stop').catch(() => {})
       // Never let an adapter choose what to kill. Direct node-owned OS evidence,
       // not disconnect/terminate success, establishes process termination.
       let disconnectError: unknown
@@ -760,6 +883,15 @@ export class DapSession {
       this.dap.close()
     }
   }
+  private hitBreakpoints(raw: unknown): string[] {
+    if (!Array.isArray(raw)) return []
+    const points = raw.slice(0, 256).map((id) => this.breakpointIds.get(id))
+    // Unknown or mixed hits remain ordinary stops. A numeric adapter id must
+    // never impersonate a logical record-point id with the same spelling.
+    return points.every((bp) => bp?.revision === this.snapshot.breakpoint_revision)
+      ? points.map((bp) => bp!.id)
+      : []
+  }
   private event(event: DebugProtocol.Event) {
     if (!live(this.snapshot) || this.ending) return
     const body = event.body ?? {}
@@ -768,6 +900,19 @@ export class DapSession {
         this.initialized = true
         break
       case 'stopped':
+        this.deferredStops.delete(body.threadId)
+        if (
+          this.breakpointSyncs &&
+          Array.isArray(body.hitBreakpointIds) &&
+          body.hitBreakpointIds.length
+        ) {
+          if (this.deferredStops.size >= 256) throw new Error('dap_pending_stops_limit')
+          this.deferredStops.set(body.threadId, {
+            event,
+            revision: this.snapshot.breakpoint_revision,
+          })
+          break
+        }
         this.observe({
           kind: 'stopped',
           ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
@@ -776,14 +921,13 @@ export class DapSession {
           ...(typeof body.description === 'string'
             ? { description: boundedText(body.description, 4096) }
             : {}),
-          hit_breakpoint_ids: Array.isArray(body.hitBreakpointIds)
-            ? body.hitBreakpointIds
-                .slice(0, 256)
-                .map((id: number) => this.breakpointIds.get(id)?.id ?? String(id).slice(0, 128))
-            : [],
+          hit_breakpoint_ids: this.hitBreakpoints(body.hitBreakpointIds),
         })
         break
       case 'continued':
+        if (body.allThreadsContinued === true || body.threadId === undefined)
+          this.deferredStops.clear()
+        else this.deferredStops.delete(body.threadId)
         this.observe({
           kind: 'continued',
           ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
@@ -791,6 +935,7 @@ export class DapSession {
         })
         break
       case 'thread':
+        if (body.reason === 'exited') this.deferredStops.delete(body.threadId)
         if (!dapThread(body.threadId) || !['started', 'exited'].includes(body.reason))
           throw new Error('dap_invalid_body')
         this.observe({ kind: 'thread', thread_id: fromDap(body.threadId), reason: body.reason })
@@ -804,9 +949,11 @@ export class DapSession {
         })
         break
       case 'invalidated':
+        this.deferredStops.clear()
         this.observe({ kind: 'invalidated' })
         break
       case 'terminated':
+        this.deferredStops.clear()
         this.observe({ kind: 'lifecycle', lifecycle: 'terminated' })
         if (this.onTerminated) this.onTerminated()
         else this.dap.close()
@@ -814,12 +961,18 @@ export class DapSession {
       case 'breakpoint': {
         const breakpoint = body.breakpoint,
           mapped = this.breakpointIds.get(breakpoint?.id)
-        if (mapped && this.snapshot.breakpoint_revision === mapped.revision)
+        if (mapped && this.snapshot.breakpoint_revision === mapped.revision) {
+          const result = this.breakpointResult(mapped.id, breakpoint)
+          for (const installed of this.installedBreakpoints.values())
+            installed.results = installed.results.map((entry) =>
+              entry.id === breakpoint.id ? { ...result, id: breakpoint.id } : entry
+            )
           this.observe({
             kind: 'breakpoints_result',
             revision: mapped.revision,
-            results: [this.breakpointResult(mapped.id, breakpoint)],
+            results: [result],
           })
+        }
         break
       }
       case 'capabilities':

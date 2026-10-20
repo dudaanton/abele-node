@@ -18,6 +18,23 @@ afterEach(() => {
 const started = new Date('2026-01-02T03:04:05.000Z')
 
 describe('a run on disk', () => {
+  it('names new runs in local time and preserves the ISO instant', () => {
+    const date = new Date('2026-01-02T23:04:05Z')
+    date.getFullYear = () => 2026
+    date.getMonth = () => 0
+    date.getDate = () => 3
+    date.getHours = () => 2
+    date.getMinutes = () => 4
+    date.getSeconds = () => 5
+    const store = new TraceStore(scratch())
+    const run = store.create({ session: 's', started: date, points: [] })
+    expect(run.id).toMatch(/^20260103-020405-/)
+    expect(store.read(run.id).run).toMatchObject({
+      name: '2026-01-03 02:04:05',
+      started_at: '2026-01-02T23:04:05.000Z',
+    })
+  })
+
   it('keeps its steps in order and its values whole, small ones in the step', () => {
     const root = scratch()
     const store = new TraceStore(root)

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { NodeCore } from '../../packages/node-core/src/index.js'
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { TracePoints, TraceRecorder } from '../../packages/node-core/src/trace/recorder.js'
@@ -9,6 +9,7 @@ import { TraceStore } from '../../packages/node-core/src/trace/store.js'
 import { wire } from '../debugger/dap-wire.js'
 import { target } from '../debugger/helpers.js'
 import { adapter } from './adapter.js'
+import { programHttpKey } from '../../packages/node-core/src/trace/program-http.js'
 
 const dirs: string[] = []
 afterEach(() => {
@@ -70,6 +71,391 @@ async function fixture(frame: () => Record<string, unknown>) {
 }
 
 describe('a run recorded over a debugger session', () => {
+  it('fences automatic continuation again after publishing its execution intent', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      const id = await f.breakpoint('record', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'record', take: [] }], [])
+      f.recorder.attach(f.session)
+      let changed = false
+      const off = f.core.debugger.subscribe(f.session.id, () => {
+        if (!changed && f.session.snapshot.execution === 'unknown') {
+          changed = true
+          f.points.set(f.session.id, [], ['record'])
+        }
+      })
+      try {
+        f.fake.hit([id])
+        await f.recorder.settled(f.session.id)
+        expect(changed).toBe(true)
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+        expect(f.fake.running).toBe(false)
+      } finally {
+        off()
+      }
+    } finally {
+      f.close()
+    }
+  })
+  it.each(['breakpoint', 'record-point'])(
+    'stops capture reads when %s configuration changes during evaluation',
+    async (mutation) => {
+      const f = await fixture(() => ({ large: 'x'.repeat(100_000), value: 1 }))
+      try {
+        const id = await f.breakpoint('record', 4)
+        f.points.set(f.session.id, [{ breakpoint_id: 'record', take: ['large', 'value'] }], [])
+        f.recorder.attach(f.session)
+        const reply = f.w.reply
+        let changed = false
+        vi.spyOn(f.w, 'reply').mockImplementation((request, body = {}, success = true) => {
+          if (!changed && request.command === 'evaluate' && 'frameId' in request.arguments) {
+            changed = true
+            if (mutation === 'breakpoint')
+              f.core.debugger.patchBreakpoints(
+                f.session.id,
+                f.session.snapshot.breakpoint_revision,
+                [{ breakpoint_id: 'record', source_id: 'source', line: 8 }],
+                []
+              )
+            else f.points.set(f.session.id, [], ['record'])
+          }
+          return reply(request, body, success)
+        })
+        f.fake.hit([id])
+        await f.recorder.settled(f.session.id)
+        expect(changed).toBe(true)
+        expect(
+          f.w.messages.filter((m) => m.command === 'evaluate' && 'frameId' in m.arguments)
+        ).toHaveLength(1)
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+      } finally {
+        vi.restoreAllMocks()
+        f.close()
+      }
+    }
+  )
+  it('does not treat an uncorrelated numeric adapter id as a logical record point id', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      await f.breakpoint('9999', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: '9999', take: [] }], [])
+      f.recorder.attach(f.session)
+      f.fake.hit([9999])
+      await f.recorder.settled(f.session.id)
+      expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+      expect(f.session.snapshot.threads[0]!.stop!.hit_breakpoint_ids).toEqual([])
+    } finally {
+      f.close()
+    }
+  })
+  it('updates active run points without losing earlier steps, with either configuration order', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      const first = await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      const run = f.recorder.recording(f.session.id)!.run_id
+      f.fake.hit([first])
+      await f.until(() => f.store.read(run).steps.length === 1 && f.fake.running)
+      f.session.admitSources(new Map([['second', '/project/src/service.ts']]))
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-2', take: [], note: 'second' }], [])
+      await f.session.patchBreakpoints(
+        f.session.snapshot.breakpoint_revision,
+        [{ breakpoint_id: 'bp-2', source_id: 'second', line: 9 }],
+        []
+      )
+      expect(f.store.read(run).run.points).toEqual([
+        { breakpoint_id: 'bp-1', file: 'src/page.ts', line: 4, take: [] },
+        { breakpoint_id: 'bp-2', file: 'src/service.ts', line: 9, take: [], note: 'second' },
+      ])
+      expect(f.store.read(run).steps).toHaveLength(1)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-2', take: ['1 as n'], note: 'updated' }], [])
+      expect(f.store.read(run).run.points[1]).toMatchObject({ take: ['1 as n'], note: 'updated' })
+      expect(f.recorder.recording(f.session.id)!.run_id).toBe(run)
+    } finally {
+      f.close()
+    }
+  })
+
+  it.each(['before', 'after'])(
+    'captures and resumes a second-source point hit %s its installation reply in the same turn',
+    async (timing) => {
+      const f = await fixture(() => ({}))
+      try {
+        const first = await f.breakpoint('bp-1', 4)
+        f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+        f.recorder.attach(f.session)
+        const run = f.recorder.recording(f.session.id)!.run_id
+        f.fake.hit([first])
+        await f.until(() => f.store.read(run).steps.length === 1 && f.fake.running)
+        f.session.admitSources(new Map([['second', '/project/src/service.ts']]))
+        f.points.set(f.session.id, [{ breakpoint_id: 'bp-2', take: [] }], [])
+        const reply = f.w.reply
+        vi.spyOn(f.w, 'reply').mockImplementation((request, body: any = {}, success = true) => {
+          const hit =
+            request.command === 'setBreakpoints' &&
+            request.arguments.source.path === '/project/src/service.ts'
+          if (hit && timing === 'before') f.fake.hit([body.breakpoints[0].id])
+          const result = reply(request, body, success)
+          if (hit && timing === 'after') f.fake.hit([body.breakpoints[0].id])
+          return result
+        })
+        await f.session.patchBreakpoints(
+          f.session.snapshot.breakpoint_revision,
+          [{ breakpoint_id: 'bp-2', source_id: 'second', line: 9 }],
+          []
+        )
+        await f.until(() => f.store.read(run).steps.length === 2 && f.fake.running)
+        expect(f.store.read(run).steps[1]).toMatchObject({ point: 'bp-2' })
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(2)
+      } finally {
+        vi.restoreAllMocks()
+        f.close()
+      }
+    }
+  )
+
+  it.each(['breakpoint', 'record-point', 'new-stop'])(
+    'does not resume a capture overtaken by a %s mutation',
+    async (mutation) => {
+      const f = await fixture(() => ({ value: 1 }))
+      try {
+        const dapId = await f.breakpoint('bp-1', 4)
+        f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: ['value'] }], [])
+        f.recorder.attach(f.session)
+        const reply = f.w.reply
+        let changed = false
+        vi.spyOn(f.w, 'reply').mockImplementation((request, body = {}, success = true) => {
+          if (request.command === 'stackTrace' && !changed) {
+            changed = true
+            if (mutation === 'breakpoint')
+              f.core.debugger.patchBreakpoints(
+                f.session.id,
+                f.session.snapshot.breakpoint_revision,
+                [{ breakpoint_id: 'bp-1', source_id: 'source', line: 8 }],
+                []
+              )
+            else if (mutation === 'record-point') f.points.set(f.session.id, [], ['bp-1'])
+            else f.fake.hit([], 'pause')
+          }
+          return reply(request, body, success)
+        })
+        f.fake.hit([dapId])
+        await f.until(() => changed)
+        await f.recorder.settled(f.session.id)
+        expect(
+          f.w.messages.filter((m) => m.command === 'evaluate' && 'frameId' in m.arguments)
+        ).toHaveLength(0)
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+        expect(f.session.snapshot.execution).toBe('stopped')
+      } finally {
+        vi.restoreAllMocks()
+        f.close()
+      }
+    }
+  )
+  it('does not attribute an external sink send to a selected server session without incoming evidence', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      const chain = f.recorder.chain(f.session.id, {
+        method: 'GET',
+        url: 'http://localhost:4399/events',
+      })!
+      expect(chain.close({ label: 'GET /events', status: 404, values: [] })).toBeUndefined()
+      expect(f.store.read(chain.runId).steps).toEqual([])
+      const invalid = f.recorder.chain(f.session.id, { method: 'GET', url: 'invalid address' })!
+      expect(invalid.close({ label: 'Invalid address', values: [] })).toBeUndefined()
+      const unrelated = f.recorder.chain(f.session.id, {
+        method: 'GET',
+        url: 'http://localhost:4399/events',
+      })!
+      f.fake.hit([f.fake.lastBreakpointId()])
+      await f.until(() => f.store.read(chain.runId).steps.length === 1)
+      expect(unrelated.close({ label: 'GET /events', values: [] })).toBeUndefined()
+      expect(unrelated.steps).toBe(0)
+      expect(f.store.read(chain.runId).steps.map((s) => s.kind)).toEqual(['probe'])
+    } finally {
+      f.close()
+    }
+  })
+
+  it('keeps the first probe under its request when the answer closes during continue', async () => {
+    let pending = true
+    const incoming = {
+      id: 'n1',
+      direction: 'incoming',
+      method: 'POST',
+      url: 'http://localhost/carts',
+      started: Date.now() - 1000,
+      ended: Date.now() + 10000,
+      request_headers: {},
+      response_headers: {},
+      request_body: '',
+      response_body: '',
+    }
+    const f = await fixture(() => ({
+      Buffer,
+      [programHttpKey]: {
+        drain: () => (pending ? ((pending = false), [incoming]) : []),
+        stop: () => {},
+      },
+    }))
+    try {
+      const dapId = await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      const chain = f.recorder.chain(f.session.id)!
+      const resume = f.session.continue.bind(f.session)
+      f.session.continue = async (...args) => {
+        const result = await resume(...args)
+        chain.close({ label: 'POST /carts', values: [] })
+        return result
+      }
+      f.fake.hit([dapId])
+      await f.until(() => f.store.read(chain.runId).steps.some((s) => s.kind === 'probe'))
+      expect(f.store.read(chain.runId).steps.find((s) => s.kind === 'probe')).toMatchObject({
+        chain: chain.id,
+        by_time: true,
+      })
+      expect(chain.steps).toBe(1)
+    } finally {
+      f.close()
+    }
+  })
+
+  it('flushes buffered HTTP before discarding a run when its final point is removed', async () => {
+    let ready = false
+    const event = {
+      id: 'n1',
+      direction: 'incoming',
+      method: 'GET',
+      url: 'http://localhost/api',
+      started: Date.now(),
+      ended: Date.now(),
+      request_headers: {},
+      response_headers: {},
+      request_body: '',
+      response_body: 'kept',
+    }
+    const f = await fixture(() => ({
+      Buffer,
+      [programHttpKey]: {
+        drain: () => (ready ? ((ready = false), [event]) : []),
+        stop: () => {
+          ready = true
+        },
+      },
+    }))
+    try {
+      await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      const run = f.recorder.recording(f.session.id)!.run_id
+      await f.recorder.settled(f.session.id)
+      f.points.set(f.session.id, [], ['bp-1'])
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      await f.recorder.settled(f.session.id)
+      expect(f.store.read(run)).toMatchObject({
+        run: { state: 'done' },
+        steps: [expect.objectContaining({ kind: 'http' })],
+      })
+    } finally {
+      f.close()
+    }
+  })
+
+  it('persists program HTTP through DAP and correlates code steps by the request interval', async () => {
+    const captured = {
+      id: 'n1',
+      direction: 'incoming',
+      method: 'POST',
+      url: 'http://localhost/api',
+      started: Date.now() - 1000,
+      ended: Date.now() + 1000,
+      status: 201,
+      request_headers: {},
+      response_headers: {},
+      request_body: 'input',
+      response_body: 'answer',
+    }
+    let pending = true
+    const f = await fixture(() => ({
+      Buffer,
+      [programHttpKey]: {
+        drain: () => (pending ? ((pending = false), [captured]) : []),
+        stop: () => {},
+      },
+    }))
+    try {
+      const dapId = await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      const run = f.recorder.recording(f.session.id)!.run_id
+      f.fake.hit([dapId])
+      await f.until(() => f.store.read(run).steps.some((s) => s.kind === 'http'))
+      await f.until(() => f.store.read(run).steps.some((s) => s.kind === 'probe'))
+      const steps = f.store.read(run).steps
+      const http = steps.find((s) => s.kind === 'http')!
+      expect(http).toMatchObject({
+        label: 'POST /api',
+        status: 201,
+        host: 'localhost',
+        chain: 'n1',
+      })
+      expect(steps.find((s) => s.kind === 'probe')).toMatchObject({ chain: 'n1', by_time: true })
+      expect(
+        f.store.text(
+          run,
+          http.values.find((v) => v.name === 'response')!
+        )
+      ).toBe('answer')
+      expect(
+        f.w.messages.some((m) => m.command === 'evaluate' && !('frameId' in m.arguments))
+      ).toBe(true)
+    } finally {
+      f.close()
+    }
+  })
+
+  it('ends immediately on removing the final point, discarding only empty runs', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      const dapId = await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)
+      f.points.set(f.session.id, [], ['bp-1'])
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      await new Promise((r) => setTimeout(r, 10))
+      expect(f.store.list()).toEqual([])
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      const run = f.recorder.recording(f.session.id)!.run_id
+      f.fake.hit([dapId])
+      await f.until(() => f.store.read(run).steps.length === 1)
+      f.points.set(f.session.id, [], ['bp-1'])
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      await f.until(() => f.store.read(run).run.state === 'done')
+      expect(f.store.read(run).steps).toHaveLength(1)
+    } finally {
+      f.close()
+    }
+  })
+
+  it('discards an empty run when the session ends', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      await f.breakpoint('bp-1', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
+      f.recorder.attach(f.session)()
+      await new Promise((r) => setTimeout(r, 10))
+      expect(f.store.list()).toEqual([])
+    } finally {
+      f.close()
+    }
+  })
+
   it('takes the values of a record point whole and lets the program go on', async () => {
     const xmlText = `<doc>${'<item>1</item>'.repeat(20_000)}</doc>`
     const f = await fixture(() => ({ xmlText, result: { items: [1, 2, 3] }, Buffer }))
@@ -118,7 +504,10 @@ describe('a run recorded over a debugger session', () => {
       const asked = f.w.messages.map((m) => m.command)
       expect(asked).not.toContain('scopes')
       expect(asked).not.toContain('variables')
-      expect(asked).not.toContain('evaluate')
+      // Global HTTP instrumentation is independent of the empty take list.
+      expect(
+        f.w.messages.filter((m) => m.command === 'evaluate' && 'frameId' in m.arguments)
+      ).toEqual([])
       expect(asked.filter((c) => c === 'continue')).toHaveLength(1)
     } finally {
       f.close()
@@ -192,10 +581,12 @@ describe('a run recorded over a debugger session', () => {
   it('keeps the run when the program ends, and marks it cut when the connection goes', async () => {
     const f = await fixture(() => ({}))
     try {
-      await f.breakpoint('bp-1', 4)
+      const dapId = await f.breakpoint('bp-1', 4)
       f.points.set(f.session.id, [{ breakpoint_id: 'bp-1', take: [] }], [])
       f.recorder.attach(f.session)
       const run = f.recorder.recording(f.session.id)!.run_id
+      f.fake.hit([dapId])
+      await f.until(() => f.store.read(run).steps.length === 1)
       expect(f.store.read(run).run.points).toEqual([
         { breakpoint_id: 'bp-1', file: 'src/page.ts', line: 4, take: [] },
       ])
