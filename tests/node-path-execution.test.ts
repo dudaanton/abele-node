@@ -434,6 +434,39 @@ it('does not treat attachment/edit access as execution approval and refuses cros
     })
   ).rejects.toThrow('unauthorized')
 })
+it('shares ordinary managed lifetime bindings while serializing provider execution', async () => {
+  const s = await setup(true)
+  const created = await s.request('workspace.create', { project_id: s.project.project_id })
+  await s.core.resources.jobs.drain()
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  const chats = []
+  for (const title of ['one', 'two']) {
+    const chat = await s.request('session.create', {
+      provider: 'claude',
+      workspace_id: created.workspace_id,
+      title,
+    })
+    chats.push(chat)
+    await s.request('session.send', {
+      session_id: chat.session_id,
+      text: 'fixture',
+      observed_seq: s.core.head(chat.session_id),
+    })
+  }
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(1)
+  s.provider.turns[0]!.complete()
+  await expect
+    .poll(() => s.core.db.prepare('SELECT count(*) AS n FROM execution_target_leases').get())
+    .toEqual({ n: 0 })
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(2)
+  expect(s.provider.turns.map((turn) => turn.context.session_id).sort()).toEqual(
+    chats.map((chat) => chat.session_id).sort()
+  )
+  s.provider.turns[1]!.complete()
+})
+
 it('maps legacy managed sessions without letting new execution-time leases bypass their lifetime lease', async () => {
   const s = await setup(true)
   const created = await s.request('workspace.create', { project_id: s.project.project_id })

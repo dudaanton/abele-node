@@ -112,6 +112,18 @@ async function setup(options: ClaudeOptions = {}, live: LiveOptions = {}) {
   }
 }
 
+it('runs two ordinary chats bound to the same managed workspace', async () => {
+  const s = await setup()
+  const first = s.session(),
+    second = s.session()
+  const one = s.send(first, 'hello')
+  await until(() => s.input(one).state === 'completed')
+  expect(s.request('session.state', { session_id: first }).process).toBe('idle')
+  const two = s.send(second, 'hello')
+  await until(() => s.input(two).state === 'completed')
+  expect(s.request('session.state', { session_id: second }).process).toBe('idle')
+})
+
 it('keeps one process across turns and journals turns, inputs and the context meter', async () => {
   const s = await setup()
   const id = s.session()

@@ -44,6 +44,46 @@ async function setup() {
   const catalog = () => request('repository.v1.worktrees', { project_id: project.project_id })
   return { dir, repo, linked, core, actor, request, project, catalog }
 }
+it('waits for the first real status scan before publishing a working observation', async () => {
+  const s = await setup()
+  const worktree_id = (await s.catalog()).entries[0].worktree_id
+  writeFileSync(join(s.repo, 'sample.txt'), 'changed before client reload\n')
+  let started!: () => void, release!: () => void
+  const scanning = new Promise<void>((resolve) => {
+    started = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const run = s.core.resources.git.run.bind(s.core.resources.git)
+  vi.spyOn(s.core.resources.git, 'run').mockImplementation(async (...args) => {
+    if (args[1].kind === 'status') {
+      started()
+      await gate
+    }
+    return run(...args)
+  })
+  let published = false
+  const pending = s.request('repository.v1.observe', { worktree_id }).then((value) => {
+    published = true
+    return value
+  })
+  try {
+    await scanning
+    expect(published).toBe(false)
+  } finally {
+    release()
+  }
+  const observation = await pending
+  const status = await s.request('repository.v1.status', {
+    worktree_id,
+    revision: observation.revision,
+  })
+  expect(status.entries).toContainEqual(
+    expect.objectContaining({ path: 'sample.txt', worktree: 'M' })
+  )
+})
+
 it('lists nested empty directories without ignored directories or symlink traversal', async () => {
   const s = await setup()
   const worktree_id = (await s.catalog()).entries.find((e: any) => e.kind === 'root').worktree_id

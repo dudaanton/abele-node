@@ -179,9 +179,21 @@ it('stops a command if streaming output cannot be journaled', async () => {
     if (type === 'command.output') throw new Error('fixture storage failure')
     return append(stream, type, actor, data)
   })
-  const run = await f.request('command.v1.run', { ...f.base, command: 'echo output; sleep 30' })
+  const run = await f.request('command.v1.run', {
+    ...f.base,
+    // Keep the output producer alive without racing a shell spawning sleep against SIGKILL.
+    argv: [process.execPath, '-e', 'console.log("output"); setInterval(() => {}, 30_000)'],
+  })
   await f.approve(run)
-  expect(await f.wait(run)).toMatchObject({ state: 'cancelled', reason: 'storage_unavailable' })
+  // Wait for the child to be reaped, without the fixture's shorter status-polling budget.
+  // The child stays alive indefinitely, so failing to kill it still hits the test deadline.
+  await f.core.manager.settled()
+  expect(
+    await f.request('command.v1.status', {
+      session_id: f.session.session_id,
+      run_id: run.run_id,
+    })
+  ).toMatchObject({ state: 'cancelled', reason: 'storage_unavailable', signal: 'SIGKILL' })
 })
 it('runs in a registered project root and never passes daemon secrets into a command', async () => {
   const f = await fixture()

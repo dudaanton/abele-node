@@ -224,6 +224,8 @@ export class ExecutionTargetService {
     )
   }
   canLease(binding: Pick<ResolvedExecutionTarget, 'path' | 'canonical_key'>, session: string) {
+    // Ordinary lifetime-lease holders may share their managed workspace. A session
+    // using only an execution-time binding must not bypass those lifetime leases.
     // Retain the child's workspace binding for follow-ups, without blocking
     // another chat once that child has no active or queued work. The execution
     // lease above this reservation check still fences unfinished cleanup.
@@ -236,9 +238,9 @@ export class ExecutionTargetService {
         .get(binding.canonical_key, session) &&
       !this.r.core.db
         .prepare(
-          "SELECT 1 FROM workspace_leases l JOIN workspaces w ON w.workspace_id=l.workspace_id WHERE json_extract(w.body,'$.path')=? AND l.session_id<>? AND (NOT EXISTS (SELECT 1 FROM delegations d WHERE d.session_id=l.session_id AND json_extract(d.body,'$.state') NOT IN ('running','provisioning')) OR EXISTS (SELECT 1 FROM inputs i WHERE i.session_id=l.session_id AND i.state IN ('accepted','queued','dispatching','delivered')))"
+          "SELECT 1 FROM workspace_leases l JOIN workspaces w ON w.workspace_id=l.workspace_id LEFT JOIN delegations d ON d.session_id=l.session_id WHERE json_extract(w.body,'$.path')=? AND l.session_id<>? AND ((d.session_id IS NULL AND NOT EXISTS (SELECT 1 FROM workspace_leases own WHERE own.workspace_id=l.workspace_id AND own.session_id=?)) OR json_extract(d.body,'$.state') IN ('running','provisioning') OR (d.session_id IS NOT NULL AND EXISTS (SELECT 1 FROM inputs i WHERE i.session_id=l.session_id AND i.state IN ('accepted','queued','dispatching','delivered'))))"
         )
-        .get(binding.path, session)
+        .get(binding.path, session, session)
     )
   }
   lease(binding: ResolvedExecutionTarget, session: string, run: string) {

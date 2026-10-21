@@ -901,6 +901,35 @@ it('rechecks a refused managed deletion with the same operation after cleaning',
   })
 })
 
+it('runs ordinary chats sharing a managed workspace and leaves completed turns idle', async () => {
+  const s = setup(),
+    p = await registered(s),
+    w = await provision(s, p.project_id)
+  const chats = (await Promise.all(
+    [1, 2].map((n) =>
+      s.request('session.create', {
+        title: `Chat ${n}`,
+        workspace_id: w.workspace_id,
+      })
+    )
+  )) as any[]
+  for (const chat of chats) {
+    expect(
+      s.core.resources.targets.canLease({ path: w.path, canonical_key: 'fixture' }, chat.session_id)
+    ).toBe(true)
+    const input = (await s.request('session.send', {
+      session_id: chat.session_id,
+      text: 'hello',
+      observed_seq: 0,
+    })) as any
+    s.core.tick()
+    expect(
+      s.core.db.prepare('SELECT state FROM inputs WHERE input_id=?').get(input.input_id)
+    ).toMatchObject({ state: 'completed' })
+    expect(s.core.resources.targets.busy(chat.session_id)).toBe(false)
+  }
+})
+
 it('preserves an existing workspace binding when upgrading the single-session lease table', async () => {
   const s = setup(),
     p = await registered(s),
