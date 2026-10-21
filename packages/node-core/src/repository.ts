@@ -246,6 +246,10 @@ export class RepositoryService {
   private workers = new Set<Worker>()
   private reconciliations = new Set<Promise<void>>()
   private active = 0
+  // Watchers share the four-job ceiling, but may occupy only one slot. Waiting
+  // readers get released slots before either new edits or background checks.
+  private backgroundActive = 0
+  private readers: { grant: () => void; cancel: () => void }[] = []
   private stopped = false
   constructor(private r: ResourceServices) {
     const version = r.core.db
@@ -654,13 +658,48 @@ export class RepositoryService {
       if (!config.external_read || !approval?.enabled) throw new ChannelError('unauthorized')
     }
   }
+  private acquireRead(): Promise<void> {
+    if (this.stopped) return Promise.reject(new ChannelError('resource_busy'))
+    if (this.active < 4 && !this.readers.length) {
+      this.active++
+      return Promise.resolve()
+    }
+    return new Promise((resolve, reject) => {
+      const remove = () => {
+        clearTimeout(timer)
+        const index = this.readers.indexOf(reader)
+        if (index >= 0) this.readers.splice(index, 1)
+      }
+      const reader = {
+        grant: () => {
+          remove()
+          this.active++
+          resolve()
+        },
+        cancel: () => {
+          remove()
+          reject(new ChannelError('resource_busy'))
+        },
+      }
+      const timer = setTimeout(() => {
+        remove()
+        reject(new ChannelError('git_timeout'))
+      }, this.r.git.timeoutMs)
+      this.readers.push(reader)
+    })
+  }
+  private releaseJob() {
+    this.active--
+    while (!this.stopped && this.active < 4 && this.readers.length) this.readers[0]!.grant()
+  }
   private async editJob<T>(work: () => Promise<T>) {
-    if (this.stopped || this.active >= 4) throw new ChannelError('resource_busy')
+    if (this.stopped || this.active >= 4 || this.readers.length)
+      throw new ChannelError('resource_busy')
     this.active++
     try {
       return await this.r.git.bounded(15000, work)
     } finally {
-      this.active--
+      this.releaseJob()
     }
   }
   async prepareEdit(actor: AuthorityContext, id: string, path: string) {
@@ -2984,7 +3023,7 @@ export class RepositoryService {
         this.unwatch(id)
         return
       }
-      if (s.checking || this.active >= 4) {
+      if (s.checking || this.active >= 4 || this.backgroundActive >= 1 || this.readers.length) {
         // Never lose overflow or a change hint while another read owns the job budget.
         if (reason === 'overflow' || s.dirty !== 'overflow') s.dirty = reason
         return
@@ -2993,6 +3032,7 @@ export class RepositoryService {
       s.dirty = undefined
       s.checking = true
       this.active++
+      this.backgroundActive++
       try {
         if (s.expires < Date.now()) {
           this.unwatch(id)
@@ -3042,7 +3082,8 @@ export class RepositoryService {
         this.unwatch(id)
       } finally {
         s.checking = false
-        this.active--
+        this.backgroundActive--
+        this.releaseJob()
         if (s.dirty && this.subscriptions.has(id) && !this.stopped && !s.pending)
           s.pending = setTimeout(() => {
             s.pending = undefined
@@ -3101,7 +3142,7 @@ export class RepositoryService {
   request(actor: AuthorityContext, method: string, p: Record<string, unknown>): Promise<unknown> {
     // The injected runner controls the whole-read budget as well as individual
     // Git processes. Normal construction still uses 15s; search/blame keep their
-    // separate, tighter execution budgets below.
+    // separate, tighter execution budgets below. Queue time consumes this budget.
     return this.r.git.bounded(this.r.git.timeoutMs, () => this.dispatch(actor, method, p))
   }
   private async dispatch(
@@ -3111,9 +3152,10 @@ export class RepositoryService {
   ): Promise<unknown> {
     if (this.stopped) throw new ChannelError('resource_busy')
     this.r.core.authority.check(actor, 'resource', String(p.worktree_id ?? p.project_id))
-    if (this.active >= 4) throw new ChannelError('resource_busy')
-    this.active++
+    await this.acquireRead()
     try {
+      if (this.stopped) throw new ChannelError('resource_busy')
+      this.r.core.authority.check(actor, 'resource', String(p.worktree_id ?? p.project_id))
       let result: unknown
       if (method === 'repository.v1.worktrees') result = await this.catalog(actor, method, p)
       else {
@@ -3300,7 +3342,7 @@ export class RepositoryService {
       this.checkPublication(actor, p, result)
       return result
     } finally {
-      this.active--
+      this.releaseJob()
     }
   }
   revoked(installation: string) {
@@ -3315,6 +3357,7 @@ export class RepositoryService {
   }
   async stop() {
     this.stopped = true
+    for (const reader of [...this.readers]) reader.cancel()
     for (const monitor of this.monitors.values()) monitor.close()
     this.monitors.clear()
     this.snapshots.clear()

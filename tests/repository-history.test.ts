@@ -36,7 +36,7 @@ async function setup(commits: { file: string; message: string }[]) {
   const worktree_id = (await request('repository.v1.worktrees', { project_id: project.project_id }))
     .entries[0].worktree_id
   const revision = await request('repository.v1.resolve', { worktree_id, ref: 'HEAD' })
-  return { repo, request, worktree_id, revision }
+  return { repo, core, request, worktree_id, revision }
 }
 function countHistoryReads() {
   const run = GitRunner.prototype.run,
@@ -57,6 +57,42 @@ afterEach(async () => {
     core.close()
   }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+it('queues concurrent commit and blame reads, including during a watch storm', async () => {
+  const s = await setup([{ file: 'sample.txt', message: 'fixture' }])
+  const params = { worktree_id: s.worktree_id, revision: s.revision }
+  const reads = () =>
+    Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        s.request(i % 2 ? 'repository.v1.commit' : 'repository.v1.blame', {
+          ...params,
+          ...(i % 2 ? {} : { path: 'sample.txt', count: 1 }),
+        })
+      )
+    )
+  expect(await reads()).toHaveLength(12)
+  for (let i = 0; i < 6; i++) await s.request('repository.v1.watch', { worktree_id: s.worktree_id })
+  const service = s.core.resources.repository as any
+  const fingerprint = service.watchFingerprint.bind(service)
+  let checking = 0,
+    peak = 0
+  const checks = vi.spyOn(service, 'watchFingerprint').mockImplementation(async (...args) => {
+    peak = Math.max(peak, ++checking)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      return await fingerprint(...args)
+    } finally {
+      checking--
+    }
+  })
+  for (let i = 0; i < 5; i++) {
+    writeFileSync(join(s.repo, 'sample.txt'), `storm ${i}\n`)
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(await reads()).toHaveLength(12)
+  }
+  expect(checks).toHaveBeenCalled()
+  expect(peak).toBe(1)
 })
 
 it('reads a page of history with one Git process, continuing where the page stopped', async () => {
