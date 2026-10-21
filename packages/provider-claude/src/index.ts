@@ -601,19 +601,29 @@ export class ClaudeProviderAdapter {
               if (p.action === 'list')
                 socket.end(JSON.stringify({ tools: sink.debugger.tools }) + '\n')
               else if (p.action === 'call' && typeof p.name === 'string') {
-                const result = await sink.debugger.call(p.name, p.args, loss.signal)
-                if (!loss.signal.aborted) {
-                  const published = sink.debugger.publish(p.args, result)
-                  const line = JSON.stringify(published) + '\n'
-                  socket.end(
-                    Buffer.byteLength(line) <= 256 * 1024
-                      ? line
-                      : JSON.stringify({
-                          code: 'debugger_response_too_large',
-                          snapshot: null,
-                          observation: 'unknown',
-                        }) + '\n'
-                  )
+                const resumeDeadline = p.name.startsWith('obsidian_') ? timer.pause() : () => {}
+                try {
+                  if (p.name.startsWith('obsidian_')) socket.setTimeout(0)
+                  const result = await (p.name.startsWith('obsidian_') &&
+                  typeof p.call_id === 'string' &&
+                  p.call_id.length <= 128
+                    ? sink.debugger.call(p.name, p.args, loss.signal, p.call_id)
+                    : sink.debugger.call(p.name, p.args, loss.signal))
+                  if (!loss.signal.aborted) {
+                    const published = sink.debugger.publish(p.args, result)
+                    const line = JSON.stringify(published) + '\n'
+                    socket.end(
+                      Buffer.byteLength(line) <= 256 * 1024
+                        ? line
+                        : JSON.stringify({
+                            code: 'debugger_response_too_large',
+                            snapshot: null,
+                            observation: 'unknown',
+                          }) + '\n'
+                    )
+                  }
+                } finally {
+                  resumeDeadline()
                 }
               } else socket.destroy()
             } finally {

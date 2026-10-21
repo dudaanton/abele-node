@@ -1,4 +1,5 @@
 import { opaqueId } from './mapper.js'
+import type { DebuggerToolDefinition } from '@abele/provider-contract'
 import { checkEffective, policyFingerprint, type PolicyPaths } from './policy.js'
 import { isCodexAuthenticated } from './auth.js'
 import { codexModelAvailable, validCodexModel, validCodexCatalog } from './models.js'
@@ -34,6 +35,7 @@ export async function openCodexThread(
     model?: string
     native_session_id?: string
     binding?: NativeBinding
+    tools?: DebuggerToolDefinition[]
   }
 ) {
   const { paths, model, native_session_id } = options
@@ -69,7 +71,14 @@ export async function openCodexThread(
     native_session_id ? 'thread/resume' : 'thread/start',
     native_session_id
       ? { ...params, modelProvider: 'openai', threadId: native_session_id, excludeTurns: true }
-      : { ...params, modelProvider: 'openai', ephemeral: false }
+      : {
+          ...params,
+          modelProvider: 'openai',
+          ephemeral: false,
+          ...(options.tools?.length
+            ? { dynamicTools: options.tools.map((tool) => ({ type: 'function', ...tool })) }
+            : {}),
+        }
   ).catch((error) => {
     if (native_session_id && error instanceof Error && error.message.startsWith('codex_rpc_error:'))
       throw new Error('codex_native_context_unavailable')

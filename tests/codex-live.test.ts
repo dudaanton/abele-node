@@ -2,6 +2,7 @@ import { expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { DebuggerToolBridge } from '@abele/provider-contract'
 import { discoverCodex } from '../packages/provider-codex/src/discovery.js'
 import { startCodexLiveSession } from '../packages/provider-codex/src/live.js'
 import {
@@ -30,6 +31,7 @@ function setup(mode = 'live') {
   })
   const events: { type: string; data: Record<string, any> }[] = []
   const sink = {
+    debugger: undefined as DebuggerToolBridge | undefined,
     event: (e: any) => events.push(e),
     processes: () => {},
     permission: async () => ({ choice: 'deny' as const, delivered: () => true }),
@@ -63,6 +65,7 @@ function setup(mode = 'live') {
       .map((l) => JSON.parse(l))
   return {
     dir,
+    sink,
     home,
     events,
     open,
@@ -71,6 +74,33 @@ function setup(mode = 'live') {
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   }
 }
+
+it('registers and answers an Obsidian dynamic tool through the fake app-server', async () => {
+  const t = setup('obsidian-tools')
+  const calls: any[] = []
+  t.sink.debugger = {
+    tools: [{ name: 'obsidian_create', description: 'Create', inputSchema: { type: 'object' } }],
+    async call(...args) {
+      calls.push(args)
+      return { state: 'succeeded', result: { text: 'created' } }
+    },
+    publish: (_a, r) => r,
+    close() {},
+  }
+  let live: Awaited<ReturnType<typeof t.open>> | undefined
+  try {
+    live = await t.open()
+    live.send({ input_id: 'one', content: 'create a note' })
+    await wait(() => t.of('live.turn.completed').length > 0)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![0]).toBe('obsidian_create')
+    expect(calls[0]![3]).toMatch(/^codex:/)
+    expect(t.log('tool-responses.jsonl')[0].result).toMatchObject({ success: true })
+  } finally {
+    await live?.stop()
+    t.cleanup()
+  }
+})
 
 it('keeps one app-server across turns, steers input into a running turn and has no turn deadline', async () => {
   const t = setup()

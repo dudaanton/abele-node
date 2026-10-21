@@ -312,6 +312,21 @@ export class ProviderSessions {
             slot.debugger
           )
 
+        if (this.core.obsidianTools.configured(session.session_id))
+          slot.debugger = this.core.obsidianTools.bridge(
+            this.core.authority.forInstallation(String(input.principal_id)),
+            session.session_id,
+            run_id,
+            () =>
+              !this.stopping &&
+              this.active.get(session.session_id) === slot &&
+              !!this.core.db
+                .prepare(
+                  "SELECT 1 FROM inputs WHERE input_id=? AND state IN ('dispatching','delivered')"
+                )
+                .get(String(input.input_id)),
+            slot.debugger
+          )
         if (session.provider === 'pi' && this.core.delegations.isActive(session.session_id))
           slot.debugger = this.core.delegations
             .reporter(session.session_id, run_id)
@@ -400,6 +415,18 @@ export class ProviderSessions {
                   }
                 )
               }
+              this.core.append(session.session_id, 'input.reply', actor, {
+                input_id: String(input.input_id),
+                run_id,
+                turn_id: run_id,
+                outcome:
+                  current.state === 'completed'
+                    ? 'success'
+                    : current.state === 'failed'
+                      ? 'failed'
+                      : 'interrupted',
+                final_reply: this.finalReply(session.session_id, run_id),
+              })
               void this.core.resources.lsp.afterEdit(session.session_id)
               this.invalidate(run_id)
               if (result.reason === 'process_cleanup_unconfirmed') this.stopping = true
@@ -614,6 +641,31 @@ export class ProviderSessions {
       this.appendProviderEvent(session_id, run_id, event, late)
     })
   }
+  finalReply(session_id: string, turn_id?: string) {
+    if (!turn_id) return null
+    const start = this.core.db
+      .prepare(
+        "SELECT seq FROM events WHERE stream_id=? AND json_extract(body,'$.type') IN ('turn.started','run.started') AND COALESCE(json_extract(body,'$.data.turn_id'),json_extract(body,'$.data.run_id'))=? ORDER BY seq DESC LIMIT 1"
+      )
+      .get(session_id, turn_id) as { seq: number } | undefined
+    if (!start) return null
+    const rows = this.core.db
+      .prepare(
+        "SELECT seq, body FROM events WHERE stream_id=? AND seq>? AND json_extract(body,'$.type')='session.update' AND json_extract(body,'$.data.turn_id')=? AND json_extract(body,'$.data.update.kind')='agent_message' ORDER BY seq"
+      )
+      .all(session_id, start.seq, turn_id) as { seq: number; body: string }[]
+    const messages = rows
+      .map((row) => ({ seq: row.seq, update: JSON.parse(row.body).data.update }))
+      .filter((row) => !row.update.parent_tool_call_id)
+    const message_id = messages.at(-1)?.update.message_id
+    if (!message_id) return null
+    // Keep the last replacement for each block of the final assistant message.
+    const blocks = new Map<number, number>()
+    for (const row of messages)
+      if (row.update.message_id === message_id) blocks.set(row.update.block ?? 0, row.seq)
+    return { message_id, event_seqs: [...blocks].sort((a, b) => a[0] - b[0]).map(([, seq]) => seq) }
+  }
+
   /** Inside a transaction. Large and raw records go to artifacts; the journal keeps a reference. */
   appendProviderEvent(session_id: string, run_id: string, event: ClaudeEvent, late = false) {
     const provider = this.core.session(session_id).provider
@@ -624,7 +676,7 @@ export class ProviderSessions {
         data: { ...event.data, diagnostic_id: 'missing_dependencies' },
       }
     // Mapped from the whole record, before a large one is moved to an artifact.
-    const turn_id = this.live.state(session_id).turn?.turn_id
+    const turn_id = this.live.state(session_id).turn?.turn_id ?? run_id
     let updates = providerSessionUpdates(provider, event.type, { ...event.data, run_id })
     if (
       dependencies &&

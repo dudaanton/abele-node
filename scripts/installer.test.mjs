@@ -24,6 +24,68 @@ import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
 for (const platform of ['mac', 'linux']) {
+  test(`update adopts known service flags but refuses structural edits: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    const first = await install(h, ['--version', '0.2.0'], env)
+    assert.equal(first.code, 0, first.stderr)
+    const c = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
+    const text = await readFile(c.service_file, 'utf8')
+    const edited =
+      platform === 'mac'
+        ? text.replace('</array>', '<string>--pi-max-tokens</string><string>12345</string></array>')
+        : text.replace(/^(ExecStart=.*)$/m, '$1 "--pi-max-tokens" "12345"')
+    for (const unsafe of [
+      edited.replace('/packages/node-daemon/dist/cli.js', '/packages/node-daemon/dist/foreign.js'),
+      platform === 'mac'
+        ? edited.replace('</dict>', '<key>Extra</key><true/></dict>')
+        : edited + '\nEnvironment=EXTRA=yes\n',
+      platform === 'mac'
+        ? edited.replace('</array>', '<string>--unknown</string></array>')
+        : edited.replace(/^(ExecStart=.*)$/m, '$1 "--unknown"'),
+    ]) {
+      await writeFile(c.service_file, unsafe)
+      const refused = await install(h, ['--version', '0.2.3'], env)
+      assert.notEqual(refused.code, 0)
+      assert.match(refused.stderr, /restore the original service/i)
+      assert.equal(await readFile(c.service_file, 'utf8'), unsafe)
+    }
+    await writeFile(c.service_file, edited + '\n# unrelated\n')
+    assert.notEqual((await install(h, ['--version', '0.2.3'], env)).code, 0)
+    await writeFile(c.service_file, edited)
+    const result = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(await readFile(c.service_file, 'utf8'), /12345/)
+    const set = await install(
+      h,
+      ['--version', '0.2.3', '--service-flags', '{"--pi-max-tokens":"54321"}'],
+      env
+    )
+    assert.equal(set.code, 0, set.stderr)
+    assert.match(await readFile(c.service_file, 'utf8'), /54321/)
+    // A legacy record has only a digest. Prove a changed default by recreating
+    // the exact original bytes, never by trusting a normalized hash alone.
+    const legacy = JSON.parse(
+      await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8')
+    )
+    const legacyText = (await readFile(c.service_file, 'utf8')).replace('54321', '32768')
+    delete legacy.service_text
+    legacy.service_sha256 = createHash('sha256').update(legacyText).digest('hex')
+    await writeFile(join(h, '.local/share/abele-node/config.json'), JSON.stringify(legacy))
+    const changedDefault = legacyText.replace('32768', '22222')
+    await writeFile(c.service_file, changedDefault)
+    if (platform === 'mac') {
+      const jobFile = join(h, '.fake-launch-job'),
+        job = JSON.parse(await readFile(jobFile, 'utf8'))
+      job.arguments = job.arguments.map((a) => (a === '54321' ? '32768' : a))
+      await writeFile(jobFile, JSON.stringify(job))
+    }
+    const recovered = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(recovered.code, 0, recovered.stderr)
+    assert.match(await readFile(c.service_file, 'utf8'), /22222/)
+  })
+}
+for (const platform of ['mac', 'linux']) {
   test(`upgrade retains all authenticated owner service flags: ${platform}`, async () => {
     const h = await home()
     const env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
@@ -143,7 +205,9 @@ for (const platform of ['mac', 'linux']) {
     assert.notEqual((await install(h, ['--adopt-debugger'], env)).code, 0)
     assert.equal(await readFile(file, 'utf8'), before)
     await writeFile(c.service_file, edited)
-    assert.notEqual((await install(h, ['--version', '0.2.3'], env)).code, 0)
+    // Argument-only edits are now adopted by update as well as explicitly.
+    const updated = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(updated.code, 0, updated.stderr)
     const adopted = await install(h, ['--adopt-debugger'], env)
     assert.equal(adopted.code, 0, adopted.stderr)
     const after = JSON.parse(await readFile(file, 'utf8'))
@@ -153,7 +217,7 @@ for (const platform of ['mac', 'linux']) {
   })
 }
 for (const platform of ['mac', 'linux']) {
-  test(`service debugger choice survives reinstall and strict adoption: ${platform}`, async () => {
+  test(`service debugger choice survives reinstall and argument-only adoption: ${platform}`, async () => {
     const h = await home(),
       env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
     let result = await install(h, ['--version', '0.2.0', '--debugger'], env)
@@ -180,22 +244,21 @@ for (const platform of ['mac', 'linux']) {
         : text.replace(/^(ExecStart=.*)$/m, '$1 "--debugger"')
     await writeFile(c.service_file, modified)
     result = await install(h, ['--version', '0.2.3'], env)
-    assert.notEqual(result.code, 0)
-    assert.match(result.stderr, /ownership missing or modified/)
+    assert.equal(result.code, 0, result.stderr)
+    const adopted = await recorded(true)
+    assert.equal(adopted.text, modified)
+    const adoptedConfig = await readFile(configFile, 'utf8')
     await writeFile(c.service_file, modified + '\n# foreign edit\n')
+    result = await install(h, ['--version', '0.2.3'], env)
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /Service ownership modified; restore the original service file/)
+    assert.equal(await readFile(configFile, 'utf8'), adoptedConfig)
+    assert.equal(await readFile(c.service_file, 'utf8'), modified + '\n# foreign edit\n')
     result = await install(h, ['--service-action', 'adopt-debugger'], env)
     assert.notEqual(result.code, 0)
-    assert.equal(await readFile(configFile, 'utf8'), JSON.stringify(c) + '\n')
+    assert.equal(await readFile(configFile, 'utf8'), adoptedConfig)
+    assert.equal(await readFile(c.service_file, 'utf8'), modified + '\n# foreign edit\n')
     await writeFile(c.service_file, modified)
-    if (platform === 'mac') {
-      // Model the owner reloading the manually edited LaunchAgent.
-      for (const name of ['.fake-launch-job', '.test-service-running']) {
-        const file = join(h, name),
-          job = JSON.parse(await readFile(file, 'utf8'))
-        job.arguments.push('--debugger')
-        await writeFile(file, JSON.stringify(job))
-      }
-    }
     result = await install(h, ['--service-action', 'adopt-debugger'], env)
     assert.equal(result.code, 0, result.stderr)
     await recorded(true)
@@ -2736,6 +2799,7 @@ test(
         enabled: false,
         running: false,
         ownership: 'none',
+        ownership_help: 'No installed service; run abele-node service enable first.',
         service_file: null,
         state_dir: join(await realpath(h), '.local/state/abele-node'),
         paired_listener: null,

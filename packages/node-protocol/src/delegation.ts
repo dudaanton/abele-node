@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { Id, Sequence } from '@abele/channel-protocol'
 import { ExpectedExecutionTargetSchema, TurnAdmissionResultSchema } from './turn.js'
+import { ObsidianToolsSnapshotSchema } from './obsidian-tools.js'
 
 export const DelegationActionSchema = z.enum(['create', 'send', 'status', 'cancel', 'read'])
 export const DelegationStateSchema = z.enum([
@@ -128,6 +129,8 @@ export const DelegationCreateSchema = z
   .object({
     grant_id: Id.optional(),
     parent_id: Id.optional(),
+    // Owner/plugin snapshot, never a model-selectable permission override.
+    obsidian_tools: ObsidianToolsSnapshotSchema.optional(),
     delegation_key: Id,
     project_id: Id.optional(),
     base_ref: z.string().min(1).max(256).default('HEAD'),

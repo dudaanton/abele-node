@@ -273,6 +273,7 @@ export class LiveSessions {
         if (slot.state === 'stopping' || !slot.live?.detach)
           return this.stop(slot.session_id, 'node_stopping')
         slot.detaching = true
+        this.core.obsidianTools.suspendRun(slot.run_id)
         await slot.live.detach()
         await slot.completion
       })
@@ -436,6 +437,14 @@ export class LiveSessions {
       )
     if (this.core.session(session_id).provider !== 'claude')
       slot.debugger = new LspTools(this.core, session_id, slot.principal, alive, slot.debugger)
+    if (this.core.obsidianTools.configured(session_id))
+      slot.debugger = this.core.obsidianTools.bridge(
+        authority,
+        session_id,
+        run_id,
+        alive,
+        slot.debugger
+      )
     return alive
   }
   private sink(slot: Slot, alive: () => boolean): LiveSessionSink {
@@ -561,11 +570,11 @@ export class LiveSessions {
       const session_id = String(input.session_id)
       if (seen.has(session_id) || !this.handles(session_id)) continue
       const slot = this.slots.get(session_id)
+      seen.add(session_id)
       if (slot?.state === 'idle' || slot?.state === 'running') {
         await this.dispatch(slot, input)
         continue
       }
-      seen.add(session_id)
       if (slot) continue
       const failure = this.failures.get(session_id)
       if (failure && Date.now() < failure.until) continue
@@ -577,6 +586,22 @@ export class LiveSessions {
     }
   }
   private async dispatch(slot: Slot, input: Input) {
+    // A letter owns its whole turn. Include dispatching inputs: the provider may
+    // not have acknowledged them yet. Never use sender metadata for authority.
+    const letter = (body: string) => {
+      const p = JSON.parse(body)
+      return !!(p.sender || p.from_session)
+    }
+    const active = this.core.db
+      .prepare(
+        "SELECT body FROM inputs WHERE session_id=? AND state IN ('dispatching','delivered')"
+      )
+      .all(slot.session_id) as { body: string }[]
+    if (
+      (active.length || slot.turn) &&
+      (letter(String(input.body)) || active.some((i) => letter(i.body)))
+    )
+      return
     const body = JSON.parse(String(input.body)) as {
       text: string
       expected_target?: ExpectedExecutionTarget
@@ -751,12 +776,12 @@ export class LiveSessions {
         this.core.transaction(() =>
           this.core.append(session_id, 'session.process', actor, { run_id, state: 'running' })
         )
-        for (const input of this.core.db
+        const input = this.core.db
           .prepare(
-            "SELECT * FROM inputs WHERE session_id=? AND state IN ('accepted','queued') ORDER BY ordinal"
+            "SELECT * FROM inputs WHERE session_id=? AND state IN ('accepted','queued') ORDER BY ordinal LIMIT 1"
           )
-          .all(session_id) as Input[])
-          await this.dispatch(slot, input)
+          .get(session_id) as Input | undefined
+        if (input) await this.dispatch(slot, input)
       }
     } catch (error) {
       try {
@@ -985,6 +1010,7 @@ export class LiveSessions {
         case 'claude.turn.completed': {
           void this.core.resources.lsp.afterEdit(session_id)
           const ids = (Array.isArray(d.input_ids) ? d.input_ids : []).map(String)
+          const turn_id = slot.turn?.turn_id ?? randomUUID()
           const outcome = String(d.outcome) as 'success' | 'failed' | 'interrupted'
           for (const id of ids) {
             const input = this.core.db
@@ -1004,7 +1030,7 @@ export class LiveSessions {
           }
           this.core.append(session_id, 'turn.completed', actor, {
             run_id,
-            turn_id: slot.turn?.turn_id ?? randomUUID(),
+            turn_id,
             outcome,
             input_ids: ids,
             subtype: (d.subtype as string | null) ?? null,
@@ -1013,6 +1039,15 @@ export class LiveSessions {
             total_cost_usd: (d.total_cost_usd as number | null) ?? null,
             terminal_reason: (d.terminal_reason as string | null) ?? null,
           })
+          const final_reply = this.owner.finalReply(session_id, turn_id)
+          for (const input_id of ids)
+            this.core.append(session_id, 'input.reply', actor, {
+              input_id,
+              run_id,
+              turn_id,
+              outcome,
+              final_reply,
+            })
           for (const prompt of this.core.prompts(session_id))
             if (prompt.state === 'pending' && prompt.run_id === run_id)
               this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)

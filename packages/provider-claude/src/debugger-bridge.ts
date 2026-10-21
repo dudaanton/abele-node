@@ -1,6 +1,8 @@
 // Versioned stdio MCP executable using the existing per-run protected IPC.
 // No authority from tool arguments and no provider permission-setting bypass.
 import { createConnection } from 'node:net'
+import { createHash, randomUUID } from 'node:crypto'
+const instance = randomUUID()
 const limit = 256 * 1024
 const unavailable = { code: 'debugger_unavailable', snapshot: null, observation: 'unknown' }
 const pending = new Map<string, AbortController>()
@@ -8,7 +10,8 @@ function request(
   action: 'list' | 'call',
   name: unknown,
   args: unknown,
-  signal: AbortSignal
+  signal: AbortSignal,
+  callId?: string
 ): Promise<any> {
   return new Promise((resolve) => {
     const started = Date.now()
@@ -36,7 +39,10 @@ function request(
       )
     const cancelled = () => failed('cancelled')
     const lost = () => failed('connection_lost')
-    const timer = setTimeout(lost, 65000)
+    // Owner absence is not a tool failure. Socket loss and explicit cancellation
+    // still release the call; durable invocations are reconciled by their ID.
+    const timer =
+      typeof name === 'string' && name.startsWith('obsidian_') ? undefined : setTimeout(lost, 65000)
     signal.addEventListener('abort', cancelled, { once: true })
     if (signal.aborted) cancelled()
     socket.on('error', lost)
@@ -53,6 +59,7 @@ function request(
           action,
           name,
           args,
+          ...(callId ? { call_id: callId } : {}),
         }) + '\n'
       )
     )
@@ -107,7 +114,18 @@ async function respond(r: any) {
       const result = await request('list', undefined, undefined, abort.signal)
       reply(r.id, { tools: Array.isArray(result.tools) ? result.tools : [] })
     } else if (r.method === 'tools/call') {
-      const result = await request('call', r.params?.name, r.params?.arguments, abort.signal)
+      const callId =
+        'claude:' +
+        createHash('sha256')
+          .update(JSON.stringify([instance, r.id]))
+          .digest('hex')
+      const result = await request(
+        'call',
+        r.params?.name,
+        r.params?.arguments,
+        abort.signal,
+        callId
+      )
       reply(r.id, {
         content: [{ type: 'text', text: JSON.stringify(result) }],
         ...(result.code && !result.reason ? { isError: true } : {}),

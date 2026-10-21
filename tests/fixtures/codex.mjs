@@ -74,7 +74,8 @@ const reply = (id, result) => send({ id, result })
 const notify = (method, params) => send({ method, params })
 let thread,
   turn,
-  waiting = false
+  waiting = false,
+  dynamicTools = []
 const said = (input) =>
   input.map((i) => (i.type === 'skill' ? `[skill ${i.name}]` : i.text)).join(' + ')
 const complete = (status = 'completed', text = 'fake response') => {
@@ -101,6 +102,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   const msg = JSON.parse(line),
     p = msg.params
   if (!msg.method) {
+    if (msg.id === 'obsidian-call') {
+      appendFileSync(join(home, 'tool-responses.jsonl'), JSON.stringify(msg) + '\n')
+      complete('completed', 'tool completed')
+    }
     if (msg.id === 'native-approval' && waiting) {
       waiting = false
       if (!['accept', 'decline', 'cancel'].includes(msg.result?.decision)) process.exit(70)
@@ -211,6 +216,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     } else {
       if (p.ephemeral !== false) process.exit(70)
       thread = { id: `thread-${randomUUID()}`, cwd: p.cwd }
+      dynamicTools = p.dynamicTools ?? []
       saved[thread.id] = thread
       writeFileSync(join(home, 'threads.json'), JSON.stringify(saved), { mode: 0o600 })
     }
@@ -248,6 +254,23 @@ for await (const line of createInterface({ input: process.stdin })) {
     turn = { id: `turn-${randomUUID()}`, status: 'inProgress' }
     reply(msg.id, { turn })
     notify('turn/started', { threadId: thread.id, turn })
+    if (mode === 'obsidian-tools') {
+      if (!dynamicTools.some((t) => t.type === 'function' && t.name === 'obsidian_create'))
+        process.exit(70)
+      send({
+        id: 'obsidian-call',
+        method: 'item/tool/call',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          callId: 'create-one',
+          namespace: null,
+          tool: 'obsidian_create',
+          arguments: { path: 'note', text: 'hello' },
+        },
+      })
+      continue
+    }
     if (mode === 'crash-after-dispatch') process.exit(17)
     if (mode === 'hang') continue
     // A live session holds a turn open until it is steered or interrupted.

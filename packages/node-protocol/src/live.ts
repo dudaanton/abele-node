@@ -136,6 +136,22 @@ export const LiveEventPayloads = {
     })
     .strict(),
   'turn.started': z.object({ ...runId, turn_id: id, trigger: z.string().max(32) }).strict(),
+  // A separate event keeps existing strict turn.completed readers compatible.
+  'input.reply': z
+    .object({
+      ...runId,
+      input_id: id,
+      turn_id: id.nullable(),
+      outcome: z.enum(['success', 'failed', 'interrupted']),
+      final_reply: z
+        .object({
+          message_id: id,
+          event_seqs: z.array(z.number().int().positive()),
+        })
+        .strict()
+        .nullable(),
+    })
+    .strict(),
   'turn.completed': z
     .object({
       ...runId,

@@ -176,6 +176,7 @@ it('stopped status is human by default, read-only, and JSON adds the deployment 
     'claude',
     'mode',
     'running',
+    'service',
     'state_dir',
     'tailscale',
   ])
@@ -198,6 +199,7 @@ it('stopped status is human by default, read-only, and JSON adds the deployment 
     'profile',
     'running',
     'runtime',
+    'service',
     'sqlite',
     'state_dir',
     'state_mode',
@@ -315,6 +317,7 @@ it.each([false, true])(
       'port',
       'running',
       'runtime',
+      'service',
       'state_dir',
       'tailscale',
     ])

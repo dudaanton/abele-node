@@ -6,6 +6,8 @@ export * from './debugger.js'
 export * from './debugger-control.js'
 export * from './trace.js'
 export * from './http.js'
+export * from './obsidian-tools.js'
+export * from './questionnaire.js'
 export * from './manager.js'
 export type NodeId = string
 export type SessionId = string

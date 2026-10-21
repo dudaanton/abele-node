@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { ChatCheckpoints } from './chat-checkpoints.js'
+import { ObsidianTools } from './obsidian-tools.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -267,6 +268,7 @@ export class FakeProvider {
   }
 }
 export class NodeCore implements JournalStore, OperationStore, SessionQueue, PromptService {
+  readonly obsidianTools: ObsidianTools
   private checkpoints?: ChatCheckpoints
   get chatCheckpoints() {
     return (this.checkpoints ??= new ChatCheckpoints(this))
@@ -488,6 +490,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       })
       this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
       this.manager = new ManagerService(this)
+      this.obsidianTools = new ObsidianTools(this)
       this.resources.mutations.recover()
       this.debuggerLaunches = new DebuggerLaunches(
         this,
@@ -520,6 +523,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         .prepare("SELECT body FROM prompts WHERE json_extract(body,'$.state')='pending'")
         .all() as Row[]) {
         const prompt = PromptSchema.parse(JSON.parse(String(row.body)))
+        if (prompt.run_id.startsWith('obsidian:')) continue
         this.resolvePrompt(prompt, 'invalidated', 'deny', null)
       }
     })
@@ -567,6 +571,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   close() {
     if (!this.closed) {
+      this.obsidianTools.close()
       void this.resources?.lsp.stop()
       this.trace.close()
       this.http.close()
@@ -725,6 +730,18 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.claude.capabilities('codex'),
       ],
       capabilities: {
+        'obsidian.tools.v1': {
+          status: 'supported' as const,
+          evidence: 'durable-invocation-single-executor-claim-v1',
+        },
+        'obsidian.tools.questions.v1': {
+          status: 'supported' as const,
+          evidence: 'invocation-bound-durable-questionnaire-v1',
+        },
+        'obsidian.tools.delegate-host.v1': {
+          status: 'supported' as const,
+          evidence: 'root-budget-depth-branch-claim-and-history-v1',
+        },
         device_disconnect: {
           status: 'supported' as const,
           evidence: 'authenticated-self-revocation',
@@ -778,6 +795,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         session_updates: {
           status: 'supported',
           evidence: `session-update-v${SESSION_UPDATE_VERSION}; session.commands`,
+        },
+        session_letters_v1: {
+          status: 'supported',
+          evidence: 'session.send sender; isolated letter turns; input.reply',
         },
         long_lived_sessions: this.claude.adapterFor('claude')?.liveAvailable
           ? {
@@ -895,6 +916,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     signal?: AbortSignal
   ): unknown {
     this.authority.check(actor, 'request')
+    if (method.startsWith('obsidian.tools.v1.'))
+      return this.obsidianTools.request(actor, method, raw, signal)
     if (method.startsWith('chat.'))
       return this.chatCheckpoints.request(actor, method, raw, operation)
     if (method.startsWith('lsp.v1.')) return this.resources.lsp.request(actor, method, raw, signal)
@@ -1085,6 +1108,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     // Preserve audit streams, provider-native history and receipts. Only remove
     // the catalog entry and its idle bindings; never stop a turn as a side effect.
     if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
+    this.obsidianTools.cancelRunInTransaction(session, actor.installation_id)
     this.resources.targets.detach(session)
     this.db.prepare('DELETE FROM workspace_leases WHERE session_id=?').run(session)
     const deleted = { session_id: session, deleted: true }
@@ -1312,6 +1336,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (method === 'session.stop') {
       if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
+      this.obsidianTools.cancelRunInTransaction(session, actor.installation_id)
       this.append(session, 'session.stop_requested', installationActor, { session_id: session })
       return this.claude.live.stopRequested(session)
     }
@@ -1351,6 +1376,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         input_id,
         text: p.text,
         observed_seq: p.observed_seq,
+        ...(p.sender ? { sender: p.sender } : {}),
         // Written by another owner session through the node's own tool, never by a client.
         ...(p.from_session ? { from_session: p.from_session } : {}),
       })
@@ -1379,6 +1405,21 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         throw new ChannelError('prompt_expired')
       if (prompt.state === 'resolved') return prompt
       if (prompt.expires_at <= Date.now()) throw new ChannelError('prompt_expired')
+      if (prompt.kind === 'questionnaire') {
+        if (p.value !== undefined || (p.choice === 'deny' && p.answers !== undefined))
+          throw new ChannelError('invalid_params')
+        const answers = p.answers as Prompt['answers']
+        if (p.choice === 'allow') this.obsidianTools.validateQuestionnaireAnswer(prompt, answers)
+        return this.resolvePrompt(
+          prompt,
+          'resolved',
+          p.choice as 'allow' | 'deny',
+          actor.installation_id,
+          undefined,
+          answers
+        )
+      }
+      if (p.answers !== undefined) throw new ChannelError('invalid_params')
       if (p.choice === 'allow') {
         if (
           prompt.kind === 'select' &&
@@ -1409,14 +1450,17 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return { input_id: p.input_id, state: 'cancelled' }
     }
     if (method === 'session.interrupt') {
-      if (this.claude.live.interruptRequested(session, String(p.run_id)))
+      if (this.claude.live.interruptRequested(session, String(p.run_id))) {
+        this.obsidianTools.cancelRunInTransaction(session, actor.installation_id, String(p.run_id))
         return { run_id: p.run_id, state: 'interrupting' }
+      }
       const input = this.db
         .prepare(
           "SELECT * FROM inputs WHERE session_id=? AND run_id=? AND state IN ('dispatching','delivered')"
         )
         .get(session, String(p.run_id)) as Row | undefined
       if (!input) throw new ChannelError('stale_revision')
+      this.obsidianTools.cancelRunInTransaction(session, actor.installation_id, String(p.run_id))
       this.debuggerControl.revokeRunInTransaction(String(p.run_id))
       this.transition(
         input,
@@ -1459,7 +1503,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     state: Prompt['state'],
     choice: 'allow' | 'deny',
     installation: string | null,
-    value?: string
+    value?: string,
+    answers?: Prompt['answers']
   ): Prompt {
     const result = PromptSchema.parse({
       ...prompt,
@@ -1467,6 +1512,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       choice,
       installation_id: installation,
       ...(value !== undefined ? { value } : {}),
+      ...(answers !== undefined ? { answers } : {}),
     })
     this.db
       .prepare('UPDATE prompts SET body=? WHERE prompt_id=?')
@@ -1477,6 +1523,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       installation ? { kind: 'installation', installation_id: installation } : nodeActor,
       result
     )
+    if (result.kind === 'questionnaire') {
+      this.obsidianTools.questionnaireAnsweredInTransaction(result)
+      return this.prompt(result.prompt_id)
+    }
     return result
   }
   workspaceProvisioning(session_id: string) {
@@ -1654,6 +1704,20 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           this.resources.targets.settle(String(input.session_id), String(input.run_id))
           this.append(String(input.session_id), failed ? 'run.failed' : 'run.completed', actor, {
             run_id: input.run_id,
+          })
+          const reply = this.db
+            .prepare(
+              "SELECT seq FROM events WHERE stream_id=? AND json_extract(body,'$.type')='content.delta' AND json_extract(body,'$.data.run_id')=? ORDER BY seq DESC LIMIT 1"
+            )
+            .get(String(input.session_id), String(input.run_id)) as { seq: number } | undefined
+          this.append(String(input.session_id), 'input.reply', nodeActor, {
+            input_id: String(input.input_id),
+            run_id: String(input.run_id),
+            turn_id: String(input.run_id),
+            outcome: failed ? 'failed' : 'success',
+            final_reply: reply
+              ? { message_id: String(input.input_id), event_seqs: [reply.seq] }
+              : null,
           })
         }
       }

@@ -16,6 +16,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { readRuntime } from './index.js'
 import { PairedListenerSchema, type PairedListenerConfig } from './paired.js'
 import { errorMessage } from './output.js'
+import { readServiceArguments, validateServiceFlags } from './service-arguments.js'
 
 /**
  * A paired configuration a service will read on every start: a regular file, not a
@@ -163,6 +164,7 @@ export function installedService(runtime: string, state: string, recover = true)
     service: number
     service_file?: string
     service_sha256?: string
+    service_text?: string
     paired_config?: string
     debugger_enabled?: boolean
   }
@@ -243,6 +245,12 @@ export function serviceStatus(runtime: string, state: string) {
     enabled: config?.service === 1,
     running: !!readRuntime(state),
     ownership,
+    ownership_help:
+      ownership === 'none'
+        ? 'No installed service; run abele-node service enable first.'
+        : ownership === 'modified' || ownership === 'missing'
+          ? 'Updates adopt supported argument-only edits. For other edits, restore the original service file and remove systemd drop-ins, then use abele-node service flags set.'
+          : 'Service fingerprint matches the installer record.',
     service_file: config?.service_file ?? null,
     state_dir: state,
     paired_listener: pairedListener(config?.paired_config || undefined),
@@ -252,14 +260,23 @@ export function serviceStatus(runtime: string, state: string) {
   }
 }
 
+export function showServiceFlags(runtime: string, state: string) {
+  const config = installedService(runtime, state, false)
+  if (!config?.service_file || config.service !== 1)
+    throw new Error('No installed service; run abele-node service enable first.')
+  return readServiceArguments(readFileSync(config.service_file, 'utf8'), process.platform).slice(3)
+}
+
 /** `undefined` keeps the recorded paired configuration, `null` removes it. */
 export async function changeService(
   runtime: string,
   state: string,
   action: string,
   paired?: string | null,
-  debuggerEnabled?: boolean
+  debuggerEnabled?: boolean,
+  flags?: Record<string, string>
 ) {
+  if (flags) validateServiceFlags(flags)
   if (!['enable', 'disable', 'adopt-debugger'].includes(action))
     throw new Error('Usage: abele-node service enable|disable|status [--json]')
   if (paired !== undefined && action !== 'enable')
@@ -272,6 +289,10 @@ export async function changeService(
         ? ['--no-paired-config']
         : ['--paired-config', protectedPairedConfig(paired).path]
   const config = installedService(runtime, state)
+  if (flags && config?.service !== 1)
+    throw new Error(
+      'Service flags require an installed service; run abele-node service enable first.'
+    )
   if (!config)
     throw new Error(
       'Service changes require a one-command installer deployment. For a source/manual deployment, use the documented manual service setup; nothing changed.'
@@ -290,6 +311,7 @@ export async function changeService(
       '--service-action',
       action,
       ...pairedArgs,
+      ...(flags ? ['--service-flags', JSON.stringify(flags)] : []),
       ...(debuggerEnabled === undefined ? [] : [debuggerEnabled ? '--debugger' : '--no-debugger']),
     ],
     {

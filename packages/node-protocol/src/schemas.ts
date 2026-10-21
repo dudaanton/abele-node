@@ -1,5 +1,7 @@
 import { z } from 'zod'
 import { ChatMethodSchemas } from './chat.js'
+import { ObsidianToolsMethodSchemas } from './obsidian-tools.js'
+import { QuestionnaireQuestionsSchema, QuestionnaireAnswersSchema } from './questionnaire.js'
 import { ManagerMethodSchemas } from './manager.js'
 import { LspMethodSchemas, LspDiagnosticsSchema } from './lsp.js'
 import {
@@ -80,7 +82,11 @@ export const InputStateSchema = z.enum([
 ])
 export const PromptSchema = z
   .object({
-    kind: z.enum(['permission', 'select', 'confirm', 'input', 'trust']).default('permission'),
+    kind: z
+      .enum(['permission', 'select', 'confirm', 'input', 'trust', 'questionnaire'])
+      .default('permission'),
+    questions: QuestionnaireQuestionsSchema.optional(),
+    answers: QuestionnaireAnswersSchema.optional(),
     prompt_id: id,
     session_id: id,
     run_id: id,
@@ -234,6 +240,7 @@ export const NodeEventSchema = EventSchema.superRefine((event, ctx) => {
 })
 const session = { session_id: id }
 export const MethodSchemas = {
+  ...ObsidianToolsMethodSchemas,
   ...ManagerMethodSchemas,
   ...LspMethodSchemas,
   ...DelegationMethodSchemas,
@@ -278,6 +285,11 @@ export const MethodSchemas = {
     .object({
       ...session,
       text: z.string().min(1).max(32768),
+      // Display-only provenance supplied by a client, never an authority identity.
+      sender: z
+        .object({ id: z.string().min(1).max(256), title: z.string().max(256) })
+        .strict()
+        .optional(),
       observed_seq: SeqSchema,
       expected_target: ExpectedExecutionTargetSchema.optional(),
       script: z
@@ -306,6 +318,7 @@ export const MethodSchemas = {
       action_digest: z.string().length(64),
       choice: z.enum(['allow', 'deny']),
       value: z.string().max(32768).optional(),
+      answers: QuestionnaireAnswersSchema.optional(),
     })
     .strict(),
   'stream.read': z

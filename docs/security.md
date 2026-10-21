@@ -8,6 +8,13 @@ The plugin pairing UI is not yet released. See [remote access](remote-access.md)
 
 ## Local admission and authority
 
+The optional [Obsidian tool bridge](obsidian-tools.md) reuses authenticated owner
+authority and the ordinary off/ask/auto policy. It adds no folder or delegation
+grants. Schemas and revision snapshots come from the plugin; the node binds
+invocations to a trusted session/run and one vault. Only a committed first claim
+authorizes execution. Reconnects reconcile the original executor's durable receipt,
+and never authorize a blind repeat of an uncertain mutation.
+
 The native local-token listener binds only `127.0.0.1`. Admission accepts the exact listener's
 `127.0.0.1:PORT` Host and loopback peer, with either no Origin (native clients) or
 `app://obsidian.md` (desktop Obsidian). Other browser origins, URL queries and

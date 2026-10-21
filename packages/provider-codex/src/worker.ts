@@ -6,7 +6,8 @@ import type {
   TurnContext,
   ProcessProbe,
 } from '@abele/provider-contract'
-import { RpcPeer } from './rpc.js'
+import { RpcPeer, ServerRequestRejected } from './rpc.js'
+import { CodexTools } from './tools.js'
 import { CodexEventMapper, opaqueId } from './mapper.js'
 import { CodexApprovalBridge } from './approval.js'
 import { launchOverrides, policyFingerprint, type PolicyPaths } from './policy.js'
@@ -49,6 +50,10 @@ export async function startCodexTurn(
     resolveTerminal = r
   })
   let peer!: RpcPeer, bridge!: CodexApprovalBridge
+  const tools = new CodexTools(sink.debugger, () => ({
+    thread: mapper.threadId,
+    turn: mapper.turnId,
+  }))
   const scope = createProcessScope(paths.state, turn.run_id)
   sink.ipc?.(scope.directory)
   peer = await RpcPeer.start({
@@ -64,8 +69,18 @@ export async function startCodexTurn(
       mapper.notification(msg)
       if (mapper.result) resolveTerminal()
     },
-    serverRequest: (msg, signal) =>
-      bridge.handle(msg, AbortSignal.any([signal, localAbort.signal])),
+    serverRequest: async (msg, signal) => {
+      const combined = AbortSignal.any([signal, localAbort.signal])
+      if (msg.method !== 'item/tool/call') return bridge.handle(msg, combined)
+      const resume = msg.params?.tool?.startsWith('obsidian_') ? timer.pause() : () => {}
+      try {
+        return await tools.handle(msg.params, combined)
+      } catch {
+        throw new ServerRequestRejected(-32602, 'invalid_tool_call')
+      } finally {
+        resume()
+      }
+    },
   })
   let reason: string | undefined,
     settled = false,
@@ -178,6 +193,7 @@ export async function startCodexTurn(
         model,
         native_session_id: turn.native_session_id,
         binding: turn.native_binding,
+        tools: sink.debugger?.tools,
       })
       const { params, inspect } = native
       mapper.bind(native.thread_id)

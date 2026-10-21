@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-import { retainServiceArguments } from './service-arguments.js'
+import {
+  retainServiceArguments,
+  validateServiceFlags,
+  serviceFlagLimits,
+} from './service-arguments.js'
 import './warnings.js'
 import { DatabaseSync } from 'node:sqlite'
 import { humanOutput, humanError, errorMessage } from './output.js'
@@ -49,6 +53,7 @@ import {
   changeService,
   installedService,
   serviceStatus,
+  showServiceFlags,
   installationMode,
   stageServiceCandidate,
   recoverServiceTransition,
@@ -76,6 +81,30 @@ async function main() {
   if (help) {
     console.log(help)
     return
+  }
+  const serviceFlags: Record<string, string> = {}
+  if (args[0] === 'service' && args[1] === 'flags' && args[2] === 'set') {
+    const globals = new Set([
+      '--state-dir',
+      '--runtime-dir',
+      '--claude-path',
+      '--tailscale-path',
+      '--no-codex',
+    ])
+    for (const arg of args.slice(3))
+      if (arg.startsWith('--') && !(arg in serviceFlagLimits) && !globals.has(arg))
+        throw new Error('Unsupported service flag: ' + arg)
+    // Capture before the ordinary start options consume these same names.
+    for (let i = 3; i < args.length; i++) {
+      const flag = args[i]!
+      if (!(flag in serviceFlagLimits)) continue
+      if (flag in serviceFlags) throw new Error('Duplicate service flag: ' + flag)
+      serviceFlags[flag] = args[i + 1] ?? ''
+      args.splice(i--, 2)
+    }
+    if (!Object.keys(serviceFlags).length)
+      throw new Error('Supply at least one service flag; see abele-node service --help.')
+    validateServiceFlags(serviceFlags)
   }
   function option(name: string, fallback: string, repeatable = false) {
     const i = args.indexOf(name)
@@ -408,6 +437,20 @@ async function main() {
       return
     }
     case 'service': {
+      if (args[1] === 'flags') {
+        if (args.length !== 3 || !['show', 'set'].includes(args[2]!))
+          throw new Error(
+            'Usage: abele-node service flags show|set [--pi-max-tokens N] [--permission-ttl-ms N] [--pi-deadline-ms N] [--json]'
+          )
+        if (args[2] === 'show') {
+          const flags = showServiceFlags(runtimeRoot, state)
+          console.log(json ? JSON.stringify({ flags }) : flags.join('\n'))
+        } else
+          output(
+            await changeService(runtimeRoot, state, 'enable', undefined, undefined, serviceFlags)
+          )
+        return
+      }
       if (args[1] === 'debugger') {
         if (args.length !== 3 || !['on', 'off', 'adopt'].includes(args[2]!))
           throw new Error('Usage: abele-node service debugger on|off|adopt [--json]')
@@ -582,6 +625,7 @@ async function main() {
       const report = {
         running: !!running,
         mode: installationMode(runtimeRoot, state),
+        service: serviceStatus(runtimeRoot, state),
         ...publicRuntime,
         state_dir: state,
         claude: running?.claude ?? new ClaudeProviderAdapter(claudeOptions).capabilities(),
@@ -646,6 +690,7 @@ async function main() {
         running: !!running,
         runtime: running?.runtime ?? null,
         launch_agent: existsSync(join(homedir(), 'Library/LaunchAgents', label + '.plist')),
+        service: serviceStatus(runtimeRoot, state),
         profile: 'local-token-v1 (loopback only)',
         paired: running?.paired ?? loadPairedConfig(true) ?? null,
         tailscale: await tailscale.doctor(

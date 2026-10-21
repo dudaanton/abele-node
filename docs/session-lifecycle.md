@@ -17,6 +17,9 @@ supported entries are also listed in `supported_capabilities`. In particular:
   `delegation.send`, and `review.submit` (implemented in 0.4.2).
 - `session.rename`: journaled display-title changes.
 - `session.delete`: journaled idle-chat deletion.
+- `obsidian.tools.v1`: ordinary Obsidian tool schemas, durable exact approvals,
+  same-vault executor selection and invocation reconciliation. See the
+  [Obsidian tools contract](obsidian-tools.md) for request shapes and plugin duties.
 
 Do not infer feature support from the release version. Discover the capability
 name before enabling a feature. Readers accept discovery fields as optional for

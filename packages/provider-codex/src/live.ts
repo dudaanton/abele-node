@@ -6,7 +6,8 @@ import type {
   LiveSessionSink,
   ProcessProbe,
 } from '@abele/provider-contract'
-import { RpcPeer, type RpcMessage } from './rpc.js'
+import { RpcPeer, ServerRequestRejected, type RpcMessage } from './rpc.js'
+import { CodexTools } from './tools.js'
 import { CodexEventMapper, opaqueId } from './mapper.js'
 import { CodexApprovalBridge } from './approval.js'
 import { launchOverrides, policyFingerprint, type PolicyPaths } from './policy.js'
@@ -83,6 +84,7 @@ export async function startCodexLiveSession(
     item: (id: string) => turn?.mapper.item(id),
   }
   let bridge!: CodexApprovalBridge
+  const tools = new CodexTools(sink.debugger, () => ({ thread, turn: turn?.id }))
   const peer = await RpcPeer.start({
     marker: scope.marker,
     executable: options.executable,
@@ -94,8 +96,14 @@ export async function startCodexLiveSession(
     processes: (p) => sink.processes(p),
     probe: options.probe,
     notification: (msg) => notification(msg),
-    serverRequest: (msg, signal) =>
-      bridge.handle(msg, turn ? AbortSignal.any([signal, turn.abort.signal]) : AbortSignal.abort()),
+    serverRequest: (msg, signal) => {
+      const activeSignal = turn ? AbortSignal.any([signal, turn.abort.signal]) : AbortSignal.abort()
+      return msg.method === 'item/tool/call'
+        ? tools.handle(msg.params, activeSignal).catch(() => {
+            throw new ServerRequestRejected(-32602, 'invalid_tool_call')
+          })
+        : bridge.handle(msg, activeSignal)
+    },
   })
   const request = (method: string, params?: unknown) => peer.request(method, params)
   bridge = new CodexApprovalBridge({
@@ -305,6 +313,7 @@ export async function startCodexLiveSession(
       model,
       native_session_id: context.native_session_id,
       binding: context.native_binding,
+      tools: sink.debugger?.tools,
     })
     await opened.inspect()
     // The node commits the exact binding before any input is written.

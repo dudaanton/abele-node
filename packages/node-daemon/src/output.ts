@@ -133,6 +133,7 @@ export function humanOutput(
         ...(r.problem ? [`Configuration problem: ${line(r.problem)}`] : []),
         `Debugger: ${r.debugger_enabled ? 'on' : 'off'}`,
         ...(r.enabled ? [`Ownership: ${shown(r.ownership)}`] : []),
+        ...(r.enabled && r.ownership_help ? [line(r.ownership_help)] : []),
         pairedListener(r.paired_listener),
         ...(!r.enabled ? ['Start in a terminal: abele-node start'] : []),
       ].join('\n')
@@ -140,6 +141,11 @@ export function humanOutput(
       return [
         `AbeleNode: ${r.running ? 'running' : 'not running'}`,
         ...(r.mode ? [`Mode: ${r.mode === 'service' ? 'background service' : 'foreground'}`] : []),
+        ...(record(r.service).enabled
+          ? [
+              `Service ownership: ${shown(record(r.service).ownership)}. ${shown(record(r.service).ownership_help)}`,
+            ]
+          : []),
         `Version: ${shown(r.version ?? record(r.runtime).version)}`,
         `Port: ${shown(r.port)}`,
         `Node ID: ${r.node_id == null ? 'not created' : line(r.node_id)}`,
@@ -180,7 +186,9 @@ export function humanOutput(
           'run abele-node start or start the installed service'
         ),
         // A foreground daemon does not require a LaunchAgent.
-        `OK Service: ${r.launch_agent ? 'LaunchAgent installed' : 'no LaunchAgent; use foreground start or your service manager'}`,
+        record(r.service).enabled
+          ? `${record(r.service).ownership === 'recorded' ? 'OK' : 'PROBLEM'} Service ownership: ${shown(record(r.service).ownership)}. ${shown(record(r.service).ownership_help)}`
+          : `OK Service: ${r.launch_agent ? 'LaunchAgent installed' : 'no LaunchAgent; use foreground start or your service manager'}`,
         ...['Claude', 'pi', ...(r.codex ? ['Codex'] : [])].map((name) => {
           const p = record(r[name.toLowerCase()])
           return `${p.available === true ? 'OK' : 'PROBLEM'} ${provider(name, p)}`

@@ -74,12 +74,14 @@ codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABEL
 paired_config='' paired_change=''
 claude_change= codex_change= codex_model_change= codex_home_change= codex_enabled_change=
 debugger_enabled='' old_debugger_enabled=false debugger_change=''
+service_flags='{}'
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action|--paired-config)
+    --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action|--paired-config|--service-flags)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then fail "$1 requires a value"; fi
       case "$2" in --*) fail "$1 requires a value" ;; esac
       case "$1" in
+        --service-flags) service_flags=$2 ;;
         --version) version=${2#v} ;; --prefix) prefix=$2 ;; --state-dir) state=$2 ;;
         --claude-path) claude=$2; claude_change=set ;; --confirm-purge-state) confirmation=$2 ;; --service-action) service_action=$2 ;;
         --codex-path) codex=$2; codex_change=set ;; --codex-model) codex_model=$2; codex_model_change=set ;; --codex-home) codex_home=$2; codex_home_change=set ;;
@@ -119,6 +121,12 @@ if [ "$os" = darwin ]; then
 fi
 # Resolve the executable now: services do not read shell startup files.
 node=$("$node" -p 'process.execPath')
+"$node" - "$service_flags" <<'NODE' || fail 'Invalid service flags; supported values are positive integers: --permission-ttl-ms (up to 3600000), --pi-deadline-ms, --pi-max-tokens.'
+const flags=JSON.parse(process.argv[2]);
+if(!flags || typeof flags!=='object' || Array.isArray(flags))process.exit(1);
+for(const [k,v] of Object.entries(flags))if(!['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens'].includes(k)||typeof v!=='string'||!/^\d+$/.test(v)||!Number.isSafeInteger(Number(v))||Number(v)<1||(k==='--permission-ttl-ms'&&Number(v)>3600000))process.exit(1);
+NODE
+[ "$service_flags" = '{}' ] || { [ "$service_action" != disable ] && [ "$service_action" != adopt-debugger ] && [ "$uninstall" = 0 ]; } || fail 'Service flags apply only to installation or service enable.'
 if [ -n "$service_action" ] && [ "$service_action" != adopt-debugger ]; then
   "$node" - "$$" <<'NODE' || fail 'Service transitions require an isolated process group; use abele-node service enable/disable.'
 const {spawnSync}=require('node:child_process');const pid=process.argv[2],r=spawnSync('/bin/ps',['-o','pgid=','-p',pid],{encoding:'utf8',timeout:1000});if(r.status!==0||r.stdout.trim()!==pid)process.exit(1);
@@ -306,6 +314,7 @@ if [ -n "$service_action" ]; then
 fi
 [ "$old_service" != 1 ] || [ "$service" = 1 ] || [ "$uninstall" = 1 ] || [ "$service_action" = disable ] || fail 'Existing install uses a service; omit --no-service for upgrades.'
 case "$old_service" in 0|1) ;; *) fail 'Invalid service ownership configuration.' ;; esac
+[ "$service_flags" = '{}' ] || [ "$old_service" = 1 ] || fail 'Service flags require an installed service; run abele-node service enable first.'
 if [ "$os" = darwin ]; then service_file=$plist; other_service_file=$unit
 else service_file=$unit; other_service_file=$plist; fi
 file_digest() { "$node" -e 'console.log(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"; }
@@ -326,25 +335,68 @@ NODE
 # A runtime install is not proof of service ownership. Check before any stop/write,
 # including uninstall and a foreground-to-service transition.
 if [ "$old_service" = 1 ]; then
-  if [ ! -f "$service_file" ] || [ -L "$service_file" ]; then fail 'Service ownership missing or modified; inspect the service before reinstalling.'; fi
+  if [ ! -f "$service_file" ] || [ -L "$service_file" ]; then fail 'Service ownership missing or modified; restore the original regular service file before retrying, then use abele-node service flags set.'; fi
   owned_file=$(get_config service_file)
   owned_digest=$(get_config service_sha256)
+  original_service_text=$(get_config service_text)
   actual_file=$(physical_path "$service_file") || fail 'Cannot resolve service ownership path.'
   actual_digest=$(file_digest "$service_file") || fail 'Cannot read service ownership file.'
   owned_matches=$(path_relation same "$owned_file" "$actual_file") || fail 'Cannot compare service ownership paths.'
-  if [ "$owned_matches" != true ]; then fail 'Service ownership missing or modified; refusing to stop or overwrite it.'; fi
+  if [ "$owned_matches" != true ]; then fail 'Service ownership missing or modified; restore the recorded service location before retrying, then use abele-node service flags set.'; fi
   if [ "$owned_digest" != "$actual_digest" ]; then
-    [ "$service_action" = adopt-debugger ] || fail 'Service ownership missing or modified; refusing to stop or overwrite it.'
-    "$node" - "$service_file" "$os" "$owned_digest" <<'NODE' || fail 'Service differs by more than one --debugger argument; refusing adoption.'
-const fs=require('node:fs'),crypto=require('node:crypto');const [file,os,digest]=process.argv.slice(2),text=fs.readFileSync(file,'utf8');
+    "$node" - "$service_file" "$os" "$owned_digest" "$config" "$service_action" <<'NODE' || fail 'Service ownership modified; restore the original service file (and remove systemd drop-ins), then use abele-node service flags set. Nothing was stopped.'
+const fs=require('node:fs'),crypto=require('node:crypto');const [file,os,digest,config,action]=process.argv.slice(2),text=fs.readFileSync(file,'utf8');
 const region=os==='darwin'?/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/:/^ExecStart=(.*)$/m;
 const match=text.match(region);if(!match)throw new Error('missing_arguments');
+const hash=s=>crypto.createHash('sha256').update(s).digest('hex');
+const baseline=JSON.parse(fs.readFileSync(config,'utf8')).service_text;
+const numeric=new Set(['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens']);
+const values=new Set([...numeric,'--port','--worktree-root','--paired-config','--tailscale-path','--node-name','--claude-path','--claude-profile','--claude-budget','--claude-deadline-ms','--claude-session-model','--claude-session-effort','--claude-session-permission-mode','--claude-session-permission-ttl-ms','--claude-account','--claude-idle-ms','--claude-max-live','--claude-detached-ms','--codex-path','--codex-model','--codex-home','--pi-provider','--pi-model','--pi-agent-dir','--pi-profile']);
+const switches=new Set(['--debugger','--no-claude-live','--no-pi-live','--claude-allow-bypass','--codex','--no-codex','--no-paired-config','--tailnet-policy-verified']);
+function strip(s){
+ const m=s.match(region);if(!m || [...s.matchAll(new RegExp(region.source,'gm'))].length!==1)throw new Error('ambiguous_arguments');
+ const token=os==='darwin'?/<string>([\s\S]*?)<\/string>/g:/"((?:\\.|[^"\\])*)"/g;
+ if(m[1].replace(token,'').trim())throw new Error('unsupported_arguments');
+ const args=[...m[1].matchAll(token)].map(m=>m[1]), kept=[];
+ for(let i=0;i<args.length;i++){
+  if(i>=3 && values.has(args[i])){const flag=args[i],v=args[++i];if(!v||v.startsWith('--')||/[\x00-\x1f\x7f]/.test(v)||(numeric.has(flag)&&(!/^\d+$/.test(v)||Number(v)<1||!Number.isSafeInteger(Number(v))||(flag==='--permission-ttl-ms'&&Number(v)>3600000))))throw new Error('invalid_flag');}
+  else if(i<3 || !switches.has(args[i]))kept.push(args[i]);
+ }
+ return JSON.stringify([s.replace(region,'ARGUMENTS'),kept]);
+}
+if(action!=='adopt-debugger' && typeof baseline==='string' && hash(baseline)===digest){
+ if(strip(text)!==strip(baseline))throw new Error('other_service_edits');
+ process.exit(0);
+}
+// Legacy hashes can prove added flags by removing their exact serialized tokens.
+// No guessed baseline is trusted unless its complete SHA-256 matches the record.
+if(action!=='adopt-debugger'){
+ strip(text);
+ let candidates=[text];
+ for(const flag of [...numeric,'--debugger']){
+  const escaped=flag.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const token=os==='darwin'?new RegExp('<string>'+escaped+'</string>'+(numeric.has(flag)?'\\s*<string>[1-9]\\d*</string>':''),'g'):new RegExp(' "'+escaped+'"'+(numeric.has(flag)?' "[1-9]\\d*"':''),'g');
+  const defaults={'--permission-ttl-ms':'60000','--pi-deadline-ms':'1800000','--pi-max-tokens':'32768'};
+  candidates=candidates.flatMap(s=>[s,s.replace(token,''),...(numeric.has(flag)?[s.replace(token,whole=>whole.replace(/([1-9]\d*)(?=<\/string>$|"$)/,defaults[flag]))]:[])]);
+ }
+ for(let candidate of candidates){
+  for(let count=0;count<64;count++){
+   if(hash(candidate)===digest)process.exit(0);
+   const m=candidate.match(region), token=os==='darwin'?/<string>([\s\S]*?)<\/string>/g:/"((?:\\.|[^"\\])*)"/g;
+   const tokens=[...m[1].matchAll(token)],last=tokens.at(-1),before=tokens.at(-2);
+   const first=last&&switches.has(last[1])?last:before&&values.has(before[1])?before:null;
+   if(!first || tokens.indexOf(first)<3)break;
+   const start=first.index-(os==='linux'&&m[1][first.index-1]===' '?1:0),end=last.index+last[0].length;
+   candidate=candidate.replace(region,whole=>whole.replace(m[1],m[1].slice(0,start)+m[1].slice(end)));
+  }
+ }
+}
 const token=os==='darwin'?/<string>--debugger<\/string>/g:/ "--debugger"/g;
 if([...match[1].matchAll(token)].length!==1)throw new Error('ambiguous_debugger');
 const candidate=text.replace(region,whole=>whole.replace(token,''));
 if(crypto.createHash('sha256').update(candidate).digest('hex')!==digest)throw new Error('other_service_edits');
 NODE
-    debugger_enabled=true
+    debugger_enabled=$("$node" -e 'const s=require("node:fs").readFileSync(process.argv[1],"utf8");console.log(/<string>--debugger<\/string>| "--debugger"(?: |$)/m.test(s))' "$service_file")
   fi
   service_file=$actual_file
   # The authenticated service file, not a possibly retargeted caller alias,
@@ -379,7 +431,7 @@ if [ "$service_action" = adopt-debugger ]; then
 const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
 const [file,service,actual,previous,enabled,temp]=process.argv.slice(2),c=JSON.parse(fs.readFileSync(file,'utf8'));
 if(c.service_sha256!==previous || fs.lstatSync(service).isSymbolicLink() || fs.realpathSync(service)!==service || crypto.createHash('sha256').update(fs.readFileSync(service)).digest('hex')!==actual)throw new Error('ownership_changed');
-c.service_sha256=actual;c.debugger_enabled=enabled==='true';
+c.service_sha256=actual;c.service_text=fs.readFileSync(service,'utf8');c.debugger_enabled=enabled==='true';
 fs.writeFileSync(temp,JSON.stringify(c)+'\n',{mode:0o600});
 const fd=fs.openSync(temp,'r');try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}
 fs.renameSync(temp,file);const dir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(dir)}finally{fs.closeSync(dir)}
@@ -508,7 +560,7 @@ for(const root of roots){
   if(!path.isAbsolute(root))throw new Error('non_absolute_unit_search_path');
   for(const name of ['service.d','abele-.service.d','abele-node.service.d']){
     const dir=path.join(root,name);
-    try{if(fs.readdirSync(dir).some(entry=>entry.endsWith('.conf')))throw new Error('unmanaged systemd drop-in overrides')}
+    try{if(fs.readdirSync(dir).some(entry=>entry.endsWith('.conf')))throw new Error('unmanaged systemd drop-in overrides; remove the drop-ins and retry, then use abele-node service flags set')}
     catch(e){if(e.code!=='ENOENT')throw e;
       try{fs.lstatSync(dir);throw new Error('unreadable systemd drop-in directory')}catch(s){if(s.code!=='ENOENT')throw s}
     }
@@ -523,7 +575,7 @@ check_manager_dropins() {
 }
 check_effective_unit() {
   loaded_dropins=$(systemctl --user show abele-node.service --property=DropInPaths --value) || return 1
-  if [ -n "$loaded_dropins" ]; then printf '%s\n' 'Unmanaged systemd drop-in overrides are loaded.' >&2; return 1; fi
+  if [ -n "$loaded_dropins" ]; then printf '%s\n' 'Unmanaged systemd drop-in overrides are loaded; remove the drop-ins and retry, then use abele-node service flags set.' >&2; return 1; fi
   fragment=$(systemctl --user show abele-node.service --property=FragmentPath --value) || return 1
   if [ "$1" = 0 ]; then
     if [ -n "$fragment" ]; then printf '%s\n' 'Unmanaged systemd fragment is already loaded.' >&2; return 1; fi
@@ -550,11 +602,11 @@ NODE
 if [ "$service" = 1 ] && [ "$old_service" = 0 ]; then assert_foreground_stopped; fi
 if [ "$service" = 1 ] || [ "$old_service" = 1 ]; then
   if [ "$os" = linux ]; then
-    check_dropins || fail 'Unmanaged systemd drop-in overrides; refusing to stop or overwrite the service.'
+    check_dropins || fail 'Unmanaged systemd drop-in overrides; remove the drop-ins and retry, then use abele-node service flags set.'
     command -v systemctl >/dev/null 2>&1 || fail 'systemctl --user unavailable; use --no-service.'
     systemctl --user show-environment >/dev/null 2>&1 || fail 'No systemd user manager; use --no-service and start manually.'
-    check_manager_dropins || fail 'Cannot exclude unloaded systemd drop-in overrides before stopping anything.'
-    check_effective_unit "$old_service" || fail 'Cannot confirm systemd service ownership before stopping anything.'
+    check_manager_dropins || fail 'Cannot exclude unloaded systemd drop-in overrides; remove overrides and retry (busctl is required). Nothing was stopped.'
+    check_effective_unit "$old_service" || fail 'Cannot confirm systemd service ownership; restore the original unit and remove drop-ins before retrying. Nothing was stopped.'
   fi
 fi
 work=''
@@ -612,8 +664,8 @@ switch_to() {
   "$node" -e 'require("node:fs").renameSync(process.argv[1],process.argv[2])' "$work/current" "$root/current"
 }
 mac_manager_inspect() {
-  "$node" - "$service_file" "gui/$(id -u)/dev.abele.node" "$1" <<'NODE'
-const fs=require('node:fs'),cp=require('node:child_process');const [file,job,absent]=process.argv.slice(2);
+  "$node" - "$service_file" "gui/$(id -u)/dev.abele.node" "$1" "${owned_digest:-}" "${actual_digest:-}" "${original_service_text:-}" <<'NODE'
+const fs=require('node:fs'),cp=require('node:child_process');const [file,job,absent,owned,actual,original]=process.argv.slice(2);
 const deadline=performance.now()+20000;let result,delay=50;
 for(;;){
 result=cp.spawnSync('/bin/launchctl',['print',job],{encoding:'utf8',timeout:1000});
@@ -628,7 +680,12 @@ const array=fs.readFileSync(file,'utf8').match(/<key>ProgramArguments<\/key>\s*<
 const expected=[...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m=>m[1].replaceAll('&quot;','"').replaceAll('&apos;',"'").replaceAll('&gt;','>').replaceAll('&lt;','<').replaceAll('&amp;','&'));
 const body=result.stdout.match(/\n[ \t]*arguments = \{\r?\n([\s\S]*?)\r?\n[ \t]*\}/)?.[1];if(!body)throw new Error('unknown_loaded_launch_arguments');
 const lines=body.split(/\r?\n/),indent=lines[0].match(/^[ \t]+/)?.[0];
-if(!indent || lines.some(line=>!line.startsWith(indent)) || JSON.stringify(lines.map(line=>line.slice(indent.length)))!==JSON.stringify(expected))throw new Error('loaded_launch_arguments_mismatch');
+// An admitted argument edit may still have the original arguments loaded.
+const loaded=lines.map(line=>line.slice(indent?.length||0));
+const stable=args=>owned===actual || original?args:args.filter((a,i)=>i<3||(!['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens','--debugger'].includes(a)&&!['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens'].includes(args[i-1])));
+const originalArray=original.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];
+const prior=originalArray?[...originalArray.matchAll(/<string>([\s\S]*?)<\/string>/g)].map(m=>m[1].replaceAll('&quot;','"').replaceAll('&apos;',"'").replaceAll('&gt;','>').replaceAll('&lt;','<').replaceAll('&amp;','&')):null;
+if(!indent || lines.some(line=>!line.startsWith(indent)) || (JSON.stringify(stable(loaded))!==JSON.stringify(stable(expected)) && !(owned!==actual && prior && JSON.stringify(loaded)===JSON.stringify(prior))))throw new Error('loaded_launch_arguments_mismatch');
 if(absent==='2')console.log('1');
 NODE
 }
@@ -728,6 +785,7 @@ start_service() {
   prepare_state || return 1
   previous_service=
   service_overrides=$("$node" -e 'const a=process.argv.slice(1),o={};for(let i=0;i<a.length;i+=3)if(a[i])o[a[i+1]]=a[i+2];if(o["--debugger"]!==undefined)o["--debugger"]=o["--debugger"]==="true";if(o["--no-codex"]!==undefined)o["--no-codex"]=o["--no-codex"]==="false";if(o["--paired-config"]==="")o["--paired-config"]=false;console.log(JSON.stringify(o))' "$paired_change" --paired-config "$paired_config" "$debugger_change" --debugger "$debugger_enabled" "$claude_change" --claude-path "$claude" "$codex_change" --codex-path "$codex" "$codex_model_change" --codex-model "$codex_model" "$codex_home_change" --codex-home "$codex_home" "$codex_enabled_change" --no-codex "$codex_enabled") || return 1
+  service_overrides=$("$node" -e 'console.log(JSON.stringify({...JSON.parse(process.argv[1]),...JSON.parse(process.argv[2])}))' "$service_overrides" "$service_flags") || return 1
   if [ "$old_service" = 1 ]; then previous_service="$backup/previous-service"; fi
   if [ "$os" = darwin ]; then
     # Treat install as a possibly partial write+bootstrap. The caller journals
@@ -985,6 +1043,20 @@ trap 'exit 1' HUP INT TERM
 work=$(mktemp -d "$root/.download.XXXXXX") || fail 'Cannot create installer scratch directory.'
 journal=$work/actions.jsonl
 : > "$journal"
+if [ "$old_service" = 1 ] && [ "$owned_digest" != "$actual_digest" ]; then
+  # Admission above proved the edit; publish it under the mutation lock before
+  # snapshotting, so rollback restores a service/config pair with matching hashes.
+  preflight_stop || fail 'Cannot confirm ownership before argument adoption; restore the original service and remove manager overrides.'
+  "$node" - "$config" "$service_file" "$owned_digest" "$actual_digest" "$work/adopt-config" <<'NODE' || fail 'Service changed during argument adoption; nothing was stopped.'
+const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
+const [config,file,previous,actual,temp]=process.argv.slice(2),c=JSON.parse(fs.readFileSync(config,'utf8')),text=fs.readFileSync(file,'utf8');
+if(c.service_sha256!==previous||fs.lstatSync(file).isSymbolicLink()||fs.realpathSync(file)!==file||crypto.createHash('sha256').update(text).digest('hex')!==actual)throw new Error('ownership_changed');
+c.service_sha256=actual;c.service_text=text;c.debugger_enabled=/<string>--debugger<\/string>| "--debugger"(?: |$)/m.test(text);
+fs.writeFileSync(temp,JSON.stringify(c)+'\n',{mode:0o600});
+const fd=fs.openSync(temp,'r');try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}
+fs.renameSync(temp,config);const dir=fs.openSync(path.dirname(config),'r');try{fs.fsyncSync(dir)}finally{fs.closeSync(dir)}
+NODE
+fi
 if [ "$old_service" = 1 ]; then
   # The backup and restore candidate must live on the service file's volume,
   # not the arbitrary runtime prefix. Keep the original until recovery succeeds.
@@ -1045,7 +1117,7 @@ if [ -n "$service_action" ]; then
     printf '%s\n' 'Service already disabled; foreground mode.'
     exit 0
   fi
-  if [ "$service_action" = enable ] && [ "$old_service" = 1 ] && [ "$debugger_enabled" = "$old_debugger_enabled" ] && [ "$paired_config" = "$old_paired_config" ] && check_health "$old" 1; then
+  if [ "$service_flags" = '{}' ] && [ "$service_action" = enable ] && [ "$old_service" = 1 ] && [ "$debugger_enabled" = "$old_debugger_enabled" ] && [ "$paired_config" = "$old_paired_config" ] && check_health "$old" 1; then
     printf '%s\n' 'Service already enabled and running.'
     exit 0
   fi
@@ -1147,7 +1219,7 @@ if(!stateStat.isDirectory() || state_identity!==expectedIdentity || fs.realpathS
 const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
-const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex')}:{};
+const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex'),service_text:fs.readFileSync(serviceFile,'utf8')}:{};
 fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,debugger_enabled:debuggerEnabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
 if(process.env.ABELE_SERVICE_TRANSITION){const path=require('node:path'),dir=process.env.ABELE_SERVICE_TRANSITION;for(const [name,file] of [['wrapper',wrapper],['config',config]]){const stage=path.join(dir,'next-'+name);fs.copyFileSync(file,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}const fd=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}
 NODE

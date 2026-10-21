@@ -453,8 +453,11 @@ export class PiProviderAdapter {
           const call = new AbortController()
           debuggerCalls.set(m.id, call)
           const signal = AbortSignal.any([abort.signal, call.signal])
+          const resumeDeadline = m.name.startsWith('obsidian_') ? timer.pause() : () => {}
           try {
-            const result = await sink.debugger.call(m.name, m.args, signal)
+            const result = await (m.name.startsWith('obsidian_')
+              ? sink.debugger.call(m.name, m.args, signal, 'pi:' + m.id)
+              : sink.debugger.call(m.name, m.args, signal))
             if (!signal.aborted)
               send({
                 kind: 'debugger_result',
@@ -465,6 +468,7 @@ export class PiProviderAdapter {
             if (!signal.aborted)
               send({ kind: 'debugger_result', id: m.id, result: nodeToolFailure(m.name, error) })
           } finally {
+            resumeDeadline()
             debuggerCalls.delete(m.id)
           }
         } else if (m.kind === 'debugger_cancel') {

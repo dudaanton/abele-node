@@ -15,6 +15,7 @@ import {
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
+import { humanOutput } from '../packages/node-daemon/src/output.js'
 
 const cli = resolve('packages/node-daemon/dist/cli.js')
 const dirs: string[] = []
@@ -83,6 +84,70 @@ function fixture() {
     configFile,
   }
 }
+
+it.each(['status', 'service'])('%s explains that no service is installed', (command) => {
+  const f = fixture()
+  const result = run(
+    f.entry,
+    f.state,
+    command,
+    ...(command === 'service' ? ['status'] : []),
+    '--json'
+  )
+  expect(result.status, result.stderr).toBe(0)
+  const report = JSON.parse(result.stdout)
+  const service = command === 'status' ? report.service : report
+  expect(service.ownership).toBe('none')
+  expect(service.ownership_help).toBe('No installed service; run abele-node service enable first.')
+})
+
+it('sets service flags through the installer and rejects invalid values before mutation', () => {
+  const f = fixture()
+  writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1 }))
+  const bad = run(f.entry, f.state, 'service', 'flags', 'set', '--permission-ttl-ms', '0')
+  expect(bad.status).not.toBe(0)
+  const result = run(f.entry, f.state, 'service', 'flags', 'set', '--pi-max-tokens', '12345')
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).not.toMatch(/^\s*\{/)
+  const calls = readFileSync(join(f.home, 'installer-args'), 'utf8').trim().split('\n')
+  expect(calls).toHaveLength(1)
+  expect(JSON.parse(calls[0]!)).toContain('{"--pi-max-tokens":"12345"}')
+})
+
+it('shows service arguments as plain text by default and JSON only on request', () => {
+  const f = fixture(),
+    file = join(f.home, 'service.plist')
+  const args = ['/node', '/runtime/cli.js', 'start', '--pi-max-tokens', '32768']
+  writeFileSync(
+    file,
+    process.platform === 'darwin'
+      ? '<key>ProgramArguments</key><array>' +
+          args.map((a) => `<string>${a}</string>`).join('') +
+          '</array>'
+      : 'ExecStart=' + args.map((a) => JSON.stringify(a)).join(' ')
+  )
+  writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1, service_file: file }))
+  const plain = run(f.entry, f.state, 'service', 'flags', 'show')
+  expect(plain.status, plain.stderr).toBe(0)
+  expect(plain.stdout).toBe('--pi-max-tokens\n32768\n')
+  const json = run(f.entry, f.state, 'service', 'flags', 'show', '--json')
+  expect(JSON.parse(json.stdout)).toEqual({ flags: ['--pi-max-tokens', '32768'] })
+})
+
+it.each(['status', 'doctor', 'service'])(
+  '%s explains modified service ownership in human text',
+  (command) => {
+    const service = {
+      enabled: true,
+      ownership: 'modified',
+      ownership_help: 'Restore the original service and use abele-node service flags set.',
+    }
+    const text = humanOutput([command], command === 'service' ? service : { service })
+    expect(text).toContain('modified')
+    expect(text).toContain('abele-node service flags set')
+    expect(text).not.toMatch(/^\s*\{/)
+  }
+)
 
 it.each([
   ['--help'],

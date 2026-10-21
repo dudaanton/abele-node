@@ -1,5 +1,6 @@
 export { recoverProviderLauncher } from './launcher.js'
 export { ActiveDeadline } from './deadline.js'
+export { ToolWaitDeadline } from './tool-deadline.js'
 
 export interface ProcessIdentity {
   pid: number
@@ -51,7 +52,7 @@ export interface DebuggerToolDefinition {
  * turn, never by queueing chat input. publish rechecks at actual IPC delivery. */
 export interface DebuggerToolBridge {
   readonly tools: DebuggerToolDefinition[]
-  call(name: string, args: unknown, signal?: AbortSignal): Promise<any>
+  call(name: string, args: unknown, signal?: AbortSignal, callId?: string): Promise<any>
   publish(args: unknown, result: any): any
   close(): void
 }

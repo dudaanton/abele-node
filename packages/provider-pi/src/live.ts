@@ -142,7 +142,9 @@ export async function startPiLiveSession(
     debuggerCalls.set(id, call)
     const signal = AbortSignal.any([abort.signal, call.signal])
     try {
-      const result = await sink.debugger.call(name, args, signal)
+      const result = await (name.startsWith('obsidian_')
+        ? sink.debugger.call(name, args, signal, 'pi:' + id)
+        : sink.debugger.call(name, args, signal))
       if (!signal.aborted)
         write({ kind: 'debugger_result', id, result: sink.debugger.publish(args, result) })
     } catch (error) {

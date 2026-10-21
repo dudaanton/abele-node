@@ -25,8 +25,8 @@ export const DebuggerToolSchema = z
     name: z
       .string()
       .max(128)
-      .regex(/^(?:lsp|(?:debug|node)_[a-z0-9_]+)$/),
-    description: z.string().max(4096),
+      .regex(/^(?:lsp|(?:debug|node)_[a-z0-9_]+|obsidian_[A-Za-z][A-Za-z0-9_]{0,63})$/),
+    description: z.string().max(16384),
     inputSchema: z.record(z.unknown()),
   })
   .strict()
@@ -80,7 +80,7 @@ export const ConfigurationSchema = z
     model: z.string().max(256),
     profile: z.enum(['inherited', 'isolated']),
     maxTokens: z.number().int().min(64).max(32768),
-    debugger_tools: z.array(DebuggerToolSchema).max(32).optional(),
+    debugger_tools: z.array(DebuggerToolSchema).max(320).optional(),
     live: z
       .object({ effort: z.string().max(32), permission_mode: z.string().max(64) })
       .strict()

@@ -35,6 +35,7 @@ import {
   NodeEventSchema,
   validateParams,
   type Prompt,
+  type QuestionnaireAnswer,
   type FakeStep,
   ProjectSchema,
   WorkspaceSchema,
@@ -95,6 +96,7 @@ export { sessionUpdatesOf, isKnownSessionUpdate, commandText } from '@abele/node
 export type { NodeConnection, ChannelConnector, RecordTransport } from '@abele/channel-protocol'
 export type {
   Prompt,
+  QuestionnaireAnswer,
   FakeStep,
   Project,
   Workspace,
@@ -732,7 +734,8 @@ export class NodeClient {
     observed_seq: number,
     script?: FakeStep[],
     expected_target?: ExpectedExecutionTarget,
-    retainedOperationId?: string
+    retainedOperationId?: string,
+    sender?: { id: string; title: string }
   ) {
     const operation_id = await this.enqueue(
       'session.send',
@@ -742,6 +745,7 @@ export class NodeClient {
         observed_seq,
         ...(script ? { script } : {}),
         ...(expected_target ? { expected_target } : {}),
+        ...(sender ? { sender } : {}),
       },
       retainedOperationId
     )
@@ -763,7 +767,35 @@ export class NodeClient {
     if (!Array.isArray(result)) throw new ChannelError('invalid_result')
     return result.map((r) => PromptSchema.parse(r))
   }
-  async answerPrompt(prompt: Prompt, choice: 'allow' | 'deny', value?: string) {
+  /** Reconnect scan for pending questionnaires across this vault's node sessions. */
+  async pendingQuestionnaires(vault_id: string, after_id?: string) {
+    const result = await this.request('obsidian.tools.v1.questions.pending', {
+      vault_id,
+      ...(after_id ? { after_id } : {}),
+    })
+    if (!Array.isArray(result)) throw new ChannelError('invalid_result')
+    return result.map((raw) => {
+      const prompt = PromptSchema.parse(raw)
+      if (prompt.kind !== 'questionnaire') throw new ChannelError('invalid_result')
+      return prompt
+    })
+  }
+  /** Answers (or cancels with null) the entire invocation-bound questionnaire once. */
+  async answerQuestionnaire(prompt: Prompt, answers: QuestionnaireAnswer[] | null) {
+    if (prompt.kind !== 'questionnaire') throw new ChannelError('invalid_params')
+    return this.answerPrompt(
+      prompt,
+      answers === null ? 'deny' : 'allow',
+      undefined,
+      answers ?? undefined
+    )
+  }
+  async answerPrompt(
+    prompt: Prompt,
+    choice: 'allow' | 'deny',
+    value?: string,
+    answers?: QuestionnaireAnswer[]
+  ) {
     if (!this.connected) throw new ChannelError('disconnected')
     const { session_id, prompt_id, run_id, revision, action_digest } = prompt
     const id = await this.enqueue('prompt.answer', {
@@ -774,6 +806,7 @@ export class NodeClient {
       action_digest,
       choice,
       ...(value !== undefined ? { value } : {}),
+      ...(answers !== undefined ? { answers } : {}),
     })
     await this.flush()
     const receipt = await this.operationResult(id)

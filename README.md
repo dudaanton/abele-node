@@ -39,6 +39,8 @@ through the node API; see [language servers](docs/lsp.md).
 - One transcript vocabulary for every agent, shaped after ACP `session/update` (messages,
   thoughts, tool calls with diffs, plan, mode, usage, compaction) and a per-session list of
   the agent's "/" commands. See [session updates](docs/session-updates.md).
+- Client chat letters carry display-only sender references, run in separate turns,
+  and journal reply mappings for other devices. See [the letters API](docs/session-letters.md).
 - Supervised pi SDK turns using the same queue, journal, approvals and native-file
   resume flow; per-feature capability gates and local model configuration apply.
 - Node-side delegation with owner-approved controller grants, isolated child workspaces,

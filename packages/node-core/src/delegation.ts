@@ -9,6 +9,7 @@ import {
   type ExpectedExecutionTarget,
   type Delegation,
   type WorkerReport,
+  type ObsidianToolsSnapshot,
 } from '@abele/node-protocol'
 import { canonical, type NodeCore } from './index.js'
 import type { DebuggerToolBridge } from '@abele/provider-contract'
@@ -483,6 +484,12 @@ export class DelegationService {
         !!reserved
       )
       const delegation_id = randomUUID()
+      this.core.obsidianTools.inheritInTransaction(
+        grant.parent_id,
+        child.session_id,
+        actor,
+        p.obsidian_tools as ObsidianToolsSnapshot | undefined
+      )
       const d = DelegationSchema.parse({
         node_id: this.core.node_id,
         session_id: child.session_id,

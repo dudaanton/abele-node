@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.39
+  sh -s -- --version 0.4.40
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -128,12 +128,38 @@ An existing manually installed service is not overwritten: stop/remove it first,
 keep its state, then use the installer with the same state/provider settings.
 The installer records the physical service-file path and a content fingerprint in
 its non-secret config. Every rerun, including uninstall and foreground-to-service
-conversion, refuses an unrecorded, missing or modified service file before it can
-stop or overwrite anything. Older installer service configurations without this
+conversion, refuses an unrecorded or missing service file before it can
+stop or overwrite anything. Argument-only edits to known daemon options are adopted
+and retained; executable paths, the state directory, extra service keys, unknown
+arguments and systemd drop-ins remain protected. Older installer service configurations without this
 ownership record are also refused. To move from such a deployment, explicitly stop
 the old service, preserve state, and remove the old service and installed
 runtime/config before doing a fresh install. Never discard the config of a running
 service; use the manual service path if you need to manage its configuration yourself.
+
+Manage service tuning without editing the plist or unit:
+
+```sh
+abele-node service flags show
+abele-node service flags set --permission-ttl-ms 3600000 --pi-deadline-ms 1800000 --pi-max-tokens 32768
+```
+
+`set` requires an enabled installer service, restarts it using the existing runtime,
+and records its new fingerprint. It changes only the supplied flags. These three
+options take positive integers; permission TTL is limited to 3600000 ms. Updates
+retain the choices. `show`, `service status`, `status` and `doctor` use human text;
+add `--json` for machine output.
+
+New installer records include the service text so updates can verify that only
+known daemon arguments changed. Legacy records contain only a SHA-256 hash: the
+installer can prove added tuning flags or edits to their original defaults
+(permission TTL 60000, pi deadline 1800000, pi max tokens 32768), and an added
+`--debugger`, by reconstructing the exact recorded bytes. An old nondefault value
+cannot be recovered from a hash. If validation refuses an edit, restore the exact
+original service file and remove systemd drop-ins, then update and use `service
+flags set`. If that original is unavailable, explicitly stop the old service,
+preserve state, and follow the fresh-install migration described above. There is
+no force-adoption switch for arbitrary service changes.
 
 Systemd drop-in admission checks apply **only to service deployments**: installing,
 upgrading or removing a managed service. Foreground-only installs, upgrades and
@@ -151,7 +177,8 @@ before stop/reload. Detectable loaded `DropInPaths` or a foreign `FragmentPath`
 are refused before the first stop; the installer does not try to enumerate every
 possible unit alias to prove that no override can appear later. It also verifies that the manager's live
 PID belongs to the recorded state/runtime. Use the manual service path if you need
-overrides. On macOS, cached launchd arguments must match the owned plist. An absent
+overrides. On macOS, cached launchd arguments must match the owned plist or the
+authenticated original command when adopting an argument edit. An absent
 daemon PID alone never confirms stop: launchd must report the job unloaded, or
 systemd must report no main PID and an inactive/failed state after stopping.
 Unknown manager responses fail closed without removing the runtime or service file.
@@ -752,15 +779,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.39 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.39: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.40 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.40: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.32 → 0.4.39
+Done: 0.4.32 → 0.4.40
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -790,7 +817,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.39  # example; select an existing release
+   git checkout v0.4.40  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

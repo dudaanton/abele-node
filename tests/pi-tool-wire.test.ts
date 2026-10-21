@@ -5,6 +5,26 @@ import {
   ParentMessageSchema,
 } from '../packages/provider-pi/src/wire.js'
 import { LspTools } from '../packages/node-core/src/lsp/tools.js'
+
+it('carries the advertised Obsidian registry alongside native tools', () => {
+  const tools = Array.from({ length: 256 }, (_, index) => ({
+    name: `obsidian_tool_${index}`,
+    description: 'Vault action',
+    inputSchema: { type: 'object' },
+  }))
+  expect(
+    ConfigurationSchema.parse({
+      cwd: '/repo',
+      sessionDir: '/sessions',
+      agentDir: '/agent',
+      provider: '',
+      model: '',
+      profile: 'isolated',
+      maxTokens: 1024,
+      debugger_tools: tools,
+    }).debugger_tools
+  ).toEqual(tools)
+})
 import {
   debuggerToolDefinitions,
   debuggerToolSpec,
