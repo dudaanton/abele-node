@@ -70,7 +70,7 @@ export class DapDebuggerBackend implements DebuggerBackend {
         case 'variables':
           return this.session.approvedVariables(p.handle, p.start, p.count, p.max_bytes, p.depth)
         case 'evaluate':
-          return this.session.evaluate(p.frame_handle, p.expression)
+          return this.session.evaluate(p.frame_handle, p.expression, p.context)
         case 'setVariable':
           return this.session.setVariable(p.handle, p.name, p.value)
         case 'detach':

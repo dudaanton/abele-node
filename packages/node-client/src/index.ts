@@ -553,6 +553,11 @@ export class NodeClient {
       await this.mutation('project.claude_permissions', { project_id, use_repository_permissions })
     )
   }
+  async setProjectCodexPermissions(project_id: string, network_enabled: boolean) {
+    return ProjectSchema.parse(
+      await this.mutation('project.codex_permissions', { project_id, network_enabled })
+    )
+  }
   async listProjects(after_id?: string) {
     const result = await this.request('project.list', { ...(after_id ? { after_id } : {}) })
     if (!Array.isArray(result)) throw new ChannelError('invalid_result')

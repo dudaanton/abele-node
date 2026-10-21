@@ -297,6 +297,12 @@ export class ManagerService {
       const input = {
         method,
         params: p,
+        ...(method === 'command.v1.run'
+          ? {
+              ...('command' in p ? { command: p.command } : {}),
+              ...('argv' in p ? { argv: p.argv } : {}),
+            }
+          : {}),
         cwd: run.cwd,
         cwd_fingerprint: run.cwd_fingerprint,
         project_id: target.project_id,

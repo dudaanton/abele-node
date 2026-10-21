@@ -625,6 +625,7 @@ export class DebuggerCoordinator {
         'status',
         'exitInfo',
         'sessionInfo',
+        'sources',
         'history',
         'replay',
         'commandResult',
@@ -645,7 +646,7 @@ export class DebuggerCoordinator {
     if (method === 'sessions') {
       if (principal.kind !== 'human') throw new ChannelError('unauthorized')
       this.permissions.owner(principal.authority)
-      return this.core.db
+      const snapshots = this.core.db
         .prepare(
           p.folder
             ? "SELECT body FROM debug_sessions WHERE json_extract(body,'$.target.worktree_id')=? AND (json_extract(body,'$.target.conversation_id')=? OR ? IS NULL) ORDER BY json_extract(body,'$.lifecycle') IN ('active','configuring') DESC, rowid DESC LIMIT ?"
@@ -662,6 +663,7 @@ export class DebuggerCoordinator {
             : [p.conversation_id, p.limit ?? 128])
         )
         .map((r) => JSON.parse(String(r.body)))
+      return this.core.debuggerLaunches.reconcileSessions(snapshots)
     }
     // Replay has exactly one resource identity: the validated cursor. A second
     // session argument must never select a different authorization scope.
@@ -670,6 +672,10 @@ export class DebuggerCoordinator {
     if (method === 'status') return this.core.debugger.snapshot(session)
     if (method === 'exitInfo') return this.core.debugger.exitInfo(session)
     if (method === 'sessionInfo') return this.core.debugger.sessionInfo(session)
+    if (method === 'sources') {
+      if (principal.kind !== 'human') throw new ChannelError('unauthorized')
+      return this.core.debuggerLaunches.sources(session)
+    }
     if (method === 'history') {
       const current = this.state(session)
       const r = this.core.debugger.history(session, p.after)

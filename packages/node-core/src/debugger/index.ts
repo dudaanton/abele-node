@@ -189,6 +189,18 @@ export class DebuggerService {
       target: DebuggerTargetSchema.parse({ ...target, node_id: this.core.node_id }),
     })
   }
+  /** Trusted host exit evidence can arrive after the adapter detached or was lost. */
+  confirmProcessExit(session: string, incarnation: string): DebuggerSnapshot {
+    this.requireEnabled()
+    const state = this.load(session)
+    if (state.incarnation !== incarnation) throw new DebuggerStateError('stale_state', state)
+    return state.lifecycle === 'terminated'
+      ? state
+      : this.transition(state, {
+          kind: 'lifecycle',
+          lifecycle: 'terminated',
+        })
+  }
   private transition(previous: DebuggerSnapshot, raw: DebuggerObservation): DebuggerSnapshot {
     const parsed = DebuggerObservationSchema.safeParse(raw)
     if (!parsed.success) throw new ChannelError('invalid_params')

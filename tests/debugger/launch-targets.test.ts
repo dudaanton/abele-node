@@ -103,6 +103,14 @@ it('discovers ignored nested output maps and resolves script arguments without n
       expect((await request('debugger.v1.launchTargets', { folder })).targets).toEqual(targets)
       await expect(
         request('debugger.v1.start', {
+          operation_id: 'missing-program',
+          folder,
+          program: 'dist/missing.js',
+        })
+      ).rejects.toMatchObject({ code: 'debugger_program_not_found' })
+      expect(launch).not.toHaveBeenCalled()
+      await expect(
+        request('debugger.v1.start', {
           operation_id: 'script',
           folder,
           program: 'package.json',

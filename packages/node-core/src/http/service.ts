@@ -47,6 +47,8 @@ interface InFlight {
   project: string
   summary: HttpSendSummary
   outcome: HttpOutcomeDoc
+  transportOutcome?: HttpOutcomeDoc
+  transportSummary?: HttpSendSummary
   chain?: TraceChain
   abort: AbortController
   endedAt?: number
@@ -127,7 +129,7 @@ export class HttpService {
       case 'http.v1.send':
         return p.route_by_destination ? this.routeSend(p) : this.send(p)
       case 'http.v1.send.status':
-        return this.status(p.project_id, p.send_id)
+        return this.status(p.project_id, p.send_id, p.transport_only)
       case 'http.v1.history': {
         const store = this.store(p.project_id)
         return { sends: store.history(p.id, p.limit) }
@@ -135,6 +137,8 @@ export class HttpService {
       case 'http.v1.body': {
         const store = this.store(p.project_id)
         const live = this.sends.get(p.send_id)
+        if (live && live.project === p.project_id && live.transportOutcome?.state === 'answered')
+          return page(live.transportOutcome.response.body, p.from ?? 0)
         if (live && !live.endedAt) throw new ChannelError('http_send_under_way')
         return page(store.body(p.send_id), p.from ?? 0)
       }
@@ -207,6 +211,11 @@ export class HttpService {
               ? { failed: true }
               : { unknown: true }),
         }
+        // Network completion is independent of adapter/recorder progress. Keep
+        // the legacy recording-aware read while negotiated transport reads can
+        // show the actual answer without waiting for instrumentation to drain.
+        entry.transportOutcome = outcome
+        entry.transportSummary = { ...done }
         if (chain) {
           // Recording availability must not turn a received answer into an unknown send.
           await this.core.trace.recorder.flushHttp(p.debug_session_id).catch((error) => {
@@ -253,6 +262,7 @@ export class HttpService {
         }
         entry.summary = done
         entry.outcome = outcome
+        entry.transportSummary = done
       })
       .catch((error) => {
         console.debug('[http] Send failed', error)
@@ -300,12 +310,14 @@ export class HttpService {
     return this.send({ ...p, debug_session_id: owner.debug_session_id })
   }
 
-  private status(project: string, sendId: string) {
+  private status(project: string, sendId: string, transportOnly = false) {
     const live = this.sends.get(sendId)
     if (live && live.project === project)
       return {
-        send: live.summary,
-        outcome: wireOutcome(live.outcome),
+        send: transportOnly ? (live.transportSummary ?? live.summary) : live.summary,
+        outcome: wireOutcome(
+          transportOnly ? (live.transportOutcome ?? live.outcome) : live.outcome
+        ),
         ...(live.chain ? { code_steps: live.chain.steps } : {}),
       }
     // Gone from memory: read back what was kept.

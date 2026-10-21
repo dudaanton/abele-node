@@ -135,7 +135,9 @@ permission; unlike reads, they run with the repository and user Git configuratio
 still with typed argv, no shell, editor, pager or prompt, and limited transports. They
 never recurse into submodules, whose git directories a worktree file names, and the checks
 around a write run with the read profile. The node's file methods refuse every `.git` path
-segment; a Codex workspace keeps its `.git` read-only. Git control that lives in tracked content
+segment. A bound Codex developer can write only its own commit metadata/ref and
+the shared Git object store; configuration, hooks and other refs remain read-only
+and other worktree metadata stays denied. Git control that lives in tracked content
 the owner pointed configuration at (a `core.hooksPath` or `include.path` inside the worktree)
 stays the owner's choice and applies to writes.
 Root/common-directory and target identities are rechecked at access and owner

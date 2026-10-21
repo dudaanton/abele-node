@@ -118,6 +118,8 @@ export class DapSession {
   private readonly sourcePaths = new Map<string, string>()
   readonly sources: ReadonlyMap<string, string> = this.sourcePaths
   private readonly stepping = new Set<number>()
+  /** Launch-owned content evidence; admission is not a permanent promise about disk contents. */
+  validateSource?: (path: string) => Promise<void>
   resolveFrameSources?: (
     paths: string[]
   ) => Promise<Map<string, { source_id: string; path: string }>>
@@ -470,6 +472,31 @@ export class DapSession {
     const before = this.current()
     const body = await this.request('threads')
     this.current()
+    return this.acceptThreads(before, body)
+  }
+  /** Host inventory maintenance is independent of a client's in-flight dispatch guard. */
+  async refreshThreads() {
+    const current = () => {
+      this.service.assertEffectsAvailable()
+      const state = this.snapshot
+      if (state.incarnation !== this.incarnation || !live(state) || this.ending || this.dap.closed)
+        throw new Error('session_not_live')
+      return state
+    }
+    const before = current()
+    const body = await this.dap.requestWhenAvailable(
+      'threads',
+      {},
+      {
+        beforeDispatch: () => {
+          current()
+        },
+      }
+    )
+    current()
+    return this.acceptThreads(before, body)
+  }
+  private acceptThreads(before: DebuggerSnapshot, body: Record<string, any>) {
     this.observe({
       kind: 'threads',
       inventory_revision: before.thread_inventory_revision,
@@ -584,6 +611,8 @@ export class DapSession {
     const before = this.current()
     const path = this.sources.get(source)
     if (!path) throw new ChannelError('unknown_source')
+    if (this.validateSource) await this.validateSource(path)
+    this.fence(before)
     if (!positive(line) || !positive(endLine) || endLine < line || endLine - line > 1000)
       throw new ChannelError('invalid_params')
     if (!this.capabilities.supportsBreakpointLocationsRequest)
@@ -595,6 +624,7 @@ export class DapSession {
       ...(column === undefined ? {} : { column }),
       ...(endColumn === undefined ? {} : { endColumn }),
     })
+    if (this.validateSource) await this.validateSource(path)
     this.fence(before)
     const raw = list(body.breakpoints, 4096)
     const items = raw.slice(0, 256).map((point) => {
@@ -615,10 +645,35 @@ export class DapSession {
     while (Buffer.byteLength(JSON.stringify(items)) > 7000) items.pop()
     return { items, truncated: items.length < raw.length, snapshot: this.snapshot }
   }
+  /** Runtime admission evidence for a canonical path, before issuing a source id. */
+  async runtimeSource(
+    path: string
+  ): Promise<'loaded' | 'not_loaded' | 'not_executable' | 'unverified'> {
+    const before = this.current()
+    if (
+      !this.capabilities.supportsLoadedSourcesRequest ||
+      !this.capabilities.supportsBreakpointLocationsRequest
+    )
+      return 'unverified'
+    const loaded = await this.request('loadedSources')
+    this.fence(before)
+    if (!list(loaded.sources, 16384).some((source) => source.path === path)) return 'not_loaded'
+    const body = await this.request('breakpointLocations', {
+      source: { path },
+      line: 1,
+      endLine: 1000,
+    })
+    this.fence(before)
+    return list(body.breakpoints, 4096).some((point) => positive(point.line) && point.line <= 1000)
+      ? 'loaded'
+      : 'not_executable'
+  }
   async sourceStatus(source: string, line: number, endLine: number) {
     const before = this.current()
     const path = this.sources.get(source)
     if (!path) throw new ChannelError('unknown_source')
+    if (this.validateSource) await this.validateSource(path)
+    this.fence(before)
     let loaded: boolean | null = null
     if (this.capabilities.supportsLoadedSourcesRequest) {
       const body = await this.request('loadedSources')
@@ -702,9 +757,22 @@ export class DapSession {
     this.objectThreads.clear()
     return before
   }
-  async evaluate(frameHandle: string, expression: string) {
+  async evaluate(frameHandle: string, expression: string, context: 'repl' | 'watch' = 'repl') {
     const frameId = this.service.resolveHandle(this.id, frameHandle, 'frame')
     const thread = this.frameThreads.get(frameHandle)
+    if (context === 'watch') {
+      if (thread === undefined) throw new DebuggerStateError('stale_handle', this.snapshot)
+      const before = this.stopped(thread)
+      const body = await this.request('evaluate', { frameId, expression, context })
+      this.fence(before)
+      if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
+      return {
+        value: boundedText(body.result, 4096),
+        truncated: Buffer.byteLength(body.result) > 4096,
+        observation_stop_epoch: before.stop_epoch,
+        source_identity: before.target.build_identity,
+      }
+    }
     const before = this.expressionIntent()
     const body = await this.request('evaluate', { frameId, expression, context: 'repl' })
     if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
@@ -981,7 +1049,10 @@ export class DapSession {
       // Owned cleanup is independent of transport success and journal availability.
       if (lifecycle === 'terminated') await this.owner!.terminate()
       if (disconnectError) throw disconnectError
-      this.observe({ kind: 'lifecycle', lifecycle })
+      this.observe({
+        kind: 'lifecycle',
+        lifecycle: this.service.exitInfo(this.id).exit_code !== null ? 'terminated' : lifecycle,
+      })
       return this.snapshot
     } catch (error) {
       if (live(this.snapshot)) this.observe({ kind: 'lifecycle', lifecycle: 'connection-lost' })
@@ -1000,6 +1071,12 @@ export class DapSession {
       : []
   }
   private event(event: DebugProtocol.Event) {
+    // An actual target exit remains evidence even while disconnect is in flight.
+    // DAP terminated alone describes the debugging session, not process death.
+    if (event.event === 'exited' && this.ending && Number.isSafeInteger(event.body?.exitCode)) {
+      this.recordExit(event.body.exitCode)
+      return
+    }
     if (!live(this.snapshot) || this.ending) return
     const body = event.body ?? {}
     switch (event.event) {
@@ -1053,7 +1130,16 @@ export class DapSession {
           ['exception', 'promise rejection'].includes(body.reason)
         ) {
           const before = this.snapshot
-          void this.request('exceptionInfo', { threadId: body.threadId })
+          // Event enrichment is independent of whichever coordinated command is
+          // in flight. The stop has already expired that command's guard.
+          void this.dap
+            .requestWhenAvailable(
+              'exceptionInfo',
+              { threadId: body.threadId },
+              {
+                beforeDispatch: () => this.service.assertEffectsAvailable(),
+              }
+            )
             .then((info) => {
               const now = this.snapshot
               if (

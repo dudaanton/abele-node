@@ -3,6 +3,7 @@ import {
   retainServiceArguments,
   validateServiceFlags,
   serviceFlagLimits,
+  summarizeServiceFlags,
 } from './service-arguments.js'
 import './warnings.js'
 import { DatabaseSync } from 'node:sqlite'
@@ -249,6 +250,7 @@ async function main() {
   const codexModel = option('--codex-model', process.env.ABELE_CODEX_MODEL ?? '')
   const codexHome = option('--codex-home', process.env.ABELE_CODEX_HOME ?? '')
   const codexOptions = {
+    allowBypass,
     enabled: !noCodex,
     ...(codexPath ? { executable: codexPath } : {}),
     model: codexModel,
@@ -440,11 +442,11 @@ async function main() {
       if (args[1] === 'flags') {
         if (args.length !== 3 || !['show', 'set'].includes(args[2]!))
           throw new Error(
-            'Usage: abele-node service flags show|set [--pi-max-tokens N] [--permission-ttl-ms N] [--pi-deadline-ms N] [--json]'
+            'Usage: abele-node service flags show|set [--allow-bypass on|off] [--pi-max-tokens N] [--permission-ttl-ms N] [--pi-deadline-ms N] [--json]'
           )
         if (args[2] === 'show') {
           const flags = showServiceFlags(runtimeRoot, state)
-          console.log(json ? JSON.stringify({ flags }) : flags.join('\n'))
+          console.log(json ? JSON.stringify({ flags }) : summarizeServiceFlags(flags))
         } else
           output(
             await changeService(runtimeRoot, state, 'enable', undefined, undefined, serviceFlags)

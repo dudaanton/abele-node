@@ -111,6 +111,35 @@ it('can select a connected replacement before claim and invalidates the old prev
   expect(f.core.prompt(prepared.prompt_id).state).toBe('invalidated')
 })
 
+it('retains a pending preview approval when the same client reconnects after window closure', () => {
+  const f = fixture()
+  f.advertise()
+  const call = f.invoke()
+  f.request('poll', { client_id: 'desktop' })
+  const executor = { invocation_id: call.invocation_id, client_id: 'desktop', revision: 'r1' }
+  const prepared = f.request('prepare', { ...executor, preview: { text: 'exact preview' } })
+  f.signal.abort()
+  expect(f.request('get', { invocation_id: call.invocation_id }).state).toBe('awaiting_approval')
+  f.request(
+    'advertise',
+    {
+      client_id: 'desktop',
+      platform: 'desktop',
+      vault_id: 'vault',
+      revisions: { agent: 'r1' },
+    },
+    new AbortController().signal
+  )
+  expect(f.request('poll', { client_id: 'desktop' })[0]).toMatchObject({
+    state: 'awaiting_approval',
+    prompt_id: prepared.prompt_id,
+    preview: { text: 'exact preview' },
+  })
+  expect(f.core.prompt(prepared.prompt_id)).toMatchObject({ state: 'pending', choice: null })
+  f.core.resolvePrompt(f.core.prompt(prepared.prompt_id), 'resolved', 'allow')
+  expect(f.request('claim', executor).execute).toBe(true)
+})
+
 it('keeps an owner wait pending for days and cancels it when its trusted run closes', async () => {
   vi.useFakeTimers()
   const f = fixture()

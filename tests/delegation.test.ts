@@ -106,6 +106,33 @@ it('keeps delegated prompts waiting and announces them in the parent mailbox', a
         (e) => e.type === 'delegation.question' && (e.data as any).report_id.startsWith('prompt:')
       )
   ).toBe(true)
+  const prompt = f.core.prompts(child.session_id)[0]!
+  f.core.delegations.promptOpened(child.session_id, { ...prompt, prompt_id: 'next-permission' })
+  const questions = f.core
+    .read(child.mailbox_stream_id, 0)
+    .filter((e) => e.type === 'delegation.question')
+  expect(questions).toHaveLength(1)
+  expect((questions[0]!.data as any).text).not.toContain(child.session_id)
+  expect((questions[0]!.data as any).text).not.toContain(prompt.prompt_id)
+  f.core.db
+    .prepare('INSERT INTO obsidian_tool_invocations VALUES(?,?,?,?,?)')
+    .run('hosted-approval', child.session_id, prompt.run_id, 'hosted-call', '{}')
+  f.core.delegations.promptOpened(child.session_id, {
+    ...prompt,
+    prompt_id: 'hosted-prompt',
+    run_id: 'obsidian:hosted-approval',
+  })
+  expect(
+    f.core.read(child.mailbox_stream_id, 0).filter((e) => e.type === 'delegation.question')
+  ).toHaveLength(1)
+  f.core.delegations.promptOpened(child.session_id, {
+    ...prompt,
+    prompt_id: 'extension-question',
+    kind: 'input',
+  })
+  expect(
+    f.core.read(child.mailbox_stream_id, 0).filter((e) => e.type === 'delegation.question')
+  ).toHaveLength(2)
 })
 it.each(['completed', 'failed', 'cancelled', 'unknown', 'stopped'] as const)(
   'continues a %s child in the same session',

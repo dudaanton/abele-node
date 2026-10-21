@@ -3,6 +3,14 @@ import { piSessionUpdates, sessionUpdatesOf } from '@abele/node-protocol'
 
 // pi's records in the shared transcript vocabulary.
 const provider = { kind: 'provider', provider: 'pi' }
+it('does not replay the harmless headless terminal-input registration warning to the owner', () => {
+  expect(
+    piSessionUpdates('pi.extension.warning', {
+      capability: 'onTerminalInput',
+      reason: 'unsupported_extension_ui',
+    })
+  ).toEqual([])
+})
 it('explains a headless display warning without claiming the extension failed', () => {
   expect(
     piSessionUpdates('pi.extension.warning', {

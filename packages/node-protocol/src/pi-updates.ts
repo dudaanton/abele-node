@@ -305,6 +305,14 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
       ]
     case 'pi.extension.error':
     case 'pi.extension.warning':
+      // Older hosts warned when extensions registered a harmless input hook.
+      // Keep genuine extension errors and unsupported display warnings visible.
+      if (
+        type === 'pi.extension.warning' &&
+        d.capability === 'onTerminalInput' &&
+        d.reason === 'unsupported_extension_ui'
+      )
+        return []
       return [
         {
           kind: 'notice',

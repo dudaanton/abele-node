@@ -25,6 +25,7 @@ export interface HostConfiguration {
   model: string
   profile: 'inherited' | 'isolated'
   maxTokens: number
+  permission_mode?: string
   debugger_tools?: DebuggerToolDefinition[]
   /** A long-lived owner session: its effort and permission mode; absent for one bounded turn. */
   live?: { effort: string; permission_mode: string }
@@ -75,7 +76,7 @@ export async function createSdkHost(
     signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
   })
   const policy = new PiApprovalPolicy(ask, signal)
-  policy.bypass = config.live?.permission_mode === 'bypassPermissions'
+  policy.bypass = (config.permission_mode ?? config.live?.permission_mode) === 'bypassPermissions'
   let selectedProvider = config.provider,
     initialModel = config.model
   const ui = new PiExtensionUiBridge(ask, signal, emit)

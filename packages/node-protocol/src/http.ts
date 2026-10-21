@@ -27,6 +27,7 @@ export const HTTP_VERSION = 1 as const
 export const HTTP_V1_CAPABILITY = {
   recording_correlation: true,
   destination_owner: true,
+  transport_status: true,
   status: 'supported' as const,
   evidence:
     'requests-as-files; environments; send-and-poll; history-on-node; keys-per-send-never-written; optional-into-recording; owner-only',
@@ -226,7 +227,9 @@ export const HttpMethodSchemas = {
       route_by_destination: z.boolean().optional(),
     })
     .strict(),
-  'http.v1.send.status': z.object({ ...project, send_id: sendId }).strict(),
+  'http.v1.send.status': z
+    .object({ ...project, send_id: sendId, transport_only: z.boolean().optional() })
+    .strict(),
   'http.v1.history': z
     .object({ ...project, id: requestId, limit: z.number().int().min(1).max(200).optional() })
     .strict(),

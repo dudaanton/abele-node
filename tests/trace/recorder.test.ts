@@ -71,6 +71,100 @@ async function fixture(frame: () => Record<string, unknown>) {
 }
 
 describe('a run recorded over a debugger session', () => {
+  it('keeps concurrent identical requests distinct by exact exchange identity', async () => {
+    const traffic: any[] = []
+    const f = await fixture(() => ({
+      Buffer,
+      [programHttpKey]: {
+        drain: () => (traffic.length ? [traffic.shift()] : []),
+        stop() {},
+      },
+    }))
+    try {
+      await f.breakpoint('point', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'point', take: [] }], [])
+      f.recorder.attach(f.session)
+      const request = { method: 'POST', url: 'http://localhost/events' }
+      const first = f.recorder.chain(f.session.id, request)!
+      const second = f.recorder.chain(f.session.id, request)!
+      for (const [id, chain] of [
+        ['second', second],
+        ['first', first],
+      ] as const)
+        traffic.push({
+          id,
+          direction: 'incoming',
+          method: request.method,
+          url: request.url,
+          started: Date.now(),
+          ended: Date.now(),
+          status: 201,
+          request_headers: { 'x-abele-step': chain.id },
+          response_headers: {},
+          request_body: '',
+          response_body: id,
+        })
+      await f.recorder.flushHttp(f.session.id)
+      const firstStep = first.close({ label: 'POST /events', values: [] })
+      const secondStep = second.close({ label: 'POST /events', values: [] })
+      expect(firstStep).not.toBe(secondStep)
+      const rows = f.store.read(first.runId).steps
+      expect(rows).toHaveLength(2)
+      expect(rows.find((row) => row.id === firstStep)).toMatchObject({
+        chain: first.id,
+        sent: true,
+      })
+      expect(rows.find((row) => row.id === secondStep)).toMatchObject({
+        chain: second.id,
+        sent: true,
+      })
+    } finally {
+      f.close()
+    }
+  })
+  it('starts no HTTP-only recording for rejected points and starts when a point binds', async () => {
+    const f = await fixture(() => ({}))
+    try {
+      await f.breakpoint('unbound', 4)
+      const result = (verified: boolean) =>
+        f.core.debugger.observe(f.session.id, f.session.incarnation, {
+          kind: 'breakpoints_result',
+          revision: f.session.snapshot.breakpoint_revision,
+          results: [{ breakpoint_id: 'unbound', verified, line: 4 }],
+        })
+      result(false)
+      f.points.set(f.session.id, [{ breakpoint_id: 'unbound', take: [] }], [])
+      f.recorder.attach(f.session)
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      expect(f.store.list()).toEqual([])
+      result(true)
+      expect(f.recorder.recording(f.session.id)).toBeDefined()
+      const run = f.recorder.recording(f.session.id)!.run_id
+      f.core.debugger.observe(f.session.id, f.session.incarnation, {
+        kind: 'breakpoints_pending',
+        revision: f.session.snapshot.breakpoint_revision,
+      })
+      expect(f.recorder.recording(f.session.id)?.run_id).toBe(run)
+      result(false)
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      f.core.debugger.observe(f.session.id, f.session.incarnation, {
+        kind: 'breakpoints_pending',
+        revision: f.session.snapshot.breakpoint_revision,
+      })
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      result(true)
+      expect(f.recorder.recording(f.session.id)).toBeDefined()
+      f.core.debugger.patchBreakpoints(
+        f.session.id,
+        f.session.snapshot.breakpoint_revision,
+        [{ breakpoint_id: 'unbound', source_id: 'source', line: 4, enabled: false }],
+        []
+      )
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+    } finally {
+      f.close()
+    }
+  })
   it('keeps one sent row only when the captured request has this send exact correlation id', async () => {
     let traffic: any[] = []
     const f = await fixture(() => ({

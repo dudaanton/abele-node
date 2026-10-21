@@ -11,6 +11,29 @@ import { target } from '../debugger/helpers.js'
 import { adapter } from './adapter.js'
 
 const dirs: string[] = []
+it('pages a fixed written prefix while older-timestamped traffic is appended', async () => {
+  const s = await setup(() => ({}))
+  try {
+    const store = s.core.trace.store(s.project_id)
+    const writer = store.create({ session: 'session', points: [], started: new Date() })
+    for (let i = 0; i < 4; i++)
+      writer.append({ kind: 'probe', at: i, label: `step ${i}`, values: [] })
+    const p = { project_id: s.project_id, run_id: writer.id, limit: 2 }
+    const first = s.request('trace.v1.run', p)
+    expect(first.run.steps).toBe(4)
+    writer.append({ kind: 'http', at: -1, label: 'late exchange', values: [] })
+    const second = s.request('trace.v1.run', { ...p, from: first.next, through: first.run.steps })
+    expect(second.steps.map((step: any) => step.label)).toEqual(['step 2', 'step 3'])
+    expect(second.next).toBeUndefined()
+    expect(second.run.steps).toBe(4)
+    expect(() => s.request('trace.v1.run', { ...p, through: 6 })).toThrow(
+      'trace_prefix_unavailable'
+    )
+    writer.close('done', 10)
+  } finally {
+    s.core.close()
+  }
+})
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })

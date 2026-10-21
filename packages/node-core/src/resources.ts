@@ -84,7 +84,12 @@ export class ProjectService {
     path: string,
     trust: unknown,
     exactRoot = false
-  ): Promise<Omit<Project, 'project_id' | 'created_at' | 'use_repository_claude_permissions'>> {
+  ): Promise<
+    Omit<
+      Project,
+      'project_id' | 'created_at' | 'use_repository_claude_permissions' | 'codex_network_enabled'
+    >
+  > {
     if (!isAbsolute(path)) throw new ChannelError('invalid_params')
     let root: string
     try {
@@ -874,7 +879,7 @@ export class ResourceServices {
     if (RESOURCE_MUTATIONS.includes(method as (typeof RESOURCE_MUTATIONS)[number])) {
       const previous = this.core.operationReceipt(actor, method, p, operation)
       if (previous) return previous.result
-      if (method === 'project.claude_permissions')
+      if (method === 'project.claude_permissions' || method === 'project.codex_permissions')
         return this.core.commitOperation(actor, method, p, operation!, () => {
           const project = this.projects.get(String(p.project_id))
           if (this.targets.projectBusy(project.project_id)) throw new ChannelError('resource_busy')
@@ -886,18 +891,20 @@ export class ResourceServices {
               .get(project.project_id)
           )
             throw new ChannelError('resource_busy')
-          if (p.use_repository_permissions && project.trust !== 'trusted')
+          if ((p.use_repository_permissions || p.network_enabled) && project.trust !== 'trusted')
             throw new ChannelError('project_untrusted')
           const updated = ProjectSchema.parse({
             ...project,
-            use_repository_claude_permissions: p.use_repository_permissions,
+            ...(method === 'project.codex_permissions'
+              ? { codex_network_enabled: p.network_enabled }
+              : { use_repository_claude_permissions: p.use_repository_permissions }),
           })
           this.core.db
             .prepare('UPDATE projects SET body=? WHERE project_id=?')
             .run(JSON.stringify(updated), project.project_id)
           this.core.append(
             'catalog',
-            'project.claude_permissions.changed',
+            method + '.changed',
             { kind: 'installation', installation_id: actor.installation_id },
             updated
           )

@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.42
+  sh -s -- --version 0.4.43
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -142,6 +142,7 @@ Manage service tuning without editing the plist or unit:
 ```sh
 abele-node service flags show
 abele-node service flags set --permission-ttl-ms 3600000 --pi-deadline-ms 1800000 --pi-max-tokens 32768
+abele-node service flags set --allow-bypass on
 ```
 
 `set` requires an enabled installer service, restarts it using the existing runtime,
@@ -149,6 +150,17 @@ and records its new fingerprint. It changes only the supplied flags. These three
 options take positive integers; permission TTL is limited to 3600000 ms. Updates
 retain the choices. `show`, `service status`, `status` and `doctor` use human text;
 add `--json` for machine output.
+
+`--allow-bypass on|off` changes the operator opt-in for without-asking sessions
+across pi, Claude Code and Codex. It restarts the service and records its new
+fingerprint through the same installer transaction. The choice survives updates,
+reinstalls and service disable/enable. `off` removes the runtime switch rather than
+passing a false value to it. This enables the session choice; it does not silently
+change existing sessions to bypass. Do not hand-edit the plist or unit.
+
+`service flags show` summarizes permission TTL and pi deadline in milliseconds,
+pi max tokens, debugger on/off, and bypass opt-in on/off, including startup defaults for omitted flags.
+`service flags show --json` retains the compatible `{ "flags": [...] }` argv form.
 
 New installer records include the service text so updates can verify that only
 known daemon arguments changed. Legacy records contain only a SHA-256 hash: the
@@ -779,15 +791,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.42 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.42: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.43 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.43: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.32 → 0.4.42
+Done: 0.4.32 → 0.4.43
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -817,7 +829,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.42  # example; select an existing release
+   git checkout v0.4.43  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test

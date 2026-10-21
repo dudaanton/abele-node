@@ -296,6 +296,7 @@ export class ClaudeProviderAdapter {
       session_defaults: this.sessionDefaults(),
       session_permission_ttl_ms: this.options.sessionPermissionTtlMs,
       efforts: [...CLAUDE_EFFORTS],
+      per_action_approval: true,
       permission_modes: CLAUDE_PERMISSION_MODES.filter(
         (m) => m !== 'bypassPermissions' || this.options.allowBypass
       ),
@@ -331,7 +332,9 @@ export class ClaudeProviderAdapter {
     )
       throw new Error('invalid_session_settings')
   }
-  configurationForTurn(turn: Pick<TurnContext, 'use_repository_claude_permissions'>) {
+  configurationForTurn(
+    turn: Pick<TurnContext, 'use_repository_claude_permissions' | 'permission_mode'>
+  ) {
     const sources =
       this.options.profile === 'isolated'
         ? []
@@ -340,6 +343,7 @@ export class ClaudeProviderAdapter {
           : ['user']
     return {
       ...this.configuration,
+      permission_mode_requested: turn.permission_mode ?? 'manual',
       settings_sources: sources,
       use_repository_claude_permissions: turn.use_repository_claude_permissions === true,
     }
@@ -431,7 +435,10 @@ export class ClaudeProviderAdapter {
     if (!checked.liveAvailable) throw new Error(checked.diagnostic)
     const settings = context.settings
     this.validateSettings(settings)
-    const configuration = checked.configurationForTurn(context)
+    const configuration = checked.configurationForTurn({
+      ...context,
+      permission_mode: settings.permission_mode,
+    })
     const accountDirectory =
       settings.account === 'default'
         ? undefined
@@ -492,6 +499,7 @@ export class ClaudeProviderAdapter {
     )
   }
   async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
+    this.validateSettings({ permission_mode: turn.permission_mode ?? 'manual' })
     const checked = new ClaudeProviderAdapter({
       ...this.options,
       executable: this.executable,
@@ -786,7 +794,7 @@ export class ClaudeProviderAdapter {
       '--max-budget-usd',
       String(this.options.budgetUsd),
       '--permission-mode',
-      'manual',
+      turn.permission_mode ?? 'manual',
       '--permission-prompts',
       'host',
       '--permission-prompt-tool',
@@ -795,6 +803,7 @@ export class ClaudeProviderAdapter {
       configPath,
     ]
     args.push('--setting-sources', settingsSources.join(','))
+    if (this.options.allowBypass) args.push('--allow-dangerously-skip-permissions')
     if (this.options.profile === 'isolated')
       args.push(
         '--strict-mcp-config',

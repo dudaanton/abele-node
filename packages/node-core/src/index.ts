@@ -540,6 +540,22 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       options.live
     )
     this.claude = this.execution
+    // Legacy sessions remain Ask instead of adopting a new bypass default.
+    this.transaction(() => {
+      for (const row of this.db.prepare('SELECT session_id,body FROM sessions').all()) {
+        const session = SessionSchema.parse(JSON.parse(String(row.body)))
+        const permission_mode =
+          session.settings?.permission_mode ?? session.tool_permissions?.permission_mode ?? 'manual'
+        const tool_permissions = this.claude.permissionPolicy(session.provider, {
+          ...session.settings,
+          permission_mode,
+        })
+        this.db
+          .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+          .run(JSON.stringify({ ...session, tool_permissions }), String(row.session_id))
+        this.delegations.permissionsChanged(String(row.session_id), tool_permissions)
+      }
+    })
     this.protectFiles()
   }
   private watchers = new Map<string, number>()
@@ -730,6 +746,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.claude.capabilities('codex'),
       ],
       capabilities: {
+        'tool.permissions.v1': {
+          status: 'supported' as const,
+          evidence: 'persisted-session-delegation-mode-and-per-action-approval',
+        },
+        'codex.developer-environment.v1': {
+          status: 'supported' as const,
+          evidence: 'node-npm-worktree-git-external-caches-project-network-opt-in',
+        },
         'obsidian.tools.v1': {
           status: 'supported' as const,
           evidence: 'durable-invocation-single-executor-claim-v1',
@@ -1230,14 +1254,20 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         throw new ChannelError('provider_unavailable')
     }
     const liveAdapter = this.claude.adapterFor(String(p.provider))
-    if (
-      p.settings &&
-      (!['claude', 'pi', 'acp'].includes(String(p.provider)) || !liveAdapter?.liveAvailable)
-    )
-      throw new ChannelError('invalid_params')
     if (p.settings)
       try {
+        if (
+          !liveAdapter?.liveAvailable &&
+          Object.keys(p.settings).some((key) => key !== 'permission_mode')
+        )
+          throw new Error('bounded_settings_unsupported')
         liveAdapter?.validateSettings?.(p.settings as SessionSettings)
+        const mode = (p.settings as SessionSettings).permission_mode
+        if (
+          mode === 'bypassPermissions' &&
+          !liveAdapter?.configuration.permission_modes?.includes(mode)
+        )
+          throw new Error('bypass_unavailable')
       } catch {
         throw new ChannelError('invalid_params')
       }
@@ -1248,6 +1278,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       created_at: new Date().toISOString(),
       ...(p.workspace_id ? { workspace_id: p.workspace_id } : {}),
       ...(p.settings ? { settings: p.settings } : {}),
+      tool_permissions: this.claude.permissionPolicy(
+        String(p.provider),
+        p.settings as SessionSettings | undefined
+      ),
       ...(p.agent ? { agent: p.agent } : {}),
     })
     this.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(session.session_id)
@@ -1315,21 +1349,44 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return updated
     }
     if (method === 'session.configure') {
-      if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
+      if (
+        !this.claude.live.handles(session) &&
+        this.db
+          .prepare(
+            "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
+          )
+          .get(session)
+      )
+        throw new ChannelError('resource_busy')
       // Choosing how a session's tools are authorized is execution authority, not display.
       this.authority.check(actor, 'execute', session)
       const settings = p.settings as SessionSettings
+      if (
+        !this.claude.live.handles(session) &&
+        Object.keys(settings).some((key) => key !== 'permission_mode')
+      )
+        throw new ChannelError('unsupported_method')
       this.claude.live.validate(session, settings)
       const before = this.claude.live.effective(session)
       const updated = SessionSchema.parse({
         ...currentSession,
         settings: { ...(currentSession.settings ?? {}), ...settings },
+        tool_permissions: this.claude.permissionPolicy(currentSession.provider, {
+          ...(currentSession.settings ?? {}),
+          ...settings,
+          permission_mode:
+            settings.permission_mode ??
+            currentSession.settings?.permission_mode ??
+            currentSession.tool_permissions?.permission_mode ??
+            'manual',
+        }),
       })
       this.db
         .prepare('UPDATE sessions SET body=? WHERE session_id=?')
         .run(JSON.stringify(updated), session)
       this.append(session, 'session.updated', installationActor, updated)
       this.append('catalog', 'session.updated', installationActor, updated)
+      this.delegations.permissionsChanged(session, updated.tool_permissions!)
       const after = this.claude.live.effective(session)
       queueMicrotask(() => this.claude.live.applied(session, before, after))
       return updated

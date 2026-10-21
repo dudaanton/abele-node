@@ -80,6 +80,7 @@ export const ConfigurationSchema = z
     model: z.string().max(256),
     profile: z.enum(['inherited', 'isolated']),
     maxTokens: z.number().int().min(64).max(32768),
+    permission_mode: z.enum(['manual', 'bypassPermissions']).optional(),
     debugger_tools: z.array(DebuggerToolSchema).max(320).optional(),
     live: z
       .object({ effort: z.string().max(32), permission_mode: z.string().max(64) })

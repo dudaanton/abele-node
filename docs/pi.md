@@ -93,6 +93,15 @@ same durable prompt service:
 - Input: allow with human-entered text as the third argument, bounded to 32768 code units.
 - Denial/cancellation: `client.answerPrompt(prompt, 'deny')`.
 
+Headless extension `onTerminalInput` registration returns a no-op disposer. Its
+routine `unsupported_extension_ui` diagnostic stays in the journal with
+`mapped: true`, but produces no conversation notice, including replay. Genuine
+extension errors and other unsupported display warnings remain visible.
+
+The [tool permission contract](tool-permissions.md) records the owner's effective
+Ask/bypass choice for both ordinary and delegated sessions. Explicit bypass needs
+the operator's opt-in; it is never inferred from provider capability.
+
 No argument editing, blanket always-allow or automatic approval is provided.
 Resolution and single-use delivery consumption are separate committed facts;
 delivery rechecks installation authority. Expiry, interruption, worker/IPC loss,

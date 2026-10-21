@@ -183,7 +183,7 @@ export class TraceService {
       case 'trace.v1.runs':
         return { runs: this.store(p.project_id).list().map(summary), ...this.folder(p.project_id) }
       case 'trace.v1.run':
-        return this.run(p.project_id, p.run_id, p.from ?? 0, p.limit ?? 5000, p.kind)
+        return this.run(p.project_id, p.run_id, p.from ?? 0, p.limit ?? 5000, p.kind, p.through)
       case 'trace.v1.value':
         return this.value(p)
       case 'trace.v1.find':
@@ -222,13 +222,20 @@ export class TraceService {
     id: string,
     from: number,
     limit: number,
-    kinds?: string[]
+    kinds?: string[],
+    through?: number
   ): TraceRunResult {
     const store = this.store(project)
     const { run, steps: written } = store.read(id)
+    if (through !== undefined && through > written.length)
+      throw new ChannelError('trace_prefix_unavailable')
+    const prefix = through === undefined ? written : written.slice(0, through)
+    // Freeze the written prefix before chronological sorting. Later completed
+    // exchanges may have earlier timestamps and must not shift existing pages.
+    if (through !== undefined) run.steps = prefix.length
     // A sent request is written when its answer is in, at the time it went: in time it heads the
     // steps it caused. The sort is stable, so everything else keeps the order it was written in.
-    const steps = [...written].sort((a, b) => a.at - b.at)
+    const steps = [...prefix].sort((a, b) => a.at - b.at)
     const requests = steps.filter(
       (s) => s.kind === 'http' && s.direction && s.duration_ms !== undefined
     )

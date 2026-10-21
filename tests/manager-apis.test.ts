@@ -172,6 +172,17 @@ it('delivers a manager approval once and never executes a repeated answer twice'
   ).toHaveLength(1)
   expect(readFileSync(join(f.folder, 'effect'), 'utf8')).toBe('once\n')
 })
+it('publishes the exact shell command and argv directly in its single approval', async () => {
+  const f = await fixture()
+  const command = 'printf "%s\\n" "a  b"\n# retain whitespace and quoting'
+  const shell = await f.request('command.v1.run', { ...f.base, command })
+  expect(f.core.prompt(shell.prompt_id).input).toMatchObject({ command })
+  const argv = ['printf', '%s\n', 'a  b']
+  const direct = await f.request('command.v1.run', { ...f.base, argv })
+  expect(f.core.prompt(direct.prompt_id).input).toMatchObject({ argv })
+  expect(f.core.prompts(f.session.session_id)).toHaveLength(2)
+  expect(f.core.prompt(shell.prompt_id).state).toBe('pending')
+})
 it('stops a command if streaming output cannot be journaled', async () => {
   const f = await fixture()
   const append = f.core.append.bind(f.core)

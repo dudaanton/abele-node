@@ -13,6 +13,7 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 export async function createHost(config, ask, signal, emit, hooks) {
   const policy = new PiApprovalPolicy(ask, signal),
     ui = new PiExtensionUiBridge(ask, signal, emit)
+  policy.bypass = (config.permission_mode ?? config.live?.permission_mode) === 'bypassPermissions'
   let rebind, beforeInvalidate
   const runtime = {
     setRebindSession: (fn) => (rebind = fn),

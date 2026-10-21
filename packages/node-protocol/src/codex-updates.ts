@@ -77,6 +77,18 @@ export function codexSessionUpdates(type: string, data: unknown): SessionUpdate[
   const d = (data && typeof data === 'object' ? data : {}) as Data
   const item = str(d.item_id)
   switch (type) {
+    case 'codex.dependencies.warning':
+      return [
+        {
+          kind: 'notice',
+          level: 'warning',
+          code: 'missing_dependencies',
+          text:
+            d.network_enabled === true
+              ? 'Project dependencies are missing. Install them before running builds or tests; project network access is enabled.'
+              : 'Project dependencies are missing. Network is disabled: install dependencies first or ask the owner to enable project network access before running builds or tests.',
+        },
+      ]
     case 'codex.message.delta':
       return item && str(d.delta)
         ? [{ kind: 'agent_message_chunk', message_id: item, text: str(d.delta)!.slice(0, TEXT) }]

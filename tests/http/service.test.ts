@@ -13,7 +13,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DapDebuggerBackend, NodeCore } from '../../packages/node-core/src/index.js'
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { HttpSendStatusSchema } from '../../packages/node-protocol/src/http.js'
@@ -103,6 +103,62 @@ const doc = (over: Record<string, unknown> = {}) => ({
 })
 
 describe('saved requests on the node', () => {
+  it('reads transport status promptly while stopped and recording completion is blocked', async () => {
+    const s = await setup(true)
+    let arrived = 0
+    const base = await service(() => {
+      arrived++
+    })
+    const session = s.core.debugger.create({ ...target, project_id: s.project_id })
+    s.core.debugger.observe(session.debug_session_id, session.incarnation, {
+      kind: 'stopped',
+      thread_id: 1,
+      all_threads_stopped: true,
+      reason: 'breakpoint',
+      hit_breakpoint_ids: [],
+    })
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const chain = vi.spyOn(s.core.trace.recorder, 'chain').mockReturnValue({
+      id: 'hexact',
+      runId: 'fixture-run',
+      steps: 0,
+      close: () => undefined,
+    })
+    const flush = vi.spyOn(s.core.trace.recorder, 'flushHttp').mockReturnValue(blocked)
+    const p = { project_id: s.project_id }
+    try {
+      const send = s.request('http.v1.send', {
+        ...p,
+        method: 'GET',
+        url: base,
+        headers: [],
+        secrets: [],
+        debug_session_id: session.debug_session_id,
+      })
+      const read = () =>
+        s.request('http.v1.send.status', { ...p, send_id: send.send_id, transport_only: true })
+      expect(read().outcome.state).toBe('sending')
+      const answered = await until(read, (status) => status.outcome.state === 'answered')
+      expect(answered.outcome.response.status).toBe(201)
+      expect(
+        JSON.parse(s.request('http.v1.body', { ...p, send_id: send.send_id }).text).method
+      ).toBe('GET')
+      expect(s.request('http.v1.send.status', { ...p, send_id: send.send_id }).outcome.state).toBe(
+        'sending'
+      )
+      expect(s.core.debugger.snapshot(session.debug_session_id).snapshot.execution).toBe('stopped')
+      expect(arrived).toBe(1)
+    } finally {
+      release()
+      await s.core.http.settled()
+      chain.mockRestore()
+      flush.mockRestore()
+      s.core.close()
+    }
+  })
   it('is offered on every node and refuses what it does not know', async () => {
     const s = await setup()
     try {

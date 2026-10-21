@@ -28,6 +28,10 @@ import { CodexDiscoveryError } from './discovery.js'
 import { codexExecutionGates, codexExecutionError, codexExecutionEvidence } from './gates.js'
 import { CodexProcessInventory } from './processes.js'
 import { readProcessScope } from './scope.js'
+import {
+  prepareDeveloperEnvironment,
+  missingDeveloperDependencies,
+} from './developer-environment.js'
 export interface CodexOptions {
   stateDir: string
   home?: string
@@ -36,6 +40,7 @@ export interface CodexOptions {
   model?: string
   deadlineMs?: number
   permissionTtlMs?: number
+  allowBypass?: boolean
 }
 export class CodexProviderAdapter {
   private ready = false
@@ -88,9 +93,12 @@ export class CodexProviderAdapter {
       diagnostic,
       accounts: ['default'],
       efforts: ['low', 'medium', 'high', 'xhigh'],
-      permission_modes: ['manual'],
+      permission_modes: ['manual', ...(options.allowBypass ? ['bypassPermissions'] : [])],
+      approval_mode: 'on-request',
+      per_action_approval: false,
+      workspace_actions_without_approval: true,
       approval_policy:
-        'Workspace-contained operations run without prompts; only single-action answers are supported. Permission expansion and session grants are denied.',
+        'Ask is unsupported and blocks execution. Explicit operator-enabled bypass permits workspace operations without prompts. Permission expansion and session grants remain denied.',
     }
   }
   protected async inspect(): Promise<CodexDoctorReport> {
@@ -146,7 +154,8 @@ export class CodexProviderAdapter {
       (settings.effort !== undefined &&
         !['low', 'medium', 'high', 'xhigh'].includes(settings.effort)) ||
       (settings.account !== undefined && settings.account !== 'default') ||
-      (settings.permission_mode !== undefined && settings.permission_mode !== 'manual')
+      (settings.permission_mode !== undefined &&
+        !this.configuration.permission_modes.includes(settings.permission_mode))
     )
       throw new Error('codex_setting_unsupported')
   }
@@ -204,7 +213,7 @@ export class CodexProviderAdapter {
     await inventory.cleanup()
   }
   /** Every launch: fresh preflight, gates, layout and schema checks, then the policy paths. */
-  private async launchPaths(cwd: string) {
+  private async launchPaths(cwd: string, network = false) {
     await this.prepare()
     requireManagedFile()
     const gateError = codexExecutionError(this.executable?.version)
@@ -252,11 +261,18 @@ export class CodexProviderAdapter {
       sibling: dirname(workspace),
       repository: realpathSync(resolve(workspace, commonDir)),
       gitdir: realpathSync(gitDir),
+      developer: prepareDeveloperEnvironment(state, workspace, network),
     }
     return paths
   }
   async startTurn(turn: TurnContext, sink: ProviderEventSink): Promise<ProviderRun> {
-    const paths = await this.launchPaths(turn.cwd)
+    this.requireExplicitBypass(turn.permission_mode)
+    const paths = await this.launchPaths(turn.cwd, turn.codex_network_enabled)
+    if (missingDeveloperDependencies(turn.cwd))
+      sink.event({
+        type: 'codex.dependencies.warning',
+        data: { network_enabled: turn.codex_network_enabled === true },
+      })
     return startCodexTurn(
       {
         executable: this.executable!,
@@ -273,10 +289,20 @@ export class CodexProviderAdapter {
     sink: LiveSessionSink
   ): Promise<LiveSession> {
     this.validateSettings(context.settings)
-    const paths = await this.launchPaths(context.cwd)
+    this.requireExplicitBypass(context.settings.permission_mode)
+    const paths = await this.launchPaths(context.cwd, context.codex_network_enabled)
+    if (missingDeveloperDependencies(context.cwd))
+      sink.event({
+        type: 'codex.dependencies.warning',
+        data: { network_enabled: context.codex_network_enabled === true },
+      })
     return startCodexLiveSession(
       { executable: this.executable!, paths, model: this.options.model, context },
       sink
     )
+  }
+  private requireExplicitBypass(mode?: string) {
+    if (mode !== 'bypassPermissions') throw new Error('interactive_approval_unsupported')
+    if (!this.options.allowBypass) throw new Error('codex_bypass_unavailable')
   }
 }

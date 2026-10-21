@@ -7,6 +7,75 @@ import { RecordQueue } from '@abele/channel-client'
 import { FrameCodec, type RecordFrame } from '@abele/channel-protocol'
 import { serveChannel } from '../packages/channel-server/src/index.js'
 
+it('keeps a chat approval pending after a client window closes and accepts it on reconnect', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'approval-window-'))
+  const core = new NodeCore(dir)
+  const incoming = new RecordQueue()
+  const actor = core.authority.authenticate(core.createToken('window').token)
+  const session = core.request(actor, 'session.create', { title: 'approval' }, 'create') as {
+    session_id: string
+  }
+  core.request(
+    actor,
+    'session.send',
+    {
+      session_id: session.session_id,
+      text: 'wait',
+      observed_seq: 0,
+      script: [{ kind: 'permission', ttl_ms: 60000 }],
+    },
+    'send'
+  )
+  core.tick()
+  const prompt = core.prompts(session.session_id)[0]!
+  const server = serveChannel(
+    {
+      receive: () => incoming,
+      send: async () => {},
+      close: async () => incoming.end(),
+    },
+    core,
+    actor
+  )
+  try {
+    incoming.push(FrameCodec.encode({ kind: 'hello', version: { major: 0, minor: 0 } }))
+    incoming.end()
+    await server
+    core.tick()
+    expect(core.prompt(prompt.prompt_id)).toMatchObject({
+      state: 'pending',
+      choice: null,
+      delivered: false,
+    })
+    expect(core.read(session.session_id, 0).filter((e) => e.type === 'prompt.resolved')).toEqual([])
+    const reconnected = core.authority.forInstallation(actor.installation_id)
+    core.request(
+      reconnected,
+      'prompt.answer',
+      {
+        session_id: session.session_id,
+        prompt_id: prompt.prompt_id,
+        run_id: prompt.run_id,
+        revision: prompt.revision,
+        action_digest: prompt.action_digest,
+        choice: 'allow',
+      },
+      'answer'
+    )
+    core.tick()
+    expect(core.prompt(prompt.prompt_id)).toMatchObject({
+      state: 'resolved',
+      choice: 'allow',
+      delivered: true,
+    })
+  } finally {
+    incoming.end()
+    await server
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 it('publishes the self-revocation acknowledgement before closing the channel', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'disconnect-channel-'))
   const core = new NodeCore(dir)

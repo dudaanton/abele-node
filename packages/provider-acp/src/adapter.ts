@@ -39,6 +39,7 @@ export class AcpProviderAdapter {
       throw new Error('invalid_acp_configuration')
     this.probe = options.processProbe ?? systemProcessProbe
     this.configuration = {
+      permission_modes: MODES,
       permission_ttl_ms: ttl,
       session_permission_ttl_ms: ttl,
       agents_file: AGENTS_FILE,

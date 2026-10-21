@@ -106,6 +106,58 @@ export class DebuggerLaunches {
     core.db.exec(
       'CREATE TABLE IF NOT EXISTS debug_launches(debug_session_id TEXT PRIMARY KEY, body TEXT NOT NULL)'
     )
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS debug_source_paths(debug_session_id TEXT PRIMARY KEY, body TEXT NOT NULL)'
+    )
+  }
+
+  sources(session: string): { sources: DebuggerStartResult['sources'] } {
+    const row = this.core.db
+      .prepare('SELECT body FROM debug_source_paths WHERE debug_session_id=?')
+      .get(session)
+    if (row) return { sources: JSON.parse(String(row.body)) }
+    const recipe = this.core.db
+      .prepare('SELECT body FROM debug_launches WHERE debug_session_id=?')
+      .get(session)
+    return { sources: recipe ? (JSON.parse(String(recipe.body)).admitted ?? []) : [] }
+  }
+
+  reconcileSessions(snapshots: DebuggerSnapshot[]): DebuggerSnapshot[] {
+    return snapshots.map((snapshot) => {
+      if (
+        snapshot.target.process_ownership !== 'external' ||
+        !['detached', 'connection-lost'].includes(snapshot.lifecycle)
+      )
+        return snapshot
+      const row = this.core.db
+        .prepare('SELECT body FROM debug_launches WHERE debug_session_id=?')
+        .get(snapshot.debug_session_id)
+      const recipe = row && JSON.parse(String(row.body))
+      const pid = recipe?.kind === 'attach' ? recipe.params?.pid : undefined
+      if (!Number.isSafeInteger(pid) || pid < 1) return snapshot
+      let exited = this.core.debugger.exitInfo(snapshot.debug_session_id).exit_code !== null
+      if (!exited) {
+        try {
+          process.kill(pid, 0)
+        } catch (error) {
+          exited = (error as NodeJS.ErrnoException).code === 'ESRCH'
+        }
+      }
+      return exited
+        ? this.core.debugger.confirmProcessExit(snapshot.debug_session_id, snapshot.incarnation)
+        : snapshot
+    })
+  }
+
+  private rememberSources(session: string, root: string, sources: ReadonlyMap<string, string>) {
+    this.core.db
+      .prepare('INSERT OR REPLACE INTO debug_source_paths VALUES(?,?)')
+      .run(
+        session,
+        JSON.stringify(
+          [...sources].map(([source_id, path]) => ({ source_id, path: relative(root, path) }))
+        )
+      )
   }
 
   profiles() {
@@ -153,6 +205,7 @@ export class DebuggerLaunches {
     operation_id: string
     debug_session_id: string
     sources: string[]
+    require_loaded?: boolean
   }): Promise<DebuggerAddSourcesResult> {
     const run = this.sessionRuns.get(p.debug_session_id)
     const context = run && this.sourceContexts.get(run)
@@ -177,6 +230,7 @@ export class DebuggerLaunches {
         )
           throw new ChannelError('debugger_session_inactive')
         const next = new Map(context.sources)
+        const digests = new Map(context.digests)
         const knownProgram = context.digests.has(context.program)
         const result = await admitSources(
           context.root,
@@ -184,8 +238,21 @@ export class DebuggerLaunches {
           p.sources,
           context.pid,
           context.program,
-          context.digests
+          digests
         )
+        if (p.require_loaded) {
+          const accepted: typeof result.sources = []
+          for (const source of result.sources) {
+            const path = next.get(source.source_id)!
+            const evidence = await this.sessions.get(p.debug_session_id)!.runtimeSource(path)
+            if (evidence === 'loaded') accepted.push(source)
+            else {
+              result.refused.push({ path: source.path, code: `debugger_source_${evidence}` })
+              if (!context.sources.has(source.source_id)) next.delete(source.source_id)
+            }
+          }
+          result.sources = accepted
+        }
         // Filesystem checks yield: recheck permission and lifetime before publishing any additions.
         await this.ownerFolder(recipe.params)
         const current = this.core.debugger.snapshot(p.debug_session_id).snapshot
@@ -203,11 +270,17 @@ export class DebuggerLaunches {
           .prepare('UPDATE debug_launches SET body=? WHERE debug_session_id=?')
           .run(JSON.stringify(recipe), context.recipe!)
         for (const [id, path] of next) context.sources.set(id, path)
+        for (const source of result.sources) {
+          const path = next.get(source.source_id)!
+          const digest = digests.get(path)
+          if (digest) context.digests.set(path, digest)
+        }
         const programProven =
           knownProgram && result.sources.some((s) => next.get(s.source_id) === context.program)
         for (const [id, owner] of this.sessionRuns) {
           if (owner !== run) continue
           this.sessions.get(id)?.admitSources(next)
+          this.rememberSources(id, root, next)
           if (programProven) {
             const snapshot = this.core.debugger.snapshot(id).snapshot
             if (snapshot.target.build_identity !== 'matched')
@@ -387,8 +460,19 @@ export class DebuggerLaunches {
       p.npm_script === undefined
         ? { program: p.program, argv: p.argv }
         : await resolveNpmScript(root, p.program, p.npm_script, p.argv)
-    const program = await realpath(this.inside(root, resolved.program))
+    const askedProgram = this.inside(root, resolved.program)
+    const program = await realpath(askedProgram).catch((error: NodeJS.ErrnoException) => {
+      throw new ChannelError(
+        error.code === 'ENOENT' || error.code === 'ENOTDIR'
+          ? 'debugger_program_not_found'
+          : 'debugger_program_unavailable'
+      )
+    })
     if (!within(root, program)) throw new ChannelError('debugger_path_escape')
+    const info = await stat(program).catch(() => {
+      throw new ChannelError('debugger_program_unavailable')
+    })
+    if (!info.isFile()) throw new ChannelError('debugger_program_not_found')
     const sources = new Map<string, string>([['s1', program]])
     for (const path of p.sources) this.inside(root, path)
     await admitSources(root, sources, p.sources)
@@ -631,6 +715,12 @@ export class DebuggerLaunches {
     const off = run.onSession((session) => {
       const context = this.sourceContexts.get(run)
       if (context) session.admitSources(context.sources)
+      this.rememberSources(session.id, root, context?.sources ?? sources)
+      session.validateSource = async (path) => {
+        const digest = context?.digests.get(path)
+        if (!digest || digest !== (await sourceDigest(path).catch(() => undefined)))
+          throw new ChannelError('debugger_source_changed')
+      }
       this.sessions.set(session.id, session)
       this.sessionRuns.set(session.id, run)
       session.resolveFrameSources = async (paths) => {
@@ -707,7 +797,7 @@ export class DebuggerLaunches {
       asking = true
       const revision = s.thread_inventory_revision
       session
-        .threads()
+        .refreshThreads()
         .catch((error) => console.debug('[debugger] Thread list not read', error))
         .finally(() => {
           asking = false
@@ -838,7 +928,9 @@ async function admitSources(
         refuse('debugger_source_limit')
         continue
       }
-      source_id = `s${admitted.size + 1}`
+      let index = admitted.size + 1
+      while (admitted.has(`s${index}`)) index++
+      source_id = `s${index}`
       admitted.set(source_id, full)
     }
     sources.push({ source_id, path: relative(root, full) })

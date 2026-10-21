@@ -37,6 +37,15 @@ after the answer commits; denial settles it as `denied`.
 Handling the reply marks the prompt delivered and journals `prompt.delivered`
 atomically with the run transition, so repeated answers never launch another effect.
 
+Command approvals additionally expose the unmodified `input.command` or
+`input.argv` directly for ordinary approval-card renderers. `input.params` remains
+the full compatible request. Render shell commands verbatim, preserving quoting,
+whitespace and newlines; render argv as individual arguments without implying a
+shell interpretation. Use this single durable prompt rather than a second client
+confirmation. Closing an approval window must not send `choice: "deny"`; denial
+is an explicit owner decision. Transport closure alone leaves pending prompts
+available to another connection, subject to their expiry and run lifetime.
+
 Before execution the node revalidates the approving and requesting identities,
 project trust, repository registration, worktree and cwd identities. Active effects
 hold execution leases, preventing worktree removal and competing execution. Git

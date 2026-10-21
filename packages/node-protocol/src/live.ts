@@ -10,6 +10,15 @@ export const SESSION_PERMISSION_MODES = [
   'dontAsk',
   'bypassPermissions',
 ] as const
+/** Effective filesystem/tool policy, recorded with each session and delegation. */
+export const ToolPermissionsSchema = z
+  .object({
+    permission_mode: z.enum(SESSION_PERMISSION_MODES),
+    per_action_approval: z.boolean(),
+    status: z.enum(['supported', 'unsupported']),
+    reason: z.string().max(256).optional(),
+  })
+  .strict()
 /** What the owner chose for one session. Absent fields take the node's defaults. */
 export const SessionSettingsSchema = z
   .object({
@@ -81,6 +90,7 @@ export const SessionContextSchema = z
 export const LiveSessionStateSchema = z
   .object({
     session_id: id,
+    tool_permissions: ToolPermissionsSchema.optional(),
     /** False: one process per message (delegated work, or a CLI without long-lived input). */
     live: z.boolean(),
     process: z.enum(['none', 'starting', 'idle', 'running', 'stopping']),

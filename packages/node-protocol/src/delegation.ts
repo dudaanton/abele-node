@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { Id, Sequence } from '@abele/channel-protocol'
 import { ExpectedExecutionTargetSchema, TurnAdmissionResultSchema } from './turn.js'
 import { ObsidianToolsSnapshotSchema } from './obsidian-tools.js'
+import { ToolPermissionsSchema, SESSION_PERMISSION_MODES } from './live.js'
 
 export const DelegationActionSchema = z.enum(['create', 'send', 'status', 'cancel', 'read'])
 export const DelegationStateSchema = z.enum([
@@ -64,6 +65,7 @@ export const DelegationSchema = z
     workspace_id: Id.nullable(),
     job_id: Id.nullable(),
     state: DelegationStateSchema,
+    tool_permissions: ToolPermissionsSchema.optional(),
     reason: z.enum(['time_limit']).optional(),
     created_at: z.string().datetime(),
   })
@@ -131,6 +133,8 @@ export const DelegationCreateSchema = z
     parent_id: Id.optional(),
     // Owner/plugin snapshot, never a model-selectable permission override.
     obsidian_tools: ObsidianToolsSnapshotSchema.optional(),
+    /** Trusted owner choice; omit for Ask. Never infer bypass from provider limitations. */
+    permission_mode: z.enum(SESSION_PERMISSION_MODES).optional(),
     delegation_key: Id,
     project_id: Id.optional(),
     base_ref: z.string().min(1).max(256).default('HEAD'),

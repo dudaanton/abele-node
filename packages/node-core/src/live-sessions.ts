@@ -164,6 +164,10 @@ export class LiveSessions {
       continuation_text: DEFAULT_CONTINUATION,
       messaging: true,
       ...(session.settings ?? {}),
+      permission_mode:
+        session.settings?.permission_mode ??
+        session.tool_permissions?.permission_mode ??
+        defaults.permission_mode,
     } as Effective
   }
   /** The permission modes a session is under: the owner's setting and, while it differs, the one
@@ -178,6 +182,13 @@ export class LiveSessions {
     const session = this.core.session(session_id)
     try {
       this.adapter(session.provider)?.validateSettings?.(settings)
+      if (
+        settings.permission_mode === 'bypassPermissions' &&
+        !this.adapter(session.provider)?.configuration.permission_modes?.includes(
+          'bypassPermissions'
+        )
+      )
+        throw new Error('bypass_unavailable')
     } catch {
       throw new ChannelError('invalid_params')
     }
@@ -215,6 +226,7 @@ export class LiveSessions {
     return {
       session_id,
       live: this.handles(session_id),
+      tool_permissions: this.core.session(session_id).tool_permissions,
       process: slot ? slot.state : 'none',
       run_id: slot?.run_id ?? null,
       turn: slot?.turn ?? null,
@@ -710,6 +722,7 @@ export class LiveSessions {
       let useRepositoryPermissions = false
       let previous_account: string | undefined
       try {
+        this.owner.assertPermissionPolicy(session_id)
         if (updateInProgress(this.core.stateDir, true)) {
           this.slots.delete(session_id)
           return
@@ -763,6 +776,7 @@ export class LiveSessions {
             ? { native_binding: this.owner.codexBinding(session_id) }
             : {}),
           use_repository_claude_permissions: useRepositoryPermissions,
+          codex_network_enabled: target.project.codex_network_enabled,
           settings: slot.settings,
           permission_ttl_ms: Number(adapter.configuration.session_permission_ttl_ms ?? 30 * 60000),
         },

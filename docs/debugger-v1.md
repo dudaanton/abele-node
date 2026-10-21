@@ -25,6 +25,20 @@ After evaluation, old handles expire. A successful, fenced stack probe confirms 
 the evaluated thread remains stopped; clients can request fresh stack/scopes handles
 and step again. A newer execution event takes precedence over that probe.
 
+With `debugger_v1.evaluate_watch`, clients may send `context:"watch"` to
+`debugger.v1.evaluate`. This uses the adapter's frame-bound watch evaluation and
+keeps the physical stop, its revision and existing handles. It does not fabricate
+an execution intent or a replacement stop. Real stop/continue/invalidation events
+still expire handles and reject an overtaken result. Expressions retain the same
+approval requirements and can execute getters or other code; this mode is not a
+side-effect-free evaluator. Omitted context preserves the existing REPL behavior.
+
+Nodes advertising `debugger_v1.launch_preflight` reject missing entry programs
+with `debugger_program_not_found` before starting an adapter or program. Other
+filesystem access failures use `debugger_program_unavailable`. These are known
+launch failures; clients should keep the current session and show the failure
+without reconnecting or claiming an unknown launch outcome.
+
 Stack items also return optional `path`, the adapter's mapped source path bounded
 to 4096 UTF-8 bytes. It is retained for callers outside the admitted source set,
 whose `source_id` stays null. Real internal paths retain their `node:` prefix.
@@ -35,8 +49,40 @@ classified separately (the program's own entry script remains admissible). Sourc
 identity uses retained digests, source-map content, and bounded read-only V8 source
 evidence at attach. Timestamp checks remain a fallback when content evidence is
 unavailable. Identical rebuilds and restored bytes retain their source identity.
+`sourceStatus` and `breakpointLocations` recheck retained content evidence on
+each query, including already admitted sources. Changed files fail with
+`debugger_source_changed`; touching a file without changing its bytes is allowed.
 A repeated attach to the same live process in the same folder returns its existing
 session, including concurrent requests with different operation IDs.
+
+With `debugger_v1.persisted_sources`, the owner can read
+`debugger.v1.sources({debug_session_id})` to obtain `{sources:[{source_id,path}]}`.
+Paths are relative to the registered folder, retained for each adapter session and
+updated by admission. They remain available after detach and node recovery, without
+opening files or obtaining a stack. An empty legacy mapping is unknown evidence;
+clients must not derive filenames from opaque source IDs. This inventory describes
+retained identity, not proof that the current bytes are loaded or executable.
+
+With `debugger_v1.source_runtime_admission`, use `require_loaded:true` on
+`debugger.v1.addSources` for executable margins. In addition to content/build
+checks, the node requires the current adapter to list the canonical source as
+loaded and return an executable position in lines 1–1000. Refusals distinguish
+`debugger_source_not_loaded`, `debugger_source_not_executable` (no position in that
+bounded window), and `debugger_source_unverified` (adapter lacks the evidence).
+A project source map alone does not satisfy this mode. Omitted `require_loaded`
+retains the existing source-identity admission contract.
+
+`debugger_v1.session_started_at` already advertises
+`debugger.v1.sessionInfo({debug_session_id}) -> {started_at}`. This immutable retained
+timestamp is the debugger session's creation time, not process boot time or
+`observed_at`; it is suitable for session-list start metadata.
+
+With `debugger_v1.session_exit_reconciliation`, listing sessions reconciles retained
+external attachments against recorded process-exit evidence or an OS `ESRCH`
+probe. Proven dead targets become `terminated` in both inventory and status.
+Permission failures and unavailable OS evidence leave the retained state intact;
+detaching or losing the adapter alone never proves that a process died. Exit
+events received during detach are retained and take precedence over `detached`.
 
 Inspection responses retain structured `data.items` and their snapshot even when
 recording state grows. Snapshot metadata is bounded separately from the inspection

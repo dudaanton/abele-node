@@ -6,6 +6,28 @@ keys, its scripts); the node reads and writes the files and sends.
 
 ## Destination ownership and recording correlation
 
+With `http_v1.transport_status`, `http.v1.send.status` accepts
+`transport_only:true`. This reads the existing send's current network outcome
+without waiting for adapter evaluation, recording drains or a paused target.
+An answered/failed/timed-out network result is available before recording links
+finish; `send.run.step` may therefore be absent. Body pages can be read once the
+transport answered. Omit the option for the existing recording-aware completion
+read. Poll the same send ID to obtain its final recording link; never resend or
+cancel because a status observation timed out. History records the actual final
+network outcome, not a failed status observation.
+
+With `trace_v1.fixed_prefix_paging`, capture the first `trace.v1.run` response's
+`run.steps`, then pass it as `through` on subsequent pages (with unchanged kind
+filters). The node sorts and pages only that written prefix. Its `run.steps` stays
+at that prefix count and `next` ends there, even if later exchanges have earlier
+timestamps. A missing/truncated prefix fails with `trace_prefix_unavailable`.
+Omitting `through` retains the live timeline behavior.
+
+`trace_v1.bound_record_points` means that recording and HTTP instrumentation start
+only after at least one enabled record point binds. Rejected or disabled points
+alone do not start a run. Pending synchronization retains an existing recording;
+when all its points are rejected or disabled, that recording ends.
+
 Detect `http_v1.destination_owner` before using
 `http.v1.destination({project_id, url})` with the fully resolved request URL. Its result is
 `{debug_session_id: string | null, candidates: string[], reason}`. `reason` is `owned`,

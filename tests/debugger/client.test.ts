@@ -79,6 +79,24 @@ it('adds sources through the typed owner client and validates the response', asy
   await expect(client.addSources(input)).rejects.toThrow()
 })
 describe('typed debugger client current-state reconciliation', () => {
+  it('does not roll back a revision or stop epoch at the same event cursor', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'debug-client-monotonic-'))
+    const core = new NodeCore(dir, { debuggerEnabled: true })
+    try {
+      const pair = core.debugger.snapshot(core.debugger.create(target).debug_session_id)
+      const newer = { ...pair, snapshot: { ...pair.snapshot, state_revision: 3, stop_epoch: 4 } }
+      let response = newer
+      const client = new DebuggerClient(async () => response)
+      await client.status(pair.snapshot.debug_session_id)
+      response = pair
+      await client.status(pair.snapshot.debug_session_id)
+      expect(client.current(pair.snapshot.debug_session_id).snapshot?.state_revision).toBe(3)
+      expect(client.current(pair.snapshot.debug_session_id).snapshot?.stop_epoch).toBe(4)
+    } finally {
+      core.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
   it('parses retained explicit child pages without accepting raw adapter references', () => {
     const page = {
       items: [{ name: 'item', value: 'Object', handle: 'opaque-child' }],

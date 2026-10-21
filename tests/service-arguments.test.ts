@@ -1,5 +1,47 @@
 import { expect, it } from 'vitest'
-import { retainServiceArguments } from '../packages/node-daemon/src/service-arguments.js'
+import {
+  retainServiceArguments,
+  summarizeServiceFlags,
+  validateServiceFlags,
+} from '../packages/node-daemon/src/service-arguments.js'
+
+it('summarizes effective service flags including defaults and debugger', () => {
+  expect(summarizeServiceFlags([])).toBe(
+    'Permission TTL: 60000 ms\nPi deadline: 1800000 ms\nPi max tokens: 32768\nDebugger: off\nAllow bypass: off'
+  )
+  expect(
+    summarizeServiceFlags([
+      '--permission-ttl-ms',
+      '120000',
+      '--pi-deadline-ms',
+      '900000',
+      '--pi-max-tokens',
+      '8192',
+      '--debugger',
+    ])
+  ).toBe(
+    'Permission TTL: 120000 ms\nPi deadline: 900000 ms\nPi max tokens: 8192\nDebugger: on\nAllow bypass: off'
+  )
+})
+
+it('toggles operator bypass without consuming neighbouring arguments and retains it across runtimes', () => {
+  expect(() => validateServiceFlags({ '--allow-bypass': 'on' })).not.toThrow()
+  expect(() => validateServiceFlags({ '--allow-bypass': 'off' })).not.toThrow()
+  expect(() => validateServiceFlags({ '--allow-bypass': 'yes' })).toThrow()
+  const old = 'ExecStart="/node" "/old/cli.js" "start" "--claude-allow-bypass" "--debugger"'
+  expect(retainServiceArguments(generated, old, 'linux')).toContain('--claude-allow-bypass')
+  expect(retainServiceArguments(generated, old, 'linux', { '--allow-bypass': 'off' })).toEqual([
+    ...generated.slice(0, 2),
+    'start',
+    '--debugger',
+  ])
+  expect(
+    retainServiceArguments(generated, old, 'linux', { '--allow-bypass': 'on' }).filter(
+      (s) => s === '--claude-allow-bypass'
+    )
+  ).toHaveLength(1)
+  expect(summarizeServiceFlags(['--claude-allow-bypass'])).toContain('Allow bypass: on')
+})
 
 const previous = [
   '/node',

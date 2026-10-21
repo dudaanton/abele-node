@@ -61,6 +61,81 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('certifies an exception stop inventory even after an in-flight command guard expires', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const off = (f.core.debuggerLaunches as any).keepThreads(f.session)
+      try {
+        f.w.reply(f.w.messages.at(-1), { threads: [{ id: 1, name: 'main' }] })
+        await new Promise((resolve) => setImmediate(resolve))
+        const revision = f.session.snapshot.state_revision
+        const guard = Object.assign(
+          () => {
+            if (f.session.snapshot.state_revision !== revision) throw new Error('stale_state')
+          },
+          { advanceIntent() {} }
+        )
+        await f.session.coordinated(guard, async () => {
+          const count = f.w.messages.length
+          f.w.send({
+            type: 'event',
+            event: 'stopped',
+            body: {
+              threadId: 7,
+              reason: 'exception',
+              allThreadsStopped: false,
+            },
+          })
+          expect(f.w.messages.length).toBe(count + 1)
+          expect(f.w.messages.at(-1).command).toBe('threads')
+          f.w.reply(f.w.messages.at(-1), { threads: [{ id: 7, name: 'main' }] })
+          await new Promise((resolve) => setImmediate(resolve))
+          expect(f.session.snapshot.execution).toBe('stopped')
+          expect(f.session.snapshot.selected_thread_id).toBe(7)
+        })
+      } finally {
+        off()
+      }
+    }))
+  it('retains actual process-exit evidence received during detach', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const pending = f.session.detach()
+      const disconnect = f.w.messages.at(-1)
+      f.w.send({ type: 'event', event: 'exited', body: { exitCode: 137 } })
+      f.w.reply(disconnect)
+      await pending
+      expect(f.core.debugger.exitInfo(f.session.id)).toEqual({ exit_code: 137 })
+      expect(f.session.snapshot.lifecycle).toBe('terminated')
+    }))
+  it.each(['not_loaded', 'not_executable', 'loaded'] as const)(
+    'requires runtime executable evidence: %s',
+    async (status) =>
+      fixture(async (f) => {
+        await ready(f)
+        f.w.send({
+          type: 'event',
+          event: 'capabilities',
+          body: {
+            capabilities: {
+              supportsLoadedSourcesRequest: true,
+              supportsBreakpointLocationsRequest: true,
+            },
+          },
+        })
+        const pending = f.session.runtimeSource(f.path)
+        expect(f.w.messages.at(-1).command).toBe('loadedSources')
+        f.w.reply(f.w.messages.at(-1), {
+          sources: status === 'not_loaded' ? [] : [{ path: f.path }],
+        })
+        if (status !== 'not_loaded') {
+          await new Promise((resolve) => setImmediate(resolve))
+          expect(f.w.messages.at(-1).command).toBe('breakpointLocations')
+          f.w.reply(f.w.messages.at(-1), { breakpoints: status === 'loaded' ? [{ line: 1 }] : [] })
+        }
+        expect(await pending).toBe(status)
+      })
+  )
   it('reports source uncertainty instead of inventing executable lines when the adapter cannot tell', async () =>
     fixture(async (f) => {
       await ready(f)
@@ -180,6 +255,42 @@ describe('internal DAP session driver', () => {
       release()
       await expect(pending).rejects.toThrow('stale_state')
     }))
+  it('keeps an exception stop connected while another command guard expires', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.w.send({
+        type: 'event',
+        event: 'capabilities',
+        body: {
+          capabilities: { supportsExceptionInfoRequest: true },
+        },
+      })
+      const revision = f.session.snapshot.state_revision
+      const guard = Object.assign(
+        () => {
+          if (f.session.snapshot.state_revision !== revision) throw new Error('stale_state')
+        },
+        { advanceIntent() {} }
+      )
+      await f.session.coordinated(guard, async () => {
+        f.w.send({
+          type: 'event',
+          event: 'stopped',
+          body: {
+            threadId: 1,
+            allThreadsStopped: true,
+            reason: 'exception',
+          },
+        })
+        expect(f.w.dap.closed).toBe(false)
+        expect(f.session.snapshot.execution).toBe('stopped')
+        const info = f.w.messages.filter((m) => m.command === 'exceptionInfo').at(-1)
+        expect(info).toBeDefined()
+        f.w.reply(info, { exceptionId: 'Error', description: 'Caught failure' })
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(f.session.snapshot.threads[0]?.stop?.description).toBe('Error: Caught failure')
+      })
+    }))
   it('reads exception details at the pause and ignores a reply after continue', async () =>
     fixture(async (f) => {
       await ready(f)
@@ -222,6 +333,42 @@ describe('internal DAP session driver', () => {
       await new Promise((resolve) => setImmediate(resolve))
       expect(f.session.snapshot.threads[0]?.stop).toBeNull()
       expect(f.session.snapshot.execution).toBe('running')
+    }))
+  it('publishes and continues a caught exception in an unadmitted library without source mapping', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: {
+          threadId: 7,
+          reason: 'exception',
+          text: 'LibraryError: invalid input',
+          allThreadsStopped: false,
+        },
+      })
+      expect(f.session.snapshot.selected_thread_id).toBe(7)
+      expect(f.session.snapshot.threads.find((t) => t.thread_id === 7)).toMatchObject({
+        status: 'stopped',
+        stop: { reason: 'exception', description: 'LibraryError: invalid input', location: null },
+      })
+      const stack = f.session.stack(7)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [
+          {
+            id: 9,
+            name: 'validate',
+            line: 3,
+            column: 1,
+            source: { path: '/runtime/library/validate.js' },
+          },
+        ],
+      })
+      expect((await stack).items[0]?.source_id).toBeNull()
+      const continued = f.session.continue(7)
+      expect(f.w.messages.at(-1).command).toBe('continue')
+      f.w.reply(f.w.messages.at(-1))
+      await continued
     }))
   it('resolves caller sources before returning a stack and keeps external frames unmapped', async () =>
     fixture(async (f) => {
@@ -354,6 +501,39 @@ describe('internal DAP session driver', () => {
         { breakpoint_id: 'on', hit_condition: '3', enabled: true },
         { breakpoint_id: 'off', enabled: false },
       ])
+    }))
+  it('evaluates a watch without manufacturing a stop or expiring its frame', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const stack = f.session.stack(1)
+      f.w.reply(f.w.messages.at(-1), {
+        stackFrames: [{ id: 42, name: 'main', line: 1, column: 1 }],
+      })
+      const frame = (await stack).items[0]!.handle
+      const before = f.session.snapshot
+      const pending = f.session.evaluate(frame, '1 + 1', 'watch')
+      expect(f.w.messages.at(-1).arguments.context).toBe('watch')
+      f.w.reply(f.w.messages.at(-1), { result: '2' })
+      expect(await pending).toMatchObject({ value: '2', observation_stop_epoch: before.stop_epoch })
+      expect(f.session.snapshot.state_revision).toBe(before.state_revision)
+      expect(f.session.snapshot.stop_epoch).toBe(before.stop_epoch)
+      expect(f.core.debugger.resolveHandle(f.session.id, frame, 'frame')).toBe(42)
+    }))
+  it('does not return a watch value from a frame resumed during evaluation', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const frame = f.core.debugger.issueHandle(f.session.id, 'frame', 42, 1)
+      ;(f.session as any).frameThreads.set(frame, 1)
+      const pending = f.session.evaluate(frame, '1', 'watch')
+      const result = f.w.messages.at(-1)
+      f.w.send({
+        type: 'event',
+        event: 'continued',
+        body: { threadId: 1, allThreadsContinued: true },
+      })
+      f.w.reply(result, { result: '1' })
+      await expect(pending).rejects.toThrow('stale_state')
+      expect(f.session.snapshot.execution).toBe('running')
     }))
   it('reconciles paused evaluation and expires old handles', async () =>
     fixture(async (f) => {

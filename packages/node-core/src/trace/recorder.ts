@@ -1,7 +1,7 @@
 /** Recording a run over a debugger session. A record point is an ordinary breakpoint plus what to
  * take there; when the program stops on record points only, the recorder takes their values
  * whole, writes a step and lets the program go on. A stop on any ordinary breakpoint stays a stop.
- * A session records whenever it has a record point: there is no separate record switch. */
+ * A session records while it has a bound record point: there is no separate record switch. */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { dirname, join, relative, isAbsolute } from 'node:path'
@@ -299,6 +299,19 @@ export class TraceRecorder {
     const snapshot = l.session.snapshot
     if (terminal[snapshot.lifecycle]) return
     const points = this.pointCopies(l, snapshot)
+    const ids = new Set(points.map((point) => point.breakpoint_id))
+    const enabled = snapshot.breakpoints.filter(
+      (bp) => ids.has(bp.breakpoint_id) && bp.enabled !== false
+    )
+    const bound = enabled.some((bp) => bp.status === 'verified' || bp.status === 'relocated')
+    // Pending adapter synchronization can keep an existing run alive, but is
+    // not evidence to start instrumentation. Rejected/disabled points alone
+    // must never turn an attempted record point into an HTTP-only recording.
+    if (!bound) {
+      if (l.writer && !enabled.some((bp) => bp.status === 'pending' || bp.status === 'requested'))
+        this.finish(l, 'done')
+      return
+    }
     try {
       if (l.writer) {
         l.writer.updatePoints(points)

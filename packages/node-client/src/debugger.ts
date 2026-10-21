@@ -4,6 +4,7 @@ import {
   DebuggerSnapshotResultSchema,
   DebuggerExitInfoResultSchema,
   DebuggerSessionInfoResultSchema,
+  DebuggerSourcesResultSchema,
   DebuggerLocationsInspectionSchema,
   DebuggerSourceStatusInspectionSchema,
   DebuggerSnapshotSchema,
@@ -97,7 +98,13 @@ export class DebuggerClient {
     const existing = this.states.get(snapshot.debug_session_id)
     // Event sequence remains monotonic across target replacement/recovery. An
     // older response must not resurrect a stop already superseded by a watch.
-    if (existing?.snapshot && existing.snapshot.event_seq > snapshot.event_seq) return
+    if (
+      existing?.snapshot &&
+      (existing.snapshot.event_seq > snapshot.event_seq ||
+        existing.snapshot.state_revision > snapshot.state_revision ||
+        existing.snapshot.stop_epoch > snapshot.stop_epoch)
+    )
+      return
     if (generation !== this.generation && existing?.observation === 'current') return
     if (!this.states.has(snapshot.debug_session_id) && this.states.size >= 128)
       this.states.delete(this.states.keys().next().value!)
@@ -175,6 +182,11 @@ export class DebuggerClient {
   async sessionInfo(debug_session_id: string) {
     return DebuggerSessionInfoResultSchema.parse(
       await this.rpc('debugger.v1.sessionInfo', { debug_session_id })
+    )
+  }
+  async sources(debug_session_id: string) {
+    return DebuggerSourcesResultSchema.parse(
+      await this.rpc('debugger.v1.sources', { debug_session_id })
     )
   }
   async breakpointLocations(params: Input<'debugger.v1.breakpointLocations'>) {

@@ -121,6 +121,7 @@ export const DebuggerAddSourcesSchema = z
   .object({
     operation_id: id,
     debug_session_id: id,
+    require_loaded: z.boolean().optional(),
     sources: z
       .array(
         z
@@ -216,6 +217,7 @@ export const DebuggerControlMethodSchemas = {
   'debugger.v1.status': DebuggerMethodSchemas['debugger.v1.status'],
   'debugger.v1.exitInfo': DebuggerMethodSchemas['debugger.v1.exitInfo'],
   'debugger.v1.sessionInfo': DebuggerMethodSchemas['debugger.v1.sessionInfo'],
+  'debugger.v1.sources': DebuggerMethodSchemas['debugger.v1.sources'],
   'debugger.v1.breakpointLocations': DebuggerMethodSchemas['debugger.v1.breakpointLocations'],
   'debugger.v1.sourceStatus': DebuggerMethodSchemas['debugger.v1.sourceStatus'],
   'debugger.v1.commandResult': DebuggerMethodSchemas['debugger.v1.commandResult'],

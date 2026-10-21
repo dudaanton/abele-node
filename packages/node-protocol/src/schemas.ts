@@ -28,6 +28,7 @@ import {
   LIVE_MUTATIONS,
   LiveEventPayloads,
   SessionSettingsSchema,
+  ToolPermissionsSchema,
 } from './live.js'
 export * from './live.js'
 import { SessionUpdateEventSchema } from './session-update.js'
@@ -125,6 +126,7 @@ export const SessionSchema = z
     workspace_id: id.nullable().optional(),
     /** The owner's choices for a long-lived session; absent means the node's defaults. */
     settings: SessionSettingsSchema.optional(),
+    tool_permissions: ToolPermissionsSchema.optional(),
   })
   .strict()
   .refine(
@@ -208,6 +210,7 @@ const EventPayloads = {
   'delegation.terminal': DelegationTerminalSchema,
   'project.registered': ProjectSchema,
   'project.claude_permissions.changed': ProjectSchema,
+  'project.codex_permissions.changed': ProjectSchema,
   'project.removed': z.object({ project_id: id }).strict(),
   'workspace.changed': z.union([WorkspaceSchema, WorkspaceInvalidationSchema]),
   'job.changed': JobSchema,

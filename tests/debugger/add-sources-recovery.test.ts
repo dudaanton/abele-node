@@ -94,6 +94,15 @@ it('retains added paths across node recovery and restores breakpoints by path af
     // This source no longer has proof when the node starts again.
     rmSync(join(dir, 'app.js.map'))
     current = open()
+    expect(
+      await current.request('debugger.v1.sources', { debug_session_id: first.debug_session_id })
+    ).toEqual({
+      sources: [
+        { source_id: 's1', path: 'app.js' },
+        { source_id: 's2', path: 'first.ts' },
+        { source_id: 's3', path: 'late.js' },
+      ],
+    })
     const restarted = await current.request('debugger.v1.restart', {
       operation_id: 'restart',
       debug_session_id: first.debug_session_id,

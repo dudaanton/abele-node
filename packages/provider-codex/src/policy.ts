@@ -1,5 +1,6 @@
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
+import type { DeveloperEnvironment } from './developer-environment.js'
 export interface PolicyPaths {
   home: string
   isolated?: boolean
@@ -9,6 +10,7 @@ export interface PolicyPaths {
   /** Resolved `git rev-parse --absolute-git-dir` (differs from the common dir in a worktree). */
   gitdir?: string
   state: string
+  developer?: DeveloperEnvironment
 }
 export const disabledFeatures = [
   'apps',
@@ -45,9 +47,8 @@ export function filesystem(p: PolicyPaths): Record<string, string> {
     [p.home]: 'deny',
     [p.sibling]: 'deny',
     [p.state]: 'deny',
-    // Git metadata is never writable, whatever the layout: <workspace>/.git (a folder
-    // or a gitfile), the resolved gitdir and the common dir are read-only inside the
-    // workspace and denied outside it.
+    // Unbound diagnostic/probe profiles keep metadata protected. A bound developer
+    // profile below adds only the object store and this worktree's commit files/ref.
     [join(p.workspace, '.git')]: 'read',
     ...Object.fromEntries(
       [p.repository, p.gitdir]
@@ -57,6 +58,52 @@ export function filesystem(p: PolicyPaths): Record<string, string> {
     [join(p.workspace, '.codex')]: 'read',
     '/private/tmp': 'deny',
     '/private/var/tmp': 'deny',
+    ...(p.developer ? developerFilesystem(p) : {}),
+  }
+}
+function developerFilesystem(p: PolicyPaths): Record<string, string> {
+  const d = p.developer!,
+    repository = p.repository,
+    gitdir = p.gitdir
+  const fs: Record<string, string> = {
+    [d.root]: 'write',
+    [d.nodeRoot]: 'read',
+    [d.gitRoot]: 'read',
+  }
+  if (!repository || !gitdir) throw new Error('codex_git_binding_unavailable')
+  if ([d.root, repository].some((path) => within(path, p.home) || within(p.home, path)))
+    throw new Error('codex_developer_home_overlap')
+  if (
+    !within(repository, gitdir) ||
+    (d.ref && (!d.ref.startsWith('refs/heads/') || !within(repository, join(repository, d.ref))))
+  )
+    throw new Error('codex_git_binding_unavailable')
+  fs[repository] = 'read'
+  fs[join(repository, 'worktrees')] = 'deny'
+  fs[gitdir] = 'read'
+  fs[join(repository, 'objects')] = 'write'
+  for (const file of ['HEAD', 'index', 'COMMIT_EDITMSG', 'logs/HEAD'])
+    for (const suffix of ['', '.lock']) fs[join(gitdir, file) + suffix] = 'write'
+  if (d.ref)
+    for (const file of [d.ref, 'logs/' + d.ref])
+      for (const suffix of ['', '.lock']) fs[join(repository, file) + suffix] = 'write'
+  return fs
+}
+export function shellEnvironment(
+  p: PolicyPaths
+): Record<string, string> & { PATH: string; HOME: string; TMPDIR: string } {
+  const d = p.developer
+  return {
+    PATH: [...(d ? [d.nodeBin, d.gitBin] : []), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'),
+    HOME: d ? join(d.root, 'home') : p.workspace,
+    TMPDIR: d ? join(d.root, 'tmp') : join(p.workspace, '.abele-tmp'),
+    ...(d
+      ? {
+          XDG_CACHE_HOME: join(d.root, 'cache'),
+          npm_config_cache: join(d.root, 'cache', 'npm'),
+          PYTHONPYCACHEPREFIX: join(d.root, 'cache', 'python'),
+        }
+      : {}),
   }
 }
 export function buildConfig(p: PolicyPaths) {
@@ -89,9 +136,9 @@ use_memories = false
 [shell_environment_policy]
 inherit = "none"
 [shell_environment_policy.set]
-PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-HOME = ${q(p.workspace)}
-TMPDIR = ${q(join(p.workspace, '.abele-tmp'))}
+${Object.entries(shellEnvironment(p))
+  .map(([key, value]) => `${key} = ${q(value)}`)
+  .join('\n')}
 [history]
 persistence = "none"
 [apps._default]
@@ -103,7 +150,7 @@ ${Object.entries(filesystem(p))
   .map(([k, v]) => `${q(k)} = ${q(v)}`)
   .join('\n')}
 [permissions.abele.network]
-enabled = false
+enabled = ${p.developer?.network === true}
 `
 }
 export function launchOverrides(p: PolicyPaths): string[] {
@@ -158,9 +205,12 @@ export function checkEffective(config: any, requirements: any, p: PolicyPaths) {
     'memories.generate_memories': false,
     'memories.use_memories': false,
     'shell_environment_policy.inherit': 'none',
-    'shell_environment_policy.set.PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
-    'shell_environment_policy.set.HOME': p.workspace,
-    'shell_environment_policy.set.TMPDIR': join(p.workspace, '.abele-tmp'),
+    ...Object.fromEntries(
+      Object.entries(shellEnvironment(p)).map(([key, value]) => [
+        'shell_environment_policy.set.' + key,
+        value,
+      ])
+    ),
     ...Object.fromEntries(disabledFeatures.map((k) => [`features.${k}`, false])),
     ...Object.fromEntries(
       ['exporter', 'trace_exporter', 'metrics_exporter'].map((k) => [`otel.${k}`, 'none'])
@@ -186,7 +236,7 @@ export function checkEffective(config: any, requirements: any, p: PolicyPaths) {
   if (
     JSON.stringify(Object.entries(profile?.workspace_roots ?? {})) !==
       JSON.stringify([[p.workspace, true]]) ||
-    profile?.network?.enabled !== false
+    profile?.network?.enabled !== (p.developer?.network === true)
   )
     throw new Error('codex_permission_profile_mismatch')
   const fs = profile.filesystem ?? {},

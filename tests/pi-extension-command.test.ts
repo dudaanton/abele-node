@@ -1,5 +1,22 @@
 import { it, expect } from 'vitest'
 import { PiExtensionUiBridge, PiSdkWorker } from '../packages/provider-pi/src/host.js'
+it('journals terminal input hook registration without failing the headless host', () => {
+  const events: any[] = []
+  const ui = new PiExtensionUiBridge(
+    async () => ({ choice: 'deny', delivered: () => true }),
+    new AbortController().signal,
+    (event) => events.push(event)
+  )
+  const dispose = { ...ui.context }.onTerminalInput(() => {})
+  expect(dispose).toBeTypeOf('function')
+  expect(() => dispose()).not.toThrow()
+  expect(events).toEqual([
+    {
+      type: 'pi.extension.warning',
+      data: { capability: 'onTerminalInput', reason: 'unsupported_extension_ui' },
+    },
+  ])
+})
 it.each([
   'setFooter',
   'setHeader',

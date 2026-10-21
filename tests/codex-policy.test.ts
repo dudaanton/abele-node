@@ -3,6 +3,7 @@ import {
   buildConfig,
   checkEffective,
   launchOverrides,
+  type PolicyPaths,
 } from '../packages/provider-codex/src/policy.js'
 const paths = {
   home: '/fixture/state/codex',
@@ -11,10 +12,10 @@ const paths = {
   sibling: '/fixture',
   repository: '/fixture/repository.git',
 }
-function effective() {
+function effective(p: PolicyPaths = paths) {
   const config: any = { mcp_servers: {}, plugins: {} }
   let section = ''
-  for (const line of buildConfig(paths).trim().split('\n')) {
+  for (const line of buildConfig(p).trim().split('\n')) {
     if (line.startsWith('[')) {
       section = line.slice(1, -1)
       continue
@@ -27,6 +28,26 @@ function effective() {
   }
   return config
 }
+it('checks the developer toolchain, external home and explicit project network policy', () => {
+  const p = {
+    ...paths,
+    gitdir: paths.repository + '/worktrees/dev',
+    developer: {
+      root: '/fixture/state/tool-home',
+      nodeBin: '/runtime/bin',
+      nodeRoot: '/runtime',
+      gitBin: '/usr/bin',
+      gitRoot: '/usr',
+      ref: 'refs/heads/dev',
+      network: true,
+    },
+  }
+  const config = effective(p),
+    requirements = { requirements: { allowRemoteControl: false } }
+  expect(() => checkEffective(config, requirements, p)).not.toThrow()
+  config.shell_environment_policy.set.HOME = p.workspace
+  expect(() => checkEffective(config, requirements, p)).toThrow()
+})
 it('uses inline tables for filesystem roots so CLI dotted-key parsing cannot reinterpret paths', () => {
   const overrides = launchOverrides(paths).filter((_, i) => i % 2 === 1)
   expect(overrides.some((k) => k.startsWith('permissions.abele.filesystem.'))).toBe(false)

@@ -12,6 +12,7 @@ export const ProjectSchema = z
     git_common_dir: path.nullable(),
     trust: TrustSchema,
     use_repository_claude_permissions: z.boolean().default(false),
+    codex_network_enabled: z.boolean().default(false),
     created_at: timestamp,
   })
   .strict()
@@ -96,6 +97,7 @@ export const ResourceMethodSchemas = {
   'project.claude_permissions': z
     .object({ project_id: id, use_repository_permissions: z.boolean() })
     .strict(),
+  'project.codex_permissions': z.object({ project_id: id, network_enabled: z.boolean() }).strict(),
   'workspace.create': z
     .object({
       project_id: id,
@@ -128,6 +130,7 @@ export const RESOURCE_MUTATIONS = [
   'project.register',
   'project.remove',
   'project.claude_permissions',
+  'project.codex_permissions',
   'workspace.create',
   'workspace.remove',
 ] as const

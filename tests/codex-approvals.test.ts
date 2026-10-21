@@ -57,6 +57,46 @@ function setup(answer: any = { choice: 'allow', delivered: () => true }) {
     close: () => rmSync(workspace, { recursive: true, force: true }),
   }
 }
+it.each(['file', '../outside', '.git/config', 'link/file'])(
+  'keeps patch confinement for %s even when every valid request would be bypass-approved',
+  async (path) => {
+    const s = setup({ choice: 'allow', delivered: () => true })
+    const external = mkdtempSync(resolve('.scratch/codex-outside-'))
+    try {
+      if (path === 'link/file') symlinkSync(external, join(s.workspace, 'link'))
+      s.mapper.notification({
+        method: 'item/started',
+        params: {
+          threadId: 'thread',
+          turnId: 'turn',
+          item: {
+            id: 'patch',
+            type: 'fileChange',
+            status: 'inProgress',
+            changes: [{ path, kind: { type: 'add' }, diff: '+edited' }],
+          },
+        },
+      })
+      const answer = await s.bridge.handle(
+        {
+          id: 5,
+          method: 'item/fileChange/requestApproval',
+          params: {
+            threadId: 'thread',
+            turnId: 'turn',
+            itemId: 'patch',
+          },
+        },
+        new AbortController().signal
+      )
+      expect(answer).toEqual({ decision: path === 'file' ? 'accept' : 'decline' })
+      expect(s.asks).toHaveLength(path === 'file' ? 1 : 0)
+    } finally {
+      s.close()
+      rmSync(external, { recursive: true, force: true })
+    }
+  }
+)
 it('dispatches only consumed single-action decisions, with generation and exact request evidence', async () => {
   let consumed = 0
   const s = setup({

@@ -24,6 +24,39 @@ import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
 for (const platform of ['mac', 'linux']) {
+  test(`service bypass opt-in survives update reinstall and disable-enable: ${platform}`, async () => {
+    const h = await home(),
+      env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    let result = await install(h, ['--version', '0.2.0'], env)
+    assert.equal(result.code, 0, result.stderr)
+    const recorded = async (enabled) => {
+      const c = JSON.parse(await readFile(join(h, '.local/share/abele-node/config.json'), 'utf8'))
+      const text = await readFile(c.service_file, 'utf8')
+      assert.equal(c.allow_bypass_enabled, enabled)
+      assert.equal(text.includes('--claude-allow-bypass'), enabled)
+      assert.equal(c.service_sha256, createHash('sha256').update(text).digest('hex'))
+    }
+    for (const args of [
+      ['--service-action', 'enable', '--service-flags', '{"--allow-bypass":"on"}'],
+      ['--version', '0.2.3'],
+      ['--version', '0.2.3'],
+    ]) {
+      result = await install(h, args, env)
+      assert.equal(result.code, 0, result.stderr)
+      await recorded(true)
+    }
+    assert.equal((await install(h, ['--service-action', 'disable'], env)).code, 0)
+    result = await install(h, ['--service-action', 'enable'], env)
+    assert.equal(result.code, 0, result.stderr)
+    await recorded(true)
+    result = await install(
+      h,
+      ['--service-action', 'enable', '--service-flags', '{"--allow-bypass":"off"}'],
+      env
+    )
+    assert.equal(result.code, 0, result.stderr)
+    await recorded(false)
+  })
   test(`update adopts known service flags but refuses structural edits: ${platform}`, async () => {
     const h = await home(),
       env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
@@ -456,7 +489,7 @@ const completed=(action,target)=>{if(journal && !fs.existsSync(process.env.HOME+
 if(isMac && args[0]==='install'){
   if(fs.existsSync(marker) && JSON.parse(fs.readFileSync(marker,'utf8')).state===state){console.error('stop_before_install');process.exit(1)}
   fs.mkdirSync(state,{recursive:true,mode:0o700});fs.mkdirSync(process.env.HOME+'/Library/LaunchAgents',{recursive:true});
-  let command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[]),...(args.includes('--debugger')?['--debugger']:[])];
+  let command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[]),...(args.includes('--debugger')?['--debugger']:[]),...(args.includes('--claude-allow-bypass')?['--claude-allow-bypass']:[])];
   if(process.env.ABELE_PREVIOUS_SERVICE_FILE)command=retainServiceArguments(command,fs.readFileSync(process.env.ABELE_PREVIOUS_SERVICE_FILE,'utf8'),'darwin',JSON.parse(process.env.ABELE_SERVICE_ARGUMENT_OVERRIDES || '{}'));
   const xml=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
   const text='<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>';

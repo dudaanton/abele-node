@@ -16,7 +16,7 @@ export interface ProviderAdapter {
   readonly configuration: Record<string, any>
   capabilities(): Record<string, any>
   configurationForTurn(
-    turn: Pick<TurnContext, 'use_repository_claude_permissions'>
+    turn: Pick<TurnContext, 'use_repository_claude_permissions' | 'permission_mode'>
   ): Record<string, unknown>
   startTurn(
     turn: TurnContext & { native_session_file?: string },

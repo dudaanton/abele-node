@@ -1,12 +1,31 @@
 export const serviceFlagLimits: Record<string, number> = {
+  '--allow-bypass': 0,
   '--permission-ttl-ms': 3600000,
   '--pi-deadline-ms': Number.MAX_SAFE_INTEGER,
   '--pi-max-tokens': Number.MAX_SAFE_INTEGER,
 }
 
+/** Human output uses the same defaults as daemon startup; JSON retains raw argv. */
+export function summarizeServiceFlags(flags: string[]): string {
+  const value = (flag: string, fallback: string) => {
+    const index = flags.lastIndexOf(flag)
+    return index < 0 ? fallback : (flags[index + 1] ?? fallback)
+  }
+  return [
+    `Permission TTL: ${value('--permission-ttl-ms', '60000')} ms`,
+    `Pi deadline: ${value('--pi-deadline-ms', '1800000')} ms`,
+    `Pi max tokens: ${value('--pi-max-tokens', '32768')}`,
+    `Debugger: ${flags.includes('--debugger') ? 'on' : 'off'}`,
+    `Allow bypass: ${flags.includes('--claude-allow-bypass') ? 'on' : 'off'}`,
+  ].join('\n')
+}
+
 export function validateServiceFlags(flags: Record<string, string>) {
   for (const [flag, value] of Object.entries(flags))
-    if (
+    if (flag === '--allow-bypass') {
+      if (value !== 'on' && value !== 'off')
+        throw new Error('Invalid --allow-bypass: use on or off.')
+    } else if (
       !serviceFlagLimits[flag] ||
       !/^\d+$/.test(value) ||
       !Number.isSafeInteger(Number(value)) ||
@@ -59,10 +78,15 @@ export function retainServiceArguments(
 ): string[] {
   const args = readServiceArguments(previous, os)
   const retained = args.slice(2)
-  for (const [flag, value] of Object.entries(overrides)) {
+  for (const [requested, setting] of Object.entries(overrides)) {
+    const flag = requested === '--allow-bypass' ? '--claude-allow-bypass' : requested
+    const value = requested === '--allow-bypass' ? setting === 'on' : setting
     for (let i = retained.length - 1; i >= 0; i--)
       if (retained[i] === flag)
-        retained.splice(i, ['--debugger', '--no-codex'].includes(flag) ? 1 : 2)
+        retained.splice(
+          i,
+          ['--debugger', '--no-codex', '--claude-allow-bypass'].includes(flag) ? 1 : 2
+        )
     if (value !== false) retained.push(flag, ...(value === true ? [] : [value]))
   }
   return [...generated.slice(0, 2), ...retained]

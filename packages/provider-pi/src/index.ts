@@ -132,6 +132,7 @@ export class PiProviderAdapter {
     this.available = version === '0.87.0' && patch === '5.0.12'
     this.liveAvailable = this.available && o.live
     this.configuration = {
+      per_action_approval: true,
       sdk_version: version,
       brace_expansion_version: patch,
       model_provider: o.provider || 'sdk-user-settings',
@@ -298,6 +299,7 @@ export class PiProviderAdapter {
     turn: TurnContext & { native_session_file?: string },
     sink: PiSink
   ): Promise<ProviderRun> {
+    this.validateSettings({ permission_mode: turn.permission_mode ?? 'manual' })
     if (!this.available) throw new Error('pi_sdk_unavailable')
     if (!isAbsolute(turn.cwd) || !/^[a-f0-9-]{36}$/.test(turn.session_id))
       throw new Error('invalid_pi_turn')
@@ -433,6 +435,7 @@ export class PiProviderAdapter {
               model: this.options.model,
               profile: this.options.profile,
               maxTokens: this.options.maxTokens,
+              permission_mode: turn.permission_mode ?? 'manual',
               ...(sink.debugger?.tools.length ? { debugger_tools: sink.debugger.tools } : {}),
               ...(turn.native_session_id ? { native_session_id: turn.native_session_id } : {}),
               ...(turn.native_session_file

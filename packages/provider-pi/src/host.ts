@@ -70,7 +70,6 @@ const HEADLESS_DISPLAY_APIS = [
   'setEditorComponent',
   'pasteToEditor',
   'addAutocompleteProvider',
-  'onTerminalInput',
 ] as const
 /** The host owns prompt transport; unavailable answers never become true/allow. */
 export class PiExtensionUiBridge {
@@ -103,6 +102,18 @@ export class PiExtensionUiBridge {
           this.emit({ type: 'pi.ui.notification', data: { message, level } }),
         setStatus: (key: string, text?: string) =>
           this.emit({ type: 'pi.ui.status', data: { key, text: text ?? null } }),
+        // There is no terminal input in this host. Registration is harmless,
+        // and extensions still need the disposer returned by the SDK API.
+        onTerminalInput: () => {
+          this.emit({
+            type: 'pi.extension.warning',
+            data: {
+              capability: 'onTerminalInput',
+              reason: 'unsupported_extension_ui',
+            },
+          })
+          return () => {}
+        },
         // The SDK spreads this object before giving it to hooks. Methods must
         // be own enumerable properties; a Proxy fallback alone is lost there.
         setWidget: (key: string, lines?: unknown) => {
@@ -125,7 +136,6 @@ export class PiExtensionUiBridge {
                 type: 'pi.extension.warning',
                 data: { capability: name, reason: 'unsupported_extension_ui' },
               })
-              if (name === 'onTerminalInput') return () => {}
             },
           ])
         ),

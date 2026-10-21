@@ -10,6 +10,8 @@ const path = z.string().min(1).max(1024)
 
 export const TRACE_VERSION = 1 as const
 export const TRACE_V1_CAPABILITY = {
+  bound_record_points: true,
+  fixed_prefix_paging: true,
   scalar_briefs: true,
   sent_observation_merge: true,
   discovery_probe_suppression: true,
@@ -226,6 +228,7 @@ export const TraceMethodSchemas = {
     .object({
       ...run,
       from: z.number().int().min(0).optional(),
+      through: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
       kind: z
         .array(z.enum(['probe', 'error', 'http', 'browser-lost']))
         .max(4)

@@ -200,14 +200,14 @@ listener is requested.
 Each active run or live owner chat has one supervised stdio app-server. Its permission profile
 grants writes to the canonical workspace and minimum runtime reads, with explicit
 denials for node state, sibling workspaces, host-temp locations and protected Git
-and policy paths. The filesystem root itself is denied too, so a command you
-approve with escalation keeps this same profile: it writes only inside the
-workspace, on 0.160.1 and 0.162.1 alike. (From 0.161.0, Codex would otherwise let an
+and policy paths. Bound developer profiles add a private tool home/cache area and
+the narrow Git commit paths described below. The filesystem root itself is denied,
+so escalation keeps this same profile on 0.160.1 and 0.162.1 alike. (From 0.161.0, Codex would otherwise let an
 approved command write anywhere that is not explicitly denied; 0.160.1 never did.)
-Git metadata is never writable: the workspace's `.git` (folder or gitfile), the
-resolved gitdir and the common Git directory are read-only when inside the workspace
-and denied when outside it, so a node-created worktree cannot write its main
-repository's configuration or hooks.
+Unbound diagnostic/probe profiles keep Git metadata read-only or denied. Bound
+developer profiles allow status/diff and committing the worktree's own branch,
+while keeping repository configuration, hooks and other refs read-only and other
+worktree metadata denied.
 Effective values are checked before user input. Project or
 managed configuration that adds roots/resources or changes checked values causes
 refusal, not silent permission broadening. Only explicit node RPC methods are
@@ -215,12 +215,23 @@ available; Codex endpoints are never exposed to the plugin.
 
 ## Approvals and questions
 
-Workspace-contained commands run without per-command prompts. Native command
-and patch approval requests require one exact, durable answer from you. Only
+The native `on-request` policy runs workspace-contained operations without
+per-action prompts. The node therefore blocks Ask (`manual`) before launch rather
+than treating it as bypass. Running requires an explicit `bypassPermissions`
+choice and the operator's shared `--claude-allow-bypass` opt-in. Native command
+and patch approval requests still use exact, durable single-action decisions. Only
 single-action `accept`, `decline` and cancellation are supported. Session-wide
 grants, rule amendments, grant roots, permission-expansion requests and requests
 with missing or inconsistent action evidence are denied. This is not pi's
 every-tool approval gate.
+
+Clients can detect this mode in the Codex provider's `configuration` returned by
+`node.describe`: `approval_mode: "on-request"`, `per_action_approval: false`, and
+`workspace_actions_without_approval: true`. These additive fields are present even
+when the provider is unavailable. For the actual session/delegation mode and
+whether it can run, read its persisted `tool_permissions` snapshot through the
+[`tool.permissions.v1` contract](tool-permissions.md). Show unsupported Ask
+explicitly; never change it automatically to bypass.
 
 Questions preserve option descriptions and free-text answers, with one durable
 prompt per bounded question. Rejection, expiry or interruption cancels the
@@ -230,6 +241,43 @@ to dispatch, not proof that an operation executed.
 Delegated children use node-owned isolated workspaces and explicit provider
 grants. Existing grants and default grant lists do not automatically acquire
 Codex authority; see [delegation](delegation.md).
+
+## Developer tool environment
+
+Detect `codex.developer-environment.v1` in node capabilities. Node-launched Codex
+developers receive node/npm from the node service's installation and the system
+Git toolchain on an explicit PATH; shell startup files and ambient credentials
+are not inherited. If npm is missing from that Node installation, startup fails
+with `codex_node_toolchain_unavailable` before launching the developer.
+
+The bound worktree can run its package tests and `git status`, `git diff`, staging
+and commits. The common Git directory is readable; only the shared object store,
+this worktree's index/HEAD/commit message/reflog and the branch bound at startup
+(including its locks and reflog) are writable. Other worktree metadata and other
+branch refs remain protected. Shared objects are necessary for a normal Git
+commit; this is not a separate object database. Creating arbitrary branches,
+changing repository configuration and rewriting other refs are not granted.
+
+HOME, TMPDIR, XDG/npm caches and Python bytecode caches use a private directory
+under node state, scoped by workspace identity, outside the checkout. This is a
+tool home, separate from the authenticated Codex home. Tools creating
+`~/Library/Caches` no longer leave those files in the worktree.
+
+Network remains **off by default**. The owner can explicitly opt a trusted project
+in with `project.codex_permissions { project_id, network_enabled: true }`, or
+`NodeClient.setProjectCodexPermissions(project_id, true)`. `Project.codex_network_enabled`
+persists and is returned to clients. Use this only when dependency installation
+or project tests need network; set it false again when it is unnecessary. The
+setting cannot change while project execution is active. It authorizes network
+for that project's Codex process, not only npm. Existing thread bindings pin this
+policy: create a new Codex session after changing network or upgrading the tool
+environment instead of weakening a thread's recorded binding.
+
+A new worktree does not inherit another checkout's `node_modules`. When a Node
+manifest declares dependencies and they are absent, the node emits a startup
+warning before model work: either install them first (owner/another authorized
+provider), or explicitly enable project network and let the developer install.
+No automatic dependency installation or implicit network grant occurs.
 
 ## Owner chats are live sessions
 

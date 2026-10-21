@@ -32,6 +32,11 @@ export const DEBUGGER_V1_CAPABILITY = Object.freeze({
   breakpoint_hit_condition: true,
   breakpoint_enabled: true,
   launch_stop_on_entry: true,
+  launch_preflight: true,
+  evaluate_watch: true,
+  persisted_sources: true,
+  source_runtime_admission: true,
+  session_exit_reconciliation: true,
   exit_code: true,
   stop_exception_text: true,
   frame_source_paths: true,
@@ -268,6 +273,11 @@ export const DebuggerExitInfoResultSchema = z
 export const DebuggerSessionInfoResultSchema = z
   .object({ started_at: z.string().datetime().nullable() })
   .strict()
+export const DebuggerSourcesResultSchema = z
+  .object({
+    sources: z.array(z.object({ source_id: id, path: z.string().max(4096) }).strict()).max(256),
+  })
+  .strict()
 export const DebuggerLocationsResultSchema = z
   .object({
     items: z
@@ -455,6 +465,7 @@ export type DebuggerVariablesResult = z.infer<typeof DebuggerVariablesResultSche
 
 export const DebuggerMethodSchemas = {
   'debugger.v1.sessionInfo': z.object(session).strict(),
+  'debugger.v1.sources': z.object(session).strict(),
   'debugger.v1.breakpointLocations': z
     .object({
       ...session,
@@ -540,7 +551,12 @@ export const DebuggerMethodSchemas = {
     })
     .strict(),
   'debugger.v1.evaluate': z
-    .object({ ...effect, frame_handle: id, expression: z.string().min(1).max(8192) })
+    .object({
+      ...effect,
+      frame_handle: id,
+      expression: z.string().min(1).max(8192),
+      context: z.enum(['repl', 'watch']).optional(),
+    })
     .strict(),
   'debugger.v1.setVariable': z
     .object({

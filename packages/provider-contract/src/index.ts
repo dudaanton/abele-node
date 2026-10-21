@@ -33,6 +33,8 @@ export interface Answer {
   delivered(): boolean | void
 }
 export interface TurnContext {
+  codex_network_enabled?: boolean
+  permission_mode?: string
   durable_permissions?: boolean
   session_id: string
   run_id: string
@@ -93,6 +95,7 @@ export interface LiveSessionSettings {
   permission_mode: string
 }
 export interface LiveSessionContext {
+  codex_network_enabled?: boolean
   session_id: string
   run_id: string
   cwd: string

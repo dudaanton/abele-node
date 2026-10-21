@@ -8,6 +8,11 @@ normal node session. The node owns the workspace, queue, transcript, human
 prompts and a separate durable mailbox. Disconnecting the parent does not stop
 the child. This is not a scheduler, a task board or a filesystem sandbox.
 
+Delegations persist their effective permission mode and interactive approval
+capability alongside the child session. See [tool permissions](tool-permissions.md)
+for `delegation.create.permission_mode`, the returned `tool_permissions` snapshot,
+the `tool.permissions.v1` discovery capability, and unsupported Ask handling.
+
 ## Installation authority and the trusted controller
 
 Discovery advertises `capabilities.delegation_without_grant.status: "supported"`.
@@ -59,9 +64,13 @@ Execution permissions and extension questions requiring human answers still use
 normal node prompts. A worker mailbox question is informational: it neither
 approves a tool nor answers a prompt. `pending_human_prompts` in status lets the
 controller direct a human to the child session. Status also returns
-`pending_prompts: [{ prompt_id, run_id, expires_at }]`. A newly opened child
-prompt posts a durable `delegation.question` with `report_id: "prompt:<id>"`
-and a child-session link in its text. This does not grant the controller
+`pending_prompts: [{ prompt_id, run_id, expires_at }]`. The first permission
+prompt in each child run posts a durable `delegation.question` with
+`report_id: "prompt:<id>"`; further tool permission gates in that run remain
+visible in child status and the child journal without repeated mailbox wakeups.
+Distinct extension questions still post notices. Notice text contains no raw
+session or prompt IDs; clients use the structured `session_id` to link the child.
+This does not grant the controller
 permission-answer authority. Delegated prompts wait for the owner until the run
 ends; their `expires_at` is `Number.MAX_SAFE_INTEGER`. Ending the run invalidates
 unanswered prompts. A refused or expired pi tool approval blocks that tool call

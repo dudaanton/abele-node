@@ -252,28 +252,53 @@ export class DelegationService {
       .prepare('UPDATE delegations SET result_text=NULL WHERE session_id=?')
       .run(session_id)
   }
-  promptOpened(session_id: string, prompt: { prompt_id: string }) {
+  promptOpened(session_id: string, prompt: { prompt_id: string; run_id: string; kind?: string }) {
     const row = this.core.db
       .prepare('SELECT * FROM delegations WHERE session_id=?')
       .get(session_id) as Row | undefined
     if (!row) return
     const d = DelegationSchema.parse(JSON.parse(row.body))
+    // Permission gates belong in the child approval UI. Wake the controller
+    // once per run, while distinct extension questions still get notices.
+    const permission = !prompt.kind || prompt.kind === 'permission'
+    const run = prompt.run_id.startsWith('obsidian:')
+      ? (this.core.db
+          .prepare(
+            'SELECT run_id FROM obsidian_tool_invocations WHERE invocation_id=? AND session_id=?'
+          )
+          .get(prompt.run_id.slice('obsidian:'.length), session_id)?.run_id ?? prompt.run_id)
+      : prompt.run_id
+    if (
+      permission &&
+      this.core.db
+        .prepare(
+          "SELECT 1 FROM prompts WHERE session_id=? AND (run_id=? OR run_id IN (SELECT 'obsidian:' || invocation_id FROM obsidian_tool_invocations WHERE session_id=? AND run_id=?)) AND prompt_id<>? AND COALESCE(json_extract(body,'$.kind'),'permission')='permission'"
+        )
+        .get(session_id, run, session_id, run, prompt.prompt_id)
+    )
+      return
     if (active(d))
       this.mailbox.message(
         d,
         'question',
         'prompt:' + prompt.prompt_id,
-        'Waiting for owner approval. Open child session ' +
-          session_id +
-          ' to answer prompt ' +
-          prompt.prompt_id +
-          '. The controller cannot approve it.'
+        'Waiting for owner approval. Open the child session to review the pending action. The controller cannot approve it.'
       )
   }
   private save(d: Delegation) {
     this.core.db
       .prepare('UPDATE delegations SET body=? WHERE delegation_id=?')
       .run(JSON.stringify(DelegationSchema.parse(d)), d.delegation_id)
+  }
+  permissionsChanged(
+    session_id: string,
+    tool_permissions: NonNullable<Delegation['tool_permissions']>
+  ) {
+    const row = this.core.db
+      .prepare('SELECT body FROM delegations WHERE session_id=?')
+      .get(session_id)
+    if (!row) return
+    this.save({ ...DelegationSchema.parse(JSON.parse(String(row.body))), tool_permissions })
   }
   request(actor: AuthorityContext, method: string, p: Params, operation?: string): unknown {
     if (method === 'delegation.status') {
@@ -479,6 +504,7 @@ export class DelegationService {
         {
           title: p.title,
           provider: p.provider,
+          settings: { permission_mode: p.permission_mode ?? 'manual' },
           ...(reserved ? { workspace_id: reserved.workspace_id } : {}),
         },
         !!reserved
@@ -501,6 +527,7 @@ export class DelegationService {
         workspace_id: reserved?.workspace_id ?? null,
         job_id: reserved?.job_id ?? null,
         state: reserved ? 'provisioning' : 'running',
+        tool_permissions: child.tool_permissions,
         created_at: new Date().toISOString(),
       })
       this.core.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(d.mailbox_stream_id)

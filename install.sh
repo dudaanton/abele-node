@@ -121,10 +121,10 @@ if [ "$os" = darwin ]; then
 fi
 # Resolve the executable now: services do not read shell startup files.
 node=$("$node" -p 'process.execPath')
-"$node" - "$service_flags" <<'NODE' || fail 'Invalid service flags; supported values are positive integers: --permission-ttl-ms (up to 3600000), --pi-deadline-ms, --pi-max-tokens.'
+"$node" - "$service_flags" <<'NODE' || fail 'Invalid service flags: use --allow-bypass on|off or positive integers for --permission-ttl-ms (up to 3600000), --pi-deadline-ms, --pi-max-tokens.'
 const flags=JSON.parse(process.argv[2]);
 if(!flags || typeof flags!=='object' || Array.isArray(flags))process.exit(1);
-for(const [k,v] of Object.entries(flags))if(!['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens'].includes(k)||typeof v!=='string'||!/^\d+$/.test(v)||!Number.isSafeInteger(Number(v))||Number(v)<1||(k==='--permission-ttl-ms'&&Number(v)>3600000))process.exit(1);
+for(const [k,v] of Object.entries(flags)){if(k==='--allow-bypass'){if(!['on','off'].includes(v))process.exit(1);continue}if(!['--permission-ttl-ms','--pi-deadline-ms','--pi-max-tokens'].includes(k)||typeof v!=='string'||!/^\d+$/.test(v)||!Number.isSafeInteger(Number(v))||Number(v)<1||(k==='--permission-ttl-ms'&&Number(v)>3600000))process.exit(1)}
 NODE
 [ "$service_flags" = '{}' ] || { [ "$service_action" != disable ] && [ "$service_action" != adopt-debugger ] && [ "$uninstall" = 0 ]; } || fail 'Service flags apply only to installation or service enable.'
 if [ -n "$service_action" ] && [ "$service_action" != adopt-debugger ]; then
@@ -287,6 +287,10 @@ if [ -f "$config" ]; then
   codex_enabled=${codex_enabled:-$(get_config codex_enabled)}
   old_paired_config=$(get_config paired_config)
   old_debugger_enabled=$(get_config debugger_enabled)
+  allow_bypass_enabled=$(get_config allow_bypass_enabled)
+  if [ -z "$allow_bypass_enabled" ]; then
+    allow_bypass_enabled=$("$node" -e 'const c=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(/<string>--claude-allow-bypass<\/string>| "--claude-allow-bypass"(?: |$)/m.test(c.service_text||""))' "$config") || fail 'Invalid recorded bypass choice.'
+  fi
   old_debugger_enabled=${old_debugger_enabled:-false}
   [ -n "$debugger_enabled" ] || debugger_enabled=$old_debugger_enabled
   [ -n "$paired_change" ] || paired_config=$old_paired_config
@@ -297,6 +301,10 @@ if [ -f "$config" ]; then
   fi
 fi
 debugger_enabled=${debugger_enabled:-false}
+allow_bypass_enabled=${allow_bypass_enabled:-false}
+case "$allow_bypass_enabled" in true|false) ;; *) fail 'Invalid bypass enabled configuration.' ;; esac
+allow_bypass_enabled=$("$node" -e 'const f=JSON.parse(process.argv[1]);console.log(f["--allow-bypass"]===undefined?process.argv[2]:f["--allow-bypass"]==="on"?"true":"false")' "$service_flags" "$allow_bypass_enabled") || fail 'Invalid bypass flag.'
+export ABELE_INSTALL_ALLOW_BYPASS="$allow_bypass_enabled"
 case "$debugger_enabled" in true|false) ;; *) fail 'Invalid debugger enabled configuration.' ;; esac
 if [ -z "$old" ] && { [ -e "$root/current" ] || [ -L "$root/current" ]; }; then fail 'Unrecorded current pointer; refusing to replace it.'; fi
 plist=$HOME/Library/LaunchAgents/dev.abele.node.plist
@@ -503,6 +511,7 @@ selected_cli() {
   [ "$codex_enabled" = true ] || set -- "$@" --no-codex
   [ -z "$paired_config" ] || set -- "$@" --paired-config "$paired_config"
   [ "$debugger_enabled" != true ] || set -- "$@" --debugger
+  [ "$allow_bypass_enabled" != true ] || set -- "$@" --claude-allow-bypass
   "$node" "$selected_runtime/packages/node-daemon/dist/cli.js" "$@"
 }
 # End provider discovery
@@ -804,7 +813,7 @@ start_service() {
     write_id=$journal_action_id
     "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" "$debugger_enabled" "${previous_service:-}" "$service_overrides" <<'NODE' || return 1
 const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired,debuggerEnabled,previousService,overrides]=process.argv.slice(2);
-const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[]),...(debuggerEnabled==='true'?['--debugger']:[])];
+const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[]),...(debuggerEnabled==='true'?['--debugger']:[]),...(process.env.ABELE_INSTALL_ALLOW_BYPASS==='true'?['--claude-allow-bypass']:[])];
 if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
 const generated=[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--service-run','--claude-path',claude,...codexArgs];
 const command=previousService?require(root+'/packages/node-daemon/dist/service-arguments.js').retainServiceArguments(generated,fs.readFileSync(previousService,'utf8'),'linux',JSON.parse(overrides)):generated;
@@ -1220,7 +1229,8 @@ const q=s=>"'"+s.replaceAll("'", "'\\''")+"'";
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[])];
 fs.writeFileSync(wrapper, '#!/bin/sh\n# abele-node installer wrapper\nexec '+[node,root+'/current/packages/node-daemon/dist/cli.js'].map(q).join(' ')+' "$@" --state-dir '+q(state)+' --claude-path '+q(claude)+' '+codexArgs.map(q).join(' ')+'\n',{mode:0o755});
 const ownership=service==='1'?{service_file:fs.realpathSync(serviceFile),service_sha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(serviceFile)).digest('hex'),service_text:fs.readFileSync(serviceFile,'utf8')}:{};
-fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,debugger_enabled:debuggerEnabled==='true',service:Number(service),...ownership})+'\n',{mode:0o600});
+const allow_bypass_enabled=service==='1'?/<string>--claude-allow-bypass<\/string>| "--claude-allow-bypass"(?: |$)/m.test(ownership.service_text):process.env.ABELE_INSTALL_ALLOW_BYPASS==='true';
+fs.writeFileSync(config,JSON.stringify({version,prefix:require('node:path').dirname(require('node:path').dirname(root)),state,state_identity,claude,codex,codex_model:model,codex_home:home,codex_enabled:enabled==='true',paired_config:paired,debugger_enabled:debuggerEnabled==='true',allow_bypass_enabled,service:Number(service),...ownership})+'\n',{mode:0o600});
 if(process.env.ABELE_SERVICE_TRANSITION){const path=require('node:path'),dir=process.env.ABELE_SERVICE_TRANSITION;for(const [name,file] of [['wrapper',wrapper],['config',config]]){const stage=path.join(dir,'next-'+name);fs.copyFileSync(file,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}const fd=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}}
 NODE
 if [ -f "$prefix/bin/abele-node" ]; then cp -p "$prefix/bin/abele-node" "$work/published-wrapper.previous"; fi

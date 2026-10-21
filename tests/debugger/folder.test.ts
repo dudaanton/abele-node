@@ -334,6 +334,14 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
         url: 'http://localhost:4399/events',
       })
     ).toMatchObject({ debug_session_id: attached.debug_session_id, reason: 'owned' })
+    for (const host of ['127.0.0.1', '[::1]']) {
+      expect(
+        await request('http.v1.destination', {
+          project_id: project.project_id,
+          url: `http://${host}:4399/events`,
+        })
+      ).toMatchObject({ debug_session_id: attached.debug_session_id, reason: 'owned' })
+    }
     identity.mockResolvedValue('reused-process-identity')
     expect(
       await request('http.v1.destination', {
@@ -393,6 +401,17 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       end_line: 2,
     }
     const typedDebugger = new DebuggerClient(request)
+    expect(
+      await request('debugger.v1.addSources', {
+        operation_id: 'runtime-evidence-required',
+        debug_session_id: attached.debug_session_id,
+        sources: ['late.ts'],
+        require_loaded: true,
+      })
+    ).toMatchObject({
+      sources: [],
+      refused: [{ path: 'late.ts', code: 'debugger_source_unverified' }],
+    })
     expect(await typedDebugger.sourceStatus(sourceQuery)).toMatchObject({
       loaded: null,
       known: false,
@@ -405,6 +424,7 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       await request('debugger.v1.sessionInfo', { debug_session_id: attached.debug_session_id })
     ).toMatchObject({ started_at: expect.any(String) })
     writeFileSync(join(dir, 'late.ts'), 'changed\n')
+    await expect(typedDebugger.sourceStatus(sourceQuery)).rejects.toThrow('debugger_source_changed')
     expect(
       (
         await request('debugger.v1.addSources', {

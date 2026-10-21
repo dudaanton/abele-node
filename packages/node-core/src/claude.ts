@@ -3,6 +3,8 @@ import { randomUUID, createHash } from 'node:crypto'
 import { ChannelError } from '@abele/channel-protocol'
 import {
   PromptSchema,
+  ToolPermissionsSchema,
+  type SessionSettings,
   SessionSchema,
   type Prompt,
   type ExpectedExecutionTarget,
@@ -53,6 +55,41 @@ export class ProviderSessions {
   }
   adapterFor(provider: string) {
     return this.adapters.get(provider)
+  }
+  permissionPolicy(provider: string, settings: SessionSettings = {}) {
+    const adapter = this.adapterFor(provider)
+    const permission_mode =
+      settings.permission_mode ?? adapter?.sessionDefaults?.().permission_mode ?? 'manual'
+    const per_action_approval = adapter?.configuration.per_action_approval !== false
+    const bypassUnavailable =
+      permission_mode === 'bypassPermissions' &&
+      !adapter?.configuration.permission_modes?.includes(permission_mode)
+    return ToolPermissionsSchema.parse({
+      permission_mode,
+      per_action_approval,
+      status:
+        !bypassUnavailable && (permission_mode === 'bypassPermissions' || per_action_approval)
+          ? 'supported'
+          : 'unsupported',
+      ...(bypassUnavailable ? { reason: 'bypass_unavailable' } : {}),
+      ...(!per_action_approval && permission_mode !== 'bypassPermissions'
+        ? { reason: 'interactive_approval_unsupported' }
+        : {}),
+    })
+  }
+  assertPermissionPolicy(session_id: string) {
+    const session = this.core.session(session_id)
+    const current = this.permissionPolicy(session.provider, {
+      ...session.settings,
+      permission_mode:
+        session.settings?.permission_mode ?? session.tool_permissions?.permission_mode ?? 'manual',
+    })
+    // Check both the persisted admission and the current runner after reconnect/update.
+    if (current.status === 'unsupported' || session.tool_permissions?.status === 'unsupported')
+      throw new Error(
+        current.reason ?? session.tool_permissions?.reason ?? 'interactive_approval_unsupported'
+      )
+    return current
   }
   isAvailable(provider: string) {
     return this.adapterFor(provider)?.available ?? false
@@ -194,6 +231,7 @@ export class ProviderSessions {
       const slot: ActiveRun = { run_id, starting: true }
       this.active.set(session.session_id, slot)
       try {
+        const toolPermissions = this.assertPermissionPolicy(session.session_id)
         const expected = (
           JSON.parse(String(input.body)) as { expected_target?: ExpectedExecutionTarget }
         ).expected_target
@@ -243,6 +281,7 @@ export class ProviderSessions {
               run_id,
               input_id: input.input_id,
               configuration: adapter.configurationForTurn({
+                permission_mode: toolPermissions.permission_mode,
                 use_repository_claude_permissions: useRepositoryPermissions,
               }),
               native_session_id: session.native_session_id ?? null,
@@ -338,6 +377,8 @@ export class ProviderSessions {
             cwd: executionTarget.path,
             text: this.core.delegations.turnText(session.session_id, body.text),
             durable_permissions: this.core.delegations.isActive(session.session_id),
+            permission_mode: toolPermissions.permission_mode,
+            codex_network_enabled: project.codex_network_enabled,
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
             ...(session.provider === 'codex' && session.native_session_id
@@ -711,7 +752,13 @@ export class ProviderSessions {
       }
     }
     // Suppressed records must also be marked mapped, or clients replay them as notices.
-    const mapped = updates.length || rateLimit || dependencies ? { mapped: true } : {}
+    const terminalInput =
+      provider === 'pi' &&
+      event.type === 'pi.extension.warning' &&
+      event.data.capability === 'onTerminalInput' &&
+      event.data.reason === 'unsupported_extension_ui'
+    const mapped =
+      updates.length || rateLimit || dependencies || terminalInput ? { mapped: true } : {}
     let data: Record<string, unknown> = {
       ...event.data,
       ...(event.data.run_id !== undefined && event.data.run_id !== run_id
@@ -863,6 +910,13 @@ export class ProviderSessions {
               "INSERT INTO prompt_deliveries(prompt_id,reservation_id,state) VALUES(?,?,'reserved') ON CONFLICT(prompt_id) DO NOTHING"
             )
             .run(prompt.prompt_id, reservation_id).changes === 1
+      if (
+        reserved &&
+        prompt.state === 'pending' &&
+        (!action.kind || action.kind === 'permission') &&
+        this.live.effective(session_id).permission_mode === 'bypassPermissions'
+      )
+        prompt = this.core.resolvePrompt(prompt, 'resolved', 'allow', null)
     })
     if (!reserved) return { choice: 'deny' as const, delivered: () => false }
     for (;;) {

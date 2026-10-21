@@ -20,6 +20,33 @@ const stopped = {
 }
 
 describe('debugger reducer, handles, replay and persistence', () => {
+  it('reconciles a detached external process only with positive OS exit evidence', () =>
+    withCore((core) => {
+      const d = core.debugger
+      const state = d.create({ ...target, process_ownership: 'external' })
+      d.observe(state.debug_session_id, state.incarnation, {
+        kind: 'lifecycle',
+        lifecycle: 'detached',
+      })
+      core.db
+        .prepare('INSERT INTO debug_launches VALUES(?,?)')
+        .run(state.debug_session_id, JSON.stringify({ kind: 'attach', params: { pid: 999999 } }))
+      const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+        throw Object.assign(new Error('permission denied'), { code: 'EPERM' })
+      })
+      try {
+        const rows = () => [d.snapshot(state.debug_session_id).snapshot]
+        expect(core.debuggerLaunches.reconcileSessions(rows())[0]?.lifecycle).toBe('detached')
+        kill.mockImplementation(() => {
+          throw Object.assign(new Error('no process'), { code: 'ESRCH' })
+        })
+        expect(core.debuggerLaunches.reconcileSessions(rows())[0]?.lifecycle).toBe('terminated')
+        expect(d.snapshot(state.debug_session_id).snapshot.lifecycle).toBe('terminated')
+        expect(kill).toHaveBeenLastCalledWith(999999, 0)
+      } finally {
+        kill.mockRestore()
+      }
+    }, true))
   it('retains a creation timestamp separately from observed_at', () =>
     withCore((core) => {
       vi.useFakeTimers({ toFake: ['Date'] })
@@ -61,6 +88,9 @@ describe('debugger reducer, handles, replay and persistence', () => {
       const next = new NodeCore(dir, { debuggerEnabled: true })
       try {
         expect(next.debugger.exitInfo(state.debug_session_id)).toEqual({ exit_code: 3 })
+        expect(next.debugger.sessionInfo(state.debug_session_id)).toEqual({
+          started_at: state.observed_at,
+        })
         expect(next.debugger.snapshot(state.debug_session_id).snapshot).not.toHaveProperty(
           'exit_code'
         )

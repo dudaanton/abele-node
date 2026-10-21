@@ -1,6 +1,14 @@
 import { expect, it } from 'vitest'
 import { CodexProviderAdapter } from '@abele/provider-codex'
 import { codexExecutionGates } from '../packages/provider-codex/src/gates.js'
+it('exposes native approval scope independently of provider readiness', () => {
+  const adapter = new CodexProviderAdapter({ stateDir: '/fixture/state', enabled: false })
+  expect(adapter.capabilities().configuration).toMatchObject({
+    approval_mode: 'on-request',
+    per_action_approval: false,
+    workspace_actions_without_approval: true,
+  })
+})
 it.each(['0.163.0', '0.161.0', '0.162.0'])(
   'does not transfer native execution evidence to unproven version %s',
   (version) => {

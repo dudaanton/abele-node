@@ -113,6 +113,22 @@ it('sets service flags through the installer and rejects invalid values before m
   expect(calls).toHaveLength(1)
   expect(JSON.parse(calls[0]!)).toContain('{"--pi-max-tokens":"12345"}')
 })
+it('routes explicit bypass opt-in and opt-out through the fingerprinted installer boundary', () => {
+  const f = fixture()
+  writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1 }))
+  for (const mode of ['on', 'off']) {
+    const result = run(f.entry, f.state, 'service', 'flags', 'set', '--allow-bypass', mode)
+    expect(result.status, result.stderr).toBe(0)
+  }
+  const calls = readFileSync(join(f.home, 'installer-args'), 'utf8').trim().split('\n')
+  expect(calls).toHaveLength(2)
+  expect(JSON.parse(calls[0]!)).toContain('{"--allow-bypass":"on"}')
+  expect(JSON.parse(calls[1]!)).toContain('{"--allow-bypass":"off"}')
+  expect(run(f.entry, f.state, 'service', 'flags', 'set', '--allow-bypass', 'yes').status).not.toBe(
+    0
+  )
+  expect(readFileSync(join(f.home, 'installer-args'), 'utf8').trim().split('\n')).toHaveLength(2)
+})
 
 it('shows service arguments as plain text by default and JSON only on request', () => {
   const f = fixture(),
@@ -129,7 +145,9 @@ it('shows service arguments as plain text by default and JSON only on request', 
   writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1, service_file: file }))
   const plain = run(f.entry, f.state, 'service', 'flags', 'show')
   expect(plain.status, plain.stderr).toBe(0)
-  expect(plain.stdout).toBe('--pi-max-tokens\n32768\n')
+  expect(plain.stdout).toBe(
+    'Permission TTL: 60000 ms\nPi deadline: 1800000 ms\nPi max tokens: 32768\nDebugger: off\nAllow bypass: off\n'
+  )
   const json = run(f.entry, f.state, 'service', 'flags', 'show', '--json')
   expect(JSON.parse(json.stdout)).toEqual({ flags: ['--pi-max-tokens', '32768'] })
 })
