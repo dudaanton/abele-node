@@ -3,6 +3,21 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { SessionSchema, PromptSchema, validateParams } from '@abele/node-protocol'
 import { PiProviderAdapter } from '@abele/provider-pi'
+import { ClaudeProviderAdapter } from '@abele/provider-claude'
+import { CodexProviderAdapter } from '@abele/provider-codex'
+it('defaults other bounded providers to thirty minutes too', () => {
+  expect(
+    new ClaudeProviderAdapter({ executable: process.env.ABELE_CLAUDE_PATH! }).configuration
+      .deadline_ms
+  ).toBe(1800000)
+  expect(
+    new CodexProviderAdapter({ stateDir: process.cwd(), enabled: false }).configuration.deadline_ms
+  ).toBe(1800000)
+})
+it('defaults to thirty minutes of active work and a full report token budget', () => {
+  const adapter = new PiProviderAdapter({ stateDir: process.cwd() })
+  expect(adapter.configuration).toMatchObject({ deadline_ms: 1800000, max_tokens: 32768 })
+})
 
 it('accepts pi selection and exact native file mapping without a protocol fork', () => {
   expect(

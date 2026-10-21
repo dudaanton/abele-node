@@ -53,7 +53,7 @@ export class CodexProviderAdapter {
   constructor(protected options: CodexOptions) {
     this.options = { ...options, model: options.model || undefined }
     this.homeSelection = resolveCodexHome(options.home)
-    const deadline = options.deadlineMs ?? 120000,
+    const deadline = options.deadlineMs ?? 1800000,
       ttl = options.permissionTtlMs ?? 60000
     if (
       !isAbsolute(options.stateDir) ||

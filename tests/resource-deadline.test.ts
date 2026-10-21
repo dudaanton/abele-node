@@ -29,12 +29,24 @@ it('allows bounded Git resource calls past the five-second control deadline with
   const requests = new RequestChannel(channel)
   try {
     const pending = requests.request('workspace.diff', { workspace_id: 'w' })
+    let settled = false
+    void pending.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
     const rejection = expect(pending).rejects.toThrow('outcome_unknown')
     await vi.advanceTimersByTimeAsync(6000)
+    expect(settled).toBe(false)
     expect(closed).toBe(false)
     await vi.advanceTimersByTimeAsync(25000)
     await rejection
-    expect(closed).toBe(true)
+    expect(settled).toBe(true)
+    // F55: the deadline bounds this request; heartbeat owns connection loss.
+    expect(closed).toBe(false)
   } finally {
     await requests.close()
     vi.useRealTimers()

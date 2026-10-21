@@ -5,6 +5,71 @@ import { join } from 'node:path'
 import { NodeCore } from '@abele/node-core'
 
 const cleanup: (() => void)[] = []
+it('does not revive a revoked controller relationship when the owner continues a retained child', async () => {
+  const f = fixture()
+  const child = await f.create()
+  f.core.tick()
+  f.request('delegation.grant.revoke', { grant_id: child.grant_id })
+  f.request('session.send', {
+    session_id: child.session_id,
+    text: 'owner work',
+    observed_seq: f.core.head(child.session_id),
+  })
+  f.core.tick()
+  expect(
+    JSON.parse(
+      String(
+        f.core.db
+          .prepare('SELECT body FROM delegations WHERE delegation_id=?')
+          .get(child.delegation_id)!.body
+      )
+    ).state
+  ).toBe('completed')
+  expect(
+    f.core
+      .read(child.session_id, 0)
+      .some((e) => e.type === 'content.delta' && (e.data as any).text === 'owner work')
+  ).toBe(true)
+})
+it('lets a parent delete a completed child by delegation identity with a replayable receipt', async () => {
+  const f = fixture()
+  const child = await f.create()
+  expect(() =>
+    f.request('delegation.delete', { delegation_id: child.delegation_id }, 'delete')
+  ).toThrow('resource_busy')
+  f.core.tick()
+  const deleted = f.request('delegation.delete', { delegation_id: child.delegation_id }, 'delete')
+  expect(deleted).toEqual({ session_id: child.session_id, deleted: true })
+  f.restart()
+  expect(f.request('delegation.delete', { delegation_id: child.delegation_id }, 'delete')).toEqual(
+    deleted
+  )
+  expect(f.request('session.list', {})).toEqual([])
+})
+it('delivers a long pi final report in ordered mailbox parts without losing its beginning', async () => {
+  const f = fixture()
+  const child = await f.create('long-report', [{ kind: 'hang' }])
+  f.core.tick()
+  const input = f.core.db
+    .prepare('SELECT * FROM inputs WHERE session_id=?')
+    .get(child.session_id) as any
+  const text = 'Beginning\n' + 'report '.repeat(9000) + '\nEnd'
+  f.core.transaction(() => {
+    f.core.delegations.observe(child.session_id, input.run_id, {
+      type: 'pi.message.final',
+      data: { message: { role: 'assistant', content: [{ type: 'text', text }] } },
+    })
+    f.core.transition(input, 'completed')
+  })
+  f.core.tick()
+  expect(
+    f.core
+      .read(child.mailbox_stream_id, 0)
+      .filter((e) => e.type === 'delegation.result')
+      .map((e) => (e.data as any).text)
+      .join('')
+  ).toBe(text)
+})
 it('reports a deadline as stopped with a resumable time-limit reason', async () => {
   const f = fixture()
   const child = await f.create('deadline', [{ kind: 'hang' }])

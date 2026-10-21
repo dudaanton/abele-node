@@ -150,6 +150,8 @@ it('launches the canonical discovered server with a different project cwd', asyn
     if (previous === undefined) delete process.env.PATH
     else process.env.PATH = previous
   })
+  mkdirSync(join(root, 'node_modules/typescript/lib'), { recursive: true })
+  writeFileSync(join(root, 'node_modules/typescript/lib/tsserver.js'), '')
   const found = discover(join(dir, 'state'), 'typescript')
   const service = new LspService(join(dir, 'state'), {
     trusted: () => true,
@@ -283,6 +285,7 @@ it('restarts once after a crash and reports a repeated crash', async () => {
   slot.connection.notify('crash', {})
   await until(() => errors.length === 2)
   await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_repeated_crash')
+  await expect(service.query(root, 'a.ts', 'diagnostics')).rejects.toThrow('lsp_repeated_crash')
 })
 it('uses fake install transports without network and refuses corrupt Rust binaries', async () => {
   const root = temp(),
@@ -302,4 +305,117 @@ it('uses fake install transports without network and refuses corrupt Rust binari
   await expect(install(root, ['rust'], undefined, transport)).rejects.toThrow('checksum_mismatch')
   const rows = await status(root, root)
   expect(rows.find((r) => r.language === 'eslint')?.project_eslint).toContain('missing')
+})
+
+it('shares version probes across concurrent status requests and reprobes replaced binaries', async () => {
+  const state = temp(),
+    bin = join(state, 'lsp/typescript/bin'),
+    marker = join(state, 'versions')
+  mkdirSync(bin, { recursive: true })
+  const file = join(bin, 'typescript-language-server')
+  const script = (version: string) =>
+    `#!${process.execPath}\nimport('node:fs').then(fs => fs.appendFileSync(${JSON.stringify(marker)}, 'probe\\n')); console.log('${version}')\n`
+  writeFileSync(file, script('1.0'))
+  chmodSync(file, 0o700)
+  await Promise.all([status(state, state, true), status(state, state, true)])
+  await status(state, state, true)
+  expect(readFileSync(marker, 'utf8').trim().split('\n')).toHaveLength(1)
+  writeFileSync(file, script('2.0-new'))
+  expect((await status(state, state, true)).find((r) => r.language === 'typescript')?.version).toBe(
+    '2.0-new'
+  )
+  expect(readFileSync(marker, 'utf8').trim().split('\n')).toHaveLength(2)
+  await install(state, ['typescript'], undefined, {
+    run: async () => '',
+    download: async () => {
+      throw new Error('unexpected_download')
+    },
+  })
+  await status(state, state, true)
+  expect(readFileSync(marker, 'utf8').trim().split('\n')).toHaveLength(3)
+})
+
+it('reports a missing TypeScript runtime before spawning or restarting a server', async () => {
+  const state = temp(),
+    root = temp(),
+    bin = join(state, 'lsp/typescript/bin')
+  mkdirSync(bin, { recursive: true })
+  const command = join(bin, 'typescript-language-server'),
+    marker = join(state, 'started')
+  writeFileSync(
+    command,
+    `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')\n`
+  )
+  chmodSync(command, 0o700)
+  writeFileSync(join(root, 'a.ts'), 'const a = 1')
+  const service = new LspService(state, {
+    trusted: () => true,
+    check: (base, path) => join(base, path),
+  })
+  cleanups.push(() => service.stop())
+  await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_typescript_missing')
+  await expect(service.query(root, 'a.ts', 'hover', { line: 0, character: 0 })).rejects.toThrow(
+    'lsp_typescript_missing'
+  )
+  expect(() => readFileSync(marker)).toThrow()
+})
+
+it('uses the node-managed TypeScript runtime while keeping the worktree as the analysis root', async () => {
+  const state = temp(),
+    root = temp(),
+    bin = join(state, 'lsp/typescript/node_modules/.bin'),
+    log = join(state, 'frames')
+  mkdirSync(bin, { recursive: true })
+  const runtime = join(state, 'lsp/typescript/node_modules/typescript/lib/tsserver.js')
+  mkdirSync(join(runtime, '..'), { recursive: true })
+  writeFileSync(runtime, '')
+  const executable = join(bin, 'typescript-language-server')
+  writeFileSync(
+    executable,
+    `#!${process.execPath}\nprocess.argv[2] = 'typescript'; process.argv[3] = ${JSON.stringify(log)}; import(${JSON.stringify(fixture)})\n`
+  )
+  chmodSync(executable, 0o700)
+  writeFileSync(join(root, 'a.ts'), 'const a = 1')
+  const service = new LspService(state, {
+    trusted: () => true,
+    check: (base, path) => join(base, path),
+  })
+  cleanups.push(() => service.stop())
+  expect(await service.open(root, 'a.ts')).toEqual({ servers: ['typescript'] })
+  const initialize = JSON.parse(readFileSync(log + '.initialize', 'utf8'))
+  expect(initialize.rootUri).toBe(new URL('file://' + realpathSync(root)).href)
+  expect(initialize.initializationOptions).toMatchObject({
+    tsserver: { path: runtime },
+    disableAutomaticTypingAcquisition: true,
+  })
+})
+
+it('backs off before restarting a failed server and cancels restart when the root closes', async () => {
+  const root = temp()
+  writeFileSync(join(root, 'a.ts'), '')
+  const service = new LspService(root, {
+    trusted: () => true,
+    check: (base, path) => join(base, path),
+    command: (language) =>
+      language === 'typescript' ? { command: process.execPath, args: [fixture] } : null,
+  })
+  cleanups.push(() => service.stop())
+  await service.open(root, 'a.ts')
+  const slot = [...(service as any).slots.values()][0],
+    connection = slot.connection
+  await connection.stop()
+  const { vi } = await import('vitest')
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    connection.onExit()
+    expect(slot.connection).toBe(connection)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(slot.connection).toBe(connection)
+    await service.releaseRoot(root)
+    await vi.advanceTimersByTimeAsync(10000)
+    expect((service as any).slots.size).toBe(0)
+    expect(slot.connection).toBe(connection)
+  } finally {
+    vi.useRealTimers()
+  }
 })

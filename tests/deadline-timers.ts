@@ -3,6 +3,9 @@ import type { DeadlineTimers } from '../packages/provider-codex/src/timers.js'
 /** Advance only the budget under test, never child I/O or cleanup watchdogs. */
 export class VirtualDeadlineTimers implements DeadlineTimers {
   now = 0
+  nowMs() {
+    return this.now
+  }
   private next = 0
   private tasks = new Map<ReturnType<typeof setTimeout>, { at: number; callback: () => void }>()
   setTimeout(callback: () => void, ms: number) {

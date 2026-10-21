@@ -421,9 +421,11 @@ it('refuses active leases, dirty/untracked/ignored content, roots and changed ma
     code: 'resource_busy',
     details: { holder: 'session', session_id: session.session_id, title: 'attached' },
   })
-  await expect(
-    s.request('session.create', { title: 'second', workspace_id: w.workspace_id })
-  ).rejects.toThrow('resource_busy')
+  const second = (await s.request('session.create', {
+    title: 'second',
+    workspace_id: w.workspace_id,
+  })) as { session_id: string }
+  await s.request('session.detach', { session_id: second.session_id })
   await s.request('session.detach', { session_id: session.session_id })
   writeFileSync(join(w.path, '.hidden'), 'dirty')
   await expect(s.request('workspace.remove', { workspace_id: w.workspace_id })).rejects.toThrow(
@@ -854,4 +856,78 @@ it('does not follow a symlink substituted for the node-owned worktree directory'
     error: 'unmanaged_workspace',
   })
   expect(git(s.repo, 'worktree', 'list', '--porcelain').match(/worktree /g)).toHaveLength(1)
+})
+
+it('allows multiple managed-worktree chats while deletion still requires every chat detached', async () => {
+  const s = setup(),
+    p = await registered(s),
+    w = await provision(s, p.project_id)
+  const one = (await s.request('session.create', {
+    title: 'one',
+    workspace_id: w.workspace_id,
+  })) as any
+  const two = (await s.request('session.create', {
+    title: 'two',
+    workspace_id: w.workspace_id,
+  })) as any
+  await s.request('session.detach', { session_id: one.session_id })
+  await expect(s.request('workspace.remove', { workspace_id: w.workspace_id })).rejects.toThrow(
+    'resource_busy'
+  )
+  await s.request('session.detach', { session_id: two.session_id })
+  const removal = (await s.request('workspace.remove', { workspace_id: w.workspace_id })) as any
+  await s.core.resources.jobs.drain()
+  expect(await s.request('job.get', { job_id: removal.job_id })).toMatchObject({
+    state: 'succeeded',
+  })
+})
+it('rechecks a refused managed deletion with the same operation after cleaning', async () => {
+  const s = setup(),
+    p = await registered(s),
+    w = await provision(s, p.project_id)
+  writeFileSync(join(w.path, '.hidden'), 'dirty')
+  await expect(
+    s.request('workspace.remove', { workspace_id: w.workspace_id }, 'retry-delete')
+  ).rejects.toThrow('workspace_dirty')
+  git(w.path, 'restore', '.hidden')
+  const removal = (await s.request(
+    'workspace.remove',
+    { workspace_id: w.workspace_id },
+    'retry-delete'
+  )) as any
+  await s.core.resources.jobs.drain()
+  expect(await s.request('job.get', { job_id: removal.job_id })).toMatchObject({
+    state: 'succeeded',
+  })
+})
+
+it('preserves an existing workspace binding when upgrading the single-session lease table', async () => {
+  const s = setup(),
+    p = await registered(s),
+    w = await provision(s, p.project_id)
+  const one = (await s.request('session.create', {
+    title: 'existing',
+    workspace_id: w.workspace_id,
+  })) as any
+  await s.core.resources.stop()
+  s.core.close()
+  const db = new DatabaseSync(join(s.state, 'node.sqlite'))
+  db.exec(`BEGIN IMMEDIATE;
+    ALTER TABLE workspace_leases RENAME TO leases_new;
+    CREATE TABLE workspace_leases(workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id), session_id TEXT UNIQUE NOT NULL REFERENCES sessions(session_id));
+    INSERT INTO workspace_leases SELECT * FROM leases_new;
+    DROP TABLE leases_new;
+    PRAGMA user_version=18; COMMIT;`)
+  db.close()
+  const reopened = new NodeCore(s.state)
+  cores.push(reopened)
+  reopened.resources.workspaces.assertLease(w.workspace_id, one.session_id)
+  const two = (await reopened.request(
+    s.actor,
+    'session.create',
+    { title: 'new', workspace_id: w.workspace_id },
+    'new-after-upgrade'
+  )) as any
+  reopened.resources.workspaces.assertLease(w.workspace_id, two.session_id)
+  expect(reopened.node_id).toBe(s.core.node_id)
 })

@@ -43,9 +43,13 @@ it.each(['late-cancellation-reply', 'late-null-reply', 'rejected-wait'] as const
           elapsed_ms: 1,
           snapshot: completion === 'late-null-reply' ? null : snapshot.snapshot,
         })
-      await watch
+      // Real disconnect keeps the watch alive for reconnect. Settle the old
+      // wait before cancelling so late replies cannot restore current state.
+      await vi.advanceTimersByTimeAsync(0)
       expect(updates).toHaveLength(2)
       expect(client.current(f.id)).toMatchObject({ observation: 'last-known' })
+      abort.abort()
+      await watch
     } finally {
       abort.abort()
       resolve?.({

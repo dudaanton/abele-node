@@ -21,6 +21,7 @@ process.stdin.on('data', (bytes) => {
     buffer = buffer.subarray(end + 4 + length)
     if (log && m.method) appendFileSync(log, m.method + '\n')
     if (m.method === 'initialize') {
+      if (log) writeFileSync(log + '.initialize', JSON.stringify(m.params))
       if (source === 'crash' && !existsSync(log + '.crashed')) {
         writeFileSync(log + '.crashed', '1')
         process.exit(1)

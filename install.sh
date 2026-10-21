@@ -72,7 +72,8 @@ version='' prefix=${HOME:?HOME must be set}/.local state='' claude='' no_service
 codex=${ABELE_CODEX_PATH:-} codex_model=${ABELE_CODEX_MODEL:-} codex_home=${ABELE_CODEX_HOME:-} codex_enabled=''
 # Paired listener configuration: keep the recorded one unless set or cleared.
 paired_config='' paired_change=''
-debugger_enabled='' old_debugger_enabled=false
+claude_change= codex_change= codex_model_change= codex_home_change= codex_enabled_change=
+debugger_enabled='' old_debugger_enabled=false debugger_change=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version|--prefix|--state-dir|--claude-path|--codex-path|--codex-model|--codex-home|--confirm-purge-state|--service-action|--paired-config)
@@ -80,14 +81,14 @@ while [ "$#" -gt 0 ]; do
       case "$2" in --*) fail "$1 requires a value" ;; esac
       case "$1" in
         --version) version=${2#v} ;; --prefix) prefix=$2 ;; --state-dir) state=$2 ;;
-        --claude-path) claude=$2 ;; --confirm-purge-state) confirmation=$2 ;; --service-action) service_action=$2 ;;
-        --codex-path) codex=$2 ;; --codex-model) codex_model=$2 ;; --codex-home) codex_home=$2 ;;
+        --claude-path) claude=$2; claude_change=set ;; --confirm-purge-state) confirmation=$2 ;; --service-action) service_action=$2 ;;
+        --codex-path) codex=$2; codex_change=set ;; --codex-model) codex_model=$2; codex_model_change=set ;; --codex-home) codex_home=$2; codex_home_change=set ;;
         --paired-config) [ -z "$paired_change" ] || fail 'Choose either --paired-config PATH or --no-paired-config.'; paired_config=$2; paired_change=set ;;
       esac
       shift 2 ;;
-    --codex) codex_enabled=true; shift ;; --no-codex) codex_enabled=false; shift ;;
-    --debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=true; shift ;;
-    --no-debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=false; shift ;;
+    --codex) codex_enabled=true; codex_enabled_change=set; shift ;; --no-codex) codex_enabled=false; codex_enabled_change=set; shift ;;
+    --debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=true; debugger_change=set; shift ;;
+    --no-debugger) [ -z "$debugger_enabled" ] || fail 'Choose --debugger or --no-debugger.'; debugger_enabled=false; debugger_change=set; shift ;;
     --adopt-debugger) service_action=adopt-debugger; shift ;;
     --no-paired-config) [ -z "$paired_change" ] || fail 'Choose either --paired-config PATH or --no-paired-config.'; paired_change=clear; shift ;;
     --no-service) no_service=1; shift ;; --uninstall) uninstall=1; shift ;;
@@ -725,6 +726,9 @@ start_service() {
   # that appeared after the initial admission check.
   if [ "$old_service" = 0 ]; then assert_foreground_stopped; fi
   prepare_state || return 1
+  previous_service=
+  service_overrides=$("$node" -e 'const a=process.argv.slice(1),o={};for(let i=0;i<a.length;i+=3)if(a[i])o[a[i+1]]=a[i+2];if(o["--debugger"]!==undefined)o["--debugger"]=o["--debugger"]==="true";if(o["--no-codex"]!==undefined)o["--no-codex"]=o["--no-codex"]==="false";if(o["--paired-config"]==="")o["--paired-config"]=false;console.log(JSON.stringify(o))' "$paired_change" --paired-config "$paired_config" "$debugger_change" --debugger "$debugger_enabled" "$claude_change" --claude-path "$claude" "$codex_change" --codex-path "$codex" "$codex_model_change" --codex-model "$codex_model" "$codex_home_change" --codex-home "$codex_home" "$codex_enabled_change" --no-codex "$codex_enabled") || return 1
+  if [ "$old_service" = 1 ]; then previous_service="$backup/previous-service"; fi
   if [ "$os" = darwin ]; then
     # Treat install as a possibly partial write+bootstrap. The caller journals
     # both intents before calling any runtime, including legacy CLIs.
@@ -733,21 +737,23 @@ start_service() {
     write_id=$journal_action_id
     journal_intent started-service "$service_file" "$runtime" || return 1
     started_id=$journal_action_id
-    selected_cli "$root/$runtime" install --json --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
+    ABELE_PREVIOUS_SERVICE_FILE="${previous_service:-}" ABELE_SERVICE_ARGUMENT_OVERRIDES="$service_overrides" selected_cli "$root/$runtime" install --json --runtime-dir "$root/$runtime" --state-dir "$state" --claude-path "$claude" > "$work/install.json" || return 1
     journal_done "$write_id" || return 1
     journal_done "$started_id" || return 1
   else
     mkdir -p "$(dirname "$unit")" || return 1
     journal_intent write-service "$service_file" "$runtime" || return 1
     write_id=$journal_action_id
-    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" "$debugger_enabled" <<'NODE' || return 1
-const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired,debuggerEnabled]=process.argv.slice(2);
+    "$node" - "$unit" "$node" "$root/$runtime" "$state" "$claude" "$codex" "$codex_model" "$codex_home" "$codex_enabled" "$paired_config" "$debugger_enabled" "${previous_service:-}" "$service_overrides" <<'NODE' || return 1
+const fs=require('node:fs'),path=require('node:path'); const [unit,node,root,state,claude,codex,model,home,enabled,paired,debuggerEnabled,previousService,overrides]=process.argv.slice(2);
 const codexArgs=[...(codex?['--codex-path',codex]:[]),...(model?['--codex-model',model]:[]),...(home?['--codex-home',home]:[]),...(enabled==='false'?['--no-codex']:[]),...(paired?['--paired-config',paired]:[]),...(debuggerEnabled==='true'?['--debugger']:[])];
 if(fs.existsSync(unit))fs.accessSync(unit,fs.constants.W_OK);
+const generated=[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--service-run','--claude-path',claude,...codexArgs];
+const command=previousService?require(root+'/packages/node-daemon/dist/service-arguments.js').retainServiceArguments(generated,fs.readFileSync(previousService,'utf8'),'linux',JSON.parse(overrides)):generated;
 const temporary=fs.mkdtempSync(path.join(path.dirname(unit),'.abele-unit-write-')),candidate=path.join(temporary,'unit');
 try{
 const q=(s,expand=false)=>'"'+s.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%').replaceAll('$',()=>expand?'$$':'$')+'"';
-fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${[node,root+'/packages/node-daemon/dist/cli.js','start','--json','--state-dir',state,'--service-run','--claude-path',claude,...codexArgs].map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[...(codex?[path.dirname(codex)]:[]),path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nKillMode=process\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
+fs.writeFileSync(candidate, `[Unit]\nDescription=AbeleNode local coding daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=${q(state)}\nExecStart=${command.map(s=>q(s,true)).join(' ')}\nEnvironment=${q('PATH='+[...(codex?[path.dirname(codex)]:[]),path.dirname(claude),path.dirname(node),process.env.HOME+'/.local/bin','/opt/homebrew/bin','/usr/local/bin','/usr/bin','/bin'].join(':'))}\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nKillMode=process\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n`, {mode:0o600});
 const fd=fs.openSync(candidate,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};
 if(process.env.ABELE_SERVICE_TRANSITION){const dir=process.env.ABELE_SERVICE_TRANSITION,stage=path.join(dir,'next-service');fs.copyFileSync(candidate,stage);const fd=fs.openSync(stage,fs.constants.O_RDONLY);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)};const parent=fs.openSync(dir,fs.constants.O_RDONLY);try{fs.fsyncSync(parent)}finally{fs.closeSync(parent)}}
 fs.renameSync(candidate,unit);

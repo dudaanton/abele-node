@@ -26,10 +26,8 @@ function approve(args: unknown): Promise<unknown> {
       socket.destroy()
       resolve(value)
     }
-    const timer = setTimeout(
-      () => finish(deny),
-      Number(process.env.ABELE_APPROVAL_TTL ?? 60000) + 3000
-    )
+    const ttl = Number(process.env.ABELE_APPROVAL_TTL ?? 60000)
+    const timer = ttl === 0 ? undefined : setTimeout(() => finish(deny), ttl + 3000)
     socket.on('error', () => finish(deny))
     socket.on('close', () => finish(deny))
     socket.on('connect', () =>

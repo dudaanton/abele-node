@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+const exec = promisify(execFile)
 import {
   constants,
   openSync,
@@ -60,9 +62,9 @@ function readFile(root: string, path: string): FileState | undefined {
   }
 }
 /** Tracked and non-ignored untracked files; dependencies and Git metadata are never copied. */
-export function snapshotFiles(root: string, include: string[] = []): FileSnapshot {
+export async function snapshotFiles(root: string, include: string[] = []): Promise<FileSnapshot> {
   if (realpathSync(root) !== root) throw new ChannelError('unsafe_path')
-  const paths = execFileSync(
+  const { stdout } = await exec(
     'git',
     [
       '-c',
@@ -90,8 +92,7 @@ export function snapshotFiles(root: string, include: string[] = []): FileSnapsho
       },
     }
   )
-    .split('\0')
-    .filter(Boolean)
+  const paths = stdout.split('\0').filter(Boolean)
   const files: FileSnapshot = Object.create(null)
   let bytes = 0
   for (const path of [...new Set([...paths, ...include])].sort()) {
@@ -115,12 +116,14 @@ export function previewFiles(before: FileSnapshot, current: FileSnapshot) {
       checkpoint: digest(stateOf(before, path) ?? null),
     }))
 }
-export function restoreFiles(
+export async function restoreFiles(
   root: string,
   before: FileSnapshot,
-  changes: ReturnType<typeof previewFiles>
+  changes: ReturnType<typeof previewFiles>,
+  beforeWrite?: () => void
 ) {
-  const actual = previewFiles(before, snapshotFiles(root, Object.keys(before)))
+  const actual = previewFiles(before, await snapshotFiles(root, Object.keys(before)))
+  beforeWrite?.()
   if (JSON.stringify(changes) !== JSON.stringify(actual)) throw new ChannelError('stale_revision')
   // Validate every target before the first write. Never traverse or replace a symlink.
   for (const change of actual) target(root, change.path)
@@ -160,7 +163,7 @@ type Checkpoint = {
 export class ChatCheckpoints {
   readonly busy = new Set<string>()
   constructor(private core: NodeCore) {}
-  capture(session_id: string, input_id: string) {
+  async capture(session_id: string, input_id: string) {
     const session = this.core.session(session_id)
     if (session.provider !== 'pi' || !session.native_session_file) return
     try {
@@ -172,7 +175,7 @@ export class ChatCheckpoints {
         root,
         native,
         binding: this.core.resources.targets.currentTarget(session_id),
-        files: snapshotFiles(root),
+        files: await snapshotFiles(root),
         seq: this.core.head(session_id),
         exclude_input_ids: (
           this.core.db
@@ -182,6 +185,11 @@ export class ChatCheckpoints {
             .all(session_id) as { input_id: string }[]
         ).map((i) => i.input_id),
       }
+      if (
+        this.core.resources.lsp.sessionRoot(session_id) !== root ||
+        digest(checkpoint.binding) !== digest(this.core.resources.targets.currentTarget(session_id))
+      )
+        throw new ChannelError('stale_revision')
       this.core.db
         .prepare('INSERT INTO chat_checkpoints VALUES(?,?,?)')
         .run(checkpoint.checkpoint_id, session_id, JSON.stringify(checkpoint))
@@ -232,6 +240,20 @@ export class ChatCheckpoints {
     if (!row) throw new ChannelError('not_found')
     return JSON.parse(row.body) as Checkpoint
   }
+  private assertIdle(actor: AuthorityContext, session_id: string) {
+    if (this.busy.has(session_id)) throw new ChannelError('resource_busy')
+    this.core.checkExecution(actor.installation_id, session_id)
+    const state = this.core.claude.live.state(session_id)
+    if (
+      !['idle', 'none'].includes(state.process) ||
+      this.core.db
+        .prepare(
+          "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
+        )
+        .get(session_id)
+    )
+      throw new ChannelError('resource_busy')
+  }
   async request(actor: AuthorityContext, method: string, raw: unknown, operation?: string) {
     const schema = ChatMethodSchemas[method as keyof typeof ChatMethodSchemas]
     if (!schema) throw new ChannelError('unsupported_method')
@@ -275,8 +297,17 @@ export class ChatCheckpoints {
       throw new ChannelError('stale_revision')
     const changes = previewFiles(
       checkpoint.files,
-      snapshotFiles(root, Object.keys(checkpoint.files))
+      await snapshotFiles(root, Object.keys(checkpoint.files))
     )
+    const checkBinding = () => {
+      if (
+        this.core.resources.lsp.sessionRoot(p.session_id) !== root ||
+        digest(checkpoint.binding) !==
+          digest(this.core.resources.targets.currentTarget(p.session_id))
+      )
+        throw new ChannelError('stale_revision')
+    }
+    checkBinding()
     const preview_id = digest({ checkpoint_id: checkpoint.checkpoint_id, root, changes })
     if (method === 'chat.preview') {
       if (Buffer.byteLength(JSON.stringify(changes)) > 24000) throw new ChannelError('output_limit')
@@ -306,18 +337,7 @@ export class ChatCheckpoints {
       (p.action === 'branch' && p.restore_files)
     )
       throw new ChannelError('invalid_params')
-    if (this.busy.has(p.session_id)) throw new ChannelError('resource_busy')
-    this.core.checkExecution(actor.installation_id, p.session_id)
-    const state = this.core.claude.live.state(p.session_id)
-    if (
-      !['idle', 'none'].includes(state.process) ||
-      this.core.db
-        .prepare(
-          "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
-        )
-        .get(p.session_id)
-    )
-      throw new ChannelError('resource_busy')
+    this.assertIdle(actor, p.session_id)
     if (
       p.restore_files &&
       (p.restore_files.preview_id !== preview_id ||
@@ -328,6 +348,11 @@ export class ChatCheckpoints {
     const [header, ...entries] = checkpoint.native.trimEnd().split('\n')
     const nativeHeader = JSON.parse(header!)
     if (nativeHeader.type !== 'session') throw new ChannelError('invalid_pi_native_state')
+    const originalFiles = p.restore_files
+      ? await snapshotFiles(root, Object.keys(checkpoint.files))
+      : undefined
+    this.assertIdle(actor, p.session_id)
+    checkBinding()
     const previous = this.core.reserveOperation(actor, method, parsed.data, operation!, () =>
       this.core.db.prepare('INSERT INTO chat_restore_attempts VALUES(?,?,?,?)').run(
         actor.installation_id,
@@ -341,9 +366,7 @@ export class ChatCheckpoints {
           root,
           action: p.action,
           restore_files: p.restore_files,
-          original_files: p.restore_files
-            ? snapshotFiles(root, Object.keys(checkpoint.files))
-            : undefined,
+          original_files: originalFiles,
         })
       )
     )
@@ -355,7 +378,12 @@ export class ChatCheckpoints {
       if (this.core.resources.lsp.sessionRoot(p.session_id) !== root)
         throw new ChannelError('stale_revision')
       // Recheck after stopping: no preview grants permission to discard a later edit.
-      if (p.restore_files) restoreFiles(root, checkpoint.files, p.restore_files.changes)
+      if (p.restore_files)
+        await restoreFiles(root, checkpoint.files, p.restore_files.changes, () => {
+          this.core.checkExecution(actor.installation_id, p.session_id)
+          if (this.core.resources.lsp.sessionRoot(p.session_id) !== root)
+            throw new ChannelError('stale_revision')
+        })
       let destination = session
       if (p.action === 'branch') {
         const target = this.core.resources.targets.currentTarget(p.session_id)?.target

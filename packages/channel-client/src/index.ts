@@ -273,7 +273,15 @@ export class RequestChannel {
     if (this.stopped) return Promise.reject(new ChannelError('disconnected'))
     const request_id = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      const ms = /^(project|workspace|review)\./.test(method) ? 30000 : 5000
+      const longPoll = /^debugger\.v1\.(wait|sleep)$/.test(method)
+        ? Number((params as { timeout_ms?: number } | null)?.timeout_ms ?? 60000)
+        : 0
+      const ms =
+        longPoll > 0 && Number.isFinite(longPoll)
+          ? Math.max(5000, Math.min(60000, longPoll) + 5000)
+          : /^(project|workspace|review)\./.test(method)
+            ? 30000
+            : 5000
       let due = Date.now() + ms
       const expire = () => {
         const pending = this.pending.get(request_id)
@@ -291,8 +299,8 @@ export class RequestChannel {
         this.pending.delete(request_id)
         reject(new ChannelError('outcome_unknown'))
         RequestChannel.debug('[Abele node] request timeout', { method })
-        if (RequestChannel.backgroundActive()) this.probe('request_timeout')
-        else void this.close('request_timeout')
+        // A deadline says nothing about transport health or other requests.
+        // Keep late replies harmless and mutations uncertain; heartbeats own liveness.
       }
       const timer = setTimeout(expire, ms)
       this.pending.set(request_id, { resolve, reject, timer })

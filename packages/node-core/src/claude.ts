@@ -312,12 +312,17 @@ export class ProviderSessions {
             slot.debugger
           )
 
+        if (session.provider === 'pi' && this.core.delegations.isActive(session.session_id))
+          slot.debugger = this.core.delegations
+            .reporter(session.session_id, run_id)
+            .bridge(slot.debugger)
         slot.run = await adapter.startTurn(
           {
             session_id: session.session_id,
             run_id,
             cwd: executionTarget.path,
             text: this.core.delegations.turnText(session.session_id, body.text),
+            durable_permissions: this.core.delegations.isActive(session.session_id),
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
             ...(session.provider === 'codex' && session.native_session_id

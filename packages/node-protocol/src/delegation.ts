@@ -69,6 +69,7 @@ export const DelegationSchema = z
   .strict()
 export type Delegation = z.infer<typeof DelegationSchema>
 export const DelegationStatusSchema = DelegationSchema.extend({
+  worktree_id: Id.nullable().optional(),
   session_head_seq: Sequence,
   mailbox_head_seq: Sequence,
   pending_human_prompts: Sequence,
@@ -139,6 +140,7 @@ export const DelegationMethodSchemas = {
   'delegation.grant.create': DelegationGrantRequestSchema,
   'delegation.grant.revoke': z.object({ grant_id: Id }).strict(),
   'delegation.status': z.object({ delegation_id: Id }).strict(),
+  'delegation.delete': z.object({ delegation_id: Id }).strict(),
   'delegation.cancel': z.object({ delegation_id: Id }).strict(),
   'delegation.send': z
     .object({
@@ -155,4 +157,5 @@ export const DELEGATION_MUTATIONS = [
   'delegation.create',
   'delegation.send',
   'delegation.cancel',
+  'delegation.delete',
 ] as const

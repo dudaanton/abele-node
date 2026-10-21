@@ -769,6 +769,27 @@ export class RepositoryService {
   editedBytes(id: string, content: string) {
     return this.content(this.get(id), content)
   }
+  /** Resolve a managed workspace to the same catalogue identity command/integrate accept. */
+  worktreeForWorkspace(id: string): string | null {
+    const workspace = this.r.workspaces.get(id)
+    if (workspace.state !== 'ready') return null
+    const fingerprint = this.targetFingerprint(workspace.path)
+    const previous = this.r.core.db
+      .prepare(
+        'SELECT worktree_id,fingerprint FROM repository_targets WHERE workspace_id=? AND active=1 ORDER BY rowid DESC LIMIT 1'
+      )
+      .get(id) as { worktree_id: string; fingerprint: string } | undefined
+    if (previous?.fingerprint === fingerprint) return previous.worktree_id
+    if (previous)
+      this.r.core.db
+        .prepare('UPDATE repository_targets SET active=0 WHERE worktree_id=?')
+        .run(previous.worktree_id)
+    const worktree = randomUUID()
+    this.r.core.db
+      .prepare('INSERT INTO repository_targets VALUES(?,?,?,?,?,?,?)')
+      .run(worktree, workspace.project_id, workspace.path, workspace.kind, id, fingerprint, 1)
+    return worktree
+  }
   private get(id: string) {
     const row = this.r.core.db
       .prepare('SELECT * FROM repository_targets WHERE worktree_id=?')
@@ -1704,7 +1725,7 @@ export class RepositoryService {
   ): Promise<WorkingSnapshot> {
     const monitor = await this.monitor(target)
     await this.configureMonitor(target, monitor)
-    const signature = monitor.signature()
+    const signature = monitor.signature(includeIgnored)
     const started = Date.now()
     const key = target.worktree_id + ':' + includeIgnored
     const cached = this.snapshots.get(key)
@@ -1842,7 +1863,13 @@ export class RepositoryService {
       this.retainedSizes.set(rows, Buffer.byteLength(JSON.stringify(rows)))
     }
     this.retainedSizes.set(files, Buffer.byteLength(JSON.stringify(files)))
-    const ignoreDirectories = new Set(['', ...children.keys()])
+    const ignoreDirectories = new Set([
+      '',
+      ...children.keys(),
+      ...[...byPath.values()]
+        .filter((entry) => entry.kind === 'directory')
+        .map((entry) => entry.path),
+    ])
     for (const row of status) {
       const parts = row.path.split('/')
       parts.pop()
@@ -1880,7 +1907,7 @@ export class RepositoryService {
       .filter((file) => file.kind === 'submodule' || file.kind === 'symlink')
       .map((file) => file.path)
     monitor.capture(stamps, started, boundaries, ignoreStamps)
-    if (monitor.reliable && monitor.signature() !== signature) {
+    if (monitor.reliable && monitor.signature(includeIgnored) !== signature) {
       if (retries) {
         try {
           return await this.workingState(target, includeIgnored, retries - 1)
@@ -2076,7 +2103,7 @@ export class RepositoryService {
     o.snapshot.monitor.touched = Date.now()
     if (o.snapshot.monitor.closed) throw new ChannelError('stale_revision')
     if (o.snapshot.monitor.reliable) {
-      if (o.snapshot.monitor.signature() !== o.snapshot.signature)
+      if (o.snapshot.monitor.signature(o.includeIgnored) !== o.snapshot.signature)
         throw new ChannelError('stale_revision')
     } else if ((await this.workingState(target, o.includeIgnored)).fingerprint !== o.fingerprint)
       throw new ChannelError('stale_revision')

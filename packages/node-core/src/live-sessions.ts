@@ -562,7 +562,7 @@ export class LiveSessions {
       if (seen.has(session_id) || !this.handles(session_id)) continue
       const slot = this.slots.get(session_id)
       if (slot?.state === 'idle' || slot?.state === 'running') {
-        this.dispatch(slot, input)
+        await this.dispatch(slot, input)
         continue
       }
       seen.add(session_id)
@@ -576,7 +576,7 @@ export class LiveSessions {
       await this.start(input)
     }
   }
-  private dispatch(slot: Slot, input: Input) {
+  private async dispatch(slot: Slot, input: Input) {
     const body = JSON.parse(String(input.body)) as {
       text: string
       expected_target?: ExpectedExecutionTarget
@@ -611,7 +611,9 @@ export class LiveSessions {
     if (!ready) return
     try {
       if (slot.state === 'idle' && !slot.turn)
-        this.core.chatCheckpoints.capture(slot.session_id, input_id)
+        await this.core.chatCheckpoints.capture(slot.session_id, input_id)
+      if (slot.stopReason || this.slots.get(slot.session_id) !== slot) return
+      this.core.checkExecution(String(input.principal_id), slot.session_id, body.expected_target)
       slot.live!.send({ input_id, content: this.content(input) })
     } catch {
       // Never written: the next process takes it.
@@ -754,7 +756,7 @@ export class LiveSessions {
             "SELECT * FROM inputs WHERE session_id=? AND state IN ('accepted','queued') ORDER BY ordinal"
           )
           .all(session_id) as Input[])
-          this.dispatch(slot, input)
+          await this.dispatch(slot, input)
       }
     } catch (error) {
       try {

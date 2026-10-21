@@ -225,12 +225,16 @@ export class NodeClient {
     }
     this.attach(channel)
     this.channel!.start()
+    this.debugger.reconnected()
     const streams = await this.store.transaction((s) => Object.keys(s.cursors))
     for (const stream of streams) await this.subscribe(stream)
     await this.flush()
   }
   /** For injected transport tests/adapters; connect() is the usual API. */
   attach(channel: AuthenticatedChannel) {
+    if (this.target.expected_node_id && this.target.expected_node_id !== channel.welcome.node_id)
+      throw new ChannelError('node_identity_mismatch')
+    this.target.expected_node_id = channel.welcome.node_id
     const requests = new RequestChannel(channel)
     this.channel = requests
     requests.onEvent = (event) => this.receive(event)
@@ -510,6 +514,9 @@ export class NodeClient {
         retainedOperationId
       )
     )
+  }
+  async deleteDelegation(delegation_id: string) {
+    return this.mutation('delegation.delete', { delegation_id })
   }
   async cancelDelegation(delegation_id: string): Promise<Delegation> {
     return DelegationSchema.parse(await this.mutation('delegation.cancel', { delegation_id }))

@@ -293,10 +293,16 @@ export class DebuggerLaunches {
           requests,
           []
         )
+        this.restoreRecordPoints(p.debug_session_id, result.debug_session_id, requests)
         await this.sessions.get(result.debug_session_id)?.syncBreakpoints()
       }
       return result
     })
+  }
+  private restoreRecordPoints(from: string, to: string, breakpoints: { breakpoint_id: string }[]) {
+    const ids = new Set(breakpoints.map((point) => point.breakpoint_id))
+    const points = this.core.trace.points.list(from).filter((point) => ids.has(point.breakpoint_id))
+    if (points.length) this.core.trace.points.set(to, points, [])
   }
 
   private once(
@@ -601,6 +607,7 @@ export class DebuggerLaunches {
             requests,
             []
           )
+          this.restoreRecordPoints(old.debug_session_id, result.debug_session_id, requests)
           await this.sessions.get(result.debug_session_id)?.syncBreakpoints()
         }
       }

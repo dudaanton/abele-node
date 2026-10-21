@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { retainServiceArguments } from './service-arguments.js'
 import './warnings.js'
 import { DatabaseSync } from 'node:sqlite'
 import { humanOutput, humanError, errorMessage } from './output.js'
@@ -174,7 +175,7 @@ async function main() {
   )
   const claudeProfile = option('--claude-profile', 'inherited')
   const claudeBudget = Number(option('--claude-budget', '0.35'))
-  const claudeDeadline = Number(option('--claude-deadline-ms', '120000'))
+  const claudeDeadline = Number(option('--claude-deadline-ms', '1800000'))
   const permissionTtl = Number(option('--permission-ttl-ms', '60000'))
   const sessionModel = option('--claude-session-model', '')
   const sessionEffort = option('--claude-session-effort', '')
@@ -229,8 +230,8 @@ async function main() {
   const piModel = option('--pi-model', '')
   const piAgentDir = resolve(option('--pi-agent-dir', join(homedir(), '.pi/agent')))
   const piProfile = option('--pi-profile', 'inherited')
-  const piDeadline = Number(option('--pi-deadline-ms', '120000'))
-  const piMaxTokens = Number(option('--pi-max-tokens', '4096'))
+  const piDeadline = Number(option('--pi-deadline-ms', '1800000'))
+  const piMaxTokens = Number(option('--pi-max-tokens', '32768'))
   if (!['inherited', 'isolated'].includes(piProfile)) throw new Error('invalid_pi_configuration')
   const piOptions = {
     agentDir: piAgentDir,
@@ -899,7 +900,7 @@ async function main() {
       }
       const destination = join(homedir(), 'Library/LaunchAgents', label + '.plist')
       mkdirSync(dirname(destination), { recursive: true })
-      const command = [
+      let command = [
         process.execPath,
         join(runtime, 'packages/node-daemon/dist/cli.js'),
         'start',
@@ -958,6 +959,13 @@ async function main() {
         '--pi-max-tokens',
         String(piMaxTokens),
       ]
+      if (process.env.ABELE_PREVIOUS_SERVICE_FILE)
+        command = retainServiceArguments(
+          command,
+          readFileSync(process.env.ABELE_PREVIOUS_SERVICE_FILE, 'utf8'),
+          'darwin',
+          JSON.parse(process.env.ABELE_SERVICE_ARGUMENT_OVERRIDES ?? '{}')
+        )
       const plist = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${command.map((v) => '<string>' + escape(v) + '</string>').join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>WorkingDirectory</key><string>${escape(state)}</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>${escape([...(codexPath ? [dirname(codexPath)] : []), dirname(claudePath), dirname(process.execPath), join(homedir(), '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':'))}</string><key>HOME</key><string>${escape(homedir())}</string>${process.env.CODEX_HOME ? `<key>CODEX_HOME</key><string>${escape(resolve(process.env.CODEX_HOME))}</string>` : ''}</dict><key>StandardOutPath</key><string>${escape(join(logs, 'stdout.log'))}</string><key>StandardErrorPath</key><string>${escape(join(logs, 'stderr.log'))}</string></dict></plist>\n`
       if (existsSync(destination)) accessSync(destination, constants.W_OK)
       const temporary = mkdtempSync(join(dirname(destination), '.abele-plist-write-'))

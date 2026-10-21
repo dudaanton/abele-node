@@ -87,6 +87,8 @@ export class DebuggerClient {
   private readonly states = new Map<string, DebuggerObservationState>()
   private readonly watchers = new Map<AbortController, () => void>()
   private generation = 0
+  private online = true
+  private readonly reconnectWaiters = new Set<() => void>()
   constructor(private readonly rpc: (method: string, params: unknown) => Promise<unknown>) {}
   current(session: string): DebuggerObservationState {
     return structuredClone(this.states.get(session) ?? { observation: 'unknown', snapshot: null })
@@ -109,6 +111,7 @@ export class DebuggerClient {
     })
   }
   disconnected() {
+    this.online = false
     this.generation++
     for (const state of this.states.values()) {
       state.observation = state.snapshot ? 'last-known' : 'unknown'
@@ -121,6 +124,31 @@ export class DebuggerClient {
         notify()
       } catch {} // one UI observer must not suppress other loss notifications
     }
+  }
+  /** Restore observations and watches only; never resend a debugger command. */
+  reconnected() {
+    this.online = true
+    for (const resume of [...this.reconnectWaiters]) resume()
+    // Retained sessions without an active view also regain a current snapshot.
+    const generation = this.generation
+    void (async () => {
+      for (const session of [...this.states.keys()]) {
+        if (!this.online || generation !== this.generation) return
+        await this.status(session).catch(() => {})
+      }
+    })()
+  }
+  private untilConnected(signal: AbortSignal) {
+    if (this.online || signal.aborted) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const resume = () => {
+        this.reconnectWaiters.delete(resume)
+        signal.removeEventListener('abort', resume)
+        resolve()
+      }
+      this.reconnectWaiters.add(resume)
+      signal.addEventListener('abort', resume, { once: true })
+    })
   }
   async status(debug_session_id: string) {
     const generation = this.generation
@@ -282,6 +310,37 @@ export class DebuggerClient {
     notify: (state: DebuggerObservationState) => void,
     signal: AbortSignal
   ) {
+    while (!signal.aborted) {
+      await this.untilConnected(signal)
+      if (signal.aborted) return
+      const generation = this.generation
+      try {
+        await this.watchOnce(session, notify, signal)
+      } catch (error) {
+        if (generation === this.generation) {
+          if ((error as { code?: string }).code !== 'outcome_unknown') throw error
+          // Only observation reads are retried; an uncertain command is never replayed.
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timer)
+              signal.removeEventListener('abort', finish)
+              resolve()
+            }
+            const timer = setTimeout(finish, 1000)
+            signal.addEventListener('abort', finish, { once: true })
+            if (signal.aborted) finish()
+          })
+          continue
+        }
+      }
+      if (generation === this.generation) return
+    }
+  }
+  private async watchOnce(
+    session: string,
+    notify: (state: DebuggerObservationState) => void,
+    signal: AbortSignal
+  ) {
     const watcher = new AbortController()
     this.watchers.set(watcher, () => {
       if (!signal.aborted) notify({ ...this.current(session), reason: 'connection_lost' })
@@ -336,7 +395,9 @@ export class DebuggerClient {
       }
     } catch (error) {
       if (!cancelled.aborted) {
-        this.disconnected()
+        const state = this.states.get(session)
+        if (state) state.observation = state.snapshot ? 'last-known' : 'unknown'
+        notify(this.current(session))
         throw error
       }
     } finally {

@@ -34,7 +34,7 @@ it('preserves optional server diagnostics through the typed status client', asyn
 })
 
 it.each(['direct', 'symlinked'] as const)(
-  'dispatches typed calls through the real confinement and journals agent diagnostics notices (%s root)',
+  'dispatches typed calls through the real confinement and publishes file diagnostics without chat notices (%s root)',
   async (kind) => {
     mkdirSync('.scratch', { recursive: true })
     const dir = mkdtempSync(resolve('.scratch/lsp-node-'))
@@ -50,6 +50,8 @@ it.each(['direct', 'symlinked'] as const)(
     chmodSync(git, 0o700)
     const bin = join(state, 'lsp/typescript/node_modules/.bin')
     mkdirSync(bin, { recursive: true })
+    mkdirSync(join(state, 'lsp/typescript/node_modules/typescript/lib'), { recursive: true })
+    writeFileSync(join(state, 'lsp/typescript/node_modules/typescript/lib/tsserver.js'), '')
     const executable = join(bin, 'typescript-language-server')
     writeFileSync(
       executable,
@@ -119,18 +121,18 @@ it.each(['direct', 'symlinked'] as const)(
         input: { path: 'a.ts' },
       })
       await core.resources.lsp.afterEdit(session.session_id)
-      let notices: any[] = []
+      let diagnostics: any[] = []
       for (let i = 0; i < 100; i++) {
-        notices = core.read(session.session_id, 0).filter((e) => e.type === 'session.update')
-        if (notices.length) break
+        diagnostics = core.read('catalog', 0).filter((e) => e.type === 'lsp.diagnostics')
+        if (diagnostics.length) break
         await new Promise((r) => setTimeout(r, 10))
       }
       expect(
-        notices.some(
-          (e) => e.data.update.kind === 'notice' && e.data.update.text.includes('[typescript]')
-        )
+        diagnostics.some((e) => e.data.diagnostics.some((d: any) => d.source === 'typescript'))
       ).toBe(true)
-      expect(core.read('catalog', 0).some((e) => e.type === 'lsp.diagnostics')).toBe(true)
+      expect(core.read(session.session_id, 0).filter((e) => e.type === 'session.update')).toEqual(
+        []
+      )
       const abort = new AbortController()
       const pending = client.hover(
         { workspace_id },

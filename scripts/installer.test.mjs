@@ -23,6 +23,50 @@ import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+for (const platform of ['mac', 'linux']) {
+  test(`upgrade retains all authenticated owner service flags: ${platform}`, async () => {
+    const h = await home()
+    const env = await (platform === 'mac' ? mockedMacService(h) : mockedLinuxService(h))
+    const first = await install(h, ['--version', '0.2.0'], env)
+    assert.equal(first.code, 0, first.stderr)
+    const configPath = join(h, '.local/share/abele-node/config.json')
+    const config = JSON.parse(await readFile(configPath, 'utf8'))
+    const flags = [
+      '--permission-ttl-ms',
+      '3600000',
+      '--pi-deadline-ms',
+      '1800000',
+      '--pi-max-tokens',
+      '32768',
+      '--future-owner-flag',
+      'space & quote',
+    ]
+    const text = await readFile(config.service_file, 'utf8')
+    const updated =
+      platform === 'mac'
+        ? text.replace(
+            '</array>',
+            flags.map((s) => '<string>' + s.replaceAll('&', '&amp;') + '</string>').join('') +
+              '</array>'
+          )
+        : text.replace(/^(ExecStart=.*)$/m, '$1 ' + flags.map((s) => '"' + s + '"').join(' '))
+    await writeFile(config.service_file, updated)
+    config.service_sha256 = createHash('sha256').update(updated).digest('hex')
+    await writeFile(configPath, JSON.stringify(config))
+    if (platform === 'mac') {
+      const jobFile = join(h, '.fake-launch-job')
+      const job = JSON.parse(await readFile(jobFile, 'utf8'))
+      job.arguments.push(...flags)
+      await writeFile(jobFile, JSON.stringify(job))
+    }
+    const upgrade = await install(h, ['--version', '0.2.3'], env)
+    assert.equal(upgrade.code, 0, upgrade.stderr)
+    const after = await readFile(config.service_file, 'utf8')
+    for (const flag of flags)
+      assert.ok(after.includes(flag.replaceAll('&', platform === 'mac' ? '&amp;' : '&')), flag)
+    assert.ok(after.includes('/0.2.3/packages/node-daemon/dist/cli.js'))
+  })
+}
 for (const unknownTotal of [false, true]) {
   test(`installer emits structured stages and download bytes (unknown total: ${unknownTotal})`, async () => {
     const h = await home()
@@ -322,8 +366,13 @@ async function release(version, broken = false, badChecksum = false) {
     await readFile('scripts/service-transition.mjs', 'utf8')
   )
   await writeFile(
+    join(tree, 'packages/node-daemon/dist/service-arguments.js'),
+    await readFile('packages/node-daemon/dist/service-arguments.js', 'utf8')
+  )
+  await writeFile(
     join(tree, 'packages/node-daemon/dist/cli.js'),
     `import fs from 'node:fs';
+import { retainServiceArguments } from './service-arguments.js';
 import {fileURLToPath} from 'node:url';
 const marker=process.env.HOME+'/.test-service-running';
 const isMac=process.env.TEST_MAC_SERVICE==='1', args=process.argv.slice(2);
@@ -344,7 +393,8 @@ const completed=(action,target)=>{if(journal && !fs.existsSync(process.env.HOME+
 if(isMac && args[0]==='install'){
   if(fs.existsSync(marker) && JSON.parse(fs.readFileSync(marker,'utf8')).state===state){console.error('stop_before_install');process.exit(1)}
   fs.mkdirSync(state,{recursive:true,mode:0o700});fs.mkdirSync(process.env.HOME+'/Library/LaunchAgents',{recursive:true});
-  const command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[]),...(args.includes('--debugger')?['--debugger']:[])];
+  let command=[process.execPath,cliPath,'start','--state-dir',state,'--claude-path',args[args.indexOf('--claude-path')+1] || '/nonexistent/claude',...(paired?['--paired-config',paired]:[]),...(args.includes('--debugger')?['--debugger']:[])];
+  if(process.env.ABELE_PREVIOUS_SERVICE_FILE)command=retainServiceArguments(command,fs.readFileSync(process.env.ABELE_PREVIOUS_SERVICE_FILE,'utf8'),'darwin',JSON.parse(process.env.ABELE_SERVICE_ARGUMENT_OVERRIDES || '{}'));
   const xml=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
   const text='<plist><dict><key>ProgramArguments</key><array>'+command.map(s=>'<string>'+xml(s)+'</string>').join('')+'</array></dict></plist>';
   if(process.env.ABELE_SERVICE_TRANSITION)fs.writeFileSync(process.env.ABELE_SERVICE_TRANSITION+'/next-service',text,{mode:0o600});

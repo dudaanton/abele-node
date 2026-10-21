@@ -139,12 +139,12 @@ describe('opt-in background channel liveness', () => {
     expect(frames(transport).filter((frame) => frame.kind === 'request')).toHaveLength(1)
   })
 
-  it('retains request deadline behavior without protection', async () => {
+  it('retains request deadlines without closing the channel when protection is off', async () => {
     const { requests, transport } = channel()
     const result = requests.request('session.send', {}).catch((error) => error)
     await vi.advanceTimersByTimeAsync(5000)
     expect(await result).toMatchObject({ code: 'outcome_unknown' })
-    expect(transport.close).toHaveBeenCalled()
+    expect(transport.close).not.toHaveBeenCalled()
   })
 
   it('clears probes and request grace timers on explicit disconnect', async () => {
@@ -200,4 +200,38 @@ describe('opt-in background channel liveness', () => {
       reason: 'peer_close',
     })
   })
+})
+
+it('times out only the slow request and accepts late replies without closing other work', async () => {
+  const { requests, queue, transport } = channel()
+  const slow = requests.request('node.describe', {}).catch((e) => e)
+  await vi.advanceTimersByTimeAsync(2000)
+  const other = requests.request('debugger.v1.status', {})
+  await vi.advanceTimersByTimeAsync(3000)
+  expect(await slow).toMatchObject({ code: 'outcome_unknown' })
+  expect(transport.close).not.toHaveBeenCalled()
+  const sent = frames(transport).filter((f) => f.kind === 'request')
+  for (const f of sent)
+    if (f.kind === 'request')
+      queue.push(
+        FrameCodec.encode({ kind: 'response', request_id: f.request_id, result: f.method })
+      )
+  await expect(other).resolves.toBe('debugger.v1.status')
+  expect(transport.close).not.toHaveBeenCalled()
+})
+it('allows the advertised debugger long-poll duration without a five-second timeout', async () => {
+  const { requests, queue, transport } = channel()
+  let expired = false
+  const wait = requests.request('debugger.v1.wait', { timeout_ms: 60000 }).catch((e) => {
+    expired = true
+    return e
+  })
+  await vi.advanceTimersByTimeAsync(5001)
+  expect(expired).toBe(false)
+  const sent = frames(transport).find((f) => f.kind === 'request')!
+  if (sent.kind === 'request')
+    queue.push(
+      FrameCodec.encode({ kind: 'response', request_id: sent.request_id, result: 'ready' })
+    )
+  await expect(wait).resolves.toBe('ready')
 })

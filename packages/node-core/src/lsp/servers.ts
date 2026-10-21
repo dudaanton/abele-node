@@ -9,6 +9,7 @@ import {
   rmSync,
   mkdtempSync,
   realpathSync,
+  statSync,
 } from 'node:fs'
 import { join, delimiter, isAbsolute, basename } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -122,6 +123,21 @@ export function projectEslint(root: string) {
   // Resolve only the project's installation, never a global fallback.
   return existsSync(join(root, 'node_modules', 'eslint', 'package.json'))
 }
+// Cache in-flight probes too: several clients often request status at once.
+// A replaced binary (including an upgrade at the same path) gets a fresh probe.
+const probes = new Map<string, { stamp: string; result: Promise<string> }>()
+function probe(server: string, args: string[]) {
+  const s = statSync(server)
+  const stamp = `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`
+  const key = JSON.stringify([server, args])
+  const previous = probes.get(key)
+  if (previous?.stamp === stamp) return previous.result
+  const result = run(server, args, {}, 3000)
+  // Bound retained entries even when many different installations are inspected.
+  if (probes.size >= 256) probes.delete(probes.keys().next().value!)
+  probes.set(key, { stamp, result })
+  return result
+}
 export async function status(state: string, root?: string, trusted = false) {
   return Promise.all(
     popular.map(async (language) => {
@@ -132,7 +148,7 @@ export async function status(state: string, root?: string, trusted = false) {
       // project-code language servers in an untrusted folder.
       if (language === 'rust' && server && basename(server) === 'rustup') {
         try {
-          const target = (await run(server, ['which', 'rust-analyzer'], {}, 3000)).trim()
+          const target = (await probe(server, ['which', 'rust-analyzer'])).trim()
           if (!isAbsolute(target)) throw new Error('missing_rust_analyzer')
           accessSync(target, constants.X_OK)
           server = realpathSync(target)
@@ -145,7 +161,7 @@ export async function status(state: string, root?: string, trusted = false) {
       let version: string | null = null
       if (server && !blocked) {
         try {
-          version = (await run(server, ['--version'], {}, 3000)).trim().slice(0, 256) || 'unknown'
+          version = (await probe(server, ['--version'])).trim().slice(0, 256) || 'unknown'
         } catch {
           version = 'unknown'
         }
@@ -246,6 +262,7 @@ export async function install(
   const plans = installPlan(languages, state)
   if (installing.has(state)) throw new Error('install_in_progress')
   installing.add(state)
+  probes.clear()
   const results: { language: string; message: string }[] = []
   try {
     for (const plan of plans) {
@@ -304,6 +321,7 @@ export async function install(
     }
     return results
   } finally {
+    probes.clear()
     installing.delete(state)
   }
 }

@@ -291,12 +291,16 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       [{ breakpoint_id: 'bp', source_id: 's2', line: 1 }],
       []
     )
+    core.trace.points.set(first.debug_session_id, [{ breakpoint_id: 'bp', take: ['n'] }], [])
     await runs[0]!.syncBreakpoints()
     closes[0]!()
     const restarted = await request('debugger.v1.restart', {
       operation_id: 'restart',
       debug_session_id: first.debug_session_id,
     })
+    expect(core.trace.points.list(restarted.debug_session_id)).toEqual([
+      { breakpoint_id: 'bp', take: ['n'] },
+    ])
     expect(configs[2]).toEqual(configs[0])
     expect(restarted.sources).toContainEqual({ source_id: 's2', path: 'late.js' })
     expect(core.debugger.snapshot(restarted.debug_session_id).snapshot.breakpoints).toMatchObject([
@@ -473,6 +477,11 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       ],
       []
     )
+    core.trace.points.set(
+      previousAttach.id,
+      [{ breakpoint_id: 'retained-disabled', take: ['n'] }],
+      []
+    )
     await previousAttach.syncBreakpoints()
     closes[4]!()
     discovery.mockResolvedValue([
@@ -487,6 +496,9 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
     expect(core.debugger.snapshot(nextProcess.debug_session_id).snapshot.breakpoints).toMatchObject(
       [{ breakpoint_id: 'retained-disabled', line: 1, condition: 'false', enabled: false }]
     )
+    expect(core.trace.points.list(nextProcess.debug_session_id)).toEqual([
+      { breakpoint_id: 'retained-disabled', take: ['n'] },
+    ])
     const running = runs[2]!.snapshot
     core.debugger.observe(running.debug_session_id, running.incarnation, {
       kind: 'lifecycle',

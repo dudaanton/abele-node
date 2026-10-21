@@ -7,6 +7,31 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PiProviderAdapter } from '@abele/provider-pi'
 import { systemProcessProbe, type ProcessIdentity } from '@abele/provider-claude'
+it('keeps an approval alive beyond the run budget and resumes work after the owner answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'abele-pi-active-budget-'))
+  const adapter = new PiProviderAdapter({ stateDir: dir, deadlineMs: 1000, profile: 'isolated' })
+  let asked = false
+  const run = await adapter.startTurn(
+    { session_id: randomUUID(), run_id: randomUUID(), cwd: dir, text: 'parallel' },
+    {
+      event: () => {},
+      processes: () => {},
+      permission: async (_action, signal) => {
+        asked = true
+        await new Promise((resolve) => setTimeout(resolve, 1200))
+        expect(signal.aborted).toBe(false)
+        return { choice: 'allow', delivered: () => true }
+      },
+    }
+  )
+  try {
+    expect(await run.done).toMatchObject({ result: { subtype: 'success' } })
+    expect(asked).toBe(true)
+  } finally {
+    await run.interrupt()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 it('cancels the exact durable question signal before an extension proceeds to another question', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abele-pi-dialog-cancel-'))
   let cancelled: AbortSignal | undefined,

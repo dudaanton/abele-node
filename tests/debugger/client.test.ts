@@ -284,3 +284,92 @@ describe('typed debugger client current-state reconciliation', () => {
     expect(client.current('selected')).toMatchObject({ observation: 'unknown', snapshot: null })
   })
 })
+
+it('resumes every watched debug session after transport reconnection without replaying commands', async () => {
+  vi.useFakeTimers()
+  const dir = mkdtempSync(join(tmpdir(), 'debug-client-resume-')),
+    core = new NodeCore(dir, { debuggerEnabled: true })
+  const actor = core.authority.authenticate(core.createToken('fixture').token)
+  const first = core.debugger.create(target),
+    second = core.debugger.create(target)
+  for (const s of [first, second])
+    core.debugger.observe(s.debug_session_id, s.incarnation, {
+      kind: 'lifecycle',
+      lifecycle: 'active',
+    })
+  const rpc = vi.fn(async (m: string, p: unknown) => core.request(actor, m, p))
+  const client = new DebuggerClient(rpc),
+    abort = new AbortController(),
+    updates = new Map<string, any[]>()
+  const watches = [first, second].map((s) => {
+    updates.set(s.debug_session_id, [])
+    return client.watch(
+      s.debug_session_id,
+      (state) => updates.get(s.debug_session_id)!.push(state),
+      abort.signal
+    )
+  })
+  try {
+    await vi.advanceTimersByTimeAsync(0)
+    client.disconnected()
+    await vi.advanceTimersByTimeAsync(0)
+    for (const s of [first, second])
+      expect(updates.get(s.debug_session_id)!.at(-1)).toMatchObject({
+        observation: 'last-known',
+        reason: 'connection_lost',
+      })
+    ;(client as any).reconnected()
+    await vi.advanceTimersByTimeAsync(0)
+    for (const s of [first, second])
+      expect(updates.get(s.debug_session_id)!.at(-1)).toMatchObject({ observation: 'current' })
+    expect(
+      rpc.mock.calls.every(([m]) =>
+        ['debugger.v1.status', 'debugger.v1.wait', 'debugger.v1.cancelWait'].includes(m)
+      )
+    ).toBe(true)
+  } finally {
+    abort.abort()
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.all(watches)
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  }
+})
+
+it('retries a timed-out observation without disconnecting another debug session', async () => {
+  vi.useFakeTimers()
+  const dir = mkdtempSync(join(tmpdir(), 'debug-client-slow-')),
+    core = new NodeCore(dir, { debuggerEnabled: true })
+  const actor = core.authority.authenticate(core.createToken('fixture').token)
+  const first = core.debugger.create(target),
+    second = core.debugger.create(target)
+  core.debugger.observe(first.debug_session_id, first.incarnation, {
+    kind: 'lifecycle',
+    lifecycle: 'active',
+  })
+  let slow = true
+  const client = new DebuggerClient(async (method, params: any) => {
+    if (method.endsWith('.status') && params.debug_session_id === first.debug_session_id && slow) {
+      slow = false
+      throw Object.assign(new Error('outcome_unknown'), { code: 'outcome_unknown' })
+    }
+    return core.request(actor, method, params)
+  })
+  await client.status(second.debug_session_id)
+  const abort = new AbortController()
+  const watch = client.watch(first.debug_session_id, () => {}, abort.signal)
+  try {
+    await vi.advanceTimersByTimeAsync(0)
+    expect(client.current(second.debug_session_id).observation).toBe('current')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(client.current(first.debug_session_id).observation).toBe('current')
+  } finally {
+    abort.abort()
+    await vi.advanceTimersByTimeAsync(0)
+    await watch
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  }
+})

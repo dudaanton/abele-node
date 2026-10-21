@@ -61,6 +61,7 @@ it('persisted outbox survives a new client; gaps stop advancement and cursor fai
     },
   } satisfies AuthenticatedChannel
   reloaded.attach(channel)
+  expect(reloaded.target.expected_node_id).toBe('node')
   const event = (seq: number) => ({
     kind: 'event',
     node_id: 'node',

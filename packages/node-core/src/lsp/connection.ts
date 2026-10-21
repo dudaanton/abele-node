@@ -4,6 +4,11 @@ const MAX_FRAME = 2 * 1024 * 1024
 type Pending = { resolve: (x: any) => void; reject: (e: Error) => void; cleanup: () => void }
 /** Minimal LSP transport: byte framing, bidirectional requests, cancellation and bounded lifetime. */
 export class LspConnection {
+  readonly exitInfo: { code: number | null; signal: NodeJS.Signals | null; stderr: string } = {
+    code: null,
+    signal: null,
+    stderr: '',
+  }
   readonly child: ChildProcessWithoutNullStreams
   private buffer = Buffer.alloc(0)
   private next = 0
@@ -21,7 +26,9 @@ export class LspConnection {
       stdio: 'pipe',
       detached: process.platform !== 'win32',
     })
-    this.child.stderr.on('data', () => {})
+    this.child.stderr.on('data', (bytes) => {
+      this.exitInfo.stderr = (this.exitInfo.stderr + bytes.toString()).slice(-2048)
+    })
     this.child.stdout.on('data', (d) => {
       try {
         this.buffer = Buffer.concat([this.buffer, d])
@@ -50,7 +57,9 @@ export class LspConnection {
     this.child.stdin.on('error', (e) => this.fail(e))
     this.child.on('error', (e) => this.fail(e))
     this.closed = new Promise((resolve) =>
-      this.child.once('close', () => {
+      this.child.once('close', (code, signal) => {
+        this.exitInfo.code = code
+        this.exitInfo.signal = signal
         this.kill('SIGKILL')
         this.fail(new Error('lsp_exited'))
         if (!this.stopping) this.onExit?.()

@@ -159,3 +159,22 @@ environment/configuration/hooks policy. Git failures or interruption never cause
 automatic replay of the operation.
 If the fast-forward loses its reply or its resulting head cannot be verified,
 status is `outcome_unknown`, since the ref may already have advanced.
+
+## Parent notifications and delegated targets
+
+A parent can subscribe to the session supplied in `command.v1.run` or
+`git.v1.integrate`. `command.updated` is durable and includes every terminal status;
+use `run_id` to correlate it and the journal sequence to deduplicate reconnect
+replay. `command.output` is output, not completion evidence. Scheduling a parent
+notice/model turn from these events belongs to the controller.
+
+For child lifecycle/approval/report notifications subscribe to the delegation's
+`mailbox_stream_id` (see [delegation](delegation.md)). A pause is a
+`delegation.terminal` with `state: "stopped", reason: "time_limit"`.
+
+Get `worktree_id` from `delegation.status` after provisioning; pass it as the child
+source or command target. `workspace_id` is not a catalogue worktree ID. Commands
+require exactly one of `project_id` or `worktree_id`, and exactly one of `argv` or
+`command`; validation messages name those alternatives. Integrations require both
+catalogue worktree IDs and the matching branches/heads. No additional approval is
+implied by resolving an ID: every effect still needs exact owner approval.

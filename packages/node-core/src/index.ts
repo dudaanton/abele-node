@@ -322,7 +322,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=3000;'
     )
     const version = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version)
-    if (version > 18) {
+    if (version > 19) {
       this.db.close()
       throw new Error('unsupported_database_version')
     }
@@ -453,6 +453,14 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       ${columns.has('stream_offset') ? '' : 'ALTER TABLE provider_runs ADD COLUMN stream_offset INTEGER NOT NULL DEFAULT 0;'}
       PRAGMA user_version=18; COMMIT;`)
     }
+    if (version < 19)
+      this.db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE workspace_leases RENAME TO workspace_leases_single;
+      CREATE TABLE workspace_leases(workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), session_id TEXT PRIMARY KEY REFERENCES sessions(session_id));
+      INSERT INTO workspace_leases SELECT * FROM workspace_leases_single;
+      DROP TABLE workspace_leases_single;
+      CREATE INDEX workspace_leases_workspace ON workspace_leases(workspace_id);
+      PRAGMA user_version=19; COMMIT;`)
     // The agent's latest "/" list per session, so a client opening at the tail need not scan back.
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS session_commands(session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, body TEXT NOT NULL)'
@@ -1066,6 +1074,27 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return result
     }, true)
   }
+  /** Called inside the owning mutation transaction, including delegation deletion. */
+  deleteSession(actor: AuthorityContext, session: string) {
+    this.authority.check(actor, 'request', session)
+    this.session(session)
+    const installationActor = {
+      kind: 'installation',
+      installation_id: actor.installation_id,
+    } as const
+    // Preserve audit streams, provider-native history and receipts. Only remove
+    // the catalog entry and its idle bindings; never stop a turn as a side effect.
+    if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
+    this.resources.targets.detach(session)
+    this.db.prepare('DELETE FROM workspace_leases WHERE session_id=?').run(session)
+    const deleted = { session_id: session, deleted: true }
+    this.append(session, 'session.deleted', installationActor, deleted)
+    this.append('catalog', 'session.deleted', installationActor, deleted)
+    // Tombstone keeps historical foreign keys (inputs, artifacts, native bindings)
+    // valid without making the chat available for new work.
+    this.db.prepare('INSERT INTO deleted_sessions VALUES(?)').run(session)
+    return deleted
+  }
   private query(actor: AuthorityContext, method: string, p: Record<string, unknown>): unknown {
     this.authority.check(actor, 'discover', String(p.session_id ?? p.stream_id ?? ''))
     switch (method) {
@@ -1230,18 +1259,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return updated
     }
     if (method === 'session.delete') {
-      // Preserve audit streams, provider-native history and receipts. Only remove
-      // the catalog entry and its idle bindings; never stop a turn as a side effect.
-      if (this.delegations.isActive(session)) throw new ChannelError('resource_busy')
-      this.resources.targets.detach(session)
-      this.db.prepare('DELETE FROM workspace_leases WHERE session_id=?').run(session)
-      const deleted = { session_id: session, deleted: true }
-      this.append(session, 'session.deleted', installationActor, deleted)
-      this.append('catalog', 'session.deleted', installationActor, deleted)
-      // Tombstone keeps historical foreign keys (inputs, artifacts, native bindings)
-      // valid without making the chat available for new work.
-      this.db.prepare('INSERT INTO deleted_sessions VALUES(?)').run(session)
-      return deleted
+      return this.deleteSession(actor, session)
     }
     if (method === 'session.detach') {
       this.resources.targets.detach(session)

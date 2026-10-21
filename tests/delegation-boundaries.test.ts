@@ -78,6 +78,15 @@ it('accepts run-fenced structured reports once and only publishes a final result
   f.core.tick()
   const prompt = f.core.prompts(child.session_id)[0]!
   const reporter = f.core.delegations.reporter(child.session_id, prompt.run_id)
+  const bridge = reporter.bridge()
+  expect(bridge.tools[0]?.name).toBe('node_worker_report')
+  expect(
+    await bridge.call('node_worker_report', {
+      report_id: 'tool',
+      kind: 'question',
+      text: 'Tool available',
+    })
+  ).toEqual({ recorded: true })
   const progress = { report_id: 'x'.repeat(128), kind: 'progress', text: 'half done' }
   expect(reporter.tool().execute(progress)).toEqual({ recorded: true })
   expect(reporter.report(progress)).toEqual({ recorded: true })
@@ -126,8 +135,11 @@ it('accepts run-fenced structured reports once and only publishes a final result
       .some((e) => e.type === 'content.delta' && (e.data as any).text === 'human followup')
   ).toBe(true)
   expect(
-    f.core.read(child.mailbox_stream_id, 0).filter((e) => e.type === 'delegation.result')
-  ).toHaveLength(1)
+    f.core
+      .read(child.mailbox_stream_id, 0)
+      .filter((e) => e.type === 'delegation.result')
+      .map((e) => (e.data as any).text)
+  ).toEqual(['Explicit final summary', 'human followup'])
 })
 it('cannot widen approved actions/providers or read after revocation of the approving owner', async () => {
   const f = fixture()

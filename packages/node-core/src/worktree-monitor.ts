@@ -35,6 +35,8 @@ export class WorktreeMonitor {
   private configured: string | null = null
   private listeners = new Set<(overflow: boolean) => void>()
   generation = 0
+  private ignoredGeneration = 0
+  private ignoredOutputRoots = new Map<string, string>()
   reliable = true
   closed = false
   touched = Date.now()
@@ -103,6 +105,7 @@ export class WorktreeMonitor {
     this.ignoreBaseline = new Map()
     this.gitBaseline = new Map()
     this.boundaries.clear()
+    this.ignoredOutputRoots.clear()
     this.capturedBefore = 0
   }
   private hasBaseline(path: string) {
@@ -145,6 +148,20 @@ export class WorktreeMonitor {
       )
         return
       let full = join(path, relative)
+      // A directory whose only ignore rule is '*' cannot expose new untracked
+      // children. Recorder/build output there must not invalidate visible trees.
+      // Tracked children and edits to the ignore rule itself remain fenced.
+      for (const [root, source] of this.ignoredOutputRoots) {
+        if (
+          full.startsWith(root + '/') &&
+          full !== source &&
+          sourceMetadata(source) === this.ignoreBaseline.get(source)
+        ) {
+          this.generation++
+          this.ignoredGeneration++
+          return
+        }
+      }
       if (
         path === this.root &&
         relative === basename(path) &&
@@ -189,6 +206,24 @@ export class WorktreeMonitor {
     // invalidate a just-captured snapshot, but replacements/edits always do.
     this.baseline = stamps
     this.ignoreBaseline = ignores
+    this.ignoredOutputRoots.clear()
+    const visibleParents = new Set<string>()
+    for (const path of stamps.keys()) {
+      for (let slash = path.indexOf('/'); slash >= 0; slash = path.indexOf('/', slash + 1))
+        visibleParents.add(path.slice(0, slash))
+    }
+    for (const source of ignores.keys()) {
+      try {
+        if (lstatSync(source).size > 4096) continue
+        if (readFileSync(source, 'utf8').trim() !== '*') continue
+        const root = source.slice(0, -'/.gitignore'.length)
+        const prefix = relative(this.root, root)
+        if (!prefix || visibleParents.has(prefix)) continue
+        this.ignoredOutputRoots.set(root, source)
+      } catch {
+        /* Missing or unreadable rules never establish an ignored boundary. */
+      }
+    }
     const gitBaseline = new Map<string, string | null>()
     for (const path of [
       join(this.gitdir, 'HEAD'),
@@ -201,8 +236,8 @@ export class WorktreeMonitor {
     this.gitBaseline = gitBaseline
   }
   /** Also fences same-turn index/HEAD/ref changes before fs events are delivered. */
-  signature() {
-    const rows: unknown[] = [this.generation]
+  signature(includeIgnored = false) {
+    const rows: unknown[] = [this.generation - (includeIgnored ? 0 : this.ignoredGeneration)]
     for (const path of [
       this.root,
       join(this.root, '.git'),

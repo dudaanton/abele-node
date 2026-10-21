@@ -177,6 +177,23 @@ export class ManagerService {
     }
     if (p.worktree_id) this.core.resources.repository.checkPublication(actor, p)
   }
+  private async worktreeTarget(worktree_id: string) {
+    if (this.core.db.prepare('SELECT 1 FROM workspaces WHERE workspace_id=?').get(worktree_id))
+      throw new ChannelError(
+        'invalid_params',
+        'Received workspace_id in a worktree field; use delegation.status.worktree_id after provisioning'
+      )
+    try {
+      return await this.core.resources.targets.resolve({ kind: 'worktree', worktree_id })
+    } catch (error) {
+      if (error instanceof ChannelError && error.code === 'not_found')
+        throw new ChannelError(
+          'not_found',
+          'Unknown worktree_id; refresh delegation.status or the project worktree catalogue'
+        )
+      throw error
+    }
+  }
   private async projectTarget(actor: AuthorityContext, project_id: string) {
     this.core.authority.check(actor, 'execute', project_id)
     const project = this.core.resources.projects.get(project_id)
@@ -244,16 +261,10 @@ export class ManagerService {
       throw new ChannelError('invalid_params', 'Request exceeds 32768 bytes')
     const target = p.project_id
       ? await this.projectTarget(actor, String(p.project_id))
-      : await this.core.resources.targets.resolve({
-          kind: 'worktree',
-          worktree_id: String(p.worktree_id),
-        })
+      : await this.worktreeTarget(String(p.worktree_id))
     const source =
       method === 'git.v1.integrate'
-        ? await this.core.resources.targets.resolve({
-            kind: 'worktree',
-            worktree_id: String(p.source_worktree_id),
-          })
+        ? await this.worktreeTarget(String(p.source_worktree_id))
         : undefined
     if (source && (source.project_id !== target.project_id || source.path === target.path))
       throw new ChannelError('invalid_params')

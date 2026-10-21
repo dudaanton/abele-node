@@ -89,7 +89,7 @@ it('leases the workspace atomically with child creation and retains it through r
   // Readiness has committed, but delegation settle has not run yet.
   expect(() =>
     f.request('session.create', { title: 'intruder', workspace_id: child.workspace_id })
-  ).toThrow(/resource_busy/)
+  ).toThrow(`resource_busy: workspace held by delegation child (${child.delegation_id})`)
   expect(() => f.core.tick()).not.toThrow()
   const cancelled = await f.create()
   f.request('delegation.cancel', { delegation_id: cancelled.delegation_id })

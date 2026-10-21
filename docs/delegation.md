@@ -153,7 +153,7 @@ wrapper. Do not use the child's session cursor as a mailbox cursor.
 Mailbox events are `delegation.created`, `delegation.progress`,
 `delegation.question`, `delegation.result` and `delegation.terminal`. They contain
 bounded structured summaries, not every provider/tool event. A successful
-completion commits exactly one result followed by a terminal status. Proposed
+completion commits its result (in ordered parts when necessary) followed by a terminal status. Proposed
 worker results cannot declare success before the provider settles. Failures,
 cancellation and uncertain delivery publish terminal status without pretending
 to have a successful result. Each mailbox is readable only by its granted
@@ -170,8 +170,10 @@ arguments. Reports have `{ report_id, kind, text }`, with `kind` equal to
 `progress`, `question` or `result`; duplicate report IDs with identical bodies
 are harmless, changed bodies fail. A stale run cannot write a report.
 
-The built-in Claude and pi adapters are supported without registering an extra
-native MCP/SDK tool: the node adds a credential-free instruction and accepts
+Pi children receive a native `node_worker_report` tool over authenticated node-tool IPC.
+It takes the same report object and binds the session/run in the node, never model input.
+It needs no filesystem execution approval. Other children and pi also support
+the credential-free instruction that accepts
 standalone final assistant messages in this format:
 
 ````text
@@ -181,11 +183,16 @@ standalone final assistant messages in this format:
 ````
 
 Partial text, user/tool messages and nested Claude child text do not become
-mailbox reports. Ordinary final assistant text provides a bounded fallback
-summary when no explicit result was reported. If no summary is available, the
+mailbox reports. Ordinary final assistant text is retained in full when no explicit result was reported.
+Long results are split into consecutive `delegation.result` events of at most 32768
+UTF-16 code units, each with a distinct report ID; concatenate their text in journal
+sequence order until `delegation.terminal`. Read every replay page. The delta fallback
+also includes the whole run, rather than its last 32 deltas. If no summary is available, the
 result links the human to the child transcript rather than inventing content.
-Native tool registration is an embedding seam, not a claim about live provider
-compatibility; no live runs are part of this increment.
+Headless pi display-only APIs (widgets, headers, footers and editor decorations)
+produce `pi.extension.warning` and do not fail extension hooks. Interactive custom
+components and non-UI extension failures still fail explicitly. No live provider
+runs were used for verification.
 
 ## Storage and verification
 
@@ -225,3 +232,45 @@ Git execution, output, page and transport budgets remain in force. Investigating
 acceptance M9 further requires the failing raw RPC error code and the plugin or
 proxy trace. Worktree-location instructions are advisory; shell approval display
 and enforcement of writes outside the worktree remain separate concerns.
+
+## Manager acceptance lifecycle
+
+Bounded pi, Claude and Codex turns default to 30 minutes of active time. Pi defaults
+to 32768 output tokens (subject to the selected model maximum). Approval waits
+stop the run clock, including overlapping waits. A delegated child prompt has no
+expiry, including turns typed directly by the owner after a pause. Claude approval
+IPC also waits durably instead of closing at its old permission TTL. Cancellation,
+revocation, lost provider connections and node restarts retain their existing
+fail-closed behavior. A genuine active-time deadline settles as `stopped` with
+`reason: "time_limit"` and publishes `delegation.terminal`; a pending owner decision
+is not discarded just because wall-clock time passed.
+
+Subscribe to each mailbox using `subscribeDelegation` / `stream.subscribe`:
+`delegation.question` announces owner approval and worker questions;
+`delegation.progress` announces progress; `delegation.result` carries reports;
+`delegation.terminal` announces completion, failure, cancellation, unknown outcomes
+or a time-limit pause. Persist the mailbox sequence and replay after reconnect.
+These are durable facts a parent can use to schedule a notice or model turn; the
+node does not itself start the parent model or spend its budget.
+
+`delegation.status` returns `worktree_id` once the managed workspace is ready,
+otherwise null. Use this catalogue ID for command/integrate calls; `workspace_id`
+is a different identity. Status retains the child session and mailbox IDs.
+
+`delegation.delete({ delegation_id })` is an idempotent mutation for deleting an
+idle child chat when its parent chat is deleted, including a parent stored only in
+the plugin. It uses the controller grant's cancel authority and normal session
+checks. Cancel active children first and retry deletion after effects are reaped;
+`resource_busy` protects active execution. It tombstones the child and releases idle
+bindings, retaining delegation audit/mailbox history and worktree files. The client
+exposes `deleteDelegation`. Parent UI code must call it for the parent's delegations.
+
+Token connections pin `target.expected_node_id` to the authenticated welcome, so
+parent approval cards and child chats use the same verified node identity.
+
+Service upgrades retain every argument from the authenticated previous service,
+including owner limits and flags unknown to the installer, replacing only the
+runtime executable/path. Explicit installer provider, debugger and pairing choices
+override just those arguments. Unsupported service command formats fail instead
+of silently dropping flags. Existing configured limits remain unchanged on update;
+the larger defaults apply when the service did not set explicit limits.

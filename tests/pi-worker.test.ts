@@ -262,3 +262,40 @@ it('rebinds the replacement runtime and waits past agent_end, retry and compacti
     native_session_id: 'new',
   })
 })
+
+it('keeps widget hooks enumerable through the SDK UI-context spread', async () => {
+  const events: any[] = []
+  const ui = new PiExtensionUiBridge(
+    async () => ({ choice: 'deny', delivered: () => true }),
+    new AbortController().signal,
+    (e) => events.push(e)
+  )
+  const { ExtensionRunner } = await import('@earendil-works/pi-coding-agent')
+  const runner = new ExtensionRunner([], {} as any, process.cwd(), {} as any, {} as any)
+  runner.setUIContext(ui.context, 'rpc')
+  const sdkUi = runner.getUIContext()
+  sdkUi.setWidget('subagents', ['Waiting'])
+  sdkUi.setWidget('subagents', undefined)
+  expect(events.map((e) => e.type)).toEqual(['pi.ui.widget', 'pi.ui.widget'])
+  expect(events[1].data).toEqual({ key: 'subagents', lines: null })
+})
+
+it('tells the agent when the user rejected an action instead of reporting an expired permission', async () => {
+  const policy = new PiApprovalPolicy(
+    async () => ({ choice: 'deny', delivered: () => true }),
+    new AbortController().signal
+  )
+  expect(
+    await policy.intercept({ tool_use_id: 'denied', tool_name: 'read', input: {} })
+  ).toMatchObject({ block: true, reason: 'User rejected this action' })
+})
+
+it('fails closed if an embedding returns an unknown approval choice', async () => {
+  const policy = new PiApprovalPolicy(
+    async () => ({ choice: 'unexpected', delivered: () => true }) as any,
+    new AbortController().signal
+  )
+  expect(
+    await policy.intercept({ tool_use_id: 'unknown', tool_name: 'read', input: {} })
+  ).toMatchObject({ block: true })
+})

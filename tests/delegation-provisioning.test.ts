@@ -70,6 +70,12 @@ it.each([false, true])(
       await core.resources.jobs.drain()
       core.tick()
       core.tick()
+      const status = request('delegation.status', { delegation_id: child.delegation_id })
+      expect(status.worktree_id).toEqual(expect.any(String))
+      const trees = await request('repository.v1.worktrees', { project_id: project.project_id })
+      expect(
+        trees.entries.find((t: any) => t.workspace_id === child.workspace_id).worktree_id
+      ).toBe(status.worktree_id)
       expect(request('delegation.status', { delegation_id: child.delegation_id }).state).toBe(
         'completed'
       )

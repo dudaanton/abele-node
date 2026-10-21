@@ -50,13 +50,28 @@ export class PiApprovalPolicy {
       const answer = await this.ask(structuredClone(action), signal)
       if (signal.aborted || canonical(action) !== before) return deny
       const confirmed = answer.delivered() === true
-      if (!confirmed || answer.choice !== 'allow') return deny
-      return undefined
+      if (!confirmed) return deny
+      if (answer.choice === 'deny') return { block: true, reason: 'User rejected this action' }
+      return answer.choice === 'allow' ? undefined : deny
     } catch {
       return deny
     }
   }
 }
+const HEADLESS_DISPLAY_APIS = [
+  'setFooter',
+  'setHeader',
+  'setTitle',
+  'setWorkingMessage',
+  'setWorkingVisible',
+  'setWorkingIndicator',
+  'setHiddenThinkingLabel',
+  'setEditorText',
+  'setEditorComponent',
+  'pasteToEditor',
+  'addAutocompleteProvider',
+  'onTerminalInput',
+] as const
 /** The host owns prompt transport; unavailable answers never become true/allow. */
 export class PiExtensionUiBridge {
   readonly context: any
@@ -88,6 +103,32 @@ export class PiExtensionUiBridge {
           this.emit({ type: 'pi.ui.notification', data: { message, level } }),
         setStatus: (key: string, text?: string) =>
           this.emit({ type: 'pi.ui.status', data: { key, text: text ?? null } }),
+        // The SDK spreads this object before giving it to hooks. Methods must
+        // be own enumerable properties; a Proxy fallback alone is lost there.
+        setWidget: (key: string, lines?: unknown) => {
+          if (lines !== undefined && !Array.isArray(lines)) {
+            this.emit({
+              type: 'pi.capability.error',
+              data: { capability: 'setWidget', reason: 'unsupported_extension_ui' },
+            })
+            return
+          }
+          this.emit({ type: 'pi.ui.widget', data: { key, lines: lines ?? null } })
+        },
+        // Display-only APIs a headless run cannot show: warn and continue so
+        // extension hooks keep running. Own properties, for the same spread.
+        ...Object.fromEntries(
+          HEADLESS_DISPLAY_APIS.map((name) => [
+            name,
+            () => {
+              this.emit({
+                type: 'pi.extension.warning',
+                data: { capability: name, reason: 'unsupported_extension_ui' },
+              })
+              if (name === 'onTerminalInput') return () => {}
+            },
+          ])
+        ),
       },
       {
         get: (target, key) => {

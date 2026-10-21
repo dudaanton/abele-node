@@ -117,7 +117,7 @@ export async function serveChannel(
   }
   const connection = new AbortController()
   let selfDisconnectReply: string | undefined
-  const timerRequests = new Set<Promise<void>>()
+  const requests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
     receive: () => transport.receive(),
     close: (reason) => transport.close(reason),
@@ -293,6 +293,10 @@ export async function serveChannel(
           // Internal/storage failures can occur after commit. Do not manufacture a
           // terminal rejection: disconnect so the durable outbox retries its receipt.
           if (!(error instanceof ChannelError)) {
+            console.error('[Abele channel] internal request failure', {
+              method: frame.method,
+              error: error instanceof Error ? error.message.slice(0, 512) : 'unknown',
+            })
             await close('internal_failure')
             return
           }
@@ -301,7 +305,7 @@ export async function serveChannel(
             kind: 'response',
             request_id: frame.request_id,
             ...(frame.operation_id ? { operation_id: frame.operation_id } : {}),
-            error: { code, message: code, details: {} },
+            error: { code, message: error.message.slice(0, 2048), details: error.details },
           }
         }
         // Do not block admission behind artifact writes. The scheduler bounds queued bytes.
@@ -313,18 +317,26 @@ export async function serveChannel(
             : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
         ).catch(() => close('send_failed'))
       }
-      if (frame.method === 'debugger.v1.wait' || frame.method === 'debugger.v1.sleep') {
-        // Timers never occupy the channel's next-input admission either. Keep
-        // reading cancel/control/heartbeat frames and observe EOF promptly.
-        if (timerRequests.size >= 128) {
-          await close('debugger_wait_limit')
-          break
+      {
+        // Feature work must not hold up heartbeat, cancellation, or unrelated
+        // requests. Domain services retain their own mutation/receipt locks.
+        if (requests.size >= 128) {
+          await send({
+            kind: 'response',
+            request_id: frame.request_id,
+            error: {
+              code: 'resource_busy',
+              message: 'Too many requests are in progress',
+              details: {},
+            },
+          })
+          continue
         }
         const task = execute()
           .catch(() => close('request_failed'))
-          .finally(() => timerRequests.delete(task))
-        timerRequests.add(task)
-      } else await execute()
+          .finally(() => requests.delete(task))
+        requests.add(task)
+      }
     }
   } catch {
     /* Reject unauthenticated/malformed records without application error details. */
@@ -334,6 +346,6 @@ export async function serveChannel(
     clearInterval(pump)
     for (const stream of [...watches.keys()]) unwatch(stream)
     await close('channel_closed')
-    await Promise.allSettled(timerRequests)
+    await Promise.allSettled(requests)
   }
 }

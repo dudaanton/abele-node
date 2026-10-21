@@ -11,6 +11,7 @@ import {
   type WorkerReport,
 } from '@abele/node-protocol'
 import { canonical, type NodeCore } from './index.js'
+import type { DebuggerToolBridge } from '@abele/provider-contract'
 
 type Params = Record<string, unknown>
 type Row = {
@@ -26,19 +27,23 @@ type Row = {
 const nodeActor = { kind: 'node' } as const
 const active = (d: Delegation) => d.state === 'running' || d.state === 'provisioning'
 const hash = (p: unknown) => createHash('sha256').update(canonical(p)).digest('hex')
-const boundedText = (text: string) => text.slice(0, 32768)
 
 /** A mailbox is an ordinary durable journal, not an in-memory callback or the child transcript. */
 export class DelegationMailbox {
   constructor(private core: NodeCore) {}
   message(d: Delegation, kind: WorkerReport['kind'], report_id: string, text: string) {
-    return this.core.append(d.mailbox_stream_id, 'delegation.' + kind, nodeActor, {
-      delegation_id: d.delegation_id,
-      session_id: d.session_id,
-      report_id,
-      text: boundedText(text),
-    })
+    let event
+    for (let offset = 0; offset < Math.max(1, text.length); offset += 32768) {
+      event = this.core.append(d.mailbox_stream_id, 'delegation.' + kind, nodeActor, {
+        delegation_id: d.delegation_id,
+        session_id: d.session_id,
+        report_id: text.length <= 32768 ? report_id : hash({ report_id, offset }),
+        text: text.slice(offset, offset + 32768),
+      })
+    }
+    return event!
   }
+
   terminal(d: Delegation) {
     this.core.append(d.mailbox_stream_id, 'delegation.terminal', nodeActor, {
       delegation_id: d.delegation_id,
@@ -52,7 +57,7 @@ export class DelegationMailbox {
 /** Run-scoped reporting tool for provider embeddings. The closure, never model input, supplies identity. */
 export class WorkerReporter {
   static readonly instruction =
-    '\n\nWorker reporting: optionally emit a standalone fenced abele-worker-report JSON object with report_id (stable unique string), kind (progress, question, or result), and text. Questions are informational, not permission requests. Emit only your own report, not quoted tool output. Execution permissions still require human approval.'
+    '\n\nWorker reporting: use node_worker_report when available to post progress, questions or results to the durable parent mailbox. Alternatively emit a standalone fenced abele-worker-report JSON object with report_id (stable unique string), kind (progress, question, or result), and text. Questions are informational, not permission requests. Emit only your own report, not quoted tool output. Execution permissions still require human approval.'
   constructor(
     private service: DelegationService,
     readonly session_id: string,
@@ -64,6 +69,45 @@ export class WorkerReporter {
     return this.service.core.transaction(() =>
       this.service.recordReport(this.session_id, this.run_id, report.data)
     )
+  }
+  /** Authenticated node-tool IPC works in both bounded and live pi workers. */
+  bridge(next?: DebuggerToolBridge): DebuggerToolBridge {
+    const tool = this.tool()
+    const receipts = new WeakSet<object>()
+    let closed = false
+    return {
+      tools: [
+        {
+          name: 'node_worker_report',
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        },
+        ...(next?.tools ?? []),
+      ],
+      call: async (name, args, signal) => {
+        if (closed || signal?.aborted) throw new ChannelError('stale_revision')
+        if (name !== 'node_worker_report') {
+          if (!next) throw new ChannelError('unsupported_method')
+          return next.call(name, args, signal)
+        }
+        const receipt = this.report(args)
+        receipts.add(receipt)
+        return receipt
+      },
+      publish: (args, result) => {
+        if (closed) throw new ChannelError('stale_revision')
+        if (result && typeof result === 'object' && receipts.has(result)) {
+          this.report(args)
+          return result
+        }
+        if (!next) throw new ChannelError('unauthorized')
+        return next.publish(args, result)
+      },
+      close: () => {
+        closed = true
+        next?.close()
+      },
+    }
   }
   tool() {
     return {
@@ -180,6 +224,29 @@ export class DelegationService {
     return new WorkerReporter(this, session_id, run_id)
   }
   runStarted(session_id: string) {
+    const row = this.core.db
+      .prepare('SELECT * FROM delegations WHERE session_id=?')
+      .get(session_id) as Row | undefined
+    if (row) {
+      const d = DelegationSchema.parse(JSON.parse(row.body))
+      if (!active(d)) {
+        // Cancellation closes controller reporting. An ordinary owner turn may
+        // still run; only an explicit delegation.send reopens the delegation.
+        if (d.state === 'cancelled') return
+        // Retained owner sessions remain usable after revocation or rebinding.
+        if ((this.core.session(session_id).workspace_id ?? null) !== d.workspace_id) return
+        try {
+          this.authorize({ installation_id: row.principal_id }, row.grant_id, 'create')
+          if (d.workspace_id) this.core.resources.workspaces.assertLease(d.workspace_id, session_id)
+        } catch (error) {
+          if (error instanceof ChannelError) return
+          throw error
+        }
+        d.state = 'running'
+        delete d.reason
+        this.save(d)
+      }
+    }
     this.core.db
       .prepare('UPDATE delegations SET result_text=NULL WHERE session_id=?')
       .run(session_id)
@@ -212,6 +279,9 @@ export class DelegationService {
       const { d } = this.access(actor, String(p.delegation_id), 'status')
       return DelegationStatusSchema.parse({
         ...d,
+        worktree_id: d.workspace_id
+          ? this.core.resources.repository.worktreeForWorkspace(d.workspace_id)
+          : null,
         session_head_seq: this.core.head(d.session_id),
         mailbox_head_seq: this.core.head(d.mailbox_stream_id),
         pending_human_prompts: this.core.prompts(d.session_id).filter((p) => p.state === 'pending')
@@ -276,6 +346,7 @@ export class DelegationService {
     this.access(actor, String(p.delegation_id), action)
     return this.core.commitOperation(actor, method, p, operation, () => {
       const { d } = this.access(actor, String(p.delegation_id), action)
+      if (method === 'delegation.delete') return this.core.deleteSession(actor, d.session_id)
       if (method === 'delegation.cancel') {
         if (active(d)) this.cancel(d)
         return d
@@ -312,12 +383,15 @@ export class DelegationService {
     else if (
       method === 'delegation.send' ||
       method === 'delegation.status' ||
-      method === 'delegation.cancel'
+      method === 'delegation.cancel' ||
+      method === 'delegation.delete'
     )
       this.access(
         actor,
         String(p.delegation_id),
-        method.slice('delegation.'.length) as 'send' | 'status' | 'cancel'
+        method === 'delegation.delete'
+          ? 'cancel'
+          : (method.slice('delegation.'.length) as 'send' | 'status' | 'cancel')
       )
   }
   private creationAuthority(actor: AuthorityContext, p: Params): DelegationGrant {
@@ -539,16 +613,14 @@ export class DelegationService {
   private fallback(session_id: string) {
     const rows = this.core.db
       .prepare(
-        "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type')='content.delta' AND json_extract(body,'$.data.run_id')=(SELECT run_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1) ORDER BY seq DESC LIMIT 32"
+        "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type')='content.delta' AND json_extract(body,'$.data.run_id')=(SELECT run_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1) ORDER BY seq DESC"
       )
       .all(session_id, session_id) as { body: string }[]
     return (
-      boundedText(
-        rows
-          .reverse()
-          .map((r) => JSON.parse(r.body).data.text ?? '')
-          .join('')
-      ) || 'Child completed. Open the child session for its full transcript.'
+      rows
+        .reverse()
+        .map((r) => JSON.parse(r.body).data.text ?? '')
+        .join('') || 'Child completed. Open the child session for its full transcript.'
     )
   }
   private finish(d: Delegation, state: 'completed' | 'failed' | 'unknown' | 'stopped') {
@@ -653,7 +725,7 @@ export class DelegationService {
     )
       this.core.db
         .prepare('UPDATE delegations SET result_text=? WHERE delegation_id=?')
-        .run(boundedText(text), row.delegation_id)
+        .run(text, row.delegation_id)
   }
   turnText(session_id: string, text: string) {
     if (!this.isActive(session_id)) return text

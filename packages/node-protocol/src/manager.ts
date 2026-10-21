@@ -39,8 +39,14 @@ export const ManagerMethodSchemas = {
       output_bytes: z.number().int().min(1024).max(16384).optional(),
     })
     .strict()
-    .refine((p) => (p.argv !== undefined) !== (p.command !== undefined))
-    .refine((p) => (p.worktree_id !== undefined) !== (p.project_id !== undefined)),
+    .refine(
+      (p) => (p.argv !== undefined) !== (p.command !== undefined),
+      'Supply exactly one of argv or command'
+    )
+    .refine(
+      (p) => (p.worktree_id !== undefined) !== (p.project_id !== undefined),
+      'Supply exactly one of project_id or worktree_id; use delegation.status.worktree_id for a child'
+    ),
   'command.v1.status': z.object(run).strict(),
   'command.v1.cancel': z.object(run).strict(),
   'git.v1.integrate': z

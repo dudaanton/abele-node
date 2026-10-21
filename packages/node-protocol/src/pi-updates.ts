@@ -309,9 +309,12 @@ export function piSessionUpdates(type: string, data: unknown): SessionUpdate[] {
         {
           kind: 'notice',
           level: type === 'pi.extension.warning' ? 'warning' : 'error',
-          text: str(d.extension)
-            ? `pi extension ${line(str(d.extension)!, 256)} failed${str(d.event) ? ` (${line(str(d.event)!, 128)})` : ''}: ${line(str(d.error) ?? 'Unknown error', 2048)}`
-            : 'A pi extension failed',
+          text:
+            type === 'pi.extension.warning' && d.reason === 'unsupported_extension_ui'
+              ? `pi extension display ${line(str(d.capability) ?? 'feature', 64)} is unavailable in this headless run; execution continues`
+              : str(d.extension)
+                ? `pi extension ${line(str(d.extension)!, 256)} failed${str(d.event) ? ` (${line(str(d.event)!, 128)})` : ''}: ${line(str(d.error) ?? 'Unknown error', 2048)}`
+                : 'A pi extension failed',
           code: type === 'pi.extension.warning' ? 'extension_warning' : 'extension_error',
         },
       ]

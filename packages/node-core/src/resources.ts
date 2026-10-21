@@ -222,8 +222,21 @@ export class WorkspaceService {
   lease(id: string, session: string, provisioning = false): WorkspaceLease {
     const workspace = this.get(id)
     if (workspace.kind !== 'managed') throw new ChannelError('git_required')
-    if (workspace.state !== (provisioning ? 'provisioning' : 'ready') || this.leased(id))
+    if (workspace.state !== (provisioning ? 'provisioning' : 'ready'))
       throw new ChannelError('resource_busy')
+    // Ordinary chats may share bindings. A delegated child's retained lease
+    // stays exclusive, including across provisioning cancellation and restart.
+    const holder = this.resources.core.db
+      .prepare(
+        'SELECT d.delegation_id,d.session_id FROM workspace_leases l JOIN delegations d ON d.session_id=l.session_id WHERE l.workspace_id=? AND l.session_id<>?'
+      )
+      .get(id, session) as { delegation_id: string; session_id: string } | undefined
+    if (holder)
+      throw new ChannelError(
+        'resource_busy',
+        `resource_busy: workspace held by delegation ${this.resources.core.session(holder.session_id).title} (${holder.delegation_id})`,
+        { holder: 'delegation', ...holder }
+      )
     this.resources.core.db.prepare('INSERT INTO workspace_leases VALUES(?,?)').run(id, session)
     return { workspace_id: id, session_id: session }
   }

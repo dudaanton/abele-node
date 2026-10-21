@@ -16,6 +16,17 @@ import { ChannelError } from '@abele/channel-protocol'
 
 const roots: string[] = [],
   cores: NodeCore[] = []
+it('explains a workspace ID supplied in a worktree field before asking for approval', async () => {
+  const f = await fixture()
+  const row = f.core.db.prepare('SELECT workspace_id FROM workspaces LIMIT 1').get()!
+  await expect(
+    f.request('command.v1.run', {
+      session_id: f.session.session_id,
+      worktree_id: row.workspace_id,
+      argv: ['true'],
+    })
+  ).rejects.toThrow('workspace_id')
+})
 const git = (cwd: string, ...args: string[]) => {
   const result = spawnSync('/usr/bin/git', args, {
     cwd,

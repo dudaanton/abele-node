@@ -73,7 +73,7 @@ it('persists pi conversation checkpoints across reopening the node and retries w
       text: 'original prompt',
     })
     // No provider is started in this test: capture the same boundary the dispatcher uses.
-    core.chatCheckpoints.capture(session.session_id, input.input_id)
+    await core.chatCheckpoints.capture(session.session_id, input.input_id)
     core.db.prepare("UPDATE inputs SET state='completed' WHERE input_id=?").run(input.input_id)
     const [checkpoint] = await request('chat.checkpoints', { session_id: session.session_id })
     expect(checkpoint.input_id).toBe(input.input_id)
@@ -157,66 +157,89 @@ it('persists pi conversation checkpoints across reopening the node and retries w
   }
 })
 
-it('previews creations, edits and deletions, refuses stale/changed previews, restores only explicitly', () => {
+it('previews creations, edits and deletions, refuses stale/changed previews, restores only explicitly', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'chat-checkpoint-')))
   try {
     execFileSync('git', ['init', '-q'], { cwd: root })
     writeFileSync(join(root, 'a'), 'before')
     writeFileSync(join(root, 'removed'), 'keep')
-    const before = snapshotFiles(root)
+    const before = await snapshotFiles(root)
     chmodSync(join(root, 'a'), 0o700)
     writeFileSync(join(root, 'a'), 'after')
     rmSync(join(root, 'removed'))
     writeFileSync(join(root, 'new'), 'new')
-    const changes = previewFiles(before, snapshotFiles(root))
+    const changes = previewFiles(before, await snapshotFiles(root))
     expect(changes.map((c) => c.path)).toEqual(['a', 'new', 'removed'])
     expect(readFileSync(join(root, 'a'), 'utf8')).toBe('after')
-    expect(() => restoreFiles(root, before, changes.slice(1))).toThrow('stale_revision')
+    await expect(restoreFiles(root, before, changes.slice(1))).rejects.toThrow('stale_revision')
     writeFileSync(join(root, 'a'), 'owner edit')
-    expect(() => restoreFiles(root, before, changes)).toThrow('stale_revision')
+    await expect(restoreFiles(root, before, changes)).rejects.toThrow('stale_revision')
     expect(readFileSync(join(root, 'a'), 'utf8')).toBe('owner edit')
-    restoreFiles(root, before, previewFiles(before, snapshotFiles(root)))
+    await restoreFiles(root, before, previewFiles(before, await snapshotFiles(root)))
     expect(readFileSync(join(root, 'a'), 'utf8')).toBe('before')
     expect(statSync(join(root, 'a')).mode & 0o777).toBe(before.a!.mode)
-    expect(snapshotFiles(root)).toEqual(before)
+    expect(await snapshotFiles(root)).toEqual(before)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-it('refuses symlinks and preserves ignored dependencies during file restoration', () => {
+it('refuses symlinks and preserves ignored dependencies during file restoration', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'chat-paths-')))
   try {
     execFileSync('git', ['init', '-q'], { cwd: root })
     writeFileSync(join(root, '.gitignore'), 'dependencies/\n')
     mkdirSync(join(root, 'dependencies'))
     writeFileSync(join(root, 'dependencies', 'local'), 'before')
-    const before = snapshotFiles(root)
+    const before = await snapshotFiles(root)
     writeFileSync(join(root, 'dependencies', 'local'), 'after')
-    expect(previewFiles(before, snapshotFiles(root))).toEqual([])
-    restoreFiles(root, before, [])
+    expect(previewFiles(before, await snapshotFiles(root))).toEqual([])
+    await restoreFiles(root, before, [])
     expect(readFileSync(join(root, 'dependencies', 'local'), 'utf8')).toBe('after')
     symlinkSync(join(root, 'dependencies', 'local'), join(root, 'link'))
-    expect(() => snapshotFiles(root)).toThrow('unsafe_path')
-    expect(() => restoreFiles(root, before, [])).toThrow('unsafe_path')
+    await expect(snapshotFiles(root)).rejects.toThrow('unsafe_path')
+    await expect(restoreFiles(root, before, [])).rejects.toThrow('unsafe_path')
     expect(readFileSync(join(root, 'dependencies', 'local'), 'utf8')).toBe('after')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-it('treats prototype property names as ordinary files after checkpoint deserialization', () => {
+it('treats prototype property names as ordinary files after checkpoint deserialization', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'chat-names-')))
   try {
     execFileSync('git', ['init', '-q'], { cwd: root })
-    const before = JSON.parse(JSON.stringify(snapshotFiles(root)))
+    const before = JSON.parse(JSON.stringify(await snapshotFiles(root)))
     writeFileSync(join(root, 'constructor'), 'new')
     writeFileSync(join(root, '__proto__'), 'new')
-    const changes = previewFiles(before, snapshotFiles(root))
+    const changes = previewFiles(before, await snapshotFiles(root))
     expect(changes.map((c) => c.path)).toEqual(['__proto__', 'constructor'])
-    restoreFiles(root, before, changes)
-    expect(snapshotFiles(root)).toEqual(before)
+    await restoreFiles(root, before, changes)
+    expect(await snapshotFiles(root)).toEqual(before)
   } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+it('lets unrelated requests run while Git inventories a checkpoint', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'chat-responsive-')))
+  const previous = process.env.PATH
+  try {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    const git = join(bin, 'git')
+    writeFileSync(git, `#!${process.execPath}\nsetTimeout(() => process.exit(0), 150)\n`)
+    chmodSync(git, 0o700)
+    process.env.PATH = bin
+    let responsive = false
+    const timer = setTimeout(() => {
+      responsive = true
+    }, 10)
+    await snapshotFiles(root)
+    clearTimeout(timer)
+    expect(responsive).toBe(true)
+  } finally {
+    process.env.PATH = previous
     rmSync(root, { recursive: true, force: true })
   }
 })

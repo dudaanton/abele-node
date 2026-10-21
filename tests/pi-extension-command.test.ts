@@ -1,5 +1,36 @@
 import { it, expect } from 'vitest'
 import { PiExtensionUiBridge, PiSdkWorker } from '../packages/provider-pi/src/host.js'
+it.each([
+  'setFooter',
+  'setHeader',
+  'setTitle',
+  'setWorkingMessage',
+  'setWorkingVisible',
+  'setWorkingIndicator',
+  'setHiddenThinkingLabel',
+  'setEditorText',
+  'setEditorComponent',
+  'pasteToEditor',
+  'addAutocompleteProvider',
+])('warns for headless %s without aborting extension lifecycle hooks', (method) => {
+  const events: any[] = []
+  const ui = new PiExtensionUiBridge(
+    async () => ({ choice: 'deny', delivered: () => true }),
+    new AbortController().signal,
+    (e) => events.push(e)
+  )
+  expect(() => ui.context[method]('children', ['working'])).not.toThrow()
+  expect(events).toContainEqual(expect.objectContaining({ type: 'pi.extension.warning' }))
+  // The SDK spreads the UI context before hooks see it; the warning must survive.
+  events.length = 0
+  expect(() => ({ ...ui.context })[method]('children', ['working'])).not.toThrow()
+  expect(events).toContainEqual(
+    expect.objectContaining({
+      type: 'pi.extension.warning',
+      data: expect.objectContaining({ capability: method }),
+    })
+  )
+})
 it('keeps a final answer successful when an agent_end hook throws', async () => {
   let listener: (e: any) => void = () => {}
   let bindings: any

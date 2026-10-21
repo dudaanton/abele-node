@@ -1,4 +1,5 @@
 export { recoverProviderLauncher } from './launcher.js'
+export { ActiveDeadline } from './deadline.js'
 
 export interface ProcessIdentity {
   pid: number
@@ -31,6 +32,7 @@ export interface Answer {
   delivered(): boolean | void
 }
 export interface TurnContext {
+  durable_permissions?: boolean
   session_id: string
   run_id: string
   cwd: string

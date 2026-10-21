@@ -1,3 +1,4 @@
+import { ActiveDeadline } from '@abele/provider-contract'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { readFileSync, mkdirSync, chmodSync, realpathSync, lstatSync } from 'node:fs'
@@ -73,8 +74,8 @@ export class PiProviderAdapter {
       provider: options.provider ?? '',
       model: options.model ?? '',
       profile: options.profile ?? 'inherited',
-      maxTokens: options.maxTokens ?? 4096,
-      deadlineMs: options.deadlineMs ?? 120000,
+      maxTokens: options.maxTokens ?? 32768,
+      deadlineMs: options.deadlineMs ?? 1800000,
       permissionTtlMs: options.permissionTtlMs ?? 60000,
       live: options.live ?? true,
       sessionEffort: options.sessionEffort ?? 'medium',
@@ -339,7 +340,7 @@ export class PiProviderAdapter {
     const finalize = () => {
       if (finalizing) return finalizing
       finalizing = (async () => {
-        clearTimeout(timer)
+        timer.close()
         abort.abort()
         try {
           closeDebugger()
@@ -404,10 +405,10 @@ export class PiProviderAdapter {
       })
       return stopping
     }
-    const timer = setTimeout(() => {
+    const timer = new ActiveDeadline(this.options.deadlineMs, () => {
       reason = 'deadline'
       void interrupt().catch(() => {})
-    }, this.options.deadlineMs)
+    })
     worker.on('message', (raw) => {
       void (async () => {
         const size = Buffer.byteLength(JSON.stringify(raw))
@@ -520,10 +521,16 @@ export class PiProviderAdapter {
           const question = new AbortController()
           questions.set(m.id, question)
           const signal = AbortSignal.any([abort.signal, question.signal])
-          const answer =
-            m.action.kind && m.action.kind !== 'permission'
-              ? await sink.question?.(m.action, signal)
-              : await sink.permission(m.action, signal)
+          const resumeDeadline = timer.pause()
+          let answer: Answer | undefined
+          try {
+            answer =
+              m.action.kind && m.action.kind !== 'permission'
+                ? await sink.question?.(m.action, signal)
+                : await sink.permission(m.action, signal)
+          } finally {
+            resumeDeadline()
+          }
           if (signal.aborted) return
           if (!answer) return send({ kind: 'answer', id: m.id, choice: 'deny' })
           answers.set(m.id, answer)

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { ActiveDeadline } from '@abele/provider-contract'
 import type {
   ProviderRun,
   ProviderEventSink,
@@ -92,7 +93,7 @@ export async function startCodexTurn(
         data: { run_id: turn.run_id, generation, cleanup_confirmed: true },
       })
       settled = true
-      timers.clearTimeout(timer)
+      timer.close()
       finish({
         ...(mapper.result ? { result: mapper.result } : {}),
         ...(reason ? { reason } : !mapper.result ? { reason: 'codex_no_terminal_result' } : {}),
@@ -145,17 +146,27 @@ export async function startCodexTurn(
     generation,
     workspace: paths.workspace,
     mapper,
-    ask: (action, signal) =>
-      action.kind === 'permission'
-        ? sink.permission(action, signal)
-        : (sink.question?.(action, signal) ??
-          Promise.resolve({ choice: 'deny', delivered: () => false })),
+    ask: async (action, signal) => {
+      const resume = timer.pause()
+      try {
+        return await (action.kind === 'permission'
+          ? sink.permission(action, signal)
+          : (sink.question?.(action, signal) ??
+            Promise.resolve({ choice: 'deny' as const, delivered: () => false })))
+      } finally {
+        resume()
+      }
+    },
     cancel: interrupt,
   })
-  const timer = timers.setTimeout(() => {
-    reason = 'deadline'
-    void interrupt().catch(() => {})
-  }, options.deadlineMs)
+  const timer = new ActiveDeadline(
+    options.deadlineMs,
+    () => {
+      reason = 'deadline'
+      void interrupt().catch(() => {})
+    },
+    timers
+  )
   const request = (method: string, params?: unknown) =>
     localAbort.signal.aborted
       ? Promise.reject(new Error('interrupted'))

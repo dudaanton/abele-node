@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -82,3 +82,63 @@ it('announces nothing when only invisible files change, and still announces a re
   writeFileSync(join(s.repo, 'notes', 'sample.md'), 'edited\n')
   await wait(() => s.invalidations(before).length > 0)
 }, 30000)
+
+it('keeps visible trees readable while an ignored recording is continuously appended', async () => {
+  const s = await setup()
+  const runs = join(s.repo, '.abele/runs'),
+    run = join(runs, 'recording')
+  mkdirSync(run, { recursive: true })
+  writeFileSync(join(runs, '.gitignore'), '*\n')
+  const timeline = join(run, 'timeline.jsonl')
+  writeFileSync(timeline, '{}\n')
+  await s.request('repository.v1.observe', { worktree_id: s.root })
+  const monitor = (s.core.resources.repository as any).monitors.get(s.root)
+  monitor.reliable = true
+  const original = s.core.resources.git.run.bind(s.core.resources.git)
+  let writes = 0
+  const spy = vi.spyOn(s.core.resources.git, 'run').mockImplementation(async (...args) => {
+    const result = await original(...args)
+    if (args[1].kind === 'status') {
+      writeFileSync(timeline, JSON.stringify({ record: ++writes }))
+      monitor.changed(s.repo, '.abele/runs/recording/timeline.jsonl')
+    }
+    return result
+  })
+  try {
+    monitor.generation++
+    const observed = await s.request('repository.v1.observe', { worktree_id: s.root })
+    const tree = await s.request('repository.v1.tree', {
+      worktree_id: s.root,
+      revision: observed.revision,
+    })
+    expect(tree.entries.some((entry: any) => entry.path === 'file')).toBe(true)
+    expect(writes).toBeGreaterThan(0)
+  } finally {
+    spy.mockRestore()
+  }
+  const hidden = await s.request('repository.v1.observe', {
+    worktree_id: s.root,
+    include_ignored: true,
+  })
+  writeFileSync(timeline, 'changed')
+  monitor.changed(s.repo, '.abele/runs/recording/timeline.jsonl')
+  await expect(
+    s.request('repository.v1.tree', { worktree_id: s.root, revision: hidden.revision })
+  ).rejects.toThrow('stale_revision')
+  const visible = await s.request('repository.v1.observe', { worktree_id: s.root })
+  writeFileSync(join(runs, '.gitignore'), '')
+  monitor.changed(s.repo, '.abele/runs/.gitignore')
+  await expect(
+    s.request('repository.v1.tree', { worktree_id: s.root, revision: visible.revision })
+  ).rejects.toThrow('stale_revision')
+  writeFileSync(join(runs, '.gitignore'), '*\n')
+  const tracked = join(runs, 'tracked.txt')
+  writeFileSync(tracked, 'before')
+  git(s.repo, 'add', '-f', '.abele/runs/tracked.txt')
+  const withTracked = await s.request('repository.v1.observe', { worktree_id: s.root })
+  writeFileSync(tracked, 'after')
+  monitor.changed(s.repo, '.abele/runs/tracked.txt')
+  await expect(
+    s.request('repository.v1.tree', { worktree_id: s.root, revision: withTracked.revision })
+  ).rejects.toThrow('stale_revision')
+})

@@ -21,7 +21,7 @@ export class NodeLsp {
   constructor(private r: ResourceServices) {
     this.service = new LspService(r.core.stateDir, {
       idleMs: Number(process.env.ABELE_LSP_IDLE_MS) || 180000,
-      memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || 384,
+      memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || 1024,
       trusted: (root) => this.trusted(root),
       read: (root, path) => {
         const ref = this.roots.get(root)
@@ -41,29 +41,6 @@ export class NodeLsp {
         if (this.stopped) return
         const ref = this.roots.get(root)
         if (!ref) return
-        const sessions: string[] = []
-        for (const row of r.core.db
-          .prepare(
-            'SELECT session_id FROM sessions WHERE session_id NOT IN (SELECT session_id FROM deleted_sessions)'
-          )
-          .all() as { session_id: string }[]) {
-          try {
-            if (this.sessionRoot(row.session_id) === root) sessions.push(row.session_id)
-          } catch {
-            /* unavailable session */
-          }
-        }
-        const text = (
-          `Diagnostics for ${path}: ` +
-          (diagnostics.length
-            ? diagnostics
-                .map(
-                  (d) =>
-                    `[${d.source}] ${d.range.start.line + 1}:${d.range.start.character + 1} ${d.message}`
-                )
-                .join('\n')
-            : 'no problems')
-        ).slice(0, 4096)
         r.core.transaction(() => {
           r.core.append(
             'catalog',
@@ -75,23 +52,25 @@ export class NodeLsp {
               diagnostics,
             }
           )
-          for (const session of sessions)
-            r.core.append(
-              session,
-              'session.update',
-              { kind: 'node' },
-              { update: { kind: 'notice', level: 'info', text } }
-            )
         })
       },
       error: (root, message) => {
+        console.warn('[Abele LSP]', { root, message })
+        const ref = this.roots.get(root)
         if (!this.stopped)
           r.core.transaction(() =>
             r.core.append(
               'catalog',
               'lsp.status',
               { kind: 'node' },
-              { workspace_id: this.roots.get(root)?.id, message }
+              {
+                ...(ref
+                  ? ref.repository
+                    ? { worktree_id: ref.id }
+                    : { workspace_id: ref.id }
+                  : {}),
+                message,
+              }
             )
           )
       },
@@ -156,6 +135,29 @@ export class NodeLsp {
         method,
         p,
         signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+      )
+    } catch (error) {
+      if (error instanceof ChannelError) throw error
+      const detail = error instanceof Error ? error.message : 'unknown failure'
+      const candidate = detail.split(':')[0]!
+      const reason = /^(lsp_[a-z_]+|cancelled|untrusted_folder|unsafe_path|stale_revision)$/.test(
+        candidate
+      )
+        ? candidate
+        : 'lsp_failed'
+      const code =
+        reason.startsWith('lsp_') && reason !== 'lsp_timeout' ? 'lsp_unavailable' : reason
+      console.warn('[Abele LSP] request unavailable', {
+        method,
+        reason,
+        detail: detail.slice(0, 512),
+      })
+      throw new ChannelError(
+        code,
+        code === 'lsp_unavailable'
+          ? 'Language analysis is unavailable. Retry after checking the language server.'
+          : code,
+        { reason }
       )
     } finally {
       if (p.request_id) this.requests.delete(key)

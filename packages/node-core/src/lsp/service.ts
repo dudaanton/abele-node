@@ -1,5 +1,5 @@
-import { readFileSync, realpathSync } from 'node:fs'
-import { extname, relative, isAbsolute, resolve, join } from 'node:path'
+import { readFileSync, realpathSync, existsSync } from 'node:fs'
+import { extname, relative, isAbsolute, resolve, join, dirname } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { LspDiagnosticSchema, LspRangeSchema, type LspDiagnostic } from '@abele/node-protocol'
@@ -15,8 +15,11 @@ type Slot = {
   docs: Map<string, Document>
   timer?: NodeJS.Timeout
   memory?: NodeJS.Timeout
+  restart?: NodeJS.Timeout
+  cancelRestart?: () => void
   crashes: number
   failed: boolean
+  tsserver?: string
 }
 export type LspOptions = {
   idleMs?: number
@@ -106,6 +109,8 @@ export class LspService {
     this.slots.delete(this.key(slot.root, slot.language))
     clearTimeout(slot.timer)
     clearInterval(slot.memory)
+    clearTimeout(slot.restart)
+    slot.cancelRestart?.()
     for (const doc of slot.docs.values()) this.setDiagnostics(slot, doc.path, [])
     await slot.connection.stop()
   }
@@ -142,7 +147,7 @@ export class LspService {
       command.command,
       command.args,
       slot.root,
-      this.options.memoryMB ?? 384
+      Math.min(384, this.options.memoryMB ?? 1024)
     ))
     c.onNotification = (method, params) => {
       if (!this.allowed(slot.root, slot.language)) {
@@ -206,31 +211,71 @@ export class LspService {
         return
       }
       if (slot.crashes++ === 0) {
-        this.options.error?.(slot.root, slot.language + ' crashed; restarting once')
-        slot.ready = this.start(slot, command)
+        this.options.error?.(
+          slot.root,
+          slot.language + ' crashed; restarting once after 1000 ms' + this.exitDetail(c)
+        )
+        slot.ready = new Promise<void>((resolve, reject) => {
+          slot.cancelRestart = () => reject(new Error('lsp_closed'))
+          slot.restart = setTimeout(() => {
+            slot.restart = undefined
+            slot.cancelRestart = undefined
+            if (
+              this.closed ||
+              this.slots.get(this.key(slot.root, slot.language)) !== slot ||
+              !this.allowed(slot.root, slot.language)
+            ) {
+              reject(new Error('lsp_closed'))
+              return
+            }
+            try {
+              this.start(slot, command).then(resolve, reject)
+            } catch (error) {
+              slot.failed = true
+              this.options.error?.(slot.root, slot.language + ' could not restart')
+              reject(error)
+            }
+          }, 1000)
+          slot.restart.unref()
+        })
         slot.ready.catch(() => {})
       } else {
         slot.failed = true
-        this.options.error?.(slot.root, slot.language + ' stopped after repeated crash')
+        this.options.error?.(
+          slot.root,
+          slot.language + ' stopped after repeated crash' + this.exitDetail(c)
+        )
       }
     }
     // V8's heap limit covers JS servers. Check RSS too, including native servers.
     slot.memory = setInterval(() => {
       if (!c.child.pid) return
-      execFile('ps', ['-axo', 'pid=,ppid=,rss='], { timeout: 1000 }, (error, stdout) => {
-        if (error) return
-        const rows = stdout
-          .trim()
-          .split('\n')
-          .map((line) => line.trim().split(/\s+/).map(Number))
-        const pids = new Set([c.child.pid])
-        for (let i = 0; i < 8; i++)
-          for (const [pid, parent] of rows) if (pids.has(parent)) pids.add(pid)
-        const rss = rows
-          .filter(([pid]) => pids.has(pid))
-          .reduce((sum, row) => sum + (row[2] ?? 0), 0)
-        if (rss > (this.options.memoryMB ?? 384) * 1024) c.kill('SIGKILL')
-      })
+      try {
+        execFile('ps', ['-axo', 'pid=,ppid=,rss='], { timeout: 1000 }, (error, stdout) => {
+          if (error) return
+          const rows = stdout
+            .trim()
+            .split('\n')
+            .map((line) => line.trim().split(/\s+/).map(Number))
+          const pids = new Set([c.child.pid])
+          for (let i = 0; i < 8; i++)
+            for (const [pid, parent] of rows) if (pids.has(parent)) pids.add(pid)
+          const rss = rows
+            .filter(([pid]) => pids.has(pid))
+            .reduce((sum, row) => sum + (row[2] ?? 0), 0)
+          const limit = this.options.memoryMB ?? 1024
+          if (rss > limit * 1024) {
+            this.options.error?.(
+              slot.root,
+              `${slot.language} exceeded process-tree memory limit: ${Math.ceil(rss / 1024)} MB / ${limit} MB`
+            )
+            c.kill('SIGKILL')
+          }
+        })
+      } catch {
+        // Process inventory is optional and can be denied by a host sandbox.
+        // A synchronous spawn failure must not escape this timer and kill the node.
+      }
     }, 5000)
     slot.memory.unref()
     return c
@@ -246,7 +291,16 @@ export class LspService {
           },
         },
         initializationOptions:
-          slot.language === 'typescript' ? { maxTsServerMemory: this.options.memoryMB ?? 384 } : {},
+          slot.language === 'typescript'
+            ? {
+                maxTsServerMemory: Math.min(384, this.options.memoryMB ?? 1024),
+                tsserver: {
+                  useSyntaxServer: 'never',
+                  ...(slot.tsserver ? { path: slot.tsserver } : {}),
+                },
+                disableAutomaticTypingAcquisition: true,
+              }
+            : {},
       })
       .then(() => {
         if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
@@ -257,6 +311,12 @@ export class LspService {
         c.kill('SIGKILL')
         throw error
       })
+  }
+  private exitDetail(connection: LspConnection) {
+    const { code, signal, stderr } = connection.exitInfo
+    // Details stay in the local log, not the catalog or a remote error payload.
+    console.warn('[Abele LSP] server exited', { code, signal, stderr })
+    return ` (exit ${code ?? 'unknown'}, signal ${signal ?? 'none'})`
   }
   private sendOpen(slot: Slot, doc: Document) {
     slot.connection.notify('textDocument/didOpen', {
@@ -328,8 +388,24 @@ export class LspService {
         if (!found) continue
         if (this.slots.size >= 16) throw new Error('lsp_process_limit')
         slot = { root, language, docs: new Map(), crashes: 0, failed: false } as Slot
+        if (language === 'typescript' && !this.options.command) {
+          slot.tsserver = [
+            join(root, 'node_modules/typescript/lib/tsserver.js'),
+            join(this.state, 'lsp/typescript/node_modules/typescript/lib/tsserver.js'),
+            join(dirname(dirname(dirname(found.command))), 'typescript/lib/tsserver.js'),
+          ].find((path) => existsSync(path))
+          if (!slot.tsserver)
+            throw new Error(
+              'lsp_typescript_missing: Install project dependencies or reinstall the TypeScript language server on this node'
+            )
+        }
         this.slots.set(key, slot)
-        slot.ready = this.start(slot, found)
+        try {
+          slot.ready = this.start(slot, found)
+        } catch (error) {
+          this.slots.delete(key)
+          throw error
+        }
         slot.ready.catch(() => {})
       }
       if (slot.failed) throw new Error('lsp_repeated_crash: ' + language)
@@ -403,7 +479,11 @@ export class LspService {
     if (![...this.slots.values()].some((s) => s.root === root && s.docs.has(path)))
       await this.open(root, path, undefined, undefined, signal)
     if (method === 'diagnostics') {
-      for (const s of this.slots.values()) if (s.root === root && s.docs.has(path)) this.touch(s)
+      for (const s of this.slots.values())
+        if (s.root === root && s.docs.has(path)) {
+          if (s.failed) throw new Error('lsp_repeated_crash: ' + s.language)
+          this.touch(s)
+        }
       return { diagnostics: this.merged(root, path) }
     }
     const slot = [...this.slots.values()].find(

@@ -3,6 +3,21 @@ import { piSessionUpdates, sessionUpdatesOf } from '@abele/node-protocol'
 
 // pi's records in the shared transcript vocabulary.
 const provider = { kind: 'provider', provider: 'pi' }
+it('explains a headless display warning without claiming the extension failed', () => {
+  expect(
+    piSessionUpdates('pi.extension.warning', {
+      capability: 'setWidget',
+      reason: 'unsupported_extension_ui',
+    })
+  ).toEqual([
+    {
+      kind: 'notice',
+      level: 'warning',
+      code: 'extension_warning',
+      text: 'pi extension display setWidget is unavailable in this headless run; execution continues',
+    },
+  ])
+})
 it('shows a post-answer hook failure as a named warning', () => {
   expect(
     piSessionUpdates('pi.extension.warning', {

@@ -1,3 +1,4 @@
+import { ActiveDeadline } from '@abele/provider-contract'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer, type Socket } from 'node:net'
 import {
@@ -151,7 +152,7 @@ export class ClaudeProviderAdapter {
       profile: options.profile ?? 'inherited',
       model: options.model ?? 'haiku',
       budgetUsd: options.budgetUsd ?? 0.35,
-      deadlineMs: options.deadlineMs ?? 120000,
+      deadlineMs: options.deadlineMs ?? 1800000,
       permissionTtlMs: options.permissionTtlMs ?? 60000,
       live: options.live ?? true,
       accounts: { ...(options.accounts ?? {}) },
@@ -671,6 +672,8 @@ export class ClaudeProviderAdapter {
           const lost = () => loss.abort()
           socket.once('close', lost)
           abort.signal.addEventListener('abort', lost, { once: true })
+          const resumeDeadline = timer.pause()
+          if (turn.durable_permissions) socket.setTimeout(0)
           try {
             const answer =
               original.tool_name === 'AskUserQuestion'
@@ -697,6 +700,8 @@ export class ClaudeProviderAdapter {
           } catch {
             socket.destroy()
           } finally {
+            resumeDeadline()
+            if (turn.durable_permissions && !socket.destroyed) socket.setTimeout(3000)
             abort.signal.removeEventListener('abort', lost)
           }
         })().catch(() => socket.destroy())
@@ -741,7 +746,9 @@ export class ClaudeProviderAdapter {
                 ABELE_SESSION_ID: turn.session_id,
                 ABELE_RUN_ID: turn.run_id,
                 ABELE_GENERATION: generation,
-                ABELE_APPROVAL_TTL: String(this.options.permissionTtlMs),
+                ABELE_APPROVAL_TTL: turn.durable_permissions
+                  ? '0'
+                  : String(this.options.permissionTtlMs),
               },
             },
           },
@@ -825,7 +832,7 @@ export class ClaudeProviderAdapter {
     const finalize = (code: number | null, signal: string | null) => {
       if (finalizing) return finalizing
       finalizing = (async () => {
-        clearTimeout(timer)
+        timer.close()
         abort.abort()
         try {
           closeDebugger()
@@ -893,10 +900,10 @@ export class ClaudeProviderAdapter {
       })
       return stopping
     }
-    const timer = setTimeout(() => {
+    const timer = new ActiveDeadline(this.options.deadlineMs, () => {
       reason = 'deadline'
       void interrupt().catch(() => {})
-    }, this.options.deadlineMs)
+    })
     worker.on('message', (m: any) => {
       try {
         if (m?.kind === 'ready' && m.evidence) {
