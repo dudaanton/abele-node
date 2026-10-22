@@ -10,6 +10,9 @@ import {
 } from '@abele/channel-protocol'
 import { MethodSchemas, PairingMethodSchemas } from '@abele/node-protocol'
 import { NodeCore } from '@abele/node-core'
+import { legacyExecutionPolicy } from './execution-policy-wire.js'
+
+const POLICY_ENABLE = 'execution.policy.v1.enable'
 
 /**
  * The welcome travels inside the handshake, which clients bound to `LIMITS.auth_bytes`, so it
@@ -116,6 +119,7 @@ export async function serveChannel(
     watches.delete(stream)
   }
   const connection = new AbortController()
+  let executionPolicyEnabled = false
   let selfDisconnectReply: string | undefined
   const requests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
@@ -139,7 +143,11 @@ export async function serveChannel(
     },
   })
   const send = (frame: unknown, priority = 0, authorize?: () => void) =>
-    scheduler.send(frame, priority, authorize)
+    scheduler.send(
+      executionPolicyEnabled ? frame : legacyExecutionPolicy(frame),
+      priority,
+      authorize
+    )
   const close = async (reason: string) => {
     if (closed) return
     closed = true
@@ -182,7 +190,7 @@ export async function serveChannel(
           subscription.bytes += bytes.byteLength
           subscription.sent.push({ seq: event.seq, bytes: bytes.byteLength })
           subscription.cursor = event.seq
-          await scheduler.send(published, 1, () => {
+          await send(published, 1, () => {
             if (!core.canPublishEvent(actor!, published)) throw new ChannelError('unauthorized')
           })
           if (closed) return
@@ -219,6 +227,7 @@ export async function serveChannel(
           instance_id: randomUUID(),
           methods: [
             ...Object.keys(MethodSchemas),
+            POLICY_ENABLE,
             ...core.debuggerControl.methods(),
             ...core.trace.methods(),
             ...core.http.methods(),
@@ -241,7 +250,19 @@ export async function serveChannel(
         let response: RecordFrame
         try {
           let result: unknown
-          if (['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)) {
+          if (frame.method === POLICY_ENABLE) {
+            if (
+              !frame.params ||
+              typeof frame.params !== 'object' ||
+              Array.isArray(frame.params) ||
+              Object.keys(frame.params).length
+            )
+              throw new ChannelError('invalid_params')
+            executionPolicyEnabled = true
+            result = { enabled: true }
+          } else if (
+            ['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)
+          ) {
             const schema =
               MethodSchemas[
                 frame.method as 'stream.subscribe' | 'stream.ack' | 'stream.unsubscribe'
@@ -314,7 +335,9 @@ export async function serveChannel(
           frame.method === 'artifact.read' ? 2 : 0,
           response.error
             ? undefined
-            : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
+            : frame.method === POLICY_ENABLE
+              ? () => core.authority.check(actor!, 'request')
+              : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
         ).catch(() => close('send_failed'))
       }
       {

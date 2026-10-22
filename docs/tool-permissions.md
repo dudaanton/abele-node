@@ -1,8 +1,27 @@
 # Session and delegation tool permissions
 
-Detect `node.describe.capabilities["tool.permissions.v1"].status === "supported"`.
+Detect `node.describe.capabilities.capabilities["tool.permissions.v1"].status === "supported"`.
+Also detect `node.describe.capabilities.capabilities["execution.policy.v1"].status === "supported"`
+and call `execution.policy.v1.enable {}` on each authenticated channel connection.
+Wait for `{ "enabled": true }` before fetching extended policy resources or subscribing.
+The same capability is advertised in the welcome's existing capability map and the
+enable method is listed in welcome methods. The request accepts only an empty object.
+Opt-in is per connection, resets on reconnect, and never changes execution permissions.
+
+Without this opt-in, all ordinary responses, replay pages and subscription events
+omit `Project.codex_network_enabled` (including when true) and `tool_permissions`
+on sessions, live session state and delegations, including nested setup results.
+Storage and provider inputs retain the real values. Older plugins therefore continue
+to parse their strict resource schemas. Clients that cannot opt in cannot read these
+fields; they must display unknown rather than infer false or bypass from absence.
+
+Provider configuration maps also omit the new `per_action_approval`, `approval_mode`
+and `workspace_actions_without_approval` metadata until opt-in, as well as ACP's new
+`configuration.permission_modes`. Existing providers' pre-existing `permission_modes`
+fields remain available; the mode names use the existing session permission enum.
+
 Sessions returned by create/get/list/configure, `session.state`, and delegations
-returned by create/status carry a persisted `tool_permissions` object:
+returned by create/status carry a persisted `tool_permissions` object after opt-in:
 
 ```json
 {

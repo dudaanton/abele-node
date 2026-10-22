@@ -6,6 +6,13 @@ import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { LocalChannelConnector, RecordQueue } from '@abele/channel-client'
 import { FrameCodec, LIMITS, type RecordTransport } from '@abele/channel-protocol'
 import { serveChannel } from '../packages/channel-server/src/index.js'
+import { legacyExecutionPolicy } from '../packages/channel-server/src/execution-policy-wire.js'
+import {
+  ProjectSchema as Project042Schema,
+  SessionSchema as Session042Schema,
+  LiveSessionStateSchema as State042Schema,
+  DelegationSchema as Delegation042Schema,
+} from './fixtures/protocol-0.4.42.js'
 import { servePairedChannel } from '../packages/node-daemon/src/paired.js'
 import {
   PairedWssConnector,
@@ -137,6 +144,129 @@ it.each([false, true])(
     expect(await client.listSessions()).toEqual([session])
   }
 )
+
+it('keeps 0.4.42 strict resource/session decoders working until connection opt-in', async () => {
+  const { core, open, seen } = setup(false)
+  const client = new NodeClient(
+    {
+      profile: 'local-token-v1',
+      url: 'ws://127.0.0.1:7777/channel',
+      token: core.createToken('legacy').token,
+    },
+    new MemoryClientStore(),
+    new LocalChannelConnector(open)
+  )
+  cleanup.push(() => client.disconnect())
+  await client.connect()
+  expect(await client.describe()).toMatchObject({
+    capabilities: { capabilities: { 'execution.policy.v1': { status: 'supported' } } },
+  })
+  await client.request('stream.subscribe', { stream_id: 'catalog', after_seq: 0 })
+  const session = await client.createSession('legacy resource')
+  for (
+    let attempts = 0;
+    attempts < 100 &&
+    !seen.some((frame) => frame.kind === 'event' && frame.type === 'session.created');
+    attempts++
+  )
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  Session042Schema.parse(
+    seen.find((frame) => frame.kind === 'event' && frame.type === 'session.created')!.data
+  )
+  for (const enabled of [false, true]) {
+    const project = {
+      project_id: 'compat-project',
+      root_path: '/fixture/project',
+      repository_path: null,
+      git_common_dir: null,
+      trust: 'trusted',
+      use_repository_claude_permissions: false,
+      codex_network_enabled: enabled,
+      created_at: new Date().toISOString(),
+    }
+    core.db
+      .prepare('INSERT OR REPLACE INTO projects(project_id,root_path,body) VALUES(?,?,?)')
+      .run(project.project_id, project.root_path, JSON.stringify(project))
+    const result = await client.request('project.get', { project_id: project.project_id })
+    expect(Project042Schema.parse(result)).not.toHaveProperty('codex_network_enabled')
+  }
+  const get = () => client.request('session.get', { session_id: session.session_id })
+  expect(Session042Schema.parse(await get())).not.toHaveProperty('tool_permissions')
+  expect(
+    State042Schema.parse(await client.request('session.state', { session_id: session.session_id }))
+  ).not.toHaveProperty('tool_permissions')
+  const replay = (await client.request('stream.read', {
+    stream_id: session.session_id,
+    after_seq: 0,
+  })) as Array<{ type: string; data: unknown }>
+  Session042Schema.parse(replay.find((event) => event.type === 'session.created')!.data)
+  await client.request('execution.policy.v1.enable', {})
+  expect(await get()).toHaveProperty('tool_permissions')
+  expect(await client.request('project.get', { project_id: 'compat-project' })).toHaveProperty(
+    'codex_network_enabled',
+    true
+  )
+  await client.connect()
+  expect(Session042Schema.parse(await get())).not.toHaveProperty('tool_permissions')
+})
+
+it('projects nested setup, delegation and event payloads without altering durable or opaque data', () => {
+  const policy = { permission_mode: 'manual', per_action_approval: true, status: 'supported' }
+  const delegation = {
+    node_id: 'node',
+    session_id: 'child',
+    delegation_id: 'delegation',
+    delegation_key: 'key',
+    grant_id: 'grant',
+    parent_id: 'parent',
+    mailbox_stream_id: 'mailbox',
+    workspace_id: null,
+    job_id: null,
+    state: 'provisioning',
+    created_at: new Date().toISOString(),
+    tool_permissions: policy,
+  }
+  const project = {
+    project_id: 'project',
+    root_path: '/fixture/project',
+    repository_path: null,
+    git_common_dir: null,
+    trust: 'trusted',
+    use_repository_claude_permissions: false,
+    created_at: new Date().toISOString(),
+    codex_network_enabled: true,
+  }
+  const original = {
+    result: { project, delegations: [delegation] },
+    data: project,
+    input: { project, delegation },
+  }
+  const projected = legacyExecutionPolicy(original) as typeof original
+  Project042Schema.parse(projected.result.project)
+  Project042Schema.parse(projected.data)
+  Delegation042Schema.parse(projected.result.delegations[0])
+  expect(projected.input).toEqual(original.input)
+  expect(project.codex_network_enabled).toBe(true)
+  expect(delegation.tool_permissions).toEqual(policy)
+  const provider = {
+    provider: 'acp',
+    configuration: {
+      permission_modes: ['manual', 'bypassPermissions'],
+      per_action_approval: true,
+      approval_mode: 'on-request',
+      workspace_actions_without_approval: true,
+      permission_ttl_ms: 60000,
+    },
+  }
+  expect(legacyExecutionPolicy(provider)).toEqual({
+    provider: 'acp',
+    configuration: { permission_ttl_ms: 60000 },
+  })
+  expect(legacyExecutionPolicy({ ...provider, provider: 'pi' })).toEqual({
+    provider: 'pi',
+    configuration: { permission_ttl_ms: 60000, permission_modes: ['manual', 'bypassPermissions'] },
+  })
+})
 
 const oldWelcome = {
   kind: 'welcome',

@@ -90,6 +90,10 @@ async function main() {
       '--runtime-dir',
       '--claude-path',
       '--tailscale-path',
+      // Installer wrappers append these recorded defaults after operator arguments.
+      '--codex-path',
+      '--codex-model',
+      '--codex-home',
       '--no-codex',
     ])
     for (const arg of args.slice(3))

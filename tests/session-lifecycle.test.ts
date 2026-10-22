@@ -210,7 +210,16 @@ it('advertises the same metadata in the handshake; clients can ignore it and sti
   const client = new NodeClient(target, new MemoryClientStore(), { connect: async () => channel })
   cleanup.push(() => client.disconnect())
   await client.connect()
-  expect(await client.listSessions()).toEqual([session])
+  // setup() returns the stored core record. This legacy connection has not
+  // enabled execution.policy.v1, so its strict wire shape omits the snapshot.
+  const { tool_permissions, ...legacySession } = session
+  expect(tool_permissions).toEqual({
+    per_action_approval: true,
+    permission_mode: 'manual',
+    status: 'supported',
+  })
+  expect(await client.listSessions()).toEqual([legacySession])
+  expect(core.session(session.session_id)).toEqual(session)
   const op = await client.send(session.session_id, 'legacy send', 0)
   await client.flush()
   expect(await client.operationResult(op.operation_id)).toMatchObject({

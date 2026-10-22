@@ -113,6 +113,51 @@ it('sets service flags through the installer and rejects invalid values before m
   expect(calls).toHaveLength(1)
   expect(JSON.parse(calls[0]!)).toContain('{"--pi-max-tokens":"12345"}')
 })
+it('accepts trailing installer wrapper defaults without changing service options', () => {
+  const f = fixture()
+  writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1 }))
+  const defaults = [
+    '--codex-path',
+    '/nonexistent/codex',
+    '--codex-model',
+    'fixture-model',
+    '--codex-home',
+    '/nonexistent/codex-home',
+  ]
+  const result = run(
+    f.entry,
+    f.state,
+    'service',
+    'flags',
+    'set',
+    '--allow-bypass',
+    'on',
+    ...defaults
+  )
+  expect(result.status, result.stderr).toBe(0)
+  const calls = readFileSync(join(f.home, 'installer-args'), 'utf8').trim().split('\n')
+  expect(calls).toHaveLength(1)
+  const args = JSON.parse(calls[0]!)
+  expect(args[args.indexOf('--service-flags') + 1]).toBe('{"--allow-bypass":"on"}')
+  for (const flag of ['--codex-path', '--codex-model', '--codex-home', '--no-codex'])
+    expect(args).not.toContain(flag)
+  const bad = run(
+    f.entry,
+    f.state,
+    'service',
+    'flags',
+    'set',
+    '--allow-bypass',
+    'off',
+    '--unsupported-option',
+    'value',
+    ...defaults
+  )
+  expect(bad.status).not.toBe(0)
+  expect(bad.stderr).toContain('Unknown option: --unsupported-option')
+  expect(readFileSync(join(f.home, 'installer-args'), 'utf8').trim().split('\n')).toHaveLength(1)
+})
+
 it('routes explicit bypass opt-in and opt-out through the fingerprinted installer boundary', () => {
   const f = fixture()
   writeFileSync(f.configFile, JSON.stringify({ ...f.config, service: 1 }))

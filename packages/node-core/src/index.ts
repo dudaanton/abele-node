@@ -746,6 +746,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.claude.capabilities('codex'),
       ],
       capabilities: {
+        'execution.policy.v1': {
+          status: 'supported' as const,
+          evidence:
+            'Call execution.policy.v1.enable with {} on each channel connection to receive extended project/session/delegation policy fields.',
+        },
         'tool.permissions.v1': {
           status: 'supported' as const,
           evidence: 'persisted-session-delegation-mode-and-per-action-approval',
