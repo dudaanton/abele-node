@@ -90,6 +90,27 @@ function setup(paired: boolean) {
   return { core, open, endpoint, seen }
 }
 
+it('reads the owner node log through the channel without changing legacy envelopes or writing a receipt', async () => {
+  const { core, open, seen } = setup(false)
+  const token = core.createToken('log owner')
+  const client = new NodeClient(
+    { profile: 'local-token-v1', url: 'ws://127.0.0.1:7777/channel', token: token.token },
+    new MemoryClientStore(),
+    new LocalChannelConnector(open)
+  )
+  cleanup.push(() => client.disconnect())
+  await client.connect()
+  const count = () => core.db.prepare('SELECT count(*) AS n FROM operations').get()!.n
+  const before = count()
+  expect(await client.request('node.log.v1.tail', {})).toMatchObject({
+    lines: [],
+    reason: 'logs_missing',
+  })
+  expect(count()).toBe(before)
+  expect(seen.find((frame) => frame.kind === 'welcome')!.methods).toContain('node.log.v1.tail')
+  expect(core.discovery().supported_capabilities).toContain('node_log_v1')
+})
+
 it.each(['command', 'integration'])(
   'requires %s context capability opt-in on every channel connection',
   async (kind) => {

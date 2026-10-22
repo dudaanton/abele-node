@@ -9,6 +9,7 @@ export * from './http.js'
 export * from './obsidian-tools.js'
 export * from './questionnaire.js'
 export * from './manager.js'
+export * from './node-log.js'
 export type NodeId = string
 export type SessionId = string
 export type StreamId = string

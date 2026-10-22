@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { NodeLogMethodSchemas } from './node-log.js'
 import { ChatMethodSchemas } from './chat.js'
 import { ObsidianToolsMethodSchemas } from './obsidian-tools.js'
 import { QuestionnaireQuestionsSchema, QuestionnaireAnswersSchema } from './questionnaire.js'
@@ -250,6 +251,7 @@ export const NodeEventSchema = EventSchema.superRefine((event, ctx) => {
 })
 const session = { session_id: id }
 export const MethodSchemas = {
+  ...NodeLogMethodSchemas,
   ...ObsidianToolsMethodSchemas,
   ...ManagerMethodSchemas,
   ...CommandContextMethodSchemas,

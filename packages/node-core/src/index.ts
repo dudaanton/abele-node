@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
+import { tailNodeLog, checkLogOwner } from './node-log.js'
 import { ChatCheckpoints } from './chat-checkpoints.js'
 import { ObsidianTools } from './obsidian-tools.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
@@ -812,6 +813,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           evidence:
             'command.context.v1.create/prepare/execute/status/cancel; provider-independent; parent-bound; ask-or-bypass',
         },
+        node_log_v1: {
+          status: 'supported',
+          evidence: 'node.log.v1.tail; owner-only; bounded; redacted; fixed-state-log-files',
+        },
         integration_context_v1: {
           status: 'supported',
           evidence:
@@ -1052,6 +1057,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     )
       return
     this.authority.check(actor, 'publish')
+    if (method === 'node.log.v1.tail') return checkLogOwner(this, actor)
     if (method.startsWith('debugger.v1.'))
       return this.debuggerControl.checkRpcPublication(actor, method, raw, result)
     // Owner-only views of the owner's own runs folder: nothing scoped beyond the installation.
@@ -1190,6 +1196,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     return deleted
   }
   private query(actor: AuthorityContext, method: string, p: Record<string, unknown>): unknown {
+    if (method === 'node.log.v1.tail') return tailNodeLog(this, actor, p)
     this.authority.check(actor, 'discover', String(p.session_id ?? p.stream_id ?? ''))
     switch (method) {
       case 'node.disconnect':

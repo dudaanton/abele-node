@@ -1,6 +1,14 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync, symlinkSync, rmSync, renameSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  symlinkSync,
+  rmSync,
+  renameSync,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { NodeCore } from '../packages/node-core/src/index.js'
@@ -10,9 +18,60 @@ import { RelativePathSchema, type DiffSnapshot } from '../packages/node-protocol
 const roots: string[] = [],
   cores: NodeCore[] = []
 function git(cwd: string, ...args: string[]) {
-  const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
-  if (r.status) throw new Error(r.stderr)
-  return r.stdout.trim()
+  return fixtureGit(cwd, args)
+}
+function fixtureGit(
+  cwd: string,
+  args: string[],
+  input?: string,
+  executable = '/usr/bin/git',
+  timeoutMs = 5000
+): Promise<string> {
+  // A synchronous child blocks Vitest's watchdog as well as the test. Keep its
+  // pipes asynchronous (including large hash-object input), kill on deadline,
+  // and reject spawn errors/signals as well as nonzero exit codes.
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      executable,
+      [
+        '--no-pager',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'commit.gpgSign=false',
+        '-c',
+        'init.templateDir=',
+        ...args,
+      ],
+      {
+        cwd,
+        encoding: 'utf8',
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))
+          ),
+          GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_TERMINAL_PROMPT: '0',
+        },
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const reason =
+            error.killed && error.signal === 'SIGKILL'
+              ? `deadline (${timeoutMs}ms), signal SIGKILL`
+              : `failed (code ${error.code}, signal ${error.signal})`
+          reject(new Error(`fixture Git ${args[0]} ${reason}: ${stderr}`, { cause: error }))
+        } else resolve(stdout.trim())
+      }
+    )
+    child.stdin!.on('error', () => {}) // Early child exit is reported by execFile.
+    child.stdin!.end(input)
+  })
 }
 async function setup(managed = false) {
   mkdirSync('.scratch', { recursive: true })
@@ -20,13 +79,13 @@ async function setup(managed = false) {
   roots.push(dir)
   const repo = join(dir, 'repo')
   mkdirSync(repo)
-  git(repo, 'init', '-b', 'main')
-  git(repo, 'config', 'user.name', 'Fixture')
-  git(repo, 'config', 'user.email', 'fixture@example.invalid')
+  await git(repo, 'init', '-b', 'main')
+  await git(repo, 'config', 'user.name', 'Fixture')
+  await git(repo, 'config', 'user.email', 'fixture@example.invalid')
   writeFileSync(join(repo, 'sample.txt'), 'one\ntwo\nthree\n')
   writeFileSync(join(repo, '.gitignore'), 'ignored\n')
-  git(repo, 'add', '.')
-  git(repo, 'commit', '-m', 'fixture')
+  await git(repo, 'add', '.')
+  await git(repo, 'commit', '-m', 'fixture')
   const core = new NodeCore(join(dir, 'state'))
   cores.push(core)
   const actor = core.authority.authenticate(core.createToken('fixture').token)
@@ -57,6 +116,19 @@ afterEach(async () => {
     c.close()
   }
   for (const d of roots.splice(0)) rmSync(d, { recursive: true, force: true })
+})
+it('bounds a stalled fixture Git command and reports the command and termination signal', async () => {
+  const dir = mkdtempSync(resolve('.scratch/fixture-git-'))
+  roots.push(dir)
+  const executable = join(dir, 'git.mjs')
+  writeFileSync(executable, `#!${process.execPath}\nsetTimeout(() => process.exit(0), 1000)\n`)
+  chmodSync(executable, 0o700)
+  await expect(fixtureGit(dir, ['init'], undefined, executable, 100)).rejects.toThrow(
+    /fixture Git init.*deadline.*SIGKILL/
+  )
+  await expect(fixtureGit(dir, ['status'], undefined, join(dir, 'missing-git'))).rejects.toThrow(
+    /fixture Git status.*ENOENT/
+  )
 })
 it('accepts saved review context when the current patch exceeds the capture limit', async () => {
   const s = await setup(true)
@@ -174,20 +246,14 @@ it.each([1536, 2048])(
   'pages Git history by serialized bytes, including JSON escaping (%i repetitions)',
   async (repetitions) => {
     const s = await setup(),
-      tree = git(s.repo, 'rev-parse', 'HEAD^{tree}')
-    let parent = git(s.repo, 'rev-parse', 'HEAD')
+      tree = await git(s.repo, 'rev-parse', 'HEAD^{tree}')
+    let parent = await git(s.repo, 'rev-parse', 'HEAD')
     const subject = '"\\\\'.repeat(repetitions)
     for (let i = 0; i < 100; i++) {
       const object = `tree ${tree}\nparent ${parent}\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\n\n${i} ${subject}\n`
-      const made = spawnSync('/usr/bin/git', ['hash-object', '-t', 'commit', '-w', '--stdin'], {
-        cwd: s.repo,
-        input: object,
-        encoding: 'utf8',
-      })
-      expect(made.status, made.stderr).toBe(0)
-      parent = made.stdout.trim()
+      parent = await fixtureGit(s.repo, ['hash-object', '-t', 'commit', '-w', '--stdin'], object)
     }
-    git(s.repo, 'update-ref', 'refs/heads/main', parent)
+    await git(s.repo, 'update-ref', 'refs/heads/main', parent)
     let offset = 0
     const ids: string[] = []
     while (true) {
@@ -204,6 +270,10 @@ it.each([1536, 2048])(
         expect(page.length).toBeLessThan(100)
       }
       if (!page.length) break
+      expect(
+        ids.length + page.length,
+        'Git history pagination must make bounded progress'
+      ).toBeLessThanOrEqual(101)
       ids.push(...page.map((row) => row.commit))
       offset += page.length
     }
@@ -213,19 +283,13 @@ it.each([1536, 2048])(
 )
 it('pages past an oversized subject with an explicit truncated preview', async () => {
   const s = await setup(),
-    tree = git(s.repo, 'rev-parse', 'HEAD^{tree}')
-  let parent = git(s.repo, 'rev-parse', 'HEAD')
+    tree = await git(s.repo, 'rev-parse', 'HEAD^{tree}')
+  let parent = await git(s.repo, 'rev-parse', 'HEAD')
   for (const subject of ['x'.repeat(600000), 'Small newest commit']) {
     const object = `tree ${tree}\nparent ${parent}\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\n\n${subject}\n`
-    const made = spawnSync('/usr/bin/git', ['hash-object', '-t', 'commit', '-w', '--stdin'], {
-      cwd: s.repo,
-      input: object,
-      encoding: 'utf8',
-    })
-    expect(made.status, made.stderr).toBe(0)
-    parent = made.stdout.trim()
+    parent = await fixtureGit(s.repo, ['hash-object', '-t', 'commit', '-w', '--stdin'], object)
   }
-  git(s.repo, 'update-ref', 'refs/heads/main', parent)
+  await git(s.repo, 'update-ref', 'refs/heads/main', parent)
   const page = (await s.request('workspace.log', {
     workspace_id: s.workspace_id,
     limit: 100,
@@ -254,8 +318,8 @@ it('lists, reads and reviews literal backslash names without admitting slash tra
   const s = await setup(true),
     path = 'report\\old.txt'
   writeFileSync(join(s.repo, path), 'before\n')
-  git(s.repo, 'add', '--', path)
-  git(s.repo, 'commit', '-m', 'native name')
+  await git(s.repo, 'add', '--', path)
+  await git(s.repo, 'commit', '-m', 'native name')
   writeFileSync(join(s.repo, path), 'after\n')
   expect(await s.request('workspace.files', { workspace_id: s.workspace_id })).toMatchObject({
     entries: expect.arrayContaining([expect.objectContaining({ name: path, path })]),
@@ -302,6 +366,7 @@ it('pages native names including ignored, untracked and dotfiles; never follows 
   symlinkSync(s.dir, join(s.repo, 'escape'))
   let after: string | undefined,
     names: string[] = []
+  const cursors = new Set<string>()
   do {
     const p = (await s.request('workspace.files', {
       workspace_id: s.workspace_id,
@@ -309,6 +374,11 @@ it('pages native names including ignored, untracked and dotfiles; never follows 
       limit: 2,
       ...(after ? { after } : {}),
     })) as { entries: { name: string; kind: string }[]; next: string | null }
+    if (p.next !== null) {
+      expect(p.entries.length, 'A continuing file page must not be empty').toBeGreaterThan(0)
+      expect(cursors.has(p.next), 'File pagination must not repeat a cursor').toBe(false)
+      cursors.add(p.next)
+    }
     names.push(...p.entries.map((e) => e.name))
     after = p.next ?? undefined
     expect(p.entries.length).toBeLessThanOrEqual(2)
@@ -383,7 +453,7 @@ it('captures every diff mode, merge-base semantics, log/show and immutable revie
     workspace_id: s.workspace_id,
   })) as { session_id: string }
   writeFileSync(join(s.repo, 'sample.txt'), 'one\nstaged\nthree\n')
-  git(s.repo, 'add', 'sample.txt')
+  await git(s.repo, 'add', 'sample.txt')
   writeFileSync(join(s.repo, 'sample.txt'), 'one\nnew\nthree\n')
   let headSnapshot: { diff_id: string } | undefined
   for (const mode of ['staged', 'unstaged', 'head', 'base']) {
@@ -456,9 +526,9 @@ it('captures every diff mode, merge-base semantics, log/show and immutable revie
       'review'
     )
   ).rejects.toThrow('idempotency_mismatch')
-  git(s.repo, 'add', 'sample.txt')
-  git(s.repo, 'commit', '-m', 'branch change')
-  const commit = git(s.repo, 'rev-parse', 'HEAD')
+  await git(s.repo, 'add', 'sample.txt')
+  await git(s.repo, 'commit', '-m', 'branch change')
+  const commit = await git(s.repo, 'rev-parse', 'HEAD')
   for (const mode of ['base', 'commit']) {
     const snap = (await s.request('workspace.diff.capture', {
       workspace_id: s.workspace_id,
