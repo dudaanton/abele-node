@@ -62,7 +62,10 @@ export class ManagerService {
   >()
   private closed = false
   private stopping = false
-  constructor(private core: NodeCore) {
+  constructor(
+    private core: NodeCore,
+    private allowBypass = false
+  ) {
     core.db.exec(
       'CREATE TABLE IF NOT EXISTS manager_runs(run_id TEXT PRIMARY KEY, body TEXT NOT NULL)'
     )
@@ -520,11 +523,15 @@ export class ManagerService {
         )
       throw error
     }
+    const requestedMode = commandContext?.original.permission_mode as 'ask' | 'bypass' | undefined
+    const tightened = requestedMode === 'bypass' && !this.allowBypass
+    const effectiveMode = tightened ? 'ask' : requestedMode
     const run: Run = {
       ...(commandContext
         ? {
             context_id: commandContext.context.context_id,
-            permission_mode: commandContext.original.permission_mode as 'ask' | 'bypass',
+            permission_mode: effectiveMode,
+            ...(tightened ? { reason: 'node_bypass_disabled' } : {}),
             ...(commandContext.original.justification !== undefined
               ? { justification: String(commandContext.original.justification) }
               : {}),
@@ -540,7 +547,7 @@ export class ManagerService {
       source,
       cwd,
       cwd_fingerprint: this.cwdFingerprint(cwd),
-      state: commandContext?.original.permission_mode === 'bypass' ? 'running' : 'pending_approval',
+      state: effectiveMode === 'bypass' ? 'running' : 'pending_approval',
       stdout: '',
       stderr: '',
       stdout_truncated: false,

@@ -299,6 +299,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     stateDir: string,
     options: {
       worktreeRoot?: string
+      /** Node-wide opt-in for command-context bypass; absent means owner approval. */
+      allowBypass?: boolean
       /** Optional Git executor; omitted uses the product's bounded defaults. */
       git?: GitRunner
       /** Authorized control infrastructure, off by default. Native profiles
@@ -493,7 +495,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         if (!this.closed) this.debuggerControl.notifyPermissions()
       })
       this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
-      this.manager = new ManagerService(this)
+      this.manager = new ManagerService(this, options.allowBypass === true)
       this.obsidianTools = new ObsidianTools(this)
       this.resources.mutations.recover()
       this.debuggerLaunches = new DebuggerLaunches(

@@ -53,11 +53,23 @@ choice: "allow" | "deny" }`. This records that single decision and starts
    `stale_approval`. Retry the same decision with its original operation ID.
    Do not expose this owner decision endpoint as a model tool. Do not use
    `prompt.answer` for context prompts.
-5. In **bypass**, prepare returns `approval: null` and immediately dispatches
-   the validated command, with no owner prompt or execute call. The client must
+5. In **bypass**, when the node's own bypass opt-in is enabled, prepare returns
+   `approval: null` and immediately dispatches the validated command, with no
+   owner prompt or execute call. This opt-in is the same
+   `--claude-allow-bypass` / `service flags set --allow-bypass on` setting used
+   by provider sessions; it is off by default and requires no provider session.
+   When it is off, a client bypass request is tightened to Ask: prepare returns
+   `permission_mode: "ask"`, `state: "pending_approval"`, the exact `approval`,
+   and `reason: "node_bypass_disabled"`. Nothing executes until the owner approves
+   that card through execute. The client should compare the effective
+   `permission_mode` with its request and display the reason for tightening.
+   These use existing response fields, preserving strict v1 response readers.
+   The client must
    pass the owner's current mode; omission is invalid and the node never infers
    bypass from authentication, project trust, context reuse or a previous run.
-   A prepared Ask action cannot be switched to bypass by execute.
+   The node only tightens the requested mode: Ask stays Ask even with opt-in on.
+   A prepared Ask action cannot be switched to bypass by execute or by enabling
+   bypass later. Retries retain the original receipt and effective mode.
 6. `command.context.v1.status` and `command.context.v1.cancel` accept
    `{ context_id, parent_chat_id, run_id }`. Cancel is a mutation. Both check
    the originating installation, parent and context/run binding. Cancel

@@ -338,6 +338,7 @@ export async function startDaemon(
     const codex = new CodexProviderAdapter({ ...codexOptions, stateDir: dir })
     await codex.prepare()
     core = new NodeCore(dir, {
+      allowBypass: claudeOptions.allowBypass === true,
       debuggerEnabled: debuggerOptions.enabled,
       ...(worktreeRoot ? { worktreeRoot } : {}),
       claude: new ClaudeProviderAdapter(claudeOptions),

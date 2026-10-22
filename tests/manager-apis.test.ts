@@ -21,6 +21,105 @@ import {
 
 const roots: string[] = [],
   cores: NodeCore[] = []
+it.each([
+  { allowBypass: false, requested: 'bypass', effective: 'ask' },
+  { allowBypass: true, requested: 'bypass', effective: 'bypass' },
+  { allowBypass: false, requested: 'ask', effective: 'ask' },
+  { allowBypass: true, requested: 'ask', effective: 'ask' },
+])(
+  'only tightens command mode ($requested, node bypass $allowBypass)',
+  async ({ allowBypass, requested, effective }) => {
+    const f = await fixture('trusted', allowBypass)
+    const context = await f.request('command.context.v1.create', {
+      parent_chat_id: 'policy-chat',
+      project_id: f.project.project_id,
+    })
+    const binding = { context_id: context.context_id, parent_chat_id: 'policy-chat' }
+    const params = {
+      ...binding,
+      permission_mode: requested,
+      argv: [
+        process.execPath,
+        '-e',
+        "require('node:fs').appendFileSync('policy-effect', 'once\\n')",
+      ],
+    }
+    const run = await f.request('command.context.v1.prepare', params, 'policy-prepare')
+    expect(run.permission_mode).toBe(effective)
+    const tightened = requested !== effective
+    if (tightened) expect(run).toMatchObject({ reason: 'node_bypass_disabled' })
+    else expect(run).not.toHaveProperty('reason')
+    CommandContextRunSchema.parse(run)
+    await f.core.manager.settled()
+    if (effective === 'ask') {
+      expect(run.state).toBe('pending_approval')
+      expect(existsSync(join(f.folder, 'policy-effect'))).toBe(false)
+      expect(run.approval.input.permission_mode).toBe('ask')
+      await f.request('command.context.v1.execute', {
+        ...binding,
+        run_id: run.run_id,
+        action_digest: run.approval.action_digest,
+        choice: 'allow',
+      })
+      await f.core.manager.settled()
+    } else expect(run.approval).toBeNull()
+    expect(readFileSync(join(f.folder, 'policy-effect'), 'utf8')).toBe('once\n')
+    expect(await f.request('command.context.v1.prepare', params, 'policy-prepare')).toEqual(run)
+    const status = await f.request('command.context.v1.status', { ...binding, run_id: run.run_id })
+    expect(status.permission_mode).toBe(effective)
+    if (tightened) expect(status.reason).toBe('node_bypass_disabled')
+  }
+)
+it('retains a tightened Ask decision across restart even when bypass is subsequently enabled', async () => {
+  const f = await fixture()
+  const context = await f.request('command.context.v1.create', {
+    parent_chat_id: 'restart-policy',
+    project_id: f.project.project_id,
+  })
+  const binding = { context_id: context.context_id, parent_chat_id: 'restart-policy' }
+  const params = { ...binding, permission_mode: 'bypass', argv: [process.execPath, '--version'] }
+  const run = await f.request('command.context.v1.prepare', params, 'tightened-prepare')
+  expect(run).toMatchObject({
+    permission_mode: 'ask',
+    reason: 'node_bypass_disabled',
+    state: 'pending_approval',
+  })
+  await f.core.manager.stop()
+  await f.core.resources.stop()
+  f.core.close()
+  cores.splice(cores.indexOf(f.core), 1)
+  const restarted = new NodeCore(join(f.dir, 'state'), { allowBypass: true })
+  cores.push(restarted)
+  expect(
+    await restarted.request(f.actor, 'command.context.v1.prepare', params, 'tightened-prepare')
+  ).toEqual(run)
+  await restarted.manager.settled()
+  expect(
+    await restarted.request(f.actor, 'command.context.v1.status', {
+      ...binding,
+      run_id: run.run_id,
+    })
+  ).toMatchObject({
+    permission_mode: 'ask',
+    reason: 'node_bypass_disabled',
+    state: 'pending_approval',
+    stdout: '',
+  })
+  await restarted.request(
+    f.actor,
+    'command.context.v1.execute',
+    { ...binding, run_id: run.run_id, action_digest: run.approval.action_digest, choice: 'allow' },
+    'tightened-approve'
+  )
+  await restarted.manager.settled()
+  expect(
+    await restarted.request(f.actor, 'command.context.v1.status', {
+      ...binding,
+      run_id: run.run_id,
+    })
+  ).toMatchObject({ state: 'exited', stdout: process.version + '\n' })
+})
+
 it('creates a command-only parent context, prepares Ask and executes only its exact approval', async () => {
   const f = await fixture()
   const count = () => f.core.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n
@@ -80,7 +179,7 @@ it('creates a command-only parent context, prepares Ask and executes only its ex
 })
 
 it('executes bypass directly and diagnoses missing context resources', async () => {
-  const f = await fixture()
+  const f = await fixture('trusted', true)
   await expect(
     f.request('command.v1.run', {
       session_id: 'missing',
@@ -136,7 +235,7 @@ it('executes bypass directly and diagnoses missing context resources', async () 
 })
 
 it('keeps bypass commands visible, cancellable and idempotent after a restart', async () => {
-  const f = await fixture()
+  const f = await fixture('trusted', true)
   const context = await f.request('command.context.v1.create', {
     parent_chat_id: 'bypass-chat',
     project_id: f.project.project_id,
@@ -168,7 +267,7 @@ it('keeps bypass commands visible, cancellable and idempotent after a restart', 
   await f.core.resources.stop()
   f.core.close()
   cores.splice(cores.indexOf(f.core), 1)
-  const restarted = new NodeCore(join(f.dir, 'state'))
+  const restarted = new NodeCore(join(f.dir, 'state'), { allowBypass: true })
   cores.push(restarted)
   expect(
     await restarted.request(f.actor, 'command.context.v1.prepare', p, 'bypass-restart')
@@ -326,7 +425,7 @@ const git = (cwd: string, ...args: string[]) => {
   if (result.status !== 0) throw new Error(result.stderr)
   return result.stdout.trim()
 }
-async function fixture(trust = 'trusted') {
+async function fixture(trust = 'trusted', allowBypass = false) {
   mkdirSync('.scratch', { recursive: true })
   const dir = mkdtempSync(resolve('.scratch/manager-apis-'))
   roots.push(dir)
@@ -340,7 +439,7 @@ async function fixture(trust = 'trusted') {
   git(folder, 'commit', '-m', 'initial')
   const developer = join(dir, 'developer')
   git(folder, 'worktree', 'add', '-b', 'developer', developer)
-  const core = new NodeCore(join(dir, 'state'))
+  const core = new NodeCore(join(dir, 'state'), { allowBypass })
   cores.push(core)
   const actor = core.authority.authenticate(core.createToken('controller').token)
   const owner = core.authority.authenticate(core.createToken('other-owner-device').token)
