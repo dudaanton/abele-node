@@ -812,6 +812,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           evidence:
             'command.context.v1.create/prepare/execute/status/cancel; provider-independent; parent-bound; ask-or-bypass',
         },
+        integration_context_v1: {
+          status: 'supported',
+          evidence:
+            'integration.context.v1.create/prepare/execute/status/cancel; parent-bound; exact-approval; ask-or-node-opted-bypass',
+        },
         git_integrate_v1: {
           status: 'supported',
           evidence:
@@ -983,7 +988,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       params = validateParams(method, raw) as Record<string, unknown>
     } catch (error) {
       if (
-        method.startsWith('command.context.v1.') &&
+        (method.startsWith('command.context.v1.') ||
+          method.startsWith('integration.context.v1.')) &&
         error &&
         typeof error === 'object' &&
         'issues' in error
@@ -1015,7 +1021,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return this.resources.targets.request(actor, method, params, operation)
     if (method.startsWith('delegation.'))
       return this.delegations.request(actor, method, params, operation)
-    if (method.startsWith('command.context.v1.'))
+    if (method.startsWith('command.context.v1.') || method.startsWith('integration.context.v1.'))
       return this.manager.requestContext(actor, method, params, operation)
     if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
       return this.manager.request(actor, method, params, operation)
@@ -1054,7 +1060,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (method.startsWith('http.v1.')) return
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
-    if (method.startsWith('command.context.v1.'))
+    if (method.startsWith('command.context.v1.') || method.startsWith('integration.context.v1.'))
       return this.manager.checkContextPublication(actor, p)
     if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
       return this.manager.checkPublication(actor, p)

@@ -36,8 +36,24 @@ function journalComplete(history: ReadonlyArray<{ type: string }>, runs: number)
   const terminals = history.filter(
     (event) => event.type === 'run.completed' || event.type === 'run.failed'
   ).length
-  return inputs === runs && terminals === runs
+  // Fake runs append input.reply after run.completed/run.failed. A client can
+  // commit that terminal event in a separate receive batch from the reply. Do
+  // not snapshot that prefix: restart correctly replays the longer journal,
+  // which would never converge to the prefix's length, however long we wait.
+  const replies = history.filter((event) => event.type === 'input.reply').length
+  return inputs === runs && terminals === runs && replies === runs
 }
+it('does not snapshot a run journal before its trailing input reply', () => {
+  const prefix = [
+    { type: 'input.completed' },
+    { type: 'run.completed' },
+    { type: 'input.reply' },
+    { type: 'input.failed' },
+    { type: 'run.failed' },
+  ]
+  expect(journalComplete(prefix, 2)).toBe(false)
+  expect(journalComplete([...prefix, { type: 'input.reply' }], 2)).toBe(true)
+})
 async function start(dir: string) {
   const child = spawn(
     process.execPath,

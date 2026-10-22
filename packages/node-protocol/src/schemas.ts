@@ -2,7 +2,11 @@ import { z } from 'zod'
 import { ChatMethodSchemas } from './chat.js'
 import { ObsidianToolsMethodSchemas } from './obsidian-tools.js'
 import { QuestionnaireQuestionsSchema, QuestionnaireAnswersSchema } from './questionnaire.js'
-import { ManagerMethodSchemas, CommandContextMethodSchemas } from './manager.js'
+import {
+  ManagerMethodSchemas,
+  CommandContextMethodSchemas,
+  IntegrationContextMethodSchemas,
+} from './manager.js'
 import { LspMethodSchemas, LspDiagnosticsSchema } from './lsp.js'
 import {
   DelegationMethodSchemas,
@@ -249,6 +253,7 @@ export const MethodSchemas = {
   ...ObsidianToolsMethodSchemas,
   ...ManagerMethodSchemas,
   ...CommandContextMethodSchemas,
+  ...IntegrationContextMethodSchemas,
   ...LspMethodSchemas,
   ...DelegationMethodSchemas,
   'delegation.create': DelegationCreateSchema.extend({
@@ -369,6 +374,10 @@ export type SessionOwnerRestartRequest = z.input<(typeof MethodSchemas)['session
 export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
+  'integration.context.v1.create',
+  'integration.context.v1.prepare',
+  'integration.context.v1.execute',
+  'integration.context.v1.cancel',
   'command.context.v1.create',
   'command.context.v1.prepare',
   'command.context.v1.execute',

@@ -100,6 +100,22 @@ export const CommandContextMethodSchemas = {
   'command.context.v1.cancel': z.object(contextRun).strict(),
 } as const
 
+/** Provider-independent integration, using the same durable context binding as commands. */
+export const IntegrationContextMethodSchemas = {
+  'integration.context.v1.create': CommandContextMethodSchemas['command.context.v1.create'],
+  'integration.context.v1.prepare': ManagerMethodSchemas['git.v1.integrate']
+    .omit({ session_id: true })
+    .extend({
+      ...contextBinding,
+      permission_mode: z.enum(['ask', 'bypass']),
+      justification: z.string().max(512).optional(),
+    })
+    .strict(),
+  'integration.context.v1.execute': CommandContextMethodSchemas['command.context.v1.execute'],
+  'integration.context.v1.status': CommandContextMethodSchemas['command.context.v1.status'],
+  'integration.context.v1.cancel': CommandContextMethodSchemas['command.context.v1.cancel'],
+} as const
+
 export const ManagerRunSchema = z
   .object({
     run_id: id,
@@ -147,3 +163,10 @@ export const CommandContextRunSchema = ManagerRunSchema.extend({
 }).strict()
 export type CommandContext = z.infer<typeof CommandContextSchema>
 export type CommandContextRun = z.infer<typeof CommandContextRunSchema>
+export const IntegrationContextSchema = CommandContextSchema
+export const IntegrationContextRunSchema = CommandContextRunSchema.extend({
+  method: z.literal('git.v1.integrate'),
+  stream_id: id,
+}).strict()
+export type IntegrationContext = z.infer<typeof IntegrationContextSchema>
+export type IntegrationContextRun = z.infer<typeof IntegrationContextRunSchema>

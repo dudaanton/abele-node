@@ -16,6 +16,7 @@ import { legacyOwnerStop } from './owner-stop-wire.js'
 const POLICY_ENABLE = 'execution.policy.v1.enable'
 const OWNER_STOP_ENABLE = 'session.owner-stop.v1.enable'
 const COMMAND_CONTEXT_ENABLE = 'command.context.v1.enable'
+const INTEGRATION_CONTEXT_ENABLE = 'integration.context.v1.enable'
 
 /**
  * The welcome travels inside the handshake, which clients bound to `LIMITS.auth_bytes`, so it
@@ -125,6 +126,7 @@ export async function serveChannel(
   let executionPolicyEnabled = false
   let ownerStopEnabled = false
   let commandContextEnabled = false
+  let integrationContextEnabled = false
   let selfDisconnectReply: string | undefined
   const requests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
@@ -239,6 +241,7 @@ export async function serveChannel(
             POLICY_ENABLE,
             OWNER_STOP_ENABLE,
             COMMAND_CONTEXT_ENABLE,
+            INTEGRATION_CONTEXT_ENABLE,
             ...core.debuggerControl.methods(),
             ...core.trace.methods(),
             ...core.http.methods(),
@@ -264,7 +267,8 @@ export async function serveChannel(
           if (
             frame.method === POLICY_ENABLE ||
             frame.method === OWNER_STOP_ENABLE ||
-            frame.method === COMMAND_CONTEXT_ENABLE
+            frame.method === COMMAND_CONTEXT_ENABLE ||
+            frame.method === INTEGRATION_CONTEXT_ENABLE
           ) {
             if (
               !frame.params ||
@@ -275,12 +279,21 @@ export async function serveChannel(
               throw new ChannelError('invalid_params')
             if (frame.method === POLICY_ENABLE) executionPolicyEnabled = true
             else if (frame.method === OWNER_STOP_ENABLE) ownerStopEnabled = true
-            else commandContextEnabled = true
+            else if (frame.method === COMMAND_CONTEXT_ENABLE) commandContextEnabled = true
+            else integrationContextEnabled = true
             result = { enabled: true }
           } else if (frame.method.startsWith('command.context.v1.') && !commandContextEnabled) {
             throw new ChannelError(
               'capability_required',
               'capability_required: enable command_context_v1 with command.context.v1.enable'
+            )
+          } else if (
+            frame.method.startsWith('integration.context.v1.') &&
+            !integrationContextEnabled
+          ) {
+            throw new ChannelError(
+              'capability_required',
+              'capability_required: enable integration_context_v1 with integration.context.v1.enable'
             )
           } else if (
             ['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)
@@ -359,7 +372,8 @@ export async function serveChannel(
             ? undefined
             : frame.method === POLICY_ENABLE ||
                 frame.method === OWNER_STOP_ENABLE ||
-                frame.method === COMMAND_CONTEXT_ENABLE
+                frame.method === COMMAND_CONTEXT_ENABLE ||
+                frame.method === INTEGRATION_CONTEXT_ENABLE
               ? () => core.authority.check(actor!, 'request')
               : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
         ).catch(() => close('send_failed'))

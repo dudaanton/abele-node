@@ -92,6 +92,84 @@ clients must inspect the result rather than retrying with a fresh operation ID.
 As with the existing runner, crash recovery cannot infer an interrupted command's
 external effects; graceful shutdown stops and reaps active commands.
 
+## Ordinary chat integration: `integration_context_v1`
+
+Discover capability `integration_context_v1`, then call
+`integration.context.v1.enable` with `{}` on **each connection**. This opt-in is
+independent of `command.context.v1.enable`; neither enables the other.
+Legacy `git.v1.integrate` remains unchanged and always asks for approval.
+
+1. `integration.context.v1.create` takes `{ parent_chat_id, worktree_id }` or
+   `{ parent_chat_id, project_id }`. It creates/reuses the same provider-independent
+   context model as command contexts, returning `{ context_id, parent_chat_id,
+stream_id, worktree_id? , project_id? }`. No provider or model starts.
+   A worktree-bound context accepts only that destination worktree; a project-bound
+   context accepts an explicitly named destination in that project. The source
+   must be a different worktree in the same project. Existing command contexts
+   can also be reused with this capability and the same parent identity.
+2. `integration.context.v1.prepare` takes:
+
+   ```ts
+   {
+     context_id, parent_chat_id,
+     worktree_id, source_worktree_id,
+     target_branch, source_branch,
+     expected_target_head, expected_source_head,
+     rebase?: boolean,
+     permission_mode: 'ask' | 'bypass',
+     justification?: string // at most 512 characters, display metadata only
+   }
+   ```
+
+   Both IDs are node worktree IDs. No session ID is needed. The integration
+   parameters are exactly those of `git.v1.integrate`; command, cwd and environment
+   overrides are not accepted. The context must match the parent installation/chat
+   and destination target, or admission fails. Justification is returned separately
+   and is never Git input or approval authority.
+
+3. In Ask, prepare returns `state: "pending_approval"`, effective
+   `permission_mode: "ask"`, and one exact durable `approval`. Render the entire
+   integration card from `approval.input`: both worktree IDs, branches, expected
+   heads, optional rebase, resolved destination cwd and both target fingerprints.
+   Nothing integrates before the owner approves this exact action digest.
+4. The owner UI calls `integration.context.v1.execute` with
+   `{ context_id, parent_chat_id, run_id, action_digest, choice: "allow" | "deny" }`.
+   Its result is the durable resolved approval receipt. Wrong or obsolete decisions
+   return `stale_approval`. Retrying a decision with its original operation ID
+   never launches a second integration. Keep execute out of model tools; never
+   automatically answer a legacy prompt or use `prompt.answer` for context approvals.
+5. Bypass executes directly only when the node's `--claude-allow-bypass` /
+   `service flags set --allow-bypass on` opt-in permits it. Prepare then returns
+   `state: "running"`, `permission_mode: "bypass"`, `approval: null`. No approval
+   card or execute call is needed. With node bypass disabled, prepare tightens the
+   request to Ask and returns the exact approval plus `reason: "node_bypass_disabled"`.
+   Show this reason to the owner. The node never changes Ask into bypass.
+6. `integration.context.v1.status` and `integration.context.v1.cancel` take
+   `{ context_id, parent_chat_id, run_id }`. Both require the original installation,
+   parent and context/run kind. Cancel invalidates a pending approval. Once an
+   integration is running, cancel returns `resource_busy`; interrupting Git midway
+   would compromise its recovery guarantees. Keep the action visible until it settles.
+
+Create, prepare, execute and cancel require stable envelope `operation_id` values.
+Retry the exact original request with its original ID after reconnects/restarts;
+changed parameters return `idempotency_mismatch`. Preparation receipts are
+immutable; poll status for the current result. Prepare/status/cancel use the same
+run fields as command contexts, with `method: "git.v1.integrate"` and an explicit
+`stream_id` for the context journal. Subscribe/read it for `prompt.*`,
+`command.updated` and integration results. The internal `session_id` is this
+journal ID, not a provider session. Protocol exports `IntegrationContextSchema`,
+`IntegrationContextRunSchema` and their types.
+
+All existing integration checks remain: trusted registered worktrees, both target
+identities, both execution leases, current authority, exact branch/head checks,
+clean working trees, Git locks, fast-forward checks and rollback after a rebase
+conflict. They are revalidated before mutation. Pending Ask approvals survive
+restart; running/interrupted integrations become `outcome_unknown` and are never
+replayed. A lost Git reply can leave the effect applied with an unknown receipt;
+inspect status and repository state rather than submitting a new operation ID.
+
+## Legacy session command and integration APIs
+
 These online controller APIs use the node's existing authenticated installation
 authority and resource scope. They are advertised in the channel welcome methods
 list, with capabilities `command_run_v1` and `git_integrate_v1`. They do not grant

@@ -253,7 +253,9 @@ export class ManagerService {
     this.core.authority.check(actor, 'request')
     this.core.assertAuditStorageAvailable()
     if (this.stopping || this.closed) throw new ChannelError('resource_busy', 'Node is stopping')
-    if (method === 'command.context.v1.create') {
+    const integration = method.startsWith('integration.context.v1.')
+    const prefix = integration ? 'integration.context.v1.' : 'command.context.v1.'
+    if (method === prefix + 'create') {
       const previous = this.core.operationReceipt(actor, method, p, operation)
       if (previous) return previous.result
       const target = await this.contextTarget(actor, p)
@@ -292,7 +294,7 @@ export class ManagerService {
       })
     }
     const context = this.context(actor, p)
-    if (method === 'command.context.v1.prepare') {
+    if (method === prefix + 'prepare') {
       const {
         context_id: _id,
         parent_chat_id: _parent,
@@ -303,18 +305,32 @@ export class ManagerService {
       const params = {
         ...command,
         session_id: context.context_id,
-        ...(context.project_id
-          ? { project_id: context.project_id }
-          : { worktree_id: context.worktree_id }),
+        ...(integration
+          ? {}
+          : context.project_id
+            ? { project_id: context.project_id }
+            : { worktree_id: context.worktree_id }),
       }
-      return this.request(actor, 'command.v1.run', params, operation, { context, original: p })
+      return this.request(
+        actor,
+        integration ? 'git.v1.integrate' : 'command.v1.run',
+        params,
+        operation,
+        { context, original: p }
+      )
     }
     const run = this.get(String(p.run_id))
     if (run.context_id !== context.context_id) throw new ChannelError('unauthorized')
-    if (method === 'command.context.v1.status') this.checkContextPublication(actor, p)
-    if (method === 'command.context.v1.status') return this.contextRunView(run)
-    if (method === 'command.context.v1.cancel') {
+    if ((run.method === 'git.v1.integrate') !== integration) throw new ChannelError('unauthorized')
+    if (method === prefix + 'status') this.checkContextPublication(actor, p)
+    if (method === prefix + 'status') return this.contextRunView(run)
+    if (method === prefix + 'cancel') {
       return this.core.commitOperation(actor, method, p, operation, () => {
+        if (integration && run.state === 'running')
+          throw new ChannelError(
+            'resource_busy',
+            'Integration is already running; inspect its final result'
+          )
         if (!terminal(run)) {
           this.active.get(run.run_id)?.stop('cancelled')
           run.state = 'cancelled'
@@ -327,7 +343,7 @@ export class ManagerService {
         return this.contextRunView(run)
       })
     }
-    if (method !== 'command.context.v1.execute') throw new ChannelError('unsupported_method')
+    if (method !== prefix + 'execute') throw new ChannelError('unsupported_method')
     this.core.authority.check(actor, 'approve', context.context_id)
     const result = this.core.commitOperation(actor, method, p, operation, () => {
       const prompt = this.runPrompt(run)
@@ -353,6 +369,7 @@ export class ManagerService {
   private contextRunView(run: Run) {
     return {
       ...this.view(run),
+      ...(run.method === 'git.v1.integrate' ? { stream_id: run.session_id } : {}),
       approval: run.permission_mode === 'ask' ? this.runPrompt(run) : null,
     }
   }
@@ -488,7 +505,11 @@ export class ManagerService {
     }
     if (!operation || operation.length > 128) throw new ChannelError('operation_id_required')
     if (this.stopping || this.closed) throw new ChannelError('resource_busy', 'Node is stopping')
-    const receiptMethod = commandContext ? 'command.context.v1.prepare' : method
+    const receiptMethod = commandContext
+      ? method === 'git.v1.integrate'
+        ? 'integration.context.v1.prepare'
+        : 'command.context.v1.prepare'
+      : method
     const receiptParams = commandContext?.original ?? p
     const previous = this.core.operationReceipt(actor, receiptMethod, receiptParams, operation)
     if (previous) return previous.result
@@ -499,6 +520,14 @@ export class ManagerService {
       : p.project_id
         ? await this.projectTarget(actor, String(p.project_id))
         : await this.worktreeTarget(String(p.worktree_id))
+    if (
+      commandContext &&
+      ((commandContext.context.project_id &&
+        commandContext.context.project_id !== target.project_id) ||
+        (commandContext.context.worktree_id &&
+          commandContext.context.worktree_id !== p.worktree_id))
+    )
+      throw new ChannelError('context_target_mismatch')
     const source =
       method === 'git.v1.integrate'
         ? await this.worktreeTarget(String(p.source_worktree_id))

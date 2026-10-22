@@ -13,7 +13,11 @@ import { resolve, join } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { OwnerGit } from '../packages/node-core/src/git-owner.js'
 import { ChannelError } from '@abele/channel-protocol'
-import { CommandContextSchema, CommandContextRunSchema } from '@abele/node-protocol'
+import {
+  CommandContextSchema,
+  CommandContextRunSchema,
+  IntegrationContextRunSchema,
+} from '@abele/node-protocol'
 import {
   processScenarioDeadline,
   waitForProcessCondition,
@@ -21,6 +25,329 @@ import {
 
 const roots: string[] = [],
   cores: NodeCore[] = []
+async function integrationFixture(allowBypass = false) {
+  const f = await fixture('trusted', allowBypass)
+  writeFileSync(join(f.developer, 'sample'), 'integrated\n')
+  git(f.developer, 'commit', '-am', 'integration effect')
+  const context = await f.request(
+    'integration.context.v1.create',
+    { parent_chat_id: 'integrating-chat', worktree_id: f.root },
+    'integration-create'
+  )
+  const binding = { context_id: context.context_id, parent_chat_id: 'integrating-chat' }
+  const params = {
+    ...binding,
+    worktree_id: f.root,
+    source_worktree_id: f.source,
+    target_branch: 'main',
+    source_branch: 'developer',
+    expected_target_head: git(f.folder, 'rev-parse', 'HEAD'),
+    expected_source_head: git(f.developer, 'rev-parse', 'HEAD'),
+    justification: '$(touch metadata-effect)',
+  }
+  const status = (run: any) =>
+    f.request('integration.context.v1.status', { ...binding, run_id: run.run_id })
+  const decide = (run: any, choice = 'allow', operation = 'integration-approve') =>
+    f.request(
+      'integration.context.v1.execute',
+      { ...binding, run_id: run.run_id, action_digest: run.approval.action_digest, choice },
+      operation
+    )
+  return { ...f, context, binding, params, status, decide }
+}
+it.each([
+  { allowBypass: false, requested: 'ask', effective: 'ask' },
+  { allowBypass: true, requested: 'ask', effective: 'ask' },
+  { allowBypass: false, requested: 'bypass', effective: 'ask' },
+  { allowBypass: true, requested: 'bypass', effective: 'bypass' },
+])(
+  'integration context follows mode $requested with node bypass $allowBypass',
+  async ({ allowBypass, requested, effective }) => {
+    const f = await integrationFixture(allowBypass)
+    const params = { ...f.params, permission_mode: requested }
+    const run = await f.request('integration.context.v1.prepare', params, 'integration-prepare')
+    expect(run.permission_mode).toBe(effective)
+    IntegrationContextRunSchema.parse(run)
+    expect(run.justification).toBe(params.justification)
+    if (requested !== effective) expect(run.reason).toBe('node_bypass_disabled')
+    if (effective === 'ask') {
+      expect(run.state).toBe('pending_approval')
+      expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(params.expected_target_head)
+      expect(run.approval.input).toMatchObject({
+        method: 'git.v1.integrate',
+        params: {
+          worktree_id: f.root,
+          source_worktree_id: f.source,
+          target_branch: 'main',
+          source_branch: 'developer',
+          expected_target_head: params.expected_target_head,
+          expected_source_head: params.expected_source_head,
+        },
+        cwd: f.folder,
+        permission_mode: 'ask',
+      })
+      expect(run.approval.input.params).not.toHaveProperty('justification')
+      await expect(
+        f.request('integration.context.v1.execute', {
+          ...f.binding,
+          run_id: run.run_id,
+          action_digest: 'wrong',
+          choice: 'allow',
+        })
+      ).rejects.toThrow('stale_approval')
+      await f.decide(run)
+      await f.decide(run)
+    } else expect(run.approval).toBeNull()
+    await f.core.manager.settled()
+    expect(await f.status(run)).toMatchObject({
+      state: 'applied',
+      head: params.expected_source_head,
+    })
+    expect(existsSync(join(f.folder, 'metadata-effect'))).toBe(false)
+    expect(
+      await f.request('integration.context.v1.prepare', params, 'integration-prepare')
+    ).toEqual(run)
+    expect(
+      f.core.read(f.context.stream_id, 0, 256).filter((e) => e.type === 'prompt.opened')
+    ).toHaveLength(effective === 'ask' ? 1 : 0)
+  }
+)
+
+it('binds integration context status and cancellation to its parent and target', async () => {
+  const f = await integrationFixture()
+  const run = await f.request('integration.context.v1.prepare', {
+    ...f.params,
+    permission_mode: 'ask',
+  })
+  const other = f.core.authority.authenticate(f.core.createToken('other integration owner').token)
+  await expect(
+    f.core.request(other, 'integration.context.v1.status', { ...f.binding, run_id: run.run_id })
+  ).rejects.toThrow('unauthorized')
+  await expect(
+    f.request('command.context.v1.cancel', { ...f.binding, run_id: run.run_id })
+  ).rejects.toThrow('unauthorized')
+  for (const action of ['status', 'cancel']) {
+    await expect(
+      f.request('integration.context.v1.' + action, {
+        ...f.binding,
+        parent_chat_id: 'other-chat',
+        run_id: run.run_id,
+      })
+    ).rejects.toThrow('unauthorized')
+  }
+  await expect(
+    f.request('integration.context.v1.prepare', {
+      ...f.params,
+      worktree_id: f.source,
+      source_worktree_id: f.root,
+      permission_mode: 'ask',
+    })
+  ).rejects.toThrow('context_target_mismatch')
+  await f.request(
+    'integration.context.v1.cancel',
+    { ...f.binding, run_id: run.run_id },
+    'integration-cancel'
+  )
+  expect(await f.status(run)).toMatchObject({ state: 'cancelled' })
+  await expect(f.decide(run)).rejects.toThrow('stale_approval')
+  expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(f.params.expected_target_head)
+  const denied = await f.request('integration.context.v1.prepare', {
+    ...f.params,
+    permission_mode: 'ask',
+  })
+  await f.decide(denied, 'deny', 'integration-deny')
+  expect(await f.status(denied)).toMatchObject({ state: 'denied' })
+  expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(f.params.expected_target_head)
+})
+
+it('retains an integration context approval across restart and never replays its decision', async () => {
+  const f = await integrationFixture()
+  const params = { ...f.params, permission_mode: 'ask', rebase: true }
+  const run = await f.request('integration.context.v1.prepare', params, 'restart-integration')
+  let core = f.core
+  const restart = async () => {
+    await core.manager.stop()
+    await core.resources.stop()
+    core.close()
+    cores.splice(cores.indexOf(core), 1)
+    core = new NodeCore(join(f.dir, 'state'))
+    cores.push(core)
+  }
+  const request = (method: string, p: unknown, op?: string): Promise<any> =>
+    Promise.resolve(core.request(f.actor, 'integration.context.v1.' + method, p, op))
+  await restart()
+  expect(await request('prepare', params, 'restart-integration')).toEqual(run)
+  expect(await request('status', { ...f.binding, run_id: run.run_id })).toMatchObject({
+    state: 'pending_approval',
+    approval: { state: 'pending' },
+  })
+  const answer = {
+    ...f.binding,
+    run_id: run.run_id,
+    action_digest: run.approval.action_digest,
+    choice: 'allow',
+  }
+  const receipt = await request('execute', answer, 'restart-decision')
+  await core.manager.settled()
+  expect(await request('status', { ...f.binding, run_id: run.run_id })).toMatchObject({
+    state: 'applied',
+  })
+  await restart()
+  expect(await request('execute', answer, 'restart-decision')).toEqual(receipt)
+  expect(await request('prepare', params, 'restart-integration')).toEqual(run)
+  await core.manager.settled()
+  expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(params.expected_source_head)
+  await expect(
+    request('prepare', { ...params, rebase: false }, 'restart-integration')
+  ).rejects.toThrow('idempotency_mismatch')
+})
+
+it.each(['ask', 'bypass'])(
+  'never replays an uncertain integration context effect (%s)',
+  async (permission_mode) => {
+    const f = await integrationFixture(true)
+    const actual = OwnerGit.prototype.run
+    let merges = 0
+    vi.spyOn(OwnerGit.prototype, 'run').mockImplementation(async function (
+      this: OwnerGit,
+      cwd,
+      args,
+      options
+    ) {
+      const result = await actual.call(this, cwd, args, options)
+      if (args[0] === 'merge') {
+        merges++
+        throw new ChannelError('git_timeout')
+      }
+      return result
+    })
+    const params = { ...f.params, permission_mode }
+    const run = await f.request('integration.context.v1.prepare', params, 'uncertain-integration')
+    const answer =
+      permission_mode === 'ask'
+        ? {
+            ...f.binding,
+            run_id: run.run_id,
+            action_digest: run.approval.action_digest,
+            choice: 'allow',
+          }
+        : null
+    if (answer) await f.request('integration.context.v1.execute', answer, 'uncertain-answer')
+    await f.core.manager.settled()
+    expect(await f.status(run)).toMatchObject({ state: 'outcome_unknown', reason: 'git_timeout' })
+    expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(params.expected_source_head)
+    await f.core.resources.stop()
+    f.core.close()
+    cores.splice(cores.indexOf(f.core), 1)
+    const restarted = new NodeCore(join(f.dir, 'state'), { allowBypass: true })
+    cores.push(restarted)
+    expect(
+      await restarted.request(
+        f.actor,
+        'integration.context.v1.prepare',
+        params,
+        'uncertain-integration'
+      )
+    ).toEqual(run)
+    if (answer)
+      await restarted.request(f.actor, 'integration.context.v1.execute', answer, 'uncertain-answer')
+    await restarted.manager.settled()
+    expect(merges).toBe(1)
+  }
+)
+
+it.each(['stale_head', 'dirty_target', 'untrusted', 'wrong_branch'])(
+  'preserves integration context preconditions: %s',
+  async (failure) => {
+    const f = await integrationFixture()
+    const params = { ...f.params, permission_mode: 'ask' }
+    if (failure === 'stale_head') params.expected_target_head = '0'.repeat(40)
+    if (failure === 'wrong_branch') params.target_branch = 'another-branch'
+    const run = await f.request('integration.context.v1.prepare', params)
+    if (failure === 'dirty_target') writeFileSync(join(f.folder, 'sample'), 'dirty\n')
+    if (failure === 'untrusted')
+      await f.request('project.trust', { project_id: f.project.project_id, trust: 'untrusted' })
+    await f.decide(run)
+    await f.core.manager.settled()
+    expect(await f.status(run)).toMatchObject({
+      state: 'failed',
+      reason:
+        failure === 'untrusted'
+          ? 'project_untrusted'
+          : failure === 'dirty_target'
+            ? 'workspace_dirty'
+            : 'stale_revision',
+    })
+    expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(f.params.expected_target_head)
+  }
+)
+
+it('holds both integration leases and refuses cancellation after the git mutation has started', async () => {
+  const f = await integrationFixture(true)
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let started = false
+  const actual = OwnerGit.prototype.run
+  vi.spyOn(OwnerGit.prototype, 'run').mockImplementation(async function (
+    this: OwnerGit,
+    cwd,
+    args,
+    options
+  ) {
+    if (args[0] === 'merge') {
+      started = true
+      await gate
+    }
+    return actual.call(this, cwd, args, options)
+  })
+  const run = await f.request('integration.context.v1.prepare', {
+    ...f.params,
+    permission_mode: 'bypass',
+  })
+  try {
+    await waitForProcessCondition(() => started, 'integration mutation started')
+    expect(
+      f.core.db
+        .prepare('SELECT count(*) AS n FROM execution_target_leases WHERE run_id=?')
+        .get(run.run_id)!.n
+    ).toBe(2)
+    await expect(
+      f.request('integration.context.v1.cancel', { ...f.binding, run_id: run.run_id })
+    ).rejects.toThrow('Integration is already running')
+  } finally {
+    release()
+    await f.core.manager.settled()
+  }
+  expect(await f.status(run)).toMatchObject({ state: 'applied' })
+})
+
+it('rolls back conflicting integration context rebases before returning failure', async () => {
+  const f = await integrationFixture(true)
+  writeFileSync(join(f.folder, 'sample'), 'owner change\n')
+  git(f.folder, 'commit', '-am', 'owner change')
+  const targetHead = git(f.folder, 'rev-parse', 'HEAD')
+  const run = await f.request('integration.context.v1.prepare', {
+    ...f.params,
+    expected_target_head: targetHead,
+    permission_mode: 'bypass',
+    rebase: true,
+  })
+  await f.core.manager.settled()
+  expect(await f.status(run)).toMatchObject({
+    state: 'failed',
+    reason: 'rebase_conflict',
+    conflicting_files: ['sample'],
+  })
+  expect(git(f.folder, 'rev-parse', 'HEAD')).toBe(targetHead)
+  expect(git(f.developer, 'rev-parse', 'HEAD')).toBe(f.params.expected_source_head)
+  expect(git(f.developer, 'status', '--porcelain')).toBe('')
+  for (const marker of ['rebase-merge', 'rebase-apply'])
+    expect(
+      existsSync(resolve(f.developer, git(f.developer, 'rev-parse', '--git-path', marker)))
+    ).toBe(false)
+})
 it.each([
   { allowBypass: false, requested: 'bypass', effective: 'ask' },
   { allowBypass: true, requested: 'bypass', effective: 'bypass' },
