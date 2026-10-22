@@ -1,5 +1,6 @@
 import { LspTools } from './lsp/tools.js'
 import { randomUUID, createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { ChannelError } from '@abele/channel-protocol'
 import {
   PromptSchema,
@@ -35,6 +36,8 @@ type ActiveRun = {
   starting: boolean
   completion?: Promise<void>
   debugger?: DebuggerToolBridge
+  cleaning?: Promise<void>
+  terminal?: boolean
 }
 /** The durable queue is the only input owner. External process effects are never inside SQL transactions. */
 export class ProviderSessions {
@@ -48,10 +51,6 @@ export class ProviderSessions {
     liveOptions: LiveOptions = {}
   ) {
     this.live = new LiveSessions(core, this, liveOptions)
-  }
-  /** An unconfirmed cleanup stops new work until the node is inspected and restarted. */
-  fence() {
-    this.stopping = true
   }
   adapterFor(provider: string) {
     return this.adapters.get(provider)
@@ -93,6 +92,30 @@ export class ProviderSessions {
   }
   isAvailable(provider: string) {
     return this.adapterFor(provider)?.available ?? false
+  }
+  admissionFailed(
+    session_id: string,
+    input_id: string,
+    run_id: string,
+    reason: string,
+    outcome = 'not_dispatched'
+  ) {
+    const text =
+      reason === 'interactive_approval_unsupported'
+        ? 'This provider cannot run in Ask mode. Select Bypass explicitly to start it.'
+        : ['codex_bypass_unavailable', 'bypass_unavailable'].includes(reason)
+          ? 'Codex Bypass requires the node owner to enable the explicit Bypass opt-in.'
+          : `Run could not start: ${reason}`
+    this.core.append(session_id, 'run.failed', actor, { run_id, input_id, reason, outcome })
+    this.core.append(session_id, 'session.update', actor, {
+      run_id,
+      update: {
+        kind: 'notice',
+        level: 'error',
+        code: reason.slice(0, 64),
+        text: text.slice(0, 4096),
+      },
+    })
   }
   get available() {
     return this.isAvailable('claude')
@@ -143,7 +166,10 @@ export class ProviderSessions {
     while (this.active.size) {
       const ready = [...this.active].filter(([, slot]) => !slot.starting)
       const attempts = await Promise.allSettled(
-        ready.map(([session, slot]) => this.retryCleanup(session, slot))
+        ready.map(async ([session, slot]) => {
+          await slot.cleaning
+          if (this.active.get(session) === slot) await this.retryCleanup(session, slot)
+        })
       )
       const failed = attempts.find(
         (attempt): attempt is PromiseRejectedResult => attempt.status === 'rejected'
@@ -157,8 +183,16 @@ export class ProviderSessions {
   private async retryCleanup(session: string, slot: ActiveRun) {
     if (slot.run) {
       await slot.run.interrupt()
-      await slot.run.done
+      const result = await slot.run.done
       await slot.completion
+      if (result.reason === 'process_cleanup_unconfirmed') {
+        const row = this.core.db
+          .prepare('SELECT processes,ipc_path FROM provider_runs WHERE run_id=?')
+          .get(slot.run_id) as { processes: string; ipc_path: string | null }
+        const adapter = this.adapterFor(this.core.session(session).provider)
+        if (!adapter) throw new Error('provider_reconciliation_required')
+        await adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
+      }
     } else {
       const row = this.core.db
         .prepare('SELECT processes,ipc_path FROM provider_runs WHERE run_id=?')
@@ -179,10 +213,38 @@ export class ProviderSessions {
         .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
         .run(slot.run_id)
       this.core.resources.targets.settle(session, slot.run_id)
+      this.core.append(session, 'session.update', actor, {
+        run_id: slot.run_id,
+        update: {
+          kind: 'notice',
+          level: 'info',
+          code: 'process_cleanup_confirmed',
+          text: 'Provider cleanup is confirmed. The execution target is available again.',
+        },
+      })
     })
     if (this.active.get(session) === slot) this.active.delete(session)
   }
   async drain() {
+    // Validate queued targets even when their session is quarantined for cleanup.
+    // Otherwise a deleted folder can leave a follow-up queued forever.
+    for (const input of this.core.db
+      .prepare("SELECT * FROM inputs WHERE state IN ('accepted','queued')")
+      .all() as Input[]) {
+      const session_id = String(input.session_id)
+      if (this.core.workspaceProvisioning(session_id)) continue
+      const path = this.core.resources.targets.pathForSession(session_id)
+      if (path && !existsSync(path))
+        this.core.transaction(() => {
+          this.core.transition(input, 'failed')
+          this.admissionFailed(
+            session_id,
+            String(input.input_id),
+            String(input.run_id ?? input.input_id),
+            'execution_target_missing'
+          )
+        })
+    }
     for (const [session, active] of this.active) {
       if (active.starting) continue
       const input = this.core.db
@@ -202,16 +264,70 @@ export class ProviderSessions {
           })
         }
       }
-      if (!['dispatching', 'delivered'].includes(String(input.state)))
-        await this.retryCleanup(session, active)
+      if (!['dispatching', 'delivered'].includes(String(input.state)) && !active.cleaning) {
+        active.terminal = true
+        // Cleanup may hang or fail. Keep the target quarantined, but never hold
+        // admission for unrelated targets while waiting on a provider process.
+        active.cleaning = this.retryCleanup(session, active)
+          .catch(() => {
+            this.core.append(session, 'session.error', actor, {
+              run_id: active.run_id,
+              code: 'process_cleanup_unconfirmed',
+              message: 'Provider cleanup is unconfirmed; this execution target remains busy.',
+            })
+          })
+          .finally(() => {
+            active.cleaning = undefined
+          })
+      }
     }
+    // Admit unrelated work first. Then give ordinary interrupts/revocations a
+    // bounded opportunity to finish durable settlement before returning to the
+    // caller. A leaked process keeps only its target quarantined after this bound.
+    const cleaning = [...this.active].flatMap(([session, slot]) =>
+      slot.cleaning ? [{ session, slot, promise: slot.cleaning }] : []
+    )
+    try {
+      await this.dispatchQueued()
+    } finally {
+      if (cleaning.length) {
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.all(cleaning.map(({ promise }) => promise)),
+            new Promise<void>((resolve) => {
+              timeout = setTimeout(resolve, 5000)
+            }),
+          ])
+          for (const { session, slot, promise } of cleaning)
+            if (slot.cleaning === promise)
+              this.core.append(session, 'session.error', actor, {
+                run_id: slot.run_id,
+                code: 'process_cleanup_unconfirmed',
+                reason: 'cleanup_timeout',
+                timeout_ms: 5000,
+                message:
+                  'Provider cleanup exceeded the wait limit; this execution target remains busy.',
+              })
+        } finally {
+          clearTimeout(timeout)
+        }
+      }
+    }
+  }
+  private async dispatchQueued() {
     await this.live.drain(this.stopping)
     if (this.stopping || updateInProgress(this.core.stateDir)) return
     const rows = this.core.db
       .prepare("SELECT * FROM inputs WHERE state IN ('accepted','queued') ORDER BY ordinal")
       .all() as Input[]
     for (const input of rows) {
-      if (this.stopping || updateInProgress(this.core.stateDir) || this.active.size >= 4) break
+      if (
+        this.stopping ||
+        updateInProgress(this.core.stateDir) ||
+        [...this.active.values()].filter((slot) => !slot.terminal).length >= 4
+      )
+        break
       const session = this.core.session(String(input.session_id))
       const adapter = this.adapterFor(session.provider)
       if (
@@ -470,7 +586,7 @@ export class ProviderSessions {
               })
               void this.core.resources.lsp.afterEdit(session.session_id)
               this.invalidate(run_id)
-              if (result.reason === 'process_cleanup_unconfirmed') this.stopping = true
+              if (result.reason === 'process_cleanup_unconfirmed') slot.terminal = true
               else
                 this.core.db
                   .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
@@ -508,7 +624,7 @@ export class ProviderSessions {
               )
             } catch {
               cleaned = false
-              this.stopping = true
+              slot.terminal = true
             }
           }
           this.core.transaction(() => {
@@ -517,11 +633,13 @@ export class ProviderSessions {
               .get(String(input.input_id)) as Input
             if (['accepted', 'queued', 'dispatching'].includes(String(current.state)))
               this.core.transition(current, current.run_id ? 'delivery_unknown' : 'failed')
-            this.core.append(session.session_id, 'run.failed', actor, {
+            this.admissionFailed(
+              session.session_id,
+              String(input.input_id),
               run_id,
-              reason: error instanceof Error ? error.message : 'provider_failed',
-              outcome: input.run_id ? 'unknown' : 'not_dispatched',
-            })
+              error instanceof Error ? error.message : 'provider_failed',
+              input.run_id ? 'unknown' : 'not_dispatched'
+            )
             this.invalidate(run_id)
             if (persisted && cleaned)
               this.core.db

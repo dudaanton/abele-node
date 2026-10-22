@@ -1,7 +1,9 @@
 import { expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawnSync, execFile } from 'node:child_process'
+import { createServer } from 'node:http'
+import { promisify } from 'node:util'
 import {
   prepareDeveloperEnvironment,
   missingDeveloperDependencies,
@@ -18,6 +20,11 @@ it('warns before testing when dependencies are absent and network is disabled', 
       JSON.stringify({ devDependencies: { fixture: '1.0.0' } })
     )
     expect(missingDeveloperDependencies(directory)).toBe(true)
+    expect(
+      codexSessionUpdates('codex.dependencies.warning', { network_enabled: false })[0]
+    ).toMatchObject({
+      text: expect.stringContaining('package installs require the project network switch'),
+    })
     expect(codexSessionUpdates('codex.dependencies.warning', { network_enabled: false })).toEqual([
       expect.objectContaining({
         kind: 'notice',
@@ -153,6 +160,57 @@ it('runs local npm tests and commits only its linked worktree branch with caches
       expect(restored.codex_network_enabled).toBe(true)
     } finally {
       core.close()
+    }
+    // Exercise npm's actual download/unpack path without an external registry
+    // or a live model. Native sandbox enforcement remains a separate gate.
+    const packageDir = join(dir, 'package')
+    mkdirSync(packageDir)
+    writeFileSync(
+      join(packageDir, 'package.json'),
+      JSON.stringify({
+        name: 'fixture-dependency',
+        version: '1.0.0',
+        main: 'index.cjs',
+      })
+    )
+    writeFileSync(join(packageDir, 'index.cjs'), 'module.exports = 42')
+    const archive = join(dir, 'dependency.tgz')
+    const packed = spawnSync('/usr/bin/tar', ['-czf', archive, '-C', dir, 'package'], {
+      encoding: 'utf8',
+    })
+    expect(packed.status, packed.stderr).toBe(0)
+    const payload = readFileSync(archive)
+    const registry = createServer((_req, res) => {
+      res.end(payload)
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        registry.once('error', reject)
+        registry.listen(0, '127.0.0.1', resolve)
+      })
+      const address = registry.address() as { port: number }
+      writeFileSync(
+        join(workspace, 'package.json'),
+        JSON.stringify({
+          dependencies: { 'fixture-dependency': `http://127.0.0.1:${address.port}/dependency.tgz` },
+          scripts: {
+            build:
+              "node -e \"require('node:assert/strict').equal(require('fixture-dependency'), 42)\"",
+          },
+        })
+      )
+      await promisify(execFile)(
+        '/bin/sh',
+        ['-c', 'npm install --ignore-scripts --no-audit --no-fund && npm run build'],
+        {
+          cwd: workspace,
+          env,
+          timeout: 15000,
+        }
+      )
+      expect(existsSync(join(workspace, 'node_modules/fixture-dependency/index.cjs'))).toBe(true)
+    } finally {
+      await new Promise<void>((resolve) => registry.close(() => resolve()))
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })

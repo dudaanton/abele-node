@@ -66,7 +66,7 @@ export const DelegationSchema = z
     job_id: Id.nullable(),
     state: DelegationStateSchema,
     tool_permissions: ToolPermissionsSchema.optional(),
-    reason: z.enum(['time_limit']).optional(),
+    reason: z.string().min(1).max(1024).optional(),
     created_at: z.string().datetime(),
   })
   .strict()
@@ -96,7 +96,7 @@ export const DelegationTerminalSchema = z
     delegation_id: Id,
     session_id: Id,
     state: z.enum(['completed', 'failed', 'cancelled', 'unknown', 'stopped']),
-    reason: z.enum(['time_limit']).optional(),
+    reason: z.string().min(1).max(1024).optional(),
   })
   .strict()
 export const DelegationMessageSchema = z

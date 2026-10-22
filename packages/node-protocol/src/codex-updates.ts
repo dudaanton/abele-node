@@ -86,7 +86,7 @@ export function codexSessionUpdates(type: string, data: unknown): SessionUpdate[
           text:
             d.network_enabled === true
               ? 'Project dependencies are missing. Install them before running builds or tests; project network access is enabled.'
-              : 'Project dependencies are missing. Network is disabled: install dependencies first or ask the owner to enable project network access before running builds or tests.',
+              : 'Project dependencies are missing. Network is disabled: package installs require the project network switch. Ask the owner to enable project network access, then retry the install before running builds or tests.',
         },
       ]
     case 'codex.message.delta':

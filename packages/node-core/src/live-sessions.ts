@@ -65,6 +65,8 @@ export interface LiveOptions {
   retryMs?: number
 }
 interface Slot {
+  cleanupPending?: boolean
+  cleaning?: Promise<void>
   session_id: string
   run_id: string
   principal: string
@@ -271,6 +273,8 @@ export class LiveSessions {
     if (slot.state !== 'starting') slot.state = 'stopping'
     if (slot.live) await slot.live.stop(reason).catch(() => {})
     await slot.completion
+    await slot.cleaning
+    if (slot.cleanupPending) await this.reconcileExited(slot)
   }
   async stopAll() {
     await Promise.all([...this.slots.keys()].map((s) => this.stop(s, 'node_stopping')))
@@ -570,8 +574,37 @@ export class LiveSessions {
     if (victim) void this.stop(victim.session_id, holder ? 'target_needed' : 'process_limit')
     return !!victim
   }
-  /** Called from the provider drain. Never blocks on a turn. */
+  private async reconcileExited(slot: Slot) {
+    const adapter = this.adapter(this.core.session(slot.session_id).provider)
+    const row = this.core.db
+      .prepare('SELECT processes,ipc_path FROM provider_runs WHERE run_id=?')
+      .get(slot.run_id) as { processes: string; ipc_path: string | null }
+    if (!adapter) throw new Error('provider_reconciliation_required')
+    await adapter.reconcile(JSON.parse(row.processes), row.ipc_path ?? undefined)
+    this.core.transaction(() => {
+      this.core.db
+        .prepare("UPDATE provider_runs SET state='settled' WHERE run_id=?")
+        .run(slot.run_id)
+      this.core.resources.targets.settle(slot.session_id, slot.run_id)
+      this.core.append(slot.session_id, 'session.process', actor, {
+        run_id: slot.run_id,
+        state: 'exited',
+        reason: 'process_cleanup_confirmed',
+      })
+    })
+    if (this.slots.get(slot.session_id) === slot) this.slots.delete(slot.session_id)
+    slot.cleanupPending = false
+  }
+  /** Called from the provider drain. Never blocks on a turn or orphan cleanup. */
   async drain(stopping: boolean) {
+    for (const slot of this.slots.values()) {
+      if (!slot.cleanupPending || slot.cleaning) continue
+      slot.cleaning = this.reconcileExited(slot)
+        .catch(() => {})
+        .finally(() => {
+          slot.cleaning = undefined
+        })
+    }
     this.maintain()
     if (stopping || updateInProgress(this.core.stateDir)) return
     const rows = this.core.db
@@ -590,7 +623,7 @@ export class LiveSessions {
       if (slot) continue
       const failure = this.failures.get(session_id)
       if (failure && Date.now() < failure.until) continue
-      if (this.slots.size >= this.maxLive) {
+      if ([...this.slots.values()].filter((slot) => !slot.cleanupPending).length >= this.maxLive) {
         this.makeRoom(Date.now())
         continue
       }
@@ -812,13 +845,19 @@ export class LiveSessions {
           .catch(() => (cleaned = false))
       this.core.transaction(() => {
         const code = error instanceof ChannelError ? error.code : 'provider_failed'
-        if (!persisted) {
-          // Nothing started: the first input cannot run as it stands.
+        {
+          // Startup did not return a live session, so this input was never sent.
           const current = this.core.db
             .prepare('SELECT * FROM inputs WHERE input_id=?')
             .get(String(first.input_id)) as Input
           if (['accepted', 'queued'].includes(String(current.state)))
             this.core.transition(current, 'failed')
+          this.owner.admissionFailed(
+            session_id,
+            String(first.input_id),
+            run_id,
+            error instanceof Error ? error.message : code
+          )
         }
         this.core.append(session_id, 'session.process', actor, {
           run_id,
@@ -832,6 +871,10 @@ export class LiveSessions {
         if (leased && cleaned) this.core.resources.targets.settle(session_id, run_id)
       })
       this.backoff(session_id)
+      if (!cleaned && persisted) {
+        slot.state = 'stopping'
+        slot.cleanupPending = true
+      }
       if (this.slots.get(session_id) === slot && (cleaned || !persisted))
         this.slots.delete(session_id)
     }
@@ -897,8 +940,15 @@ export class LiveSessions {
       }
     })
     if (!expected && Date.now() - slot.startedAt < 30000) this.backoff(session_id)
-    if (unconfirmed) this.owner.fence()
-    else if (this.slots.get(session_id) === slot) this.slots.delete(session_id)
+    if (unconfirmed) {
+      slot.state = 'stopping'
+      slot.cleanupPending = true
+      this.core.append(session_id, 'session.error', actor, {
+        run_id,
+        code: 'process_cleanup_unconfirmed',
+        message: 'Provider cleanup is unconfirmed; this execution target remains busy.',
+      })
+    } else if (this.slots.get(session_id) === slot) this.slots.delete(session_id)
   }
   private record(slot: Slot, event: ProviderEvent) {
     this.core.transaction(() => {

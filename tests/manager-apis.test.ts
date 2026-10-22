@@ -13,6 +13,10 @@ import { resolve, join } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { OwnerGit } from '../packages/node-core/src/git-owner.js'
 import { ChannelError } from '@abele/channel-protocol'
+import {
+  processScenarioDeadline,
+  waitForProcessCondition,
+} from '../scripts/process-test-budget.mjs'
 
 const roots: string[] = [],
   cores: NodeCore[] = []
@@ -88,15 +92,15 @@ async function fixture(trust = 'trusted') {
   }
   const base = { session_id: session.session_id, worktree_id: root }
   const wait = async (run: any) => {
-    for (let i = 0; i < 300; i++) {
-      const status = await request('command.v1.status', {
-        session_id: session.session_id,
-        run_id: run.run_id,
-      })
-      if (!['pending_approval', 'running'].includes(status.state)) return status
-      await new Promise((r) => setTimeout(r, 10))
-    }
-    throw new Error('run did not finish')
+    // Await child reaping / git completion, not a three-second polling allowance.
+    // Vitest's deadline remains the hang guard if the operation never settles.
+    await core.manager.settled()
+    const status = await request('command.v1.status', {
+      session_id: session.session_id,
+      run_id: run.run_id,
+    })
+    expect(['pending_approval', 'running']).not.toContain(status.state)
+    return status
   }
   return {
     dir,
@@ -183,29 +187,34 @@ it('publishes the exact shell command and argv directly in its single approval',
   expect(f.core.prompts(f.session.session_id)).toHaveLength(2)
   expect(f.core.prompt(shell.prompt_id).state).toBe('pending')
 })
-it('stops a command if streaming output cannot be journaled', async () => {
-  const f = await fixture()
-  const append = f.core.append.bind(f.core)
-  vi.spyOn(f.core, 'append').mockImplementation((stream, type, actor, data) => {
-    if (type === 'command.output') throw new Error('fixture storage failure')
-    return append(stream, type, actor, data)
-  })
-  const run = await f.request('command.v1.run', {
-    ...f.base,
-    // Keep the output producer alive without racing a shell spawning sleep against SIGKILL.
-    argv: [process.execPath, '-e', 'console.log("output"); setInterval(() => {}, 30_000)'],
-  })
-  await f.approve(run)
-  // Wait for the child to be reaped, without the fixture's shorter status-polling budget.
-  // The child stays alive indefinitely, so failing to kill it still hits the test deadline.
-  await f.core.manager.settled()
-  expect(
-    await f.request('command.v1.status', {
-      session_id: f.session.session_id,
-      run_id: run.run_id,
+// Child startup and reaping may be slow on CI; completion evidence drives the test.
+it(
+  'stops a command if streaming output cannot be journaled',
+  { timeout: processScenarioDeadline(1) },
+  async () => {
+    const f = await fixture()
+    const append = f.core.append.bind(f.core)
+    vi.spyOn(f.core, 'append').mockImplementation((stream, type, actor, data) => {
+      if (type === 'command.output') throw new Error('fixture storage failure')
+      return append(stream, type, actor, data)
     })
-  ).toMatchObject({ state: 'cancelled', reason: 'storage_unavailable', signal: 'SIGKILL' })
-})
+    const run = await f.request('command.v1.run', {
+      ...f.base,
+      // Keep the output producer alive without racing a shell spawning sleep against SIGKILL.
+      argv: [process.execPath, '-e', 'console.log("output"); setInterval(() => {}, 30_000)'],
+    })
+    await f.approve(run)
+    // Wait for the child to be reaped, without the fixture's shorter status-polling budget.
+    // The child stays alive indefinitely, so failing to kill it still hits the test deadline.
+    await f.core.manager.settled()
+    expect(
+      await f.request('command.v1.status', {
+        session_id: f.session.session_id,
+        run_id: run.run_id,
+      })
+    ).toMatchObject({ state: 'cancelled', reason: 'storage_unavailable', signal: 'SIGKILL' })
+  }
+)
 it('runs in a registered project root and never passes daemon secrets into a command', async () => {
   const f = await fixture()
   process.env.MANAGER_FIXTURE_SECRET = 'must-not-pass'
@@ -248,6 +257,13 @@ it('rechecks trust and symlink cwd identity after approval and holds a worktree 
   await expect
     .poll(() => f.core.resources.targets.leasedPath(f.folder), { timeout: 2000 })
     .toBe(true)
+  const head = f.core.head(f.session.session_id)
+  await expect(f.request('command.v1.run', { ...f.base, argv: ['true'] })).rejects.toMatchObject({
+    code: 'resource_busy',
+  })
+  expect(f.core.read(f.session.session_id, head).some((e) => e.type === 'prompt.opened')).toBe(
+    false
+  )
   await f.request('command.v1.cancel', { session_id: f.session.session_id, run_id: running.run_id })
   await f.core.manager.settled()
   expect(f.core.resources.targets.leasedPath(f.folder)).toBe(false)
@@ -327,22 +343,44 @@ it('retains receipts across restart, invalidates old approvals and never replays
   expect(restarted.prompt(run.prompt_id).state).toBe('invalidated')
   expect(existsSync(join(f.folder, 'replayed'))).toBe(false)
 })
-it('supports a trusted plain folder project and reaps a command on graceful shutdown', async () => {
-  const f = await fixture()
-  const folder = join(f.dir, 'plain')
-  mkdirSync(folder)
-  const project = await f.request('project.register', { path: folder, trust: 'trusted' })
-  const run = await f.request('command.v1.run', {
-    session_id: f.session.session_id,
-    project_id: project.project_id,
-    command: 'echo started; sleep 30',
-  })
-  await f.approve(run)
-  await new Promise((r) => setTimeout(r, 30))
-  await f.core.resources.stop()
-  expect(await f.wait(run)).toMatchObject({ state: 'cancelled', reason: 'node_shutdown' })
-  expect(f.core.resources.targets.leasedPath(folder)).toBe(false)
-})
+// Child startup and reaping may be slow on CI; completion evidence drives the test.
+it(
+  'supports a trusted plain folder project and reaps a command on graceful shutdown',
+  { timeout: processScenarioDeadline(1) },
+  async () => {
+    const f = await fixture()
+    const folder = join(f.dir, 'plain')
+    mkdirSync(folder)
+    const project = await f.request('project.register', { path: folder, trust: 'trusted' })
+    const run = await f.request('command.v1.run', {
+      session_id: f.session.session_id,
+      project_id: project.project_id,
+      argv: [
+        process.execPath,
+        '-e',
+        'setTimeout(() => console.log("started"), 100); setInterval(() => {}, 30_000)',
+      ],
+    })
+    await f.approve(run)
+    // Exercise shutdown after the child actually produces output, even with a slow spawn.
+    await waitForProcessCondition(async () => {
+      const status = await f.request('command.v1.status', {
+        session_id: f.session.session_id,
+        run_id: run.run_id,
+      })
+      return status.stdout === 'started\n'
+    }, 'manager command startup')
+    expect(
+      await f.request('command.v1.status', {
+        session_id: f.session.session_id,
+        run_id: run.run_id,
+      })
+    ).toMatchObject({ state: 'running', stdout: 'started\n' })
+    await f.core.resources.stop()
+    expect(await f.wait(run)).toMatchObject({ state: 'cancelled', reason: 'node_shutdown' })
+    expect(f.core.resources.targets.leasedPath(folder)).toBe(false)
+  }
+)
 it('requires an exact durable approval from another device, streams bounded output and returns exit status', async () => {
   const f = await fixture()
   const params = {

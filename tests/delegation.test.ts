@@ -5,6 +5,54 @@ import { join } from 'node:path'
 import { NodeCore } from '@abele/node-core'
 
 const cleanup: (() => void)[] = []
+it('reports provider refusal reasons in delegation status', async () => {
+  const f = fixture()
+  const child = await f.create('refusal', [{ kind: 'hang' }])
+  f.core.tick()
+  const input = f.core.db
+    .prepare('SELECT * FROM inputs WHERE session_id=?')
+    .get(child.session_id) as any
+  f.core.transaction(() => {
+    f.core.transition(input, 'failed')
+    f.core.append(
+      child.session_id,
+      'run.failed',
+      { kind: 'node' },
+      {
+        run_id: input.run_id,
+        input_id: input.input_id,
+        reason: 'interactive_approval_unsupported',
+      }
+    )
+  })
+  f.core.tick()
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toMatchObject({
+    state: 'failed',
+    reason: 'interactive_approval_unsupported',
+  })
+})
+it.each([false, true])(
+  'reports an owner interruption as stopped rather than failed or unknown (queued: %s)',
+  async (queued) => {
+    const f = fixture()
+    const child = await f.create('stop', [{ kind: 'hang' }])
+    if (!queued) f.core.tick()
+    const input = f.core.db
+      .prepare('SELECT * FROM inputs WHERE session_id=?')
+      .get(child.session_id) as any
+    f.request(
+      queued ? 'input.cancel' : 'session.interrupt',
+      queued
+        ? { session_id: child.session_id, input_id: input.input_id }
+        : { session_id: child.session_id, run_id: input.run_id }
+    )
+    f.core.tick()
+    expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toMatchObject({
+      state: 'stopped',
+      reason: 'stopped_by_owner',
+    })
+  }
+)
 it('does not revive a revoked controller relationship when the owner continues a retained child', async () => {
   const f = fixture()
   const child = await f.create()

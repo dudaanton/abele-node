@@ -636,12 +636,19 @@ export class DelegationService {
           : states.some((s) => ['failed', 'interrupted', 'cancelled'].includes(s.state))
             ? 'failed'
             : 'completed'
+      const terminal = this.core.db
+        .prepare(
+          "SELECT body FROM events WHERE stream_id=? AND json_extract(body,'$.type') IN ('run.failed','run.interrupted') AND (json_extract(body,'$.data.run_id')=(SELECT run_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1) OR json_extract(body,'$.data.input_id')=(SELECT input_id FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1)) ORDER BY seq DESC LIMIT 1"
+        )
+        .get(d.session_id, d.session_id, d.session_id) as { body: string } | undefined
+      const reason = terminal ? JSON.parse(terminal.body).data.reason : undefined
+      if (typeof reason === 'string' && reason) d.reason = reason.slice(0, 1024)
       if (state === 'completed') {
         const result = row.result_text ?? this.fallback(d.session_id)
         this.mailbox.message(d, 'result', 'node-final-' + this.core.head(d.session_id), result)
       }
       if (deadline) d.reason = 'time_limit'
-      this.finish(d, state)
+      this.finish(d, reason === 'stopped_by_owner' ? 'stopped' : state)
     }
   }
   private fallback(session_id: string) {

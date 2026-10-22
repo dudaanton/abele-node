@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -11,10 +11,15 @@ interface Turn {
   context: TurnContext
   sink: ProviderEventSink
   complete: (reason?: string) => void
+  interrupt?: () => Promise<void>
 }
 function adapter() {
   const turns: Turn[] = []
+  let liveAvailable = false
   const fake: ProviderAdapter = {
+    get liveAvailable() {
+      return liveAvailable
+    },
     available: true,
     configuration: {},
     capabilities: () => ({ provider: 'claude', capabilities: {} }),
@@ -26,16 +31,24 @@ function adapter() {
         complete = (reason) =>
           resolve(reason ? { reason } : { result: { subtype: 'success', is_error: false } })
       })
-      turns.push({ context, sink, complete })
+      const turn = { context, sink, complete } as Turn
+      turns.push(turn)
       return {
         done,
         interrupt: async () => {
+          await turn.interrupt?.()
           complete()
         },
       }
     },
   }
-  return { fake, turns }
+  return {
+    fake,
+    turns,
+    setLive: (enabled: boolean) => {
+      liveAvailable = enabled
+    },
+  }
 }
 async function setup(gitRepository = false) {
   mkdirSync('.scratch', { recursive: true })
@@ -82,6 +95,320 @@ afterEach(async () => {
     c.close()
   }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
+})
+it('bounds a stuck cleanup wait while admitting unrelated queued work', async () => {
+  const s = await setup()
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  const first = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: first.session_id,
+    text: 'first',
+    observed_seq: s.core.head(first.session_id),
+  })
+  await s.core.execution.drain()
+  const turn = s.provider.turns[0]!
+  let release!: () => void
+  turn.interrupt = () =>
+    new Promise<void>((resolve) => {
+      release = resolve
+    })
+  await s.request('session.interrupt', {
+    session_id: first.session_id,
+    run_id: turn.context.run_id,
+  })
+  const folder = join(s.dir, 'other')
+  mkdirSync(folder)
+  const project = await s.request('project.register', {
+    path: folder,
+    trust: 'trusted',
+    exact_root: true,
+  })
+  const workspace = (await s.request('workspace.list', { project_id: project.project_id }))[0]
+  const target = { kind: 'workspace', workspace_id: workspace.workspace_id }
+  await s.request('project.execution', { project_id: project.project_id, target, enabled: true })
+  const second = await s.request('session.create', { provider: 'claude', target })
+  await s.request('session.send', {
+    session_id: second.session_id,
+    text: 'second',
+    observed_seq: s.core.head(second.session_id),
+  })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    let settled = false
+    const draining = s.core.execution.drain().then(() => {
+      settled = true
+    })
+    await vi.waitFor(() => expect(s.provider.turns).toHaveLength(2))
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(5000)
+    await draining
+    expect(settled).toBe(true)
+    expect(s.core.resources.targets.leasedPath(s.folder)).toBe(true)
+    expect(
+      s.core
+        .read(first.session_id, 0)
+        .some((e) => e.type === 'session.error' && (e.data as any).reason === 'cleanup_timeout')
+    ).toBe(true)
+  } finally {
+    release?.()
+    turn.interrupt = undefined
+    vi.useRealTimers()
+  }
+})
+it.each(['interrupt', 'revoke'])(
+  'settles asynchronous cleanup before drain returns after %s',
+  async (action) => {
+    const s = await setup()
+    await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+    await s.request('project.execution', {
+      project_id: s.project.project_id,
+      target: s.target,
+      enabled: true,
+    })
+    const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+    await s.request('session.send', {
+      session_id: chat.session_id,
+      text: 'fixture',
+      observed_seq: s.core.head(chat.session_id),
+    })
+    await s.core.execution.drain()
+    const turn = s.provider.turns[0]!
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    turn.interrupt = () => gate
+    if (action === 'interrupt')
+      await s.request('session.interrupt', {
+        session_id: chat.session_id,
+        run_id: turn.context.run_id,
+      })
+    else s.core.revokeToken(s.actor.installation_id)
+    const draining = s.core.execution.drain()
+    const scheduled = setImmediate(release)
+    try {
+      await draining
+      expect(
+        s.core.db.prepare("SELECT count(*) AS n FROM provider_runs WHERE state='active'").get()
+      ).toEqual({ n: 0 })
+      expect(s.core.resources.targets.leasedPath(s.folder)).toBe(false)
+    } finally {
+      clearImmediate(scheduled)
+      release()
+    }
+  }
+)
+it.each([false, true])(
+  'fails a queued input when its execution folder has disappeared (active: %s)',
+  async (active) => {
+    const s = await setup()
+    await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+    await s.request('project.execution', {
+      project_id: s.project.project_id,
+      target: s.target,
+      enabled: true,
+    })
+    const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+    if (active) {
+      await s.request('session.send', {
+        session_id: chat.session_id,
+        text: 'active',
+        observed_seq: s.core.head(chat.session_id),
+      })
+      await s.core.execution.drain()
+      s.provider.turns[0]!.complete('process_cleanup_unconfirmed')
+      await expect
+        .poll(() => s.core.read(chat.session_id, 0).some((e) => e.type === 'run.interrupted'))
+        .toBe(true)
+      s.provider.fake.reconcile = async () => {
+        throw new Error('injected_cleanup_failure')
+      }
+    }
+    await s.request('session.send', {
+      session_id: chat.session_id,
+      text: 'fixture',
+      observed_seq: s.core.head(chat.session_id),
+    })
+    rmSync(s.folder, { recursive: true })
+    await s.core.execution.drain()
+    s.provider.fake.reconcile = async () => {}
+    expect(
+      s.core.db
+        .prepare('SELECT state FROM inputs WHERE session_id=? ORDER BY ordinal DESC LIMIT 1')
+        .get(chat.session_id)
+    ).toEqual({ state: 'failed' })
+    expect(
+      s.core
+        .read(chat.session_id, 0)
+        .some((e) => e.type === 'run.failed' && typeof (e.data as any).reason === 'string')
+    ).toBe(true)
+  }
+)
+it('exposes queued input identities in the journal and lets the owner cancel them', async () => {
+  const s = await setup()
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: chat.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(chat.session_id),
+  })
+  const queued = s.core.read(chat.session_id, 0).find((e) => e.type === 'input.queued')!
+  expect(queued).toBeDefined()
+  expect(
+    await s.request('input.cancel', {
+      session_id: chat.session_id,
+      input_id: (queued.data as any).input_id,
+    })
+  ).toMatchObject({ state: 'cancelled' })
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(0)
+})
+it.each([false, true])('passes project network opt-in %s to provider turns', async (enabled) => {
+  const s = await setup()
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  await s.request('project.codex_permissions', {
+    project_id: s.project.project_id,
+    network_enabled: enabled,
+  })
+  const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: chat.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(chat.session_id),
+  })
+  await s.core.execution.drain()
+  expect(s.provider.turns[0]!.context.codex_network_enabled).toBe(enabled)
+})
+it('publishes a readable chat notice when provider admission refuses a run', async () => {
+  const s = await setup()
+  s.provider.fake.configuration.per_action_approval = false
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: chat.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(chat.session_id),
+  })
+  await s.core.execution.drain()
+  expect(
+    s.core
+      .read(chat.session_id, 0)
+      .some(
+        (e) =>
+          e.type === 'session.update' &&
+          (e.data as any).update.kind === 'notice' &&
+          (e.data as any).update.text.includes('Bypass')
+      )
+  ).toBe(true)
+})
+it('fails a queued live input and explains missing Bypass opt-in after startup refuses it', async () => {
+  const s = await setup()
+  s.provider.setLive(true)
+  s.provider.fake.startSession = async () => {
+    throw new Error('codex_bypass_unavailable')
+  }
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  const chat = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: chat.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(chat.session_id),
+  })
+  await s.core.execution.drain()
+  expect(
+    s.core.db.prepare('SELECT state FROM inputs WHERE session_id=?').get(chat.session_id)
+  ).toEqual({ state: 'failed' })
+  expect(
+    s.core
+      .read(chat.session_id, 0)
+      .some((e) => e.type === 'session.update' && (e.data as any).update.text.includes('opt-in'))
+  ).toBe(true)
+  expect(s.core.resources.targets.leasedPath(s.folder)).toBe(false)
+})
+it('isolates an exited live process with unconfirmed cleanup from other sessions', async () => {
+  const s = await setup()
+  let exit!: (result: { reason?: string }) => void
+  s.provider.setLive(true)
+  s.provider.fake.startSession = async () => ({
+    done: new Promise((resolve) => {
+      exit = resolve
+    }),
+    send: () => {},
+    interrupt: async () => {},
+    control: async () => ({}),
+    stop: async () => {
+      exit({})
+    },
+  })
+  await s.request('project.trust', { project_id: s.project.project_id, trust: 'trusted' })
+  await s.request('project.execution', {
+    project_id: s.project.project_id,
+    target: s.target,
+    enabled: true,
+  })
+  const first = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: first.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(first.session_id),
+  })
+  await s.core.execution.drain()
+  exit({ reason: 'process_cleanup_unconfirmed' })
+  await Promise.resolve()
+  s.provider.fake.reconcile = async () => {
+    throw new Error('injected_cleanup_failure')
+  }
+  // Switch subsequent sessions to the bounded fake turn adapter.
+  s.provider.setLive(false)
+  const folder = join(s.dir, 'other')
+  mkdirSync(folder)
+  const project = await s.request('project.register', {
+    path: folder,
+    trust: 'trusted',
+    exact_root: true,
+  })
+  const workspace = (await s.request('workspace.list', { project_id: project.project_id }))[0]
+  const target = { kind: 'workspace', workspace_id: workspace.workspace_id }
+  await s.request('project.execution', { project_id: project.project_id, target, enabled: true })
+  const second = await s.request('session.create', { provider: 'claude', target })
+  await s.request('session.send', {
+    session_id: second.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(second.session_id),
+  })
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(1)
+  expect(s.core.resources.targets.leasedPath(s.folder)).toBe(true)
+  s.provider.fake.reconcile = async () => {}
+  await Promise.resolve()
+  await s.core.execution.drain()
+  await expect.poll(() => s.core.resources.targets.leasedPath(s.folder)).toBe(false)
 })
 for (const repository of [false, true])
   it(`runs approved ${repository ? 'Git root' : 'plain folder'} chats at the actual root with execution-time exclusive leases`, async () => {
@@ -377,6 +704,16 @@ it('does not release a target lease when worker cleanup is unconfirmed', async (
   await expect(
     s.request('project.trust', { project_id: s.project.project_id, trust: 'untrusted' })
   ).rejects.toThrow('resource_busy')
+  // Recovery must not leave the entire scheduler permanently paused.
+  await s.core.execution.drain()
+  const next = await s.request('session.create', { provider: 'claude', target: s.target })
+  await s.request('session.send', {
+    session_id: next.session_id,
+    text: 'fixture',
+    observed_seq: s.core.head(next.session_id),
+  })
+  await s.core.execution.drain()
+  expect(s.provider.turns).toHaveLength(2)
 })
 it('does not treat attachment/edit access as execution approval and refuses cross-project switching', async () => {
   const s = await setup(true),

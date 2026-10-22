@@ -52,13 +52,38 @@ async function start(dir: string) {
   child.stderr!.on('data', (d) => {
     err += d
   })
-  child.stdout!.on('data', (d) => {
-    text += d
-  })
-  await eventually(async () => {
-    if (child.exitCode !== null) throw new Error(err)
-    return text.includes('"listening"')
-  }, 'CLI daemon startup')
+  // The CLI's complete listening record is readiness. React to it directly on
+  // both cold start and restart; the phase deadline only guards a hung child.
+  let onData: (data: Buffer) => void
+  let onExit: () => void
+  let onError: (error: Error) => void
+  try {
+    await withProcessDeadline(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          onData = (data) => {
+            text += data
+            if (
+              text
+                .split('\n')
+                .slice(0, -1)
+                .some((line) => line.includes('"listening"'))
+            )
+              resolve()
+          }
+          onExit = () => reject(new Error(`CLI exited before listening: ${err}`))
+          onError = reject
+          child.stdout!.on('data', onData)
+          child.once('exit', onExit)
+          child.once('error', onError)
+        }),
+      'CLI daemon startup'
+    )
+  } finally {
+    child.stdout!.off('data', onData!)
+    child.off('exit', onExit!)
+    child.off('error', onError!)
+  }
   const ready = JSON.parse(
     text
       .trim()
@@ -135,6 +160,8 @@ it(
 )
 it(
   'real CLI daemon: offline persisted send, prompt, concurrent clients, replay/live and restart converge',
+  // Eight process/convergence phases plus cleanup on slow CI. Readiness and
+  // journal evidence drive progress; this aggregate budget is only a hang guard.
   { timeout: processScenarioDeadline(8) },
   async () => {
     const dir = mkdtempSync(resolve('.scratch/e2e-'))

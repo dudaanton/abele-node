@@ -292,6 +292,12 @@ export class ManagerService {
       stderr_truncated: false,
     }
     this.check(run)
+    for (const binding of [target, source])
+      if (binding && this.core.resources.targets.leasedPath(binding.path))
+        throw new ChannelError(
+          'resource_busy',
+          'Execution target is busy; retry after the active run ends.'
+        )
     return this.core.commitOperation(actor, method, p, operation, () => {
       this.check(run)
       const input = {

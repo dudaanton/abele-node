@@ -126,7 +126,16 @@ it('core retains an unconfirmed stopped worker so stop fails while the probe fai
     process.kill(worker.pid, 'SIGSTOP')
     unavailable = true
     s.request('session.interrupt', { session_id: s.session_id, run_id: row.run_id })
-    await expect(s.core.claude.drain()).rejects.toThrow(/process_cleanup_unconfirmed/)
+    // Cleanup failures are isolated and journaled so drain can admit other sessions.
+    await s.core.claude.drain()
+    await until(() =>
+      s.core
+        .read(s.session_id, 0)
+        .some(
+          (e) =>
+            e.type === 'session.error' && (e.data as any).code === 'process_cleanup_unconfirmed'
+        )
+    )
     await expect(s.core.claude.stop()).rejects.toThrow(/process_cleanup_unconfirmed/)
     expect(systemProcessProbe.identity(worker.pid)).toBeDefined()
     expect(systemProcessProbe.identity(child)).toBeDefined()

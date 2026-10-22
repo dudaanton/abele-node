@@ -1509,6 +1509,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       if (!['accepted', 'queued'].includes(String(input.state)))
         throw new ChannelError('resource_busy')
       this.transition(input, 'cancelled')
+      this.append(session, 'run.interrupted', installationActor, {
+        input_id: input.input_id,
+        reason: 'stopped_by_owner',
+        outcome: 'not_dispatched',
+      })
       return { input_id: p.input_id, state: 'cancelled' }
     }
     if (method === 'session.interrupt') {
@@ -1533,6 +1538,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.append(session, 'run.interrupted', installationActor, {
         run_id: p.run_id,
         outcome: 'unknown',
+        reason: 'stopped_by_owner',
       })
       for (const prompt of this.prompts(session))
         if (prompt.state === 'pending' && prompt.run_id === p.run_id)
