@@ -6,7 +6,13 @@ import { LspDiagnosticSchema, LspRangeSchema, type LspDiagnostic } from '@abele/
 import { LspConnection } from './connection.js'
 import { servers, discover, projectEslint, projectCodeServers, type Language } from './servers.js'
 
-type Document = { path: string; text: string; version: number; languageId: string }
+type Document = {
+  path: string
+  text: string
+  version: number
+  languageId: string
+  owners: Set<string>
+}
 type Slot = {
   root: string
   language: Language
@@ -58,6 +64,12 @@ export class LspService {
   private diagnostics = new Map<string, Map<Language, LspDiagnostic[]>>()
   private closed = false
   private activity = new Map<string, number>()
+  private pending = new Set<{
+    root: string
+    path: string
+    owner: string
+    controller: AbortController
+  }>()
   constructor(
     private state: string,
     private options: LspOptions
@@ -98,10 +110,15 @@ export class LspService {
   }
   private touch(slot: Slot) {
     clearTimeout(slot.timer)
-    slot.timer = setTimeout(() => {
-      if (this.activity.has(slot.root)) this.touch(slot)
-      else void this.remove(slot)
-    }, this.options.idleMs ?? 180000)
+    slot.timer = undefined
+    if (this.activity.has(slot.root) || [...slot.docs.values()].some((doc) => doc.owners.size))
+      return
+    slot.timer = setTimeout(
+      () => {
+        void this.remove(slot)
+      },
+      this.options.idleMs ?? 30 * 60 * 1000
+    )
     slot.timer.unref()
   }
   private async remove(slot: Slot) {
@@ -330,6 +347,7 @@ export class LspService {
   }
   private async active<T>(root: string, work: () => Promise<T>) {
     this.activity.set(root, (this.activity.get(root) ?? 0) + 1)
+    for (const slot of this.slots.values()) if (slot.root === root) this.touch(slot)
     try {
       return await work()
     } finally {
@@ -339,19 +357,50 @@ export class LspService {
       for (const slot of this.slots.values()) if (slot.root === root) this.touch(slot)
     }
   }
-  async open(root: string, path: string, text?: string, version?: number, signal?: AbortSignal) {
+  private async owned<T>(
+    root: string,
+    path: string,
+    owner: string | null,
+    signal: AbortSignal | undefined,
+    work: (signal?: AbortSignal) => Promise<T>
+  ) {
+    if (owner === null) return work(signal)
+    const controller = new AbortController()
+    const pending = { root, path, owner, controller }
+    this.pending.add(pending)
+    try {
+      return await work(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal)
+    } finally {
+      this.pending.delete(pending)
+    }
+  }
+  async open(
+    root: string,
+    path: string,
+    text?: string,
+    version?: number,
+    signal?: AbortSignal,
+    owner: string | null = 'local'
+  ) {
+    // Opens/updates are idempotent per owner. null is background analysis, not a visible view.
     // Only the root alias is resolved. check() still refuses symlinks below it.
     root = realpathSync(root)
-    return this.active(root, () => this.openDocument(root, path, text, version, signal))
+    return this.active(root, () =>
+      this.owned(root, path, owner, signal, (signal) =>
+        this.openDocument(root, path, text, version, signal, owner)
+      )
+    )
   }
   private async openDocument(
     root: string,
     path: string,
     text?: string,
     version?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    owner: string | null = null
   ) {
     if (this.closed) throw new Error('lsp_closed')
+    if (signal?.aborted) throw new Error('cancelled')
     await this.enforceTrust(root)
     const target = this.options.check(root, path)
     text ??= this.options.read ? this.options.read(root, path) : readFileSync(target, 'utf8')
@@ -411,6 +460,7 @@ export class LspService {
       if (slot.failed) throw new Error('lsp_repeated_crash: ' + language)
       this.touch(slot)
       await waitFor(slot.ready, signal)
+      if (signal?.aborted) throw new Error('cancelled')
       if (!this.allowed(root, language)) throw new Error('untrusted_folder')
       if (slot.docs.size >= 64 && !slot.docs.has(path)) throw new Error('lsp_document_limit')
       const previous = slot.docs.get(path)
@@ -428,7 +478,9 @@ export class LspService {
                 : language === 'bash'
                   ? 'shellscript'
                   : language
-      const doc = { path, text, version: next, languageId }
+      const owners = previous?.owners ?? new Set<string>()
+      if (owner !== null) owners.add(owner)
+      const doc = { path, text, version: next, languageId, owners }
       slot.docs.set(path, doc)
       if (previous)
         slot.connection.notify('textDocument/didChange', {
@@ -440,44 +492,68 @@ export class LspService {
     }
     return { servers: opened }
   }
-  closeDocument(root: string, path: string) {
+  closeDocument(root: string, path: string, owner = 'local') {
     root = realpathSync(root)
     this.options.check(root, path)
+    // Cancel older acquisitions even when initialization has not created a document yet.
+    for (const pending of this.pending)
+      if (pending.root === root && pending.path === path && pending.owner === owner)
+        pending.controller.abort()
     for (const slot of this.slots.values())
-      if (slot.root === root && slot.docs.delete(path)) {
-        try {
-          slot.connection.notify('textDocument/didClose', {
-            textDocument: { uri: pathToFileURL(resolve(root, path)).href },
-          })
-        } catch {
-          /* crashed */
-        }
-        this.setDiagnostics(slot, path, [])
-        this.touch(slot)
-      }
+      if (slot.root === root) this.closeOwnedDocument(slot, path, owner)
     return { closed: true }
+  }
+  releaseOwner(owner: string) {
+    // Disconnect cleanup must work even if the root or file has disappeared.
+    for (const pending of this.pending) if (pending.owner === owner) pending.controller.abort()
+    for (const slot of this.slots.values())
+      for (const path of slot.docs.keys()) this.closeOwnedDocument(slot, path, owner)
+  }
+  private closeOwnedDocument(slot: Slot, path: string, owner: string) {
+    const doc = slot.docs.get(path)
+    if (!doc || !doc.owners.delete(owner) || doc.owners.size) return
+    slot.docs.delete(path)
+    try {
+      slot.connection.notify('textDocument/didClose', {
+        textDocument: { uri: pathToFileURL(resolve(slot.root, path)).href },
+      })
+    } catch {
+      /* crashed */
+    }
+    this.setDiagnostics(slot, path, [])
+    this.touch(slot)
   }
   async query(
     root: string,
     path: string,
     method: string,
     position?: unknown,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    owner = 'local'
   ) {
     root = realpathSync(root)
-    return this.active(root, () => this.queryDocument(root, path, method, position, signal))
+    return this.active(root, () =>
+      this.owned(root, path, owner, signal, (signal) =>
+        this.queryDocument(root, path, method, position, signal, owner)
+      )
+    )
   }
   private async queryDocument(
     root: string,
     path: string,
     method: string,
     position?: unknown,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    owner = 'local'
   ) {
     const target = this.options.check(root, path)
     await this.enforceTrust(root)
+    if (signal?.aborted) throw new Error('cancelled')
+    // A querying connection owns an existing buffer just as it owns an implicitly opened one.
+    for (const slot of this.slots.values())
+      if (slot.root === root) slot.docs.get(path)?.owners.add(owner)
     if (![...this.slots.values()].some((s) => s.root === root && s.docs.has(path)))
-      await this.open(root, path, undefined, undefined, signal)
+      await this.open(root, path, undefined, undefined, signal, owner)
     if (method === 'diagnostics') {
       for (const s of this.slots.values())
         if (s.root === root && s.docs.has(path)) {
@@ -562,10 +638,12 @@ export class LspService {
     const paths = new Set(
       [...this.slots.values()].filter((s) => s.root === root).flatMap((s) => [...s.docs.keys()])
     )
-    for (const path of paths) if (!skip.has(path)) await this.open(root, path)
+    for (const path of paths)
+      if (!skip.has(path)) await this.open(root, path, undefined, undefined, undefined, null)
   }
   async stop() {
     this.closed = true
+    for (const pending of this.pending) pending.controller.abort()
     await Promise.all([...this.slots.values()].map((s) => this.remove(s)))
     this.diagnostics.clear()
   }

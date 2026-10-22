@@ -248,6 +248,7 @@ it.each(['direct', 'symlinked'] as const)(
     await expect(service.open(root, '../secret.ts')).rejects.toThrow('unsafe_path')
     await expect(service.open(root, 'escape.ts')).rejects.toThrow('unsafe_path')
     await expect(service.open(root, 'escape-dir/secret.ts')).rejects.toThrow('unsafe_path')
+    service.closeDocument(root, 'a.ts')
     await new Promise((r) => setTimeout(r, 300))
     await service.open(root, 'a.ts')
     expect(

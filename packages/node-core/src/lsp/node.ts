@@ -1,4 +1,5 @@
 import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
+import { randomUUID } from 'node:crypto'
 import { relative, isAbsolute, extname, join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { decodeGit } from '../git.js'
@@ -15,12 +16,13 @@ export class NodeLsp {
   readonly service: LspService
   private roots = new Map<string, { id: string; repository: boolean; project: string }>()
   private requests = new Map<string, AbortController>()
+  private connections = new Map<AbortSignal, { owner: string; release: () => void }>()
   private stopped = false
   private edited = new Map<string, Set<string>>()
   private refreshes = new Set<Promise<void>>()
   constructor(private r: ResourceServices) {
     this.service = new LspService(r.core.stateDir, {
-      idleMs: Number(process.env.ABELE_LSP_IDLE_MS) || 180000,
+      idleMs: Number(process.env.ABELE_LSP_IDLE_MS) || 30 * 60 * 1000,
       memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || 1024,
       trusted: (root) => this.trusted(root),
       read: (root, path) => {
@@ -120,7 +122,8 @@ export class NodeLsp {
     const parsed = schema.safeParse(raw)
     if (!parsed.success) throw new ChannelError('invalid_params')
     const p = parsed.data as Record<string, any>
-    const key = actor.installation_id + ':' + p.request_id
+    const owner = this.connectionOwner(actor, signal)
+    const key = owner + ':' + p.request_id
     if (method === 'lsp.v1.cancel') {
       this.requests.get(key)?.abort()
       return { cancelled: true }
@@ -134,7 +137,8 @@ export class NodeLsp {
         actor,
         method,
         p,
-        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+        owner
       )
     } catch (error) {
       if (error instanceof ChannelError) throw error
@@ -163,11 +167,27 @@ export class NodeLsp {
       if (p.request_id) this.requests.delete(key)
     }
   }
+  private connectionOwner(actor: AuthorityContext, signal?: AbortSignal) {
+    // Direct in-process callers have no channel lifetime; transport callers always pass it.
+    if (!signal) return actor.installation_id
+    if (signal.aborted) throw new ChannelError('cancelled')
+    const existing = this.connections.get(signal)
+    if (existing) return existing.owner
+    const owner = randomUUID()
+    const release = () => {
+      this.connections.delete(signal)
+      this.service.releaseOwner(owner)
+    }
+    this.connections.set(signal, { owner, release })
+    signal.addEventListener('abort', release, { once: true })
+    return owner
+  }
   private async dispatch(
     actor: AuthorityContext,
     method: string,
     p: Record<string, any>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    owner: string
   ) {
     if (method === 'lsp.v1.install') {
       this.r.core.authority.check(actor, 'mutate')
@@ -183,9 +203,17 @@ export class NodeLsp {
       return status(this.r.core.stateDir, root, !!root && this.trusted(root))
     if (!root) throw new ChannelError('workspace_required')
     this.r.core.authority.check(actor, 'resource', String(p.workspace_id ?? p.worktree_id))
-    if (method === 'lsp.v1.open') return this.service.open(root, p.path, p.text, p.version, signal)
-    if (method === 'lsp.v1.close') return this.service.closeDocument(root, p.path)
-    return this.service.query(root, p.path, method.slice('lsp.v1.'.length), p.position, signal)
+    if (method === 'lsp.v1.open')
+      return this.service.open(root, p.path, p.text, p.version, signal, owner)
+    if (method === 'lsp.v1.close') return this.service.closeDocument(root, p.path, owner)
+    return this.service.query(
+      root,
+      p.path,
+      method.slice('lsp.v1.'.length),
+      p.position,
+      signal,
+      owner
+    )
   }
   observe(session: string, type: string, data: any) {
     if (this.stopped) return
@@ -253,7 +281,7 @@ export class NodeLsp {
       for (const raw of paths) {
         const path = isAbsolute(raw) ? relative(root, raw) : raw
         try {
-          await this.service.open(root, path)
+          await this.service.open(root, path, undefined, undefined, undefined, null)
           opened.add(path)
         } catch {
           /* not a supported confined file */
@@ -266,6 +294,9 @@ export class NodeLsp {
   }
   stop() {
     this.stopped = true
+    for (const [signal, { release }] of this.connections)
+      signal.removeEventListener('abort', release)
+    this.connections.clear()
     for (const c of this.requests.values()) c.abort()
     this.requests.clear()
     return Promise.all([this.service.stop(), ...this.refreshes]).then(() => {})
