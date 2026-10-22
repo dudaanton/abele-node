@@ -1,5 +1,85 @@
 # Manager command and integration APIs
 
+## Ordinary chat commands: `command_context_v1`
+
+Clients discover `command_context_v1` in the capabilities map, then call
+`command.context.v1.enable` with `{}` on **each channel connection**. Without
+this opt-in, context methods return `capability_required`. Existing session APIs,
+command run results, session catalogues and approval behavior remain unchanged.
+Context events appear only in their own explicitly subscribed journal.
+
+`session.create` is a provider session API, not a command-only context API.
+An ordinary chat should use the following methods instead. No model, fake
+provider, delegation grant, session binding or separate execution grant is needed.
+The authenticated installation must have execution authority on the registered
+project/target, and the project must be trusted. Existing repository access,
+path containment, target identity, environment restrictions, execution leases,
+revocation and audit storage checks still apply. These commands run as the node
+OS user under the same policy as `command.v1.run`.
+
+All mutations require a stable channel-envelope `operation_id`. Preserve it
+through reconnects and retries; changing any parameter with that ID returns
+`idempotency_mismatch`.
+
+1. `command.context.v1.create` accepts `{ parent_chat_id, project_id }` or
+   `{ parent_chat_id, worktree_id }`, exactly one target. It creates or reuses
+   a context for that installation, parent chat and explicit target. It returns
+   `{ context_id, parent_chat_id, stream_id, project_id? , worktree_id? }`.
+   A project selects its root directory; a worktree selects that exact worktree.
+   Creation starts no provider and executes no command. The context and receipt
+   survive restarts. The parent ID is a stable client chat identity, not a node
+   session ID. Contexts are not listed as provider sessions.
+2. `command.context.v1.prepare` accepts `{ context_id, parent_chat_id,
+permission_mode: "ask" | "bypass", argv? , command? , cwd? , env? ,
+timeout_ms? , output_bytes? , justification? }`. Command fields and limits
+   match `command.v1.run`; supply exactly one nonempty command or argv array.
+   The optional justification is at most 512 characters, returned only as
+   display metadata; it is never executable input or approval authority.
+   The node resolves and validates the target and directory before committing
+   an action. Missing resources name `context`, `project`, `worktree` or `cwd`
+   in the error message and `error.details.resource`. Invalid parameters identify
+   the offending fields. Legacy session command errors identify a missing
+   `session` and direct ordinary clients to this capability.
+3. In **Ask**, prepare returns a run in `pending_approval` with `approval`, the
+   exact durable node prompt. Render `approval.input.command` verbatim or
+   `approval.input.argv` as individual arguments, together with the resolved
+   absolute `approval.input.cwd`. Show one owner confirmation for that exact
+   card. Nothing executes before approval. Never add a preliminary confirmation
+   or automatically answer an unrelated node/provider prompt.
+4. The owner UI calls `command.context.v1.execute` with `{ context_id,
+parent_chat_id, run_id, action_digest: approval.action_digest,
+choice: "allow" | "deny" }`. This records that single decision and starts
+   execution only for `allow`. A mismatched digest or obsolete approval returns
+   `stale_approval`. Retry the same decision with its original operation ID.
+   Do not expose this owner decision endpoint as a model tool. Do not use
+   `prompt.answer` for context prompts.
+5. In **bypass**, prepare returns `approval: null` and immediately dispatches
+   the validated command, with no owner prompt or execute call. The client must
+   pass the owner's current mode; omission is invalid and the node never infers
+   bypass from authentication, project trust, context reuse or a previous run.
+   A prepared Ask action cannot be switched to bypass by execute.
+6. `command.context.v1.status` and `command.context.v1.cancel` accept
+   `{ context_id, parent_chat_id, run_id }`. Cancel is a mutation. Both check
+   the originating installation, parent and context/run binding. Cancel
+   invalidates an unanswered approval or stops/reaps an active process group.
+   Subscribe/read `stream_id` for `prompt.*`, `command.updated` and bounded
+   `command.output` events so actions remain visible while running.
+
+Prepare/status/cancel return the existing run fields plus `context_id`,
+`permission_mode`, optional `justification`, and `approval` (prompt or null).
+The internal `session_id` field equals the context journal ID; it is **not** a
+provider session and must not be passed to session APIs. The execute result is
+the resolved approval receipt. Preparation and decision receipts are immutable;
+use status for current state/output. `CommandContextSchema` and
+`CommandContextRunSchema` are exported by `@abele/node-protocol`.
+
+Pending Ask approvals survive restarts and are revalidated before execution.
+Interrupted execution is recorded as `outcome_unknown`, never replayed.
+A crash after a durable intent but before launch can also produce that state;
+clients must inspect the result rather than retrying with a fresh operation ID.
+As with the existing runner, crash recovery cannot infer an interrupted command's
+external effects; graceful shutdown stops and reaps active commands.
+
 These online controller APIs use the node's existing authenticated installation
 authority and resource scope. They are advertised in the channel welcome methods
 list, with capabilities `command_run_v1` and `git_integrate_v1`. They do not grant

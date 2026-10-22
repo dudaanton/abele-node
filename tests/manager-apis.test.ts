@@ -13,6 +13,7 @@ import { resolve, join } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { OwnerGit } from '../packages/node-core/src/git-owner.js'
 import { ChannelError } from '@abele/channel-protocol'
+import { CommandContextSchema, CommandContextRunSchema } from '@abele/node-protocol'
 import {
   processScenarioDeadline,
   waitForProcessCondition,
@@ -20,6 +21,287 @@ import {
 
 const roots: string[] = [],
   cores: NodeCore[] = []
+it('creates a command-only parent context, prepares Ask and executes only its exact approval', async () => {
+  const f = await fixture()
+  const count = () => f.core.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n
+  const before = count()
+  const params = { parent_chat_id: 'ordinary-chat', project_id: f.project.project_id }
+  const context = await f.request('command.context.v1.create', params, 'create-context')
+  CommandContextSchema.parse(context)
+  const [reused, concurrent] = await Promise.all([
+    f.request('command.context.v1.create', params),
+    f.request('command.context.v1.create', params),
+  ])
+  expect(reused).toEqual(context)
+  expect(concurrent).toEqual(context)
+  expect(await f.request('command.context.v1.create', params, 'create-context')).toEqual(context)
+  expect(await f.request('command.context.v1.create', params)).toEqual(context)
+  expect(count()).toBe(before)
+  const binding = { context_id: context.context_id, parent_chat_id: params.parent_chat_id }
+  const p = {
+    ...binding,
+    argv: [process.execPath, '--version'],
+    permission_mode: 'ask',
+    justification: 'Check runtime',
+  }
+  const prepared = await f.request('command.context.v1.prepare', p, 'prepare-command')
+  CommandContextRunSchema.parse(prepared)
+  expect(prepared.justification).toBe(p.justification)
+  expect(prepared.approval.input).not.toHaveProperty('justification')
+  expect(await f.request('command.context.v1.prepare', p, 'prepare-command')).toEqual(prepared)
+  await expect(
+    f.request('command.context.v1.prepare', { ...p, permission_mode: 'bypass' }, 'prepare-command')
+  ).rejects.toThrow('idempotency_mismatch')
+  expect(prepared.approval.input).toMatchObject({ argv: p.argv, cwd: f.folder })
+  expect(prepared.state).toBe('pending_approval')
+  await f.core.manager.settled()
+  const approval = {
+    ...binding,
+    run_id: prepared.run_id,
+    action_digest: prepared.approval.action_digest,
+    choice: 'allow',
+  }
+  await expect(
+    f.request('command.context.v1.execute', { ...approval, action_digest: 'wrong' })
+  ).rejects.toThrow('stale_approval')
+  await f.request('command.context.v1.execute', approval, 'approve-command')
+  await f.request('command.context.v1.execute', approval, 'approve-command')
+  await f.core.manager.settled()
+  expect(
+    await f.request('command.context.v1.status', { ...binding, run_id: prepared.run_id })
+  ).toMatchObject({ state: 'exited', stdout: process.version + '\n' })
+  await expect(
+    f.request('command.context.v1.status', {
+      ...binding,
+      parent_chat_id: 'another-chat',
+      run_id: prepared.run_id,
+    })
+  ).rejects.toThrow('unauthorized')
+})
+
+it('executes bypass directly and diagnoses missing context resources', async () => {
+  const f = await fixture()
+  await expect(
+    f.request('command.v1.run', {
+      session_id: 'missing',
+      project_id: f.project.project_id,
+      command: 'true',
+    })
+  ).rejects.toMatchObject({ details: { resource: 'session' } })
+  await expect(
+    f.request('command.context.v1.create', { parent_chat_id: 'chat', project_id: 'missing' })
+  ).rejects.toThrow('project')
+  await expect(
+    f.request('command.context.v1.create', { parent_chat_id: 'chat', worktree_id: 'missing' })
+  ).rejects.toThrow('worktree')
+  const context = await f.request('command.context.v1.create', {
+    parent_chat_id: 'chat',
+    worktree_id: f.root,
+  })
+  const binding = { context_id: context.context_id, parent_chat_id: 'chat' }
+  await expect(
+    f.request('command.context.v1.prepare', { ...binding, command: 'true' })
+  ).rejects.toThrow('permission_mode')
+  await expect(
+    f.request('command.context.v1.prepare', {
+      ...binding,
+      command: 'true',
+      cwd: 'missing',
+      permission_mode: 'ask',
+    })
+  ).rejects.toThrow('cwd')
+  await expect(
+    f.request('command.context.v1.prepare', {
+      ...binding,
+      context_id: 'missing',
+      command: 'true',
+      permission_mode: 'ask',
+    })
+  ).rejects.toThrow('context')
+  const run = await f.request(
+    'command.context.v1.prepare',
+    { ...binding, argv: [process.execPath, '--version'], permission_mode: 'bypass' },
+    'bypass-command'
+  )
+  expect(run.approval).toBeNull()
+  expect(run.state).toBe('running')
+  CommandContextRunSchema.parse(run)
+  await f.core.manager.settled()
+  expect(
+    await f.request('command.context.v1.status', { ...binding, run_id: run.run_id })
+  ).toMatchObject({ state: 'exited' })
+  expect(f.core.read(context.stream_id, 0, 256).filter((e) => e.type === 'prompt.opened')).toEqual(
+    []
+  )
+})
+
+it('keeps bypass commands visible, cancellable and idempotent after a restart', async () => {
+  const f = await fixture()
+  const context = await f.request('command.context.v1.create', {
+    parent_chat_id: 'bypass-chat',
+    project_id: f.project.project_id,
+  })
+  const binding = { context_id: context.context_id, parent_chat_id: 'bypass-chat' }
+  const p = {
+    ...binding,
+    permission_mode: 'bypass',
+    argv: [
+      process.execPath,
+      '-e',
+      "require('node:fs').appendFileSync('bypass-effects', 'once\\n'); console.log('ready'); setInterval(() => {}, 1000)",
+    ],
+    justification: '$(touch metadata-must-not-execute)',
+  }
+  const run = await f.request('command.context.v1.prepare', p, 'bypass-restart')
+  await waitForProcessCondition(async () => {
+    const status = await f.request('command.context.v1.status', { ...binding, run_id: run.run_id })
+    return status.stdout.includes('ready')
+  }, 'bypass command output')
+  expect(f.core.read(context.stream_id, 0, 256).some((e) => e.type === 'command.output')).toBe(true)
+  await f.request('command.context.v1.cancel', { ...binding, run_id: run.run_id })
+  await f.core.manager.settled()
+  expect(
+    await f.request('command.context.v1.status', { ...binding, run_id: run.run_id })
+  ).toMatchObject({ state: 'cancelled' })
+  expect(readFileSync(join(f.folder, 'bypass-effects'), 'utf8')).toBe('once\n')
+  expect(existsSync(join(f.folder, 'metadata-must-not-execute'))).toBe(false)
+  await f.core.resources.stop()
+  f.core.close()
+  cores.splice(cores.indexOf(f.core), 1)
+  const restarted = new NodeCore(join(f.dir, 'state'))
+  cores.push(restarted)
+  expect(
+    await restarted.request(f.actor, 'command.context.v1.prepare', p, 'bypass-restart')
+  ).toEqual(run)
+  await restarted.manager.settled()
+  expect(readFileSync(join(f.folder, 'bypass-effects'), 'utf8')).toBe('once\n')
+})
+
+it('retains exact Ask approval and effect receipts across restarts without replay', async () => {
+  const f = await fixture()
+  const params = { parent_chat_id: 'restart-chat', project_id: f.project.project_id }
+  const context = await f.request('command.context.v1.create', params, 'restart-create')
+  const binding = { context_id: context.context_id, parent_chat_id: params.parent_chat_id }
+  const marker = join(f.folder, 'effects')
+  const command = {
+    ...binding,
+    argv: [process.execPath, '-e', "require('node:fs').appendFileSync('effects', 'once\\n')"],
+    permission_mode: 'ask',
+  }
+  const prepared = await f.request('command.context.v1.prepare', command, 'restart-prepare')
+  expect(existsSync(marker)).toBe(false)
+  let current = f.core
+  const restart = async () => {
+    await current.manager.stop()
+    await current.resources.stop()
+    current.close()
+    cores.splice(cores.indexOf(current), 1)
+    current = new NodeCore(join(f.dir, 'state'))
+    cores.push(current)
+  }
+  const request = (method: string, p: unknown, op = method): Promise<any> =>
+    Promise.resolve(current.request(f.actor, method, p, op))
+  await restart()
+  expect(await request('command.context.v1.create', params, 'restart-create')).toEqual(context)
+  expect(await request('command.context.v1.prepare', command, 'restart-prepare')).toEqual(prepared)
+  expect(
+    await request('command.context.v1.status', { ...binding, run_id: prepared.run_id })
+  ).toMatchObject({ state: 'pending_approval', approval: { state: 'pending' } })
+  const approval = {
+    ...binding,
+    run_id: prepared.run_id,
+    action_digest: prepared.approval.action_digest,
+    choice: 'allow',
+  }
+  const receipt = await request('command.context.v1.execute', approval, 'restart-approve')
+  await current.manager.settled()
+  expect(readFileSync(marker, 'utf8')).toBe('once\n')
+  await restart()
+  expect(await request('command.context.v1.execute', approval, 'restart-approve')).toEqual(receipt)
+  await current.manager.settled()
+  expect(readFileSync(marker, 'utf8')).toBe('once\n')
+  await expect(
+    request(
+      'command.context.v1.prepare',
+      { ...command, command: 'false', argv: undefined },
+      'restart-prepare'
+    )
+  ).rejects.toThrow('idempotency_mismatch')
+})
+
+it('denies or cancels context commands and rechecks trust after preparation', async () => {
+  const f = await fixture()
+  const context = await f.request('command.context.v1.create', {
+    parent_chat_id: 'chat',
+    worktree_id: f.root,
+  })
+  const binding = { context_id: context.context_id, parent_chat_id: 'chat' }
+  const prepare = () =>
+    f.request('command.context.v1.prepare', {
+      ...binding,
+      command: 'touch must-not-exist',
+      permission_mode: 'ask',
+    })
+  const denied = await prepare()
+  await f.request('command.context.v1.execute', {
+    ...binding,
+    run_id: denied.run_id,
+    action_digest: denied.approval.action_digest,
+    choice: 'deny',
+  })
+  expect(
+    await f.request('command.context.v1.status', { ...binding, run_id: denied.run_id })
+  ).toMatchObject({ state: 'denied' })
+  const cancelled = await prepare()
+  await expect(
+    f.request('command.context.v1.cancel', {
+      ...binding,
+      parent_chat_id: 'wrong',
+      run_id: cancelled.run_id,
+    })
+  ).rejects.toThrow('unauthorized')
+  const other = f.core.authority.authenticate(f.core.createToken('other-installation').token)
+  await expect(
+    f.core.request(
+      other,
+      'command.context.v1.cancel',
+      { ...binding, run_id: cancelled.run_id },
+      'foreign-cancel'
+    )
+  ).rejects.toThrow('unauthorized')
+  await f.request(
+    'command.context.v1.cancel',
+    { ...binding, run_id: cancelled.run_id },
+    'cancel-command'
+  )
+  await f.request(
+    'command.context.v1.cancel',
+    { ...binding, run_id: cancelled.run_id },
+    'cancel-command'
+  )
+  await expect(
+    f.request('command.context.v1.execute', {
+      ...binding,
+      run_id: cancelled.run_id,
+      action_digest: cancelled.approval.action_digest,
+      choice: 'allow',
+    })
+  ).rejects.toThrow('stale_approval')
+  const stale = await prepare()
+  await f.request('project.trust', { project_id: f.project.project_id, trust: 'untrusted' })
+  await f.request('command.context.v1.execute', {
+    ...binding,
+    run_id: stale.run_id,
+    action_digest: stale.approval.action_digest,
+    choice: 'allow',
+  })
+  await f.core.manager.settled()
+  expect(
+    await f.request('command.context.v1.status', { ...binding, run_id: stale.run_id })
+  ).toMatchObject({ state: 'failed', reason: 'project_untrusted' })
+  expect(existsSync(join(f.folder, 'must-not-exist'))).toBe(false)
+  await expect(prepare()).rejects.toThrow('project_untrusted')
+})
 it('explains a workspace ID supplied in a worktree field before asking for approval', async () => {
   const f = await fixture()
   const row = f.core.db.prepare('SELECT workspace_id FROM workspaces LIMIT 1').get()!

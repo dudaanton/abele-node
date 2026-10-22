@@ -805,6 +805,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           evidence:
             'command.v1.run/status/cancel; exact-durable-owner-prompt; trusted-target; bounded-streaming-output',
         },
+        command_context_v1: {
+          status: 'supported',
+          evidence:
+            'command.context.v1.create/prepare/execute/status/cancel; provider-independent; parent-bound; ask-or-bypass',
+        },
         git_integrate_v1: {
           status: 'supported',
           evidence:
@@ -975,6 +980,21 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     try {
       params = validateParams(method, raw) as Record<string, unknown>
     } catch (error) {
+      if (
+        method.startsWith('command.context.v1.') &&
+        error &&
+        typeof error === 'object' &&
+        'issues' in error
+      ) {
+        const fields = (
+          error as { issues: { path: (string | number)[]; message: string }[] }
+        ).issues.map((issue) => issue.path.join('.') || issue.message)
+        throw new ChannelError(
+          'invalid_params',
+          'Invalid command context parameters: ' + fields.join(', '),
+          { fields }
+        )
+      }
       throw new ChannelError(
         error instanceof Error && error.message === 'unsupported_method'
           ? 'unsupported_method'
@@ -993,6 +1013,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return this.resources.targets.request(actor, method, params, operation)
     if (method.startsWith('delegation.'))
       return this.delegations.request(actor, method, params, operation)
+    if (method.startsWith('command.context.v1.'))
+      return this.manager.requestContext(actor, method, params, operation)
     if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
       return this.manager.request(actor, method, params, operation)
     if (/^(project|workspace|job|review|repository|filesystem)\./.test(method))
@@ -1030,6 +1052,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (method.startsWith('http.v1.')) return
     if (Object.hasOwn(PairingMethodSchemas, method)) return
     const p = validateParams(method, raw) as Record<string, unknown>
+    if (method.startsWith('command.context.v1.'))
+      return this.manager.checkContextPublication(actor, p)
     if (method.startsWith('command.v1.') || method === 'git.v1.integrate')
       return this.manager.checkPublication(actor, p)
     this.authority.check(

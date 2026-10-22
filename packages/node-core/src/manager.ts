@@ -15,7 +15,18 @@ import type { ResolvedExecutionTarget } from './execution-targets.js'
 import { OwnerGit } from './git-owner.js'
 
 type Params = CommandRunRequest | GitIntegrateRequest
+interface CommandContext {
+  context_id: string
+  parent_chat_id: string
+  installation_id: string
+  project_id?: string
+  worktree_id?: string
+  target: ResolvedExecutionTarget
+}
 interface Run {
+  context_id?: string
+  permission_mode?: 'ask' | 'bypass'
+  justification?: string
   run_id: string
   prompt_id: string
   session_id: string
@@ -55,11 +66,20 @@ export class ManagerService {
     core.db.exec(
       'CREATE TABLE IF NOT EXISTS manager_runs(run_id TEXT PRIMARY KEY, body TEXT NOT NULL)'
     )
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS command_contexts(context_id TEXT PRIMARY KEY, owner TEXT NOT NULL, parent TEXT NOT NULL, target_key TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,parent,target_key))'
+    )
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS command_context_prompts(prompt_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES streams(stream_id), run_id TEXT NOT NULL, body TEXT NOT NULL)'
+    )
     for (const row of core.db.prepare('SELECT body FROM manager_runs').all() as {
       body: string
     }[]) {
       const run = JSON.parse(row.body) as Run
-      if (!terminal(run)) {
+      if (
+        !terminal(run) &&
+        !(run.context_id && run.permission_mode === 'ask' && run.state === 'pending_approval')
+      ) {
         run.state = 'outcome_unknown'
         run.reason = 'daemon_restart'
         this.save(run)
@@ -164,6 +184,203 @@ export class ManagerService {
       throw new ChannelError('unsafe_path')
     return path
   }
+  private context(actor: AuthorityContext, p: Record<string, unknown>): CommandContext {
+    const row = this.core.db
+      .prepare('SELECT body FROM command_contexts WHERE context_id=?')
+      .get(String(p.context_id)) as { body: string } | undefined
+    if (!row)
+      throw new ChannelError(
+        'not_found',
+        'Missing command context (session replacement); create a context first',
+        { resource: 'context' }
+      )
+    const context = JSON.parse(row.body) as CommandContext
+    if (
+      context.installation_id !== actor.installation_id ||
+      context.parent_chat_id !== p.parent_chat_id
+    )
+      throw new ChannelError('unauthorized')
+    this.core.authority.check(actor, 'request', context.context_id)
+    return context
+  }
+  checkContextPublication(actor: AuthorityContext, p: Record<string, unknown>) {
+    this.core.authority.check(actor, 'publish')
+    if (p.context_id) {
+      const context = this.context(actor, p)
+      if (p.run_id && this.get(String(p.run_id)).context_id !== context.context_id)
+        throw new ChannelError('unauthorized')
+      if (p.run_id)
+        this.checkPublication(actor, { session_id: context.context_id, run_id: p.run_id })
+    }
+  }
+  private async contextTarget(actor: AuthorityContext, p: Record<string, unknown>) {
+    const resource = p.project_id ? 'project' : 'worktree'
+    try {
+      const target = p.project_id
+        ? await this.projectTarget(actor, String(p.project_id))
+        : await this.worktreeTarget(String(p.worktree_id))
+      this.core.authority.check(actor, 'execute', target.project_id)
+      this.core.authority.check(
+        actor,
+        'execute',
+        target.target.kind === 'worktree' ? target.target.worktree_id : ''
+      )
+      if (this.core.resources.targets.check(target, false).trust !== 'trusted')
+        throw new ChannelError('project_untrusted')
+      return target
+    } catch (error) {
+      if (
+        error instanceof ChannelError &&
+        ['not_found', 'repository_unavailable', 'unsafe_path'].includes(error.code)
+      )
+        throw new ChannelError(
+          error.code,
+          `Missing or unavailable ${resource}; refresh the registered execution target`,
+          { resource }
+        )
+      throw error
+    }
+  }
+  async requestContext(
+    actor: AuthorityContext,
+    method: string,
+    p: Record<string, unknown>,
+    operation?: string
+  ) {
+    this.core.authority.check(actor, 'request')
+    this.core.assertAuditStorageAvailable()
+    if (this.stopping || this.closed) throw new ChannelError('resource_busy', 'Node is stopping')
+    if (method === 'command.context.v1.create') {
+      const previous = this.core.operationReceipt(actor, method, p, operation)
+      if (previous) return previous.result
+      const target = await this.contextTarget(actor, p)
+      return this.core.commitOperation(actor, method, p, operation, () => {
+        const key = canonical({ project_id: p.project_id, worktree_id: p.worktree_id })
+        const row = this.core.db
+          .prepare('SELECT body FROM command_contexts WHERE owner=? AND parent=? AND target_key=?')
+          .get(actor.installation_id, String(p.parent_chat_id), key) as { body: string } | undefined
+        if (row) return this.contextView(JSON.parse(row.body) as CommandContext)
+        const context: CommandContext = {
+          context_id: randomUUID(),
+          parent_chat_id: String(p.parent_chat_id),
+          installation_id: actor.installation_id,
+          ...(p.project_id
+            ? { project_id: String(p.project_id) }
+            : { worktree_id: String(p.worktree_id) }),
+          target,
+        }
+        this.core.db.prepare('INSERT INTO streams(stream_id) VALUES(?)').run(context.context_id)
+        this.core.db
+          .prepare('INSERT INTO command_contexts VALUES(?,?,?,?,?)')
+          .run(
+            context.context_id,
+            actor.installation_id,
+            context.parent_chat_id,
+            key,
+            JSON.stringify(context)
+          )
+        this.core.append(
+          context.context_id,
+          'command.context.created',
+          node,
+          this.contextView(context)
+        )
+        return this.contextView(context)
+      })
+    }
+    const context = this.context(actor, p)
+    if (method === 'command.context.v1.prepare') {
+      const {
+        context_id: _id,
+        parent_chat_id: _parent,
+        permission_mode: _mode,
+        justification: _why,
+        ...command
+      } = p
+      const params = {
+        ...command,
+        session_id: context.context_id,
+        ...(context.project_id
+          ? { project_id: context.project_id }
+          : { worktree_id: context.worktree_id }),
+      }
+      return this.request(actor, 'command.v1.run', params, operation, { context, original: p })
+    }
+    const run = this.get(String(p.run_id))
+    if (run.context_id !== context.context_id) throw new ChannelError('unauthorized')
+    if (method === 'command.context.v1.status') this.checkContextPublication(actor, p)
+    if (method === 'command.context.v1.status') return this.contextRunView(run)
+    if (method === 'command.context.v1.cancel') {
+      return this.core.commitOperation(actor, method, p, operation, () => {
+        if (!terminal(run)) {
+          this.active.get(run.run_id)?.stop('cancelled')
+          run.state = 'cancelled'
+          this.save(run)
+          const prompt = this.runPrompt(run)
+          if (prompt.state === 'pending')
+            this.resolveRunPrompt(run, prompt, 'invalidated', 'deny', null)
+          this.event(run)
+        }
+        return this.contextRunView(run)
+      })
+    }
+    if (method !== 'command.context.v1.execute') throw new ChannelError('unsupported_method')
+    this.core.authority.check(actor, 'approve', context.context_id)
+    const result = this.core.commitOperation(actor, method, p, operation, () => {
+      const prompt = this.runPrompt(run)
+      if (run.permission_mode !== 'ask' || p.action_digest !== prompt.action_digest)
+        throw new ChannelError('stale_approval')
+      if (prompt.state !== 'pending' || run.state !== 'pending_approval')
+        throw new ChannelError('stale_approval')
+      return this.resolveRunPrompt(
+        run,
+        prompt,
+        'resolved',
+        p.choice as 'allow' | 'deny',
+        actor.installation_id
+      )
+    }) as Prompt
+    this.answered(result, actor)
+    return result
+  }
+  private contextView(context: CommandContext) {
+    const { target: _target, installation_id: _owner, ...view } = context
+    return { ...view, stream_id: context.context_id }
+  }
+  private contextRunView(run: Run) {
+    return {
+      ...this.view(run),
+      approval: run.permission_mode === 'ask' ? this.runPrompt(run) : null,
+    }
+  }
+  private runPrompt(run: Run): Prompt {
+    if (!run.context_id) return this.core.prompt(run.prompt_id)
+    const row = this.core.db
+      .prepare('SELECT body FROM command_context_prompts WHERE prompt_id=?')
+      .get(run.prompt_id) as { body: string } | undefined
+    if (!row) throw new ChannelError('not_found', 'Missing command approval')
+    return PromptSchema.parse(JSON.parse(row.body))
+  }
+  private resolveRunPrompt(
+    run: Run,
+    prompt: Prompt,
+    state: Prompt['state'],
+    choice: 'allow' | 'deny',
+    installation: string | null
+  ) {
+    if (!run.context_id) return this.core.resolvePrompt(prompt, state, choice, installation)
+    const result = PromptSchema.parse({ ...prompt, state, choice, installation_id: installation })
+    this.core.db
+      .prepare('UPDATE command_context_prompts SET body=? WHERE prompt_id=?')
+      .run(JSON.stringify(result), prompt.prompt_id)
+    this.core.append(
+      run.session_id,
+      'prompt.' + state,
+      installation ? { kind: 'installation', installation_id: installation } : node,
+      result
+    )
+    return result
+  }
   checkPublication(actor: AuthorityContext, p: Record<string, unknown>) {
     this.core.authority.check(actor, 'publish', String(p.session_id))
     if (p.run_id) {
@@ -224,10 +441,23 @@ export class ManagerService {
     actor: AuthorityContext,
     method: string,
     p: Record<string, unknown>,
-    operation?: string
+    operation?: string,
+    commandContext?: { context: CommandContext; original: Record<string, unknown> }
   ) {
     this.core.authority.check(actor, 'request', String(p.session_id))
-    this.core.session(String(p.session_id))
+    if (!commandContext) {
+      try {
+        this.core.session(String(p.session_id))
+      } catch (error) {
+        if (error instanceof ChannelError && error.code === 'not_found')
+          throw new ChannelError(
+            'not_found',
+            'Missing session; ordinary chats should use command_context_v1',
+            { resource: 'session' }
+          )
+        throw error
+      }
+    }
     if (method === 'command.v1.status' || method === 'command.v1.cancel') {
       const run = this.get(String(p.run_id))
       if (run.session_id !== p.session_id) throw new ChannelError('not_found')
@@ -243,9 +473,9 @@ export class ManagerService {
             this.active.get(run.run_id)?.stop('cancelled')
             run.state = 'cancelled'
             this.save(run)
-            const prompt = this.core.prompt(run.prompt_id)
+            const prompt = this.runPrompt(run)
             if (prompt.state === 'pending')
-              this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)
+              this.resolveRunPrompt(run, prompt, 'invalidated', 'deny', null)
             this.event(run)
           }
           return this.view(run)
@@ -255,13 +485,17 @@ export class ManagerService {
     }
     if (!operation || operation.length > 128) throw new ChannelError('operation_id_required')
     if (this.stopping || this.closed) throw new ChannelError('resource_busy', 'Node is stopping')
-    const previous = this.core.operationReceipt(actor, method, p, operation)
+    const receiptMethod = commandContext ? 'command.context.v1.prepare' : method
+    const receiptParams = commandContext?.original ?? p
+    const previous = this.core.operationReceipt(actor, receiptMethod, receiptParams, operation)
     if (previous) return previous.result
     if (Buffer.byteLength(canonical(p)) > 32768)
       throw new ChannelError('invalid_params', 'Request exceeds 32768 bytes')
-    const target = p.project_id
-      ? await this.projectTarget(actor, String(p.project_id))
-      : await this.worktreeTarget(String(p.worktree_id))
+    const target = commandContext
+      ? await this.contextTarget(actor, p)
+      : p.project_id
+        ? await this.projectTarget(actor, String(p.project_id))
+        : await this.worktreeTarget(String(p.worktree_id))
     const source =
       method === 'git.v1.integrate'
         ? await this.worktreeTarget(String(p.source_worktree_id))
@@ -273,8 +507,29 @@ export class ManagerService {
         if (!ENV.test(key) || value.includes('\0'))
           throw new ChannelError('invalid_params', 'Environment key is not allowed: ' + key)
       }
-    const cwd = this.cwd(target.path, p.cwd as string | undefined)
+    let cwd: string
+    try {
+      cwd = this.cwd(target.path, p.cwd as string | undefined)
+      this.cwdFingerprint(cwd)
+    } catch (error) {
+      if (commandContext)
+        throw new ChannelError(
+          'unsafe_path',
+          'Missing or unsafe cwd; select a directory inside the execution target',
+          { resource: 'cwd' }
+        )
+      throw error
+    }
     const run: Run = {
+      ...(commandContext
+        ? {
+            context_id: commandContext.context.context_id,
+            permission_mode: commandContext.original.permission_mode as 'ask' | 'bypass',
+            ...(commandContext.original.justification !== undefined
+              ? { justification: String(commandContext.original.justification) }
+              : {}),
+          }
+        : {}),
       run_id: randomUUID(),
       prompt_id: randomUUID(),
       session_id: String(p.session_id),
@@ -285,7 +540,7 @@ export class ManagerService {
       source,
       cwd,
       cwd_fingerprint: this.cwdFingerprint(cwd),
-      state: 'pending_approval',
+      state: commandContext?.original.permission_mode === 'bypass' ? 'running' : 'pending_approval',
       stdout: '',
       stderr: '',
       stdout_truncated: false,
@@ -298,7 +553,7 @@ export class ManagerService {
           'resource_busy',
           'Execution target is busy; retry after the active run ends.'
         )
-    return this.core.commitOperation(actor, method, p, operation, () => {
+    const result = this.core.commitOperation(actor, receiptMethod, receiptParams, operation, () => {
       this.check(run)
       const input = {
         method,
@@ -310,6 +565,13 @@ export class ManagerService {
             }
           : {}),
         cwd: run.cwd,
+        ...(commandContext
+          ? {
+              context_id: run.context_id,
+              parent_chat_id: commandContext.context.parent_chat_id,
+              permission_mode: run.permission_mode,
+            }
+          : {}),
         cwd_fingerprint: run.cwd_fingerprint,
         project_id: target.project_id,
         target_fingerprint: target.fingerprint,
@@ -322,9 +584,9 @@ export class ManagerService {
         revision: 1,
         action_digest: createHash('sha256').update(canonical(input)).digest('hex'),
         expires_at: Number.MAX_SAFE_INTEGER,
-        state: 'pending',
-        choice: null,
-        installation_id: null,
+        state: run.permission_mode === 'bypass' ? 'resolved' : 'pending',
+        choice: run.permission_mode === 'bypass' ? 'allow' : null,
+        installation_id: run.permission_mode === 'bypass' ? actor.installation_id : null,
         delivered: false,
         tool_name: method,
         title:
@@ -335,17 +597,24 @@ export class ManagerService {
       })
       this.save(run)
       this.core.db
-        .prepare('INSERT INTO prompts VALUES(?,?,?,?)')
+        .prepare(
+          `INSERT INTO ${run.context_id ? 'command_context_prompts' : 'prompts'} VALUES(?,?,?,?)`
+        )
         .run(prompt.prompt_id, prompt.session_id, prompt.run_id, JSON.stringify(prompt))
       this.core.append(
         run.session_id,
-        'prompt.opened',
+        run.permission_mode === 'bypass' ? 'command.bypass' : 'prompt.opened',
         { kind: 'installation', installation_id: actor.installation_id },
         prompt
       )
       this.event(run)
-      return this.view(run)
+      return commandContext ? this.contextRunView(run) : this.view(run)
     })
+    if (run.permission_mode === 'bypass') {
+      const row = this.core.db.prepare('SELECT 1 FROM manager_runs WHERE run_id=?').get(run.run_id)
+      if (row) this.answered(this.runPrompt(run), actor)
+    }
+    return result
   }
   /** Called after prompt.answer has committed, never from inside its transaction. */
   answered(prompt: Prompt, owner: AuthorityContext) {
@@ -354,13 +623,21 @@ export class ManagerService {
       .get(prompt.run_id) as { body: string } | undefined
     if (!row) return
     const run = JSON.parse(row.body) as Run
-    if (run.prompt_id !== prompt.prompt_id || run.state !== 'pending_approval') return
+    const bypassAdmission =
+      run.permission_mode === 'bypass' && run.state === 'running' && !this.runPrompt(run).delivered
+    if (
+      run.prompt_id !== prompt.prompt_id ||
+      (run.state !== 'pending_approval' && !bypassAdmission)
+    )
+      return
     const allowed = !this.stopping && prompt.state === 'resolved' && prompt.choice === 'allow'
     // Claim and consume the reply atomically before yielding; duplicate answers cannot launch twice.
     run.state = allowed ? 'running' : 'denied'
     this.core.transaction(() => {
       this.core.db
-        .prepare('UPDATE prompts SET body=? WHERE prompt_id=?')
+        .prepare(
+          `UPDATE ${run.context_id ? 'command_context_prompts' : 'prompts'} SET body=? WHERE prompt_id=?`
+        )
         .run(JSON.stringify({ ...prompt, delivered: true }), prompt.prompt_id)
       this.core.append(run.session_id, 'prompt.delivered', node, {
         prompt_id: prompt.prompt_id,

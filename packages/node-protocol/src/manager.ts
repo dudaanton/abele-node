@@ -65,6 +65,41 @@ export const ManagerMethodSchemas = {
 export type CommandRunRequest = z.infer<(typeof ManagerMethodSchemas)['command.v1.run']>
 export type GitIntegrateRequest = z.infer<(typeof ManagerMethodSchemas)['git.v1.integrate']>
 
+const contextBinding = { context_id: id, parent_chat_id: id }
+const contextRun = { ...contextBinding, run_id: id }
+export const CommandContextMethodSchemas = {
+  'command.context.v1.create': z
+    .object({
+      parent_chat_id: id,
+      project_id: id.optional(),
+      worktree_id: id.optional(),
+    })
+    .strict()
+    .refine(
+      (p) => (p.project_id !== undefined) !== (p.worktree_id !== undefined),
+      'Supply exactly one project_id or worktree_id'
+    ),
+  'command.context.v1.prepare': ManagerMethodSchemas['command.v1.run']
+    .innerType()
+    .innerType()
+    .omit({ session_id: true, project_id: true, worktree_id: true })
+    .extend({
+      ...contextBinding,
+      permission_mode: z.enum(['ask', 'bypass']),
+      justification: z.string().max(512).optional(),
+    })
+    .strict()
+    .refine(
+      (p) => (p.argv !== undefined) !== (p.command !== undefined),
+      'Supply exactly one argv or command'
+    ),
+  'command.context.v1.execute': z
+    .object({ ...contextRun, action_digest: id, choice: z.enum(['allow', 'deny']) })
+    .strict(),
+  'command.context.v1.status': z.object(contextRun).strict(),
+  'command.context.v1.cancel': z.object(contextRun).strict(),
+} as const
+
 export const ManagerRunSchema = z
   .object({
     run_id: id,
@@ -94,3 +129,21 @@ export const ManagerRunSchema = z
   })
   .strict()
 export type ManagerRun = z.infer<typeof ManagerRunSchema>
+
+export const CommandContextSchema = z
+  .object({
+    context_id: id,
+    parent_chat_id: id,
+    stream_id: id,
+    project_id: id.optional(),
+    worktree_id: id.optional(),
+  })
+  .strict()
+export const CommandContextRunSchema = ManagerRunSchema.extend({
+  context_id: id,
+  permission_mode: z.enum(['ask', 'bypass']),
+  justification: z.string().max(512).optional(),
+  approval: z.record(z.unknown()).nullable(),
+}).strict()
+export type CommandContext = z.infer<typeof CommandContextSchema>
+export type CommandContextRun = z.infer<typeof CommandContextRunSchema>

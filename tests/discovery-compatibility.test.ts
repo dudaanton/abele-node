@@ -90,6 +90,29 @@ function setup(paired: boolean) {
   return { core, open, endpoint, seen }
 }
 
+it('requires command context capability opt-in on every channel connection', async () => {
+  const { core, open } = setup(false)
+  const token = core.createToken('command owner')
+  const client = new NodeClient(
+    { profile: 'local-token-v1', url: 'ws://127.0.0.1:7777/channel', token: token.token },
+    new MemoryClientStore(),
+    new LocalChannelConnector(open)
+  )
+  cleanup.push(() => client.disconnect())
+  await client.connect()
+  const prepare = () =>
+    client.request('command.context.v1.status', {
+      context_id: 'missing',
+      parent_chat_id: 'chat',
+      run_id: 'missing',
+    })
+  await expect(prepare()).rejects.toThrow('capability_required')
+  await client.request('command.context.v1.enable', {})
+  await expect(prepare()).rejects.toThrow('context')
+  await client.connect()
+  await expect(prepare()).rejects.toThrow('capability_required')
+})
+
 it.each([false, true])(
   'legacy owner send restarts after Stop while controller admission stays fenced (delegated: %s)',
   async (delegated) => {
