@@ -400,7 +400,7 @@ export class ReviewBatchService {
       if (refusal) return refusal
       if (core.session(batch.session_id).workspace_id !== session.workspace_id)
         throw new ChannelError('invalid_anchor')
-      const result = core.acceptInput(actor, {
+      const result = core.acceptOwnerInput(actor, {
         session_id: batch.session_id,
         observed_seq: batch.observed_seq,
         text,

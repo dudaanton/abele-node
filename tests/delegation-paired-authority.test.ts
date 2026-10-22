@@ -7,6 +7,50 @@ import type { DelegationCreateRequest } from '@abele/node-protocol'
 import { generateIdentity, type AuthorityContext } from '@abele/channel-protocol'
 
 const cleanup: (() => void)[] = []
+it('holds an owner Stop across two paired devices and daemon restart until the owner restarts', async () => {
+  const f = setup()
+  const owner = await f.paired()
+  const manager = await f.paired()
+  const grant = f.grant(owner, manager)
+  const child = await f.create(manager, grant.grant_id)
+  f.core.tick()
+  const prompt = f.core.prompts(child.session_id)[0]!
+  f.request(owner, 'session.interrupt', { session_id: child.session_id, run_id: prompt.run_id })
+  f.restart()
+  expect(
+    f.request(manager, 'delegation.send', {
+      delegation_id: child.delegation_id,
+      text: 'resume',
+      observed_seq: 0,
+    })
+  ).toMatchObject({
+    code: 'owner_restart_required',
+    reason: 'stopped_by_owner',
+    stop_generation: 1,
+  })
+  expect(
+    f.core.acceptInput(manager, {
+      session_id: child.session_id,
+      text: 'another route',
+      observed_seq: 0,
+    })
+  ).toMatchObject({ code: 'owner_restart_required' })
+  expect(
+    f.request(owner, 'session.owner_restart', {
+      session_id: child.session_id,
+      stop_generation: 1,
+      text: 'fresh owner input',
+      observed_seq: 0,
+    })
+  ).toHaveProperty('input_id')
+  f.core.tick()
+  expect(
+    f.core
+      .read(child.session_id, 0)
+      .filter((e) => e.type === 'content.delta')
+      .map((e) => (e.data as any).text)
+  ).toEqual(['fresh owner input'])
+})
 it.each(['local', 'paired'] as const)(
   'delegates grant-free with retained %s authority',
   async (profile) => {

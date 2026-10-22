@@ -2,7 +2,7 @@ import { z } from 'zod'
 import { Id, Sequence } from '@abele/channel-protocol'
 import { ExpectedExecutionTargetSchema, TurnAdmissionResultSchema } from './turn.js'
 import { ObsidianToolsSnapshotSchema } from './obsidian-tools.js'
-import { ToolPermissionsSchema, SESSION_PERMISSION_MODES } from './live.js'
+import { ToolPermissionsSchema, SESSION_PERMISSION_MODES, OwnerStopFields } from './live.js'
 
 export const DelegationActionSchema = z.enum(['create', 'send', 'status', 'cancel', 'read'])
 export const DelegationStateSchema = z.enum([
@@ -55,6 +55,7 @@ export const DelegationGrantSchema = z
 export type DelegationGrant = z.infer<typeof DelegationGrantSchema>
 export const DelegationSchema = z
   .object({
+    ...OwnerStopFields,
     node_id: Id,
     session_id: Id,
     delegation_id: Id,
@@ -93,6 +94,7 @@ export const DelegationSendResultSchema = TurnAdmissionResultSchema
 export type DelegationSendResult = z.infer<typeof DelegationSendResultSchema>
 export const DelegationTerminalSchema = z
   .object({
+    ...OwnerStopFields,
     delegation_id: Id,
     session_id: Id,
     state: z.enum(['completed', 'failed', 'cancelled', 'unknown', 'stopped']),

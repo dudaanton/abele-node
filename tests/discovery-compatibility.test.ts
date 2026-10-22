@@ -91,6 +91,154 @@ function setup(paired: boolean) {
 }
 
 it.each([false, true])(
+  'legacy owner send restarts after Stop while controller admission stays fenced (delegated: %s)',
+  async (delegated) => {
+    const { core, open } = setup(false)
+    const token = core.createToken('legacy owner')
+    const actor = core.authority.authenticate(token.token)
+    const client = new NodeClient(
+      { profile: 'local-token-v1', url: 'ws://127.0.0.1:7777/channel', token: token.token },
+      new MemoryClientStore(),
+      new LocalChannelConnector(open)
+    )
+    cleanup.push(() => client.disconnect())
+    await client.connect()
+    const child = delegated
+      ? await client.createDelegation({
+          parent_id: 'manager',
+          delegation_key: 'legacy-stop',
+          title: 'Child',
+          provider: 'fake',
+          text: 'old work',
+        })
+      : await client.createSession('Direct')
+    const oldParams = {
+      session_id: child.session_id,
+      text: 'owner work before Stop',
+      observed_seq: 0,
+    }
+    const old = await client.send(child.session_id, oldParams.text, 0)
+    const oldReceipt = await client.sendResult(old.operation_id)
+    await client.stopSession(child.session_id)
+    expect(core.request(actor, 'session.send', oldParams, old.operation_id)).toEqual(oldReceipt)
+    expect(core.session(child.session_id).owner_stopped).toBe(true)
+    if (delegated)
+      await expect(
+        client.sendDelegation((child as any).delegation_id, 'manager follow-up', 0)
+      ).rejects.toThrow('owner_restart_required')
+    expect(
+      core.acceptInput(actor, {
+        session_id: child.session_id,
+        text: 'controller tool',
+        observed_seq: 0,
+        sender: { id: 'owner', title: 'Owner' },
+      })
+    ).toMatchObject({ code: 'owner_restart_required' })
+    const invalid = await client.send(
+      child.session_id,
+      'invalid owner input',
+      Number.MAX_SAFE_INTEGER
+    )
+    await expect(client.sendResult(invalid.operation_id)).rejects.toThrow('stale_revision')
+    expect(core.session(child.session_id).owner_stopped).toBe(true)
+    const sent = await client.send(
+      child.session_id,
+      'fresh owner work',
+      core.head(child.session_id)
+    )
+    expect(await client.sendResult(sent.operation_id)).toHaveProperty('input_id')
+    core.tick()
+    expect(
+      core
+        .read(child.session_id, 0)
+        .filter((e) => e.type === 'content.delta')
+        .map((e) => (e.data as any).text)
+    ).toEqual(['fresh owner work'])
+    expect(core.session(child.session_id).owner_stopped).toBe(false)
+  }
+)
+
+it('negotiates owner-stop fields per connection while fencing independent devices unconditionally', async () => {
+  const { core, open } = setup(false)
+  const managerToken = core.createToken('manager')
+  const ownerToken = core.createToken('owner')
+  const connect = async (token: string) => {
+    const client = new NodeClient(
+      { profile: 'local-token-v1', url: 'ws://127.0.0.1:7777/channel', token },
+      new MemoryClientStore(),
+      new LocalChannelConnector(open)
+    )
+    cleanup.push(() => client.disconnect())
+    await client.connect()
+    return client
+  }
+  const manager = await connect(managerToken.token)
+  const owner = await connect(ownerToken.token)
+  const actor = core.authority.authenticate(managerToken.token)
+  const grant: any = core.request(
+    actor,
+    'delegation.grant.create',
+    { parent_id: 'parent', project_ids: [], allow_fake: true },
+    'grant'
+  )
+  const child: any = await core.request(
+    actor,
+    'delegation.create',
+    {
+      grant_id: grant.grant_id,
+      delegation_key: 'child',
+      title: 'Child',
+      provider: 'fake',
+      text: 'work',
+    },
+    'child'
+  )
+  await owner.stopSession(child.session_id)
+  const legacy = await manager.request('session.get', { session_id: child.session_id })
+  expect(Session042Schema.parse(legacy)).not.toHaveProperty('owner_stopped')
+  const legacyDelegation = (await manager.request('delegation.status', {
+    delegation_id: child.delegation_id,
+  })) as Record<string, unknown>
+  const {
+    worktree_id: _worktree,
+    session_head_seq: _sessionHead,
+    mailbox_head_seq: _mailboxHead,
+    pending_human_prompts: _pendingCount,
+    pending_prompts: _pending,
+    ...legacyBase
+  } = legacyDelegation
+  expect(Delegation042Schema.parse(legacyBase)).toMatchObject({ state: 'stopped' })
+  await expect(manager.sendDelegation(child.delegation_id, 'resume', 0)).rejects.toThrow(
+    'owner_restart_required'
+  )
+  await manager.request('session.owner-stop.v1.enable', {})
+  expect(await manager.request('session.state', { session_id: child.session_id })).toMatchObject({
+    owner_stopped: true,
+    stop_generation: 1,
+    stop_reason: 'stopped_by_owner',
+  })
+  expect(await manager.sendDelegation(child.delegation_id, 'resume', 0)).toMatchObject({
+    code: 'owner_restart_required',
+    stop_generation: 1,
+  })
+  await owner.request('session.owner-stop.v1.enable', {})
+  expect(
+    await owner.restartSessionByOwner({
+      session_id: child.session_id,
+      stop_generation: 1,
+      text: 'fresh owner work',
+      observed_seq: core.head(child.session_id),
+    })
+  ).toMatchObject({ input_id: expect.any(String) })
+  core.tick()
+  expect(await manager.request('session.get', { session_id: child.session_id })).toMatchObject({
+    owner_stopped: false,
+    stop_generation: 1,
+    stop_reason: null,
+  })
+})
+
+it.each([false, true])(
   '0.4.2 decoders still pair/connect and chat against the new node (paired=%s)',
   async (paired) => {
     const { core, open, endpoint, seen } = setup(paired)

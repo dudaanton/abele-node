@@ -5,6 +5,209 @@ import { join } from 'node:path'
 import { NodeCore } from '@abele/node-core'
 
 const cleanup: (() => void)[] = []
+it('adds durable owner intent to an existing database without losing sessions or receipts', async () => {
+  const f = fixture()
+  const child = await f.create('upgrade')
+  f.core.db.exec('DROP TABLE session_owner_stops')
+  f.restart()
+  expect(await f.create('upgrade')).toEqual(child)
+  f.request('session.stop', { session_id: child.session_id })
+  f.restart()
+  expect(f.request('session.get', { session_id: child.session_id })).toMatchObject({
+    owner_stopped: true,
+    stop_generation: 1,
+  })
+})
+it('owner interruption invalidates approval and survives late metadata and terminal records', async () => {
+  const f = fixture()
+  const child = await f.create('approval-fence', [{ kind: 'permission' }, { kind: 'echo' }])
+  const oldBody = f.core.db
+    .prepare('SELECT body FROM sessions WHERE session_id=?')
+    .get(child.session_id)!.body
+  f.core.tick()
+  const prompt = f.core.prompts(child.session_id)[0]!
+  f.request('session.interrupt', { session_id: child.session_id, run_id: prompt.run_id })
+  expect(f.core.prompt(prompt.prompt_id).state).toBe('invalidated')
+  expect(() =>
+    f.request('prompt.answer', {
+      session_id: child.session_id,
+      prompt_id: prompt.prompt_id,
+      run_id: prompt.run_id,
+      revision: prompt.revision,
+      action_digest: prompt.action_digest,
+      choice: 'allow',
+    })
+  ).toThrow('prompt_expired')
+  // A metadata writer that captured the pre-Stop session cannot overwrite execution intent.
+  f.core.db
+    .prepare('UPDATE sessions SET body=? WHERE session_id=?')
+    .run(String(oldBody), child.session_id)
+  f.core.transaction(() =>
+    f.core.append(
+      child.session_id,
+      'run.failed',
+      { kind: 'node' },
+      { run_id: prompt.run_id, reason: 'late_provider_failure' }
+    )
+  )
+  f.restart()
+  f.core.tick()
+  expect(f.request('session.get', { session_id: child.session_id })).toMatchObject({
+    owner_stopped: true,
+    stop_generation: 1,
+    stop_reason: 'stopped_by_owner',
+  })
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toMatchObject({
+    state: 'stopped',
+    reason: 'stopped_by_owner',
+  })
+})
+it('supersedes queued controller work, keeps old receipts inert, and rejects stale owner generations', async () => {
+  const f = fixture()
+  const child = await f.create('queue-fence', [{ kind: 'hang' }])
+  const params = {
+    delegation_id: child.delegation_id,
+    text: 'old controller input',
+    observed_seq: 0,
+  }
+  const oldReceipt = f.request('delegation.send', params, 'before-stop')
+  const stop = { session_id: child.session_id }
+  f.request('session.stop', stop, 'stop-one')
+  const stopHead = f.core.head(child.session_id)
+  expect(f.request('session.stop', stop, 'stop-one')).toMatchObject({ state: 'stopped' })
+  expect(f.core.head(child.session_id)).toBe(stopHead)
+  expect(f.request('delegation.send', params, 'before-stop')).toEqual(oldReceipt)
+  f.core.tick()
+  expect(f.core.read(child.session_id, 0).filter((e) => e.type === 'run.started')).toHaveLength(0)
+  expect(
+    f.core.db
+      .prepare('SELECT state FROM inputs WHERE session_id=?')
+      .all(child.session_id)
+      .map((r) => r.state)
+  ).toEqual(['cancelled', 'cancelled'])
+  const restart = { ...stop, stop_generation: 1, text: 'fresh owner input', observed_seq: 0 }
+  f.request('session.stop', stop, 'stop-two')
+  expect(() => f.request('session.owner_restart', restart, 'stale-restart')).toThrow(
+    'stale_revision'
+  )
+  expect(() =>
+    f.core.request(
+      { installation_id: f.actor.installation_id },
+      'session.owner_restart',
+      { ...restart, stop_generation: 2 },
+      'model'
+    )
+  ).toThrow('unauthorized')
+  expect(
+    f.core.acceptInput(f.actor, { ...stop, text: 'internal wake', observed_seq: 0 })
+  ).toMatchObject({ code: 'owner_restart_required' })
+  expect(f.request('session.state', stop)).toMatchObject({
+    owner_stopped: true,
+    stop_generation: 2,
+  })
+  const receipt = f.request(
+    'session.owner_restart',
+    { ...restart, stop_generation: 2 },
+    'fresh-restart'
+  )
+  f.core.tick()
+  expect(f.core.read(child.session_id, 0).filter((e) => e.type === 'run.started')).toHaveLength(1)
+  expect(
+    f.core
+      .read(child.session_id, 0)
+      .filter((e) => e.type === 'content.delta')
+      .map((e) => (e.data as any).text)
+  ).toEqual(['fresh owner input'])
+  f.request('session.stop', stop, 'stop-three')
+  expect(
+    f.request('session.owner_restart', { ...restart, stop_generation: 2 }, 'fresh-restart')
+  ).toEqual(receipt)
+  expect(f.request('session.get', stop)).toMatchObject({ owner_stopped: true, stop_generation: 3 })
+  expect(
+    f.core
+      .read(child.session_id, 0)
+      .filter((e) => e.type === 'session.owner_stop')
+      .map((e) => (e.data as any).owner_stopped)
+  ).toEqual([true, true, false, true])
+})
+it('keeps controller cancellation restartable without creating owner intent', async () => {
+  const f = fixture()
+  const child = await f.create('controller-cancel', [{ kind: 'hang' }])
+  f.request('delegation.cancel', { delegation_id: child.delegation_id })
+  expect(f.core.ownerStopRefusal(child.session_id)).toBeNull()
+  expect(
+    f.request('delegation.send', {
+      delegation_id: child.delegation_id,
+      text: 'again',
+      observed_seq: 0,
+    })
+  ).toHaveProperty('input_id')
+  f.core.tick()
+  expect(f.request('delegation.status', { delegation_id: child.delegation_id }).state).toBe(
+    'completed'
+  )
+})
+it.each([false, true])(
+  'fences owner stops across devices and restart (queued: %s)',
+  async (queued) => {
+    const f = fixture()
+    const child = await f.create('owner-fence', [{ kind: 'hang' }])
+    const owner = f.core.authority.authenticate(f.core.createToken('owner-device').token)
+    if (!queued) f.core.tick()
+    const input = f.core.db
+      .prepare('SELECT * FROM inputs WHERE session_id=?')
+      .get(child.session_id) as any
+    f.core.request(
+      owner,
+      queued ? 'input.cancel' : 'session.interrupt',
+      {
+        session_id: child.session_id,
+        ...(queued ? { input_id: input.input_id } : { run_id: input.run_id }),
+      },
+      'owner-stop'
+    )
+    f.restart()
+    const refusal = {
+      code: 'owner_restart_required',
+      session_id: child.session_id,
+      reason: 'stopped_by_owner',
+      stop_generation: 1,
+    }
+    const followup = { delegation_id: child.delegation_id, text: 'resume', observed_seq: 0 }
+    const stoppedHead = f.core.head(child.session_id)
+    const mailboxHead = f.core.head(child.mailbox_stream_id)
+    expect(f.request('delegation.send', followup, 'retry')).toEqual(refusal)
+    expect(f.request('delegation.send', followup, 'retry')).toEqual(refusal)
+    expect(f.request('delegation.send', followup)).toEqual(refusal)
+    expect(
+      f.core.acceptInput(f.actor, { session_id: child.session_id, text: 'bypass', observed_seq: 0 })
+    ).toEqual(refusal)
+    f.core.tick()
+    expect(f.core.head(child.session_id)).toBe(stoppedHead)
+    expect(f.core.head(child.mailbox_stream_id)).toBe(mailboxHead)
+    expect(f.request('delegation.status', { delegation_id: child.delegation_id })).toMatchObject({
+      state: 'stopped',
+      reason: 'stopped_by_owner',
+      stop_generation: 1,
+    })
+    expect(
+      f.core.read(child.session_id, 0).filter((e) => e.type === 'input.accepted')
+    ).toHaveLength(1)
+    const restart = {
+      session_id: child.session_id,
+      stop_generation: 1,
+      text: 'owner restarts',
+      observed_seq: f.core.head(child.session_id),
+    }
+    const receipt = f.core.request(owner, 'session.owner_restart', restart, 'restart')
+    expect(receipt).toHaveProperty('input_id')
+    expect(f.core.request(owner, 'session.owner_restart', restart, 'restart')).toEqual(receipt)
+    f.core.tick()
+    expect(f.core.read(child.session_id, 0).filter((e) => e.type === 'run.started')).toHaveLength(
+      queued ? 1 : 2
+    )
+  }
+)
 it('reports provider refusal reasons in delegation status', async () => {
   const f = fixture()
   const child = await f.create('refusal', [{ kind: 'hang' }])

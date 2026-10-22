@@ -42,6 +42,15 @@ type ActiveRun = {
 /** The durable queue is the only input owner. External process effects are never inside SQL transactions. */
 export class ProviderSessions {
   private active = new Map<string, ActiveRun>()
+  hasExecution(session_id: string) {
+    return (
+      this.active.has(session_id) ||
+      this.live.hasExecution(session_id) ||
+      !!this.core.db
+        .prepare("SELECT 1 FROM provider_runs WHERE session_id=? AND state='active'")
+        .get(session_id)
+    )
+  }
   private stopping = false
   /** Long-lived processes for owner sessions; delegated work stays one process per message. */
   readonly live: LiveSessions
@@ -534,7 +543,8 @@ export class ProviderSessions {
             question: (action, signal) => this.permission(input, action, signal),
           }
         )
-        if (this.stopping) await slot.run.interrupt()
+        if (this.stopping || this.core.ownerStopRefusal(session.session_id))
+          await slot.run.interrupt()
         slot.completion = slot.run.done
           .then((result) => {
             slot.debugger?.close()

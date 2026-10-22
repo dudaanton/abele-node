@@ -11,8 +11,10 @@ import {
 import { MethodSchemas, PairingMethodSchemas } from '@abele/node-protocol'
 import { NodeCore } from '@abele/node-core'
 import { legacyExecutionPolicy } from './execution-policy-wire.js'
+import { legacyOwnerStop } from './owner-stop-wire.js'
 
 const POLICY_ENABLE = 'execution.policy.v1.enable'
+const OWNER_STOP_ENABLE = 'session.owner-stop.v1.enable'
 
 /**
  * The welcome travels inside the handshake, which clients bound to `LIMITS.auth_bytes`, so it
@@ -120,6 +122,7 @@ export async function serveChannel(
   }
   const connection = new AbortController()
   let executionPolicyEnabled = false
+  let ownerStopEnabled = false
   let selfDisconnectReply: string | undefined
   const requests = new Set<Promise<void>>()
   const scheduler = new RecordScheduler({
@@ -144,7 +147,11 @@ export async function serveChannel(
   })
   const send = (frame: unknown, priority = 0, authorize?: () => void) =>
     scheduler.send(
-      executionPolicyEnabled ? frame : legacyExecutionPolicy(frame),
+      ownerStopEnabled
+        ? executionPolicyEnabled
+          ? frame
+          : legacyExecutionPolicy(frame)
+        : legacyOwnerStop(executionPolicyEnabled ? frame : legacyExecutionPolicy(frame)),
       priority,
       authorize
     )
@@ -228,6 +235,7 @@ export async function serveChannel(
           methods: [
             ...Object.keys(MethodSchemas),
             POLICY_ENABLE,
+            OWNER_STOP_ENABLE,
             ...core.debuggerControl.methods(),
             ...core.trace.methods(),
             ...core.http.methods(),
@@ -250,7 +258,7 @@ export async function serveChannel(
         let response: RecordFrame
         try {
           let result: unknown
-          if (frame.method === POLICY_ENABLE) {
+          if (frame.method === POLICY_ENABLE || frame.method === OWNER_STOP_ENABLE) {
             if (
               !frame.params ||
               typeof frame.params !== 'object' ||
@@ -258,7 +266,8 @@ export async function serveChannel(
               Object.keys(frame.params).length
             )
               throw new ChannelError('invalid_params')
-            executionPolicyEnabled = true
+            if (frame.method === POLICY_ENABLE) executionPolicyEnabled = true
+            else ownerStopEnabled = true
             result = { enabled: true }
           } else if (
             ['stream.subscribe', 'stream.ack', 'stream.unsubscribe'].includes(frame.method)
@@ -335,7 +344,7 @@ export async function serveChannel(
           frame.method === 'artifact.read' ? 2 : 0,
           response.error
             ? undefined
-            : frame.method === POLICY_ENABLE
+            : frame.method === POLICY_ENABLE || frame.method === OWNER_STOP_ENABLE
               ? () => core.authority.check(actor!, 'request')
               : () => core.checkPublication(actor!, frame.method, frame.params, response.result)
         ).catch(() => close('send_failed'))

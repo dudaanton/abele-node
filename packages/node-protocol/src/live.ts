@@ -1,6 +1,11 @@
 import { z } from 'zod'
 
 const id = z.string().min(1).max(128)
+export const OwnerStopFields = {
+  stop_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  owner_stopped: z.boolean().optional(),
+  stop_reason: z.literal('stopped_by_owner').nullable().optional(),
+} as const
 export const SESSION_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export const SESSION_PERMISSION_MODES = [
   'manual',
@@ -89,6 +94,7 @@ export const SessionContextSchema = z
   .strict()
 export const LiveSessionStateSchema = z
   .object({
+    ...OwnerStopFields,
     session_id: id,
     tool_permissions: ToolPermissionsSchema.optional(),
     /** False: one process per message (delegated work, or a CLI without long-lived input). */
@@ -132,6 +138,14 @@ export const LiveSessionStateSchema = z
 export type LiveSessionState = z.infer<typeof LiveSessionStateSchema>
 const runId = { run_id: id }
 export const LiveEventPayloads = {
+  'session.owner_stop': z
+    .object({
+      session_id: id,
+      stop_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      owner_stopped: z.boolean(),
+      reason: z.literal('stopped_by_owner').nullable(),
+    })
+    .strict(),
   'session.process': z
     .object({
       ...runId,

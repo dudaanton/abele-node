@@ -29,6 +29,7 @@ import {
   LiveEventPayloads,
   SessionSettingsSchema,
   ToolPermissionsSchema,
+  OwnerStopFields,
 } from './live.js'
 export * from './live.js'
 import { SessionUpdateEventSchema } from './session-update.js'
@@ -110,6 +111,7 @@ export const PromptSchema = z
 export type Prompt = z.infer<typeof PromptSchema>
 export const SessionSchema = z
   .object({
+    ...OwnerStopFields,
     session_id: id,
     title: z.string().max(256),
     provider: z.enum(['fake', 'claude', 'pi', 'codex', 'acp']),
@@ -160,6 +162,7 @@ export const ErrorCodeSchema = z.enum([
   'operation_id_required',
   'idempotency_mismatch',
   'stale_revision',
+  'owner_restart_required',
   'prompt_expired',
   'resource_busy',
   'resync_required',
@@ -303,6 +306,16 @@ export const MethodSchemas = {
     })
     .strict(),
   'session.interrupt': z.object({ ...session, run_id: id }).strict(),
+  // Owner UI only: never expose this operation through a model/controller tool adapter.
+  'session.owner_restart': z
+    .object({
+      ...session,
+      stop_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      text: z.string().min(1).max(32768),
+      observed_seq: SeqSchema,
+      expected_target: ExpectedExecutionTargetSchema.optional(),
+    })
+    .strict(),
   'input.cancel': z.object({ ...session, input_id: id }).strict(),
   'prompt.list': z
     .object({
@@ -351,6 +364,7 @@ export const MethodSchemas = {
     .strict(),
 } as const
 export type SessionSendRequest = z.input<(typeof MethodSchemas)['session.send']>
+export type SessionOwnerRestartRequest = z.input<(typeof MethodSchemas)['session.owner_restart']>
 export type DelegationCreateRequest = z.input<(typeof MethodSchemas)['delegation.create']>
 export type Method = keyof typeof MethodSchemas
 export const MUTATIONS = new Set<Method>([
@@ -376,6 +390,7 @@ export const MUTATIONS = new Set<Method>([
   'session.delete',
   'session.send',
   'session.interrupt',
+  'session.owner_restart',
   'input.cancel',
   'prompt.answer',
 ])

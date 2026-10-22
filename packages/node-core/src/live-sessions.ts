@@ -209,7 +209,7 @@ export class LiveSessions {
       void slot.live
         .control('set_permission_mode', { mode: after.permission_mode })
         .then(() => (slot.settings = { ...slot.settings, permission_mode: after.permission_mode }))
-        .catch(() => void this.stop(session_id, 'settings_not_applied'))
+        .catch(() => void this.stop(session_id, 'settings_not_applied').catch(() => {}))
     // The tools a process offers are fixed when it starts; calls check the grant every time.
     if (
       before.effort !== after.effort ||
@@ -221,14 +221,25 @@ export class LiveSessions {
   get size() {
     return this.slots.size
   }
+  hasExecution(session_id: string) {
+    return this.slots.has(session_id)
+  }
   state(session_id: string): LiveSessionState {
     const slot = this.slots.get(session_id)
+    const session = this.core.session(session_id)
     const settings = this.effective(session_id)
     const iso = (ms: number) => new Date(ms).toISOString()
     return {
       session_id,
+      ...(session.stop_generation
+        ? {
+            stop_generation: session.stop_generation,
+            owner_stopped: session.owner_stopped,
+            stop_reason: session.stop_reason,
+          }
+        : {}),
       live: this.handles(session_id),
-      tool_permissions: this.core.session(session_id).tool_permissions,
+      tool_permissions: session.tool_permissions,
       process: slot ? slot.state : 'none',
       run_id: slot?.run_id ?? null,
       turn: slot?.turn ?? null,
@@ -246,13 +257,15 @@ export class LiveSessions {
   interruptRequested(session_id: string, run_id: string) {
     const slot = this.slots.get(session_id)
     if (!slot || slot.run_id !== run_id) return false
+    slot.compaction = undefined
+    slot.continueAfterTurn = undefined
     this.core.append(session_id, 'turn.interrupt_requested', actor, { run_id })
     for (const prompt of this.core.prompts(session_id))
       if (prompt.state === 'pending' && prompt.run_id === run_id)
         this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)
     queueMicrotask(() => {
       if (slot.live) void slot.live.interrupt().catch(() => {})
-      else void this.stop(session_id, 'interrupted_while_starting')
+      else void this.stop(session_id, 'interrupted_while_starting').catch(() => {})
     })
     return true
   }
@@ -263,7 +276,12 @@ export class LiveSessions {
       .all(session_id) as Input[])
       this.core.transition(input, 'cancelled')
     const slot = this.slots.get(session_id)
-    if (slot) queueMicrotask(() => void this.stop(session_id, 'stopped_by_owner'))
+    // Cleanup failure is already journaled/quarantined by exited(); drain retries it.
+    if (slot) {
+      slot.compaction = undefined
+      slot.continueAfterTurn = undefined
+    }
+    if (slot) queueMicrotask(() => void this.stop(session_id, 'stopped_by_owner').catch(() => {}))
     return { session_id, state: slot ? 'stopping' : 'stopped' }
   }
   async stop(session_id: string, reason: string) {
@@ -425,7 +443,10 @@ export class LiveSessions {
     const { session_id, run_id } = slot
     const authority = this.core.authority.forInstallation(slot.principal)
     const alive = () =>
-      this.slots.get(session_id) === slot && slot.state !== 'stopping' && !this.deleted(session_id)
+      this.slots.get(session_id) === slot &&
+      slot.state !== 'stopping' &&
+      !this.deleted(session_id) &&
+      !this.core.ownerStopRefusal(session_id)
     if (this.core.debugger.enabled)
       slot.debugger = new DebuggerRunBinding(this.core, {
         authority,
@@ -562,7 +583,7 @@ export class LiveSessions {
         )
           reason = 'idle'
       }
-      if (reason) void this.stop(slot.session_id, reason)
+      if (reason) void this.stop(slot.session_id, reason).catch(() => {})
     }
   }
   /** Make room by ending the longest idle process that has nothing running. */
@@ -571,7 +592,8 @@ export class LiveSessions {
       .filter((s) => (holder ? s.session_id === holder : true) && this.reapable(s, now))
       .sort((a, b) => a.idleSince - b.idleSince)
     const victim = candidates[0]
-    if (victim) void this.stop(victim.session_id, holder ? 'target_needed' : 'process_limit')
+    if (victim)
+      void this.stop(victim.session_id, holder ? 'target_needed' : 'process_limit').catch(() => {})
     return !!victim
   }
   private async reconcileExited(slot: Slot) {
@@ -683,6 +705,10 @@ export class LiveSessions {
       if (slot.state === 'idle' && !slot.turn)
         await this.core.chatCheckpoints.capture(slot.session_id, input_id)
       if (slot.stopReason || this.slots.get(slot.session_id) !== slot) return
+      const current = this.core.db
+        .prepare('SELECT state FROM inputs WHERE input_id=?')
+        .get(input_id)
+      if (current?.state !== 'dispatching') return
       this.core.checkExecution(String(input.principal_id), slot.session_id, body.expected_target)
       slot.live!.send({ input_id, content: this.content(input) })
     } catch {
@@ -694,7 +720,10 @@ export class LiveSessions {
         if (current.state !== 'dispatching') return
         this.core.db.prepare('UPDATE inputs SET run_id=NULL WHERE input_id=?').run(input_id)
         current.run_id = null
-        this.core.transition(current, 'queued')
+        this.core.transition(
+          current,
+          this.core.ownerStopRefusal(slot.session_id) ? 'cancelled' : 'queued'
+        )
       })
     }
   }
@@ -1058,6 +1087,11 @@ export class LiveSessions {
           return
         }
         case 'claude.turn.started': {
+          if (this.core.ownerStopRefusal(session_id))
+            queueMicrotask(() => {
+              if (this.core.ownerStopRefusal(session_id))
+                void slot.live?.interrupt().catch(() => {})
+            })
           slot.turn = {
             turn_id: randomUUID(),
             trigger: String(d.trigger ?? 'unknown').slice(0, 32),
@@ -1208,6 +1242,7 @@ export class LiveSessions {
   }
   /** After a requested compaction the session goes on by itself, as the owner's own input. */
   private continuation(session_id: string, next: { principal: string; text: string }) {
+    if (this.core.ownerStopRefusal(session_id)) return
     const input_id = randomUUID()
     const body = {
       session_id,

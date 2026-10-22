@@ -20,5 +20,17 @@ export const TargetChangedRefusalSchema = z
   .strict()
 export type TargetChangedRefusal = z.infer<typeof TargetChangedRefusalSchema>
 export const TurnAcceptedSchema = z.object({ input_id: Id, accepted_seq: Sequence }).strict()
-export const TurnAdmissionResultSchema = z.union([TurnAcceptedSchema, TargetChangedRefusalSchema])
+export const OwnerRestartRequiredSchema = z
+  .object({
+    code: z.literal('owner_restart_required'),
+    session_id: Id,
+    reason: z.literal('stopped_by_owner'),
+    stop_generation: Sequence,
+  })
+  .strict()
+export const TurnAdmissionResultSchema = z.union([
+  TurnAcceptedSchema,
+  TargetChangedRefusalSchema,
+  OwnerRestartRequiredSchema,
+])
 export type TurnAdmissionResult = z.infer<typeof TurnAdmissionResultSchema>

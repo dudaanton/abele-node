@@ -463,6 +463,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       DROP TABLE workspace_leases_single;
       CREATE INDEX workspace_leases_workspace ON workspace_leases(workspace_id);
       PRAGMA user_version=19; COMMIT;`)
+    // Additive execution intent store, like the auxiliary replay/checkpoint tables below.
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS session_owner_stops(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), generation INTEGER NOT NULL CHECK(generation>0), stopped INTEGER NOT NULL CHECK(stopped IN (0,1)))'
+    )
     // The agent's latest "/" list per session, so a client opening at the tail need not scan back.
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS session_commands(session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, body TEXT NOT NULL)'
@@ -755,6 +759,11 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported' as const,
           evidence: 'persisted-session-delegation-mode-and-per-action-approval',
         },
+        'session.owner-stop.v1': {
+          status: 'supported' as const,
+          evidence:
+            'session.owner-stop.v1.enable; durable-session-fence; generation-matched-session.owner_restart; owner-UI-only',
+        },
         'codex.developer-environment.v1': {
           status: 'supported' as const,
           evidence: 'node-npm-worktree-git-external-caches-project-network-opt-in',
@@ -990,7 +999,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return this.resources.request(actor, method, params, operation)
     if (!MUTATIONS.has(method as Method)) return this.query(actor, method, params)
     const result = this.commitOperation(actor, method, params, operation, () =>
-      this.mutate(actor, method, params)
+      this.mutate(actor, method, params, method === 'session.send' || method === 'session.compact')
     )
     if (method === 'prompt.answer') this.manager.answered(result as Prompt, actor)
     if (method === 'session.interrupt') this.debuggerControl.interruptedRun(String(params.run_id))
@@ -1174,7 +1183,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
               'SELECT body FROM sessions WHERE session_id>? AND session_id NOT IN (SELECT session_id FROM deleted_sessions) ORDER BY session_id LIMIT ?'
             )
             .all(String(p.after_id ?? ''), Number(p.limit)) as Row[]
-        ).map((r) => SessionSchema.parse(JSON.parse(String(r.body))))
+        ).map((r) => this.session(String(JSON.parse(String(r.body)).session_id)))
       case 'session.get':
         return this.session(String(p.session_id))
       case 'session.commands': {
@@ -1238,6 +1247,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   acceptInput(actor: AuthorityContext, p: Record<string, unknown>): TurnAdmissionResult {
     return this.mutate(actor, 'session.send', p) as TurnAdmissionResult
+  }
+  /** Trusted owner request services only, inside their validated operation transaction.
+   * Model/controller adapters must use acceptInput, regardless of installation identity. */
+  acceptOwnerInput(actor: AuthorityContext, p: Record<string, unknown>): TurnAdmissionResult {
+    this.authority.check(actor, 'execute', String(p.session_id))
+    return this.mutate(actor, 'session.send', p, true) as TurnAdmissionResult
   }
   acceptSession(
     actor: AuthorityContext,
@@ -1303,7 +1318,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.append('catalog', 'session.created', installationActor, session)
     return session
   }
-  private mutate(actor: AuthorityContext, method: string, p: Record<string, unknown>): unknown {
+  private mutate(
+    actor: AuthorityContext,
+    method: string,
+    p: Record<string, unknown>,
+    ownerInput = false
+  ): unknown {
     const installationActor = {
       kind: 'installation',
       installation_id: actor.installation_id,
@@ -1396,25 +1416,51 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       queueMicrotask(() => this.claude.live.applied(session, before, after))
       return updated
     }
+    if (method === 'session.owner_restart') {
+      // Only the authenticated owner request boundary supplies a profile. Internal
+      // model bridges admit ordinary inputs, and never export this method.
+      if (!actor.profile) throw new ChannelError('unauthorized')
+      const current = this.session(session)
+      if (!current.owner_stopped || current.stop_generation !== p.stop_generation)
+        throw new ChannelError('stale_revision')
+      const refusal = this.resources.targets.refusal(
+        session,
+        p.expected_target as ExpectedExecutionTarget | undefined
+      )
+      if (refusal) return refusal
+      if (this.claude.hasExecution(session) && this.claude.live.state(session).process !== 'idle')
+        throw new ChannelError('resource_busy')
+      // Use the same atomic owner admission as legacy session.send.
+      const { stop_generation: _generation, ...input } = p
+      return this.mutate(actor, 'session.send', { ...input, script: [{ kind: 'echo' }] }, true)
+    }
     if (method === 'session.stop') {
-      if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
-      this.obsidianTools.cancelRunInTransaction(session, actor.installation_id)
+      this.recordOwnerStop(session, actor)
       this.append(session, 'session.stop_requested', installationActor, { session_id: session })
       return this.claude.live.stopRequested(session)
     }
     if (method === 'session.compact') {
       if (!this.claude.live.handles(session)) throw new ChannelError('unsupported_method')
       const focus = typeof p.focus === 'string' ? p.focus.trim() : ''
-      return this.mutate(actor, 'session.send', {
-        session_id: session,
-        text: focus ? `/compact ${focus}` : '/compact',
-        observed_seq: this.head(session),
-        script: [{ kind: 'echo' }],
-        compact: true,
-        ...(typeof p.continue === 'boolean' ? { continue: p.continue } : {}),
-      })
+      return this.mutate(
+        actor,
+        'session.send',
+        {
+          session_id: session,
+          text: focus ? `/compact ${focus}` : '/compact',
+          observed_seq: this.head(session),
+          script: [{ kind: 'echo' }],
+          compact: true,
+          ...(typeof p.continue === 'boolean' ? { continue: p.continue } : {}),
+        },
+        ownerInput
+      )
     }
     if (method === 'session.send') {
+      const stopped = this.ownerStopRefusal(session)
+      // This flag comes only from the validated owner request/operation boundary.
+      // Delegations and model tools use acceptInput, even with the same authority.
+      if (stopped && !ownerInput) return stopped
       if (this.chatCheckpoints.busy.has(session)) throw new ChannelError('resource_busy')
       const refusal = this.resources.targets.refusal(
         session,
@@ -1433,6 +1479,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           throw new ChannelError('invalid_params')
       }
       if (Number(p.observed_seq) > this.head(session)) throw new ChannelError('stale_revision')
+      if (stopped)
+        this.db.prepare('UPDATE session_owner_stops SET stopped=0 WHERE session_id=?').run(session)
       const input_id = randomUUID()
       const event = this.append(session, 'input.accepted', installationActor, {
         input_id,
@@ -1449,6 +1497,15 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         .run(input_id, session, actor.installation_id, 'accepted', JSON.stringify(p))
       const input = this.db.prepare('SELECT * FROM inputs WHERE input_id=?').get(input_id) as Row
       this.transition(input, 'queued')
+      if (stopped) {
+        this.append(session, 'session.owner_stop', installationActor, {
+          session_id: session,
+          stop_generation: stopped.stop_generation,
+          owner_stopped: false,
+          reason: null,
+        })
+        this.delegations.ownerRestarted(session)
+      }
       return { input_id, accepted_seq: event.seq }
     }
     if (method === 'prompt.answer') {
@@ -1509,6 +1566,8 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       if (!['accepted', 'queued'].includes(String(input.state)))
         throw new ChannelError('resource_busy')
       this.transition(input, 'cancelled')
+      this.recordOwnerStop(session, actor)
+      this.claude.live.stopRequested(session)
       this.append(session, 'run.interrupted', installationActor, {
         input_id: input.input_id,
         reason: 'stopped_by_owner',
@@ -1517,8 +1576,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       return { input_id: p.input_id, state: 'cancelled' }
     }
     if (method === 'session.interrupt') {
+      // Rollback also removes this intent for an invalid/stale run. No external
+      // cleanup is scheduled until the run identity has been checked below.
+      this.recordOwnerStop(session, actor, false)
       if (this.claude.live.interruptRequested(session, String(p.run_id))) {
-        this.obsidianTools.cancelRunInTransaction(session, actor.installation_id, String(p.run_id))
         return { run_id: p.run_id, state: 'interrupting' }
       }
       const input = this.db
@@ -1527,7 +1588,6 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         )
         .get(session, String(p.run_id)) as Row | undefined
       if (!input) throw new ChannelError('stale_revision')
-      this.obsidianTools.cancelRunInTransaction(session, actor.installation_id, String(p.run_id))
       this.debuggerControl.revokeRunInTransaction(String(p.run_id))
       this.transition(
         input,
@@ -1554,7 +1614,69 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       )
       .get(id) as Row | undefined
     if (!row) throw new ChannelError('not_found')
-    return SessionSchema.parse(JSON.parse(String(row.body)))
+    const stop = this.db
+      .prepare('SELECT generation,stopped FROM session_owner_stops WHERE session_id=?')
+      .get(id)
+    return SessionSchema.parse({
+      ...JSON.parse(String(row.body)),
+      ...(stop
+        ? {
+            stop_generation: Number(stop.generation),
+            owner_stopped: !!stop.stopped,
+            stop_reason: stop.stopped ? 'stopped_by_owner' : null,
+          }
+        : {}),
+    })
+  }
+  ownerStopRefusal(session_id: string) {
+    const session = this.session(session_id)
+    return session.owner_stopped
+      ? {
+          code: 'owner_restart_required' as const,
+          session_id,
+          reason: 'stopped_by_owner' as const,
+          stop_generation: session.stop_generation!,
+        }
+      : null
+  }
+  /** Inside the owner mutation transaction; independent of provider cleanup/outcomes. */
+  private recordOwnerStop(session_id: string, authority: AuthorityContext, interruptActive = true) {
+    const current = this.session(session_id)
+    const stop_generation = (current.stop_generation ?? 0) + 1
+    if (!Number.isSafeInteger(stop_generation)) throw new ChannelError('resource_busy')
+    this.db
+      .prepare(
+        'INSERT INTO session_owner_stops VALUES(?,?,1) ON CONFLICT(session_id) DO UPDATE SET generation=excluded.generation,stopped=1'
+      )
+      .run(session_id, stop_generation)
+    const actor = { kind: 'installation' as const, installation_id: authority.installation_id }
+    this.append(session_id, 'session.owner_stop', actor, {
+      session_id,
+      stop_generation,
+      owner_stopped: true,
+      reason: 'stopped_by_owner',
+    })
+    for (const input of this.db
+      .prepare(
+        "SELECT * FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
+      )
+      .all(session_id) as Row[]) {
+      if (['accepted', 'queued'].includes(String(input.state))) this.transition(input, 'cancelled')
+      else if (input.state === 'dispatching' && this.claude.live.handles(session_id))
+        // May be awaiting a checkpoint or an acknowledgement. Never replay it
+        // when a fresh owner message releases the fence before that await ends.
+        this.transition(input, 'delivery_unknown')
+      else if (interruptActive && !this.claude.live.handles(session_id)) {
+        this.transition(input, current.provider === 'fake' ? 'interrupted' : 'delivery_unknown')
+        this.debuggerControl.revokeRunInTransaction(String(input.run_id))
+        if (current.provider === 'fake')
+          this.resources.targets.settle(session_id, String(input.run_id))
+      }
+    }
+    for (const prompt of this.prompts(session_id))
+      if (prompt.state === 'pending') this.resolvePrompt(prompt, 'invalidated', 'deny', null)
+    this.delegations.ownerStopped(session_id, stop_generation)
+    this.obsidianTools.cancelRunInTransaction(session_id, authority.installation_id)
   }
   transition(input: Row, state: string) {
     InputStateSchema.parse(state)
@@ -1611,6 +1733,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   ) {
     const actor = { installation_id }
     this.authority.check(actor, 'execute', session_id)
+    if (this.ownerStopRefusal(session_id)) throw new ChannelError('owner_restart_required')
     if (this.resources.targets.refusal(session_id, expected_target))
       throw new ChannelError('target_changed')
     const session = this.session(session_id)

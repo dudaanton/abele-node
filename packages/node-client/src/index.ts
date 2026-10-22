@@ -37,6 +37,7 @@ import {
   type Prompt,
   type QuestionnaireAnswer,
   type FakeStep,
+  type SessionOwnerRestartRequest,
   ProjectSchema,
   WorkspaceSchema,
   JobSchema,
@@ -58,7 +59,6 @@ import {
   type ExpectedExecutionTarget,
   type TurnAdmissionResult,
   TurnAdmissionResultSchema,
-  TurnAcceptedSchema,
   LiveSessionStateSchema,
   type SessionSettings,
   SessionCommandsSchema,
@@ -426,7 +426,7 @@ export class NodeClient {
     options: { focus?: string; continue?: boolean } = {},
     operation?: string
   ) {
-    return TurnAcceptedSchema.parse(
+    return TurnAdmissionResultSchema.parse(
       await this.mutation(
         'session.compact',
         MethodSchemas['session.compact'].parse({ session_id, ...options }),
@@ -437,6 +437,12 @@ export class NodeClient {
   /** Ends the session's process and everything it started; queued messages are cancelled. */
   stopSession(session_id: string, operation?: string) {
     return this.mutation('session.stop', { session_id }, operation)
+  }
+  /** Fresh child-chat owner gesture only. Never expose through model/controller adapters. */
+  async restartSessionByOwner(params: SessionOwnerRestartRequest, operation?: string) {
+    return TurnAdmissionResultSchema.parse(
+      await this.mutation('session.owner_restart', params, operation)
+    )
   }
   /** The agent's "/" commands as it last reported them; render each update with sessionUpdatesOf. */
   async sessionCommands(session_id: string) {

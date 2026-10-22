@@ -51,6 +51,9 @@ export class DelegationMailbox {
       session_id: d.session_id,
       state: d.state,
       ...(d.reason ? { reason: d.reason } : {}),
+      ...(d.stop_generation
+        ? { stop_generation: d.stop_generation, owner_stopped: d.owner_stopped }
+        : {}),
     })
   }
 }
@@ -221,6 +224,35 @@ export class DelegationService {
       )
       .get(session_id)
   }
+  ownerStopped(session_id: string, stop_generation: number) {
+    const row = this.core.db
+      .prepare('SELECT body FROM delegations WHERE session_id=?')
+      .get(session_id)
+    if (!row) return
+    const d = DelegationSchema.parse(JSON.parse(String(row.body)))
+    d.reason = 'stopped_by_owner'
+    d.stop_generation = stop_generation
+    d.owner_stopped = true
+    d.stop_reason = 'stopped_by_owner'
+    this.finish(d, 'stopped')
+  }
+  ownerRestarted(session_id: string) {
+    const row = this.core.db
+      .prepare('SELECT body FROM delegations WHERE session_id=?')
+      .get(session_id)
+    if (!row) return
+    const d = DelegationSchema.parse(JSON.parse(String(row.body)))
+    d.owner_stopped = false
+    d.stop_reason = null
+    delete d.reason
+    this.save(d)
+    this.core.append(d.mailbox_stream_id, 'session.owner_stop', nodeActor, {
+      session_id,
+      stop_generation: d.stop_generation,
+      owner_stopped: false,
+      reason: null,
+    })
+  }
   reporter(session_id: string, run_id: string) {
     return new WorkerReporter(this, session_id, run_id)
   }
@@ -378,6 +410,8 @@ export class DelegationService {
         return d
       }
       if (method === 'delegation.send') {
+        const stopped = this.core.ownerStopRefusal(d.session_id)
+        if (stopped) return stopped
         const refusal = this.core.resources.targets.refusal(
           d.session_id,
           p.expected_target as ExpectedExecutionTarget | undefined

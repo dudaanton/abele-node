@@ -436,7 +436,7 @@ export class ChatCheckpoints {
             .prepare('SELECT body FROM inputs WHERE input_id=?')
             .get(checkpoint.input_id) as { body: string }
           this.busy.delete(p.session_id)
-          input = this.core.acceptInput(actor, {
+          input = this.core.acceptOwnerInput(actor, {
             session_id: destination.session_id,
             text: p.action === 'edit' ? p.text : JSON.parse(row.body).text,
             observed_seq: this.core.head(destination.session_id),
