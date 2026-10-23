@@ -1,5 +1,6 @@
 import { it, expect, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs'
+import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { LspService } from '../packages/node-core/src/lsp/service.js'
@@ -128,3 +129,63 @@ it('reports watchdog stops separately and restarts a failed slot on explicit ope
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+it.each([true, false])(
+  'reports repeated worker crashes through a root alias (ps succeeds: %s)',
+  async (inventoryAvailable) => {
+    const dir = mkdtempSync(resolve('.scratch/lsp-root-alias-'))
+    const actual = join(dir, 'actual'),
+      root = join(dir, 'alias')
+    mkdirSync(actual)
+    symlinkSync(actual, root, 'dir')
+    writeFileSync(join(actual, 'a.ts'), '')
+    const service = new LspService(dir, {
+      trusted: () => true,
+      check: (base, path) => join(base, path),
+      command: () => ({
+        command: process.execPath,
+        args: [resolve('tests/fixtures/fake-lsp.mjs')],
+      }),
+    })
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      await service.open(root, 'a.ts')
+      const slot = [...(service as any).slots.values()][0]
+      const inventory = vi.mocked(execFile).mockImplementation(((
+        _c: any,
+        _a: any,
+        _o: any,
+        cb: any
+      ) => {
+        cb(
+          inventoryAvailable ? null : new Error('ps denied'),
+          `${slot.connection.child.pid} 1 65536\n`
+        )
+        return {} as any
+      }) as any)
+      const before = inventory.mock.calls.length
+      vi.advanceTimersByTime(5000)
+      expect(inventory.mock.calls.length).toBe(before + 1)
+      const previous = slot.connection
+      previous.notify('workerCrash', {})
+      await expect.poll(() => slot.connection !== previous, { timeout: 5000 }).toBe(true)
+      await service.open(root, 'a.ts')
+      vi.advanceTimersByTime(5000)
+      expect(inventory.mock.calls.length).toBe(before + 2)
+      const closed = once(slot.connection.child, 'close', { signal: AbortSignal.timeout(5000) })
+      slot.connection.notify('workerCrash', {})
+      await closed
+      expect(service.lastFailure(realpathSync(root), 'typescript')).toBe('lsp_repeated_crash')
+      expect(service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
+      expect(service.failureMessage(root, 'typescript')).toContain('heap out of memory')
+      expect(service.failureMessage(root, 'typescript')).toContain('SIGABRT')
+      await expect(service.open(root, 'a.ts')).resolves.toEqual({ servers: ['typescript'] })
+      expect(service.lastFailure(root, 'typescript')).toBeUndefined()
+    } finally {
+      await service.stop()
+      vi.useRealTimers()
+      vi.mocked(execFile).mockReset()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)

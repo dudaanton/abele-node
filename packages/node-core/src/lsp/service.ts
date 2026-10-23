@@ -88,7 +88,17 @@ export class LspService {
   private heapLimit() {
     return Math.max(1, Math.floor(this.memoryLimit() / 2))
   }
+  private failureRoot(root: string) {
+    // open/query store canonical roots. Status callers can still hold a symlink
+    // spelling (notably macOS /var); preserve non-throwing lookup after removal.
+    try {
+      return realpathSync(root)
+    } catch {
+      return root
+    }
+  }
   failureMessage(root: string, language: string) {
+    root = this.failureRoot(root)
     return (
       this.slots.get(this.key(root, language as Language))?.failure?.message ??
       this.lastFailure(root, language)
@@ -103,6 +113,7 @@ export class LspService {
     return root + '\0' + language
   }
   lastFailure(root: string, language: string) {
+    root = this.failureRoot(root)
     return (
       this.slots.get(this.key(root, language as Language))?.failure?.code ??
       this.failures.get(root)?.get(language as Language)?.reason
