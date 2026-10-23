@@ -108,9 +108,12 @@ it(
       send('one more thing')
       await core.execution.drain()
       await waitForProcessCondition(
-        () => states().join() === 'completed,completed',
-        'Codex steered inputs completed'
+        () => journal('turn.completed').length === 1,
+        'Codex steered turn completed'
       )
+      // Completion must include the accepted steer even when both RPC records
+      // arrive in one pipe chunk. A lost input is a failure, not a slow runner.
+      expect(states()).toEqual(['completed', 'completed'])
       expect(journal('turn.completed').at(-1).data.input_ids).toHaveLength(2)
       expect(journal('session.context').at(-1).data.percentage).toBe(25)
       expect(journal('codex.commands')).toHaveLength(1)

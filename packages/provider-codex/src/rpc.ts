@@ -123,7 +123,12 @@ export class RpcPeer {
   private sampler?: ReturnType<typeof setInterval>
   private pending = new Map<
     number,
-    { resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
+    {
+      resolve(value: any): void
+      reject(error: Error): void
+      timer: ReturnType<typeof setTimeout>
+      accepted?: (value: any) => void
+    }
   >()
   private seen = new Set<string>()
   private activeRequests = new Map<string, AbortController>()
@@ -297,7 +302,15 @@ export class RpcPeer {
       this.pending.delete(msg.id)
       this.timers.clearTimeout(slot.timer)
       if (msg.error) slot.reject(new Error(`codex_rpc_error:${msg.error.code}`))
-      else slot.resolve(msg.result)
+      else {
+        try {
+          slot.accepted?.(msg.result)
+        } catch (error) {
+          slot.reject(error instanceof Error ? error : new Error('codex_acceptance_failed'))
+          throw error
+        }
+        slot.resolve(msg.result)
+      }
     }
   }
   private write(msg: RpcMessage) {
@@ -319,7 +332,8 @@ export class RpcPeer {
       })
     )
   }
-  request(method: string, params?: unknown): Promise<any> {
+  // Commit acceptance before dispatching subsequent records in the same pipe chunk.
+  request(method: string, params?: unknown, accepted?: (value: any) => void): Promise<any> {
     if (!METHODS.has(method) || this.reason || this.pending.size >= 32)
       return Promise.reject(new Error('codex_request_forbidden'))
     const id = ++this.next
@@ -328,7 +342,7 @@ export class RpcPeer {
         () => this.fail('codex_rpc_timeout'),
         this.options.timeoutMs ?? 10000
       )
-      this.pending.set(id, { resolve, reject, timer })
+      this.pending.set(id, { resolve, reject, timer, accepted })
       void this.write({ id, method, params }).catch(() => {})
     })
   }

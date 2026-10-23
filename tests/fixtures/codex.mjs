@@ -314,10 +314,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue
     }
     appendFileSync(join(home, 'steer-log.jsonl'), JSON.stringify(p) + '\n', { mode: 0o600 })
+    // Coalesce acceptance and completion, as pipes commonly do on busy runners.
+    process.stdout.cork()
     reply(msg.id, { turnId: turn.id })
     if (!said(p.input).includes('hold')) {
       complete('completed', `steered: ${said(p.input)}`)
     }
+    process.stdout.uncork()
   } else if (msg.method === 'thread/compact/start') {
     if (!thread || p.threadId !== thread.id) process.exit(70)
     reply(msg.id, {})

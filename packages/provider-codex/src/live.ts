@@ -235,18 +235,23 @@ export async function startCodexLiveSession(
       if (COMPACT.test(plain(next.content))) return
       const active = turn
       try {
-        await request('turn/steer', {
-          threadId: thread,
-          expectedTurnId: active.id,
-          input: input(next.content),
-        })
+        await peer.request(
+          'turn/steer',
+          {
+            threadId: thread,
+            expectedTurnId: active.id,
+            input: input(next.content),
+          },
+          () => {
+            queue.shift()
+            active.inputs.push(next.input_id)
+            emit(LIVE.delivered, { input_id: next.input_id })
+          }
+        )
       } catch {
         // The turn ended first: the input starts the next one.
         return
       }
-      queue.shift()
-      active.inputs.push(next.input_id)
-      emit(LIVE.delivered, { input_id: next.input_id })
       return pump()
     }
     const first = queue[0]!
