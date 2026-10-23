@@ -46,6 +46,18 @@ export class WorkspaceFileService {
     }
     return w.path
   }
+  readRoot(id: string, repository = false) {
+    return repository ? this.r.repository.readRoot(id) : this.root(id)
+  }
+  readTarget(id: string, path: string, repository = false) {
+    return this.fileTarget(this.readRoot(id, repository), path)
+  }
+  private fileTarget(root: string, path: string) {
+    const target = this.checked(root, path)
+    if (!lstatSync(target).isFile() || realpathSync(target) !== target)
+      throw new ChannelError('unsafe_path')
+    return target
+  }
   private checked(root: string, path: string, allowLink = false) {
     if (!RelativePathSchema.safeParse(path).success) throw new ChannelError('unsafe_path')
     // Protocol separators are '/'; a backslash is a native filename byte on POSIX, not traversal.
@@ -93,10 +105,7 @@ export class WorkspaceFileService {
         throw new ChannelError('unsafe_path')
       }
     }
-    const target = this.checked(root, path)
-    if (!lstatSync(target).isFile() || realpathSync(target) !== target)
-      throw new ChannelError('unsafe_path')
-    return target
+    return this.fileTarget(root, path)
   }
   stat(id: string, path: string) {
     const root = this.root(id),
@@ -137,7 +146,7 @@ export class WorkspaceFileService {
     return { entries, next: entries.length < names.length ? (entries.at(-1)?.name ?? null) : null }
   }
   read(id: string, path: string, repository = false) {
-    const root = this.root(id, repository),
+    const root = this.readRoot(id, repository),
       target = this.checked(root, path),
       before = lstatSync(target)
     if (!before.isFile()) throw new ChannelError('unsafe_path')

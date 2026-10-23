@@ -3,6 +3,11 @@ import { pathToFileURL } from 'node:url'
 let buffer = Buffer.alloc(0)
 const source = process.argv[2]
 const log = process.argv[3]
+const uriRoot = process.argv[4]
+let rootUri
+const documents = new Map()
+const documentUri = (uri) =>
+  uriRoot && uri.startsWith(rootUri + '/') ? uriRoot + uri.slice(rootUri.length) : uri
 const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }
 function send(message) {
   const body = JSON.stringify({ jsonrpc: '2.0', ...message })
@@ -19,29 +24,66 @@ process.stdin.on('data', (bytes) => {
     if (buffer.length < end + 4 + length) return
     const m = JSON.parse(buffer.subarray(end + 4, end + 4 + length))
     buffer = buffer.subarray(end + 4 + length)
+    if (m.id === 'config' && m.result && log)
+      writeFileSync(log + '.configuration', JSON.stringify(m.result))
     if (log && m.method) appendFileSync(log, m.method + '\n')
     if (m.method === 'initialize') {
+      if (source === 'initialize-wait') continue
+      rootUri = m.params.rootUri
       if (log) writeFileSync(log + '.initialize', JSON.stringify(m.params))
       if (source === 'crash' && !existsSync(log + '.crashed')) {
         writeFileSync(log + '.crashed', '1')
         process.exit(1)
       }
-      send({ id: m.id, result: { capabilities: { textDocumentSync: 1 } } })
+      send({
+        id: m.id,
+        result: {
+          capabilities: {
+            textDocumentSync: 1,
+            ...(source === 'pull' ? { diagnosticProvider: { identifier: 'fixture' } } : {}),
+          },
+        },
+      })
       send({ id: 'config', method: 'workspace/configuration', params: { items: [{}] } })
     } else if (m.method === 'textDocument/didOpen' || m.method === 'textDocument/didChange') {
+      if (source === 'pull') {
+        documents.set(
+          m.params.textDocument.uri,
+          m.params.textDocument.text ?? m.params.contentChanges[0].text
+        )
+        if (m.method === 'textDocument/didChange')
+          send({ id: 'refresh', method: 'workspace/diagnostic/refresh', params: {} })
+        continue
+      }
       send({
         method: 'textDocument/publishDiagnostics',
         params: {
-          uri: m.params.textDocument.uri,
+          uri: documentUri(m.params.textDocument.uri),
           version: m.params.textDocument.version,
           diagnostics: [{ range, message: 'Ошибка 🐛', source: 'untrusted', severity: 1 }],
         },
       })
+    } else if (m.method === 'textDocument/diagnostic') {
+      const reply = {
+        id: m.id,
+        result: {
+          kind: 'full',
+          items: [
+            {
+              range,
+              message: 'pulled diagnostic',
+              severity: 1,
+              code: documents.get(m.params.textDocument.uri) ?? 'fixture',
+            },
+          ],
+        },
+      }
+      setTimeout(() => send(reply), Number(process.argv[5]) || 0)
     } else if (m.method === 'textDocument/definition') {
       send({
         id: m.id,
         result: [
-          { uri: m.params.textDocument.uri, range },
+          { uri: documentUri(m.params.textDocument.uri), range },
           { uri: pathToFileURL('/outside/secret.ts').href, range },
         ],
       })

@@ -306,6 +306,15 @@ export class ChatCheckpoints {
           digest(this.core.resources.targets.currentTarget(p.session_id))
       )
         throw new ChannelError('stale_revision')
+      // LSP roots are readable. Restoring repository files separately requires edit approval.
+      if (method === 'chat.restore' && p.restore_files) {
+        const target = this.core.resources.targets.bound(p.session_id)?.target
+        if (
+          target?.kind === 'worktree' &&
+          this.core.resources.repository.fileRoot(target.worktree_id) !== root
+        )
+          throw new ChannelError('stale_revision')
+      }
     }
     checkBinding()
     const preview_id = digest({ checkpoint_id: checkpoint.checkpoint_id, root, changes })
@@ -375,14 +384,12 @@ export class ChatCheckpoints {
     try {
       await this.core.claude.live.stop(p.session_id, 'chat_restore')
       this.core.checkExecution(actor.installation_id, p.session_id)
-      if (this.core.resources.lsp.sessionRoot(p.session_id) !== root)
-        throw new ChannelError('stale_revision')
+      checkBinding()
       // Recheck after stopping: no preview grants permission to discard a later edit.
       if (p.restore_files)
         await restoreFiles(root, checkpoint.files, p.restore_files.changes, () => {
           this.core.checkExecution(actor.installation_id, p.session_id)
-          if (this.core.resources.lsp.sessionRoot(p.session_id) !== root)
-            throw new ChannelError('stale_revision')
+          checkBinding()
         })
       let destination = session
       if (p.action === 'branch') {

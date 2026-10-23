@@ -35,9 +35,9 @@ export class NodeLsp {
       },
       check: (root, path) => {
         const ref = this.roots.get(root)
-        if (!ref || r.files.root(ref.id, ref.repository) !== root)
+        if (!ref || r.files.readRoot(ref.id, ref.repository) !== root)
           throw new ChannelError('unsafe_path')
-        return r.files.writeTarget(ref.id, path, false, ref.repository)
+        return r.files.readTarget(ref.id, path, ref.repository)
       },
       diagnostics: (root, path, diagnostics) => {
         if (this.stopped) return
@@ -79,7 +79,7 @@ export class NodeLsp {
     })
   }
   root(id: string, repository = false) {
-    const root = this.r.files.root(id, repository)
+    const root = this.r.files.readRoot(id, repository)
     const project = repository
       ? this.r.repository.executionIdentity(id).project_id
       : this.r.workspaces.get(id).project_id
@@ -91,7 +91,7 @@ export class NodeLsp {
       const ref = this.roots.get(root)
       return (
         !!ref &&
-        this.r.files.root(ref.id, ref.repository) === root &&
+        this.r.files.readRoot(ref.id, ref.repository) === root &&
         this.r.projects.get(ref.project).trust === 'trusted'
       )
     } catch {
@@ -199,8 +199,20 @@ export class NodeLsp {
       : p.worktree_id
         ? this.root(p.worktree_id, true)
         : undefined
-    if (method === 'lsp.v1.status')
-      return status(this.r.core.stateDir, root, !!root && this.trusted(root))
+    if (method === 'lsp.v1.status') {
+      const rows = await status(this.r.core.stateDir, root, !!root && this.trusted(root))
+      return rows.map((row) => {
+        const failure = root && !row.reason && this.service.lastFailure(root, row.language)
+        return failure
+          ? {
+              ...row,
+              diagnostic: [row.diagnostic, 'Last language analysis request failed: ' + failure]
+                .filter(Boolean)
+                .join('; '),
+            }
+          : row
+      })
+    }
     if (!root) throw new ChannelError('workspace_required')
     this.r.core.authority.check(actor, 'resource', String(p.workspace_id ?? p.worktree_id))
     if (method === 'lsp.v1.open')

@@ -38,12 +38,30 @@ The owner grants or revokes trust with the existing journaled protocol method
 trust. No trust is inferred from opening a folder, installing a server, or requesting
 diagnostics. Revocation stops active gated servers and clears their diagnostics.
 
+Language analysis requires read access to the selected workspace or worktree, independently
+of repository edit approval. External linked worktrees require external-read access and use
+their own files and dependencies. Root identity, relative paths, and symlink confinement are
+checked for reads, queries, agent tools, and diagnostic refreshes. This grants no write access;
+servers that execute project code still require the owning project's trust.
+Chat execution grants and provider tool approvals are separate from the repository edit
+approval used for manual file writes. Direct LSP calls require neither of those grants;
+agent LSP tools retain their existing execution checks.
+
 Root-scoped `lsp.v1.status` includes `reason: 'untrusted_folder'` for gated servers when trust
 is absent; `found` still reports installation availability. Blocked servers are not started,
 even for version probes (`version` is null). Opens return no gated servers, diagnostics are
 empty for those servers, and language queries report `untrusted_folder`. The same rule covers
 agent tools, turn refreshes, diagnostic pushes, and crash restarts. Existing owners must have
 explicitly marked the project trusted for these servers to run.
+
+Root-scoped status also includes the last failed analysis request in the affected server's
+`diagnostic` field, for example `lsp_document_limit`, `lsp_process_limit`, `output_limit`, or
+`lsp_timeout`. `found` still means the executable was discovered, not that analysis succeeded.
+This bounded in-memory history clears when the failed document opens successfully or its
+root is released. Unscoped CLI status remains installation discovery; live crash/restart and
+memory-limit notices are also published through `lsp.status` events.
+New analysis failures also emit `lsp.status`, including failures during background refresh;
+repeating the same failure for the same document is deduplicated until recovery.
 
 Private npm installs use `--ignore-scripts`, exact versions, and separate prefixes inside
 the node state folder. Pins: typescript-language-server 4.3.4, TypeScript 5.9.3, pyright
@@ -70,12 +88,27 @@ ranges use zero-based UTF-16 offsets. `open` accepts optional full text and a mo
 increasing version; call it again to update a document. Without text, it reads the current
 file using the existing confined file API. Symlinks and traversal are rejected. Definitions
 and references outside the root are omitted, including dependency definitions outside it.
+Server result URIs are canonicalized before confinement so macOS path aliases and case
+spellings of the same file map back to its canonical relative path. Document requests still
+reject symlinks; canonicalizing a server result never permits a target outside the root.
+Document cache keys also use canonical relative paths, including on case-insensitive disks.
 Server-initiated workspace edits are refused.
+
+Monorepos use the selected worktree as the server root and working directory. TypeScript
+discovers nested tsconfig files, shared extends and project references; a root solution
+config with `files: []` does not prevent analysis of an opened package file. Root-hoisted
+dependencies and workspace source-package links are supported. The 64-document limit counts
+open buffers per server, not the files in its project graph; the process limit counts
+server/root pairs, not workspace packages. The 512 KiB limit applies to each opened document.
 
 Diagnostics are asynchronous pushes in the catalog stream (`lsp.diagnostics`) and a cached
 per-file pull via `diagnostics`. Open the file first and listen for pushes to receive the
 initial analysis; a pull immediately after open can still be empty. TypeScript and ESLint
 results are merged, tagged with their server source, and bounded to 256 entries/64 KiB.
+For servers advertising LSP pull diagnostics (including the pinned ESLint server), the node
+requests diagnostics after opens, changes, and server refresh requests, then publishes the
+same catalog events. Results for replaced buffers, closed documents, or revoked roots are
+discarded. ESLint receives its settings and workspace folder from the selected worktree.
 Other responses are bounded too. Each call can carry a `request_id`; `cancel` aborts that
 installation's matching request. The typed `NodeClient.lsp` methods send cancellation for
 an optional `AbortSignal`. Calls are online-only and are never automatically retried.

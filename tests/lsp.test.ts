@@ -283,9 +283,13 @@ it('restarts once after a crash and reports a repeated crash', async () => {
   await service.open(root, 'a.ts')
   // Trigger a second crash through a deterministic fake definition request.
   const slot = [...(service as any).slots.values()][0]
+  expect(errors).toContain('typescript analysis request failed: lsp_exited')
   slot.connection.notify('crash', {})
-  await until(() => errors.length === 2)
+  // Request-failure reporting adds a notice for the initial failed open. Wait for the
+  // second process exit itself, rather than a count already reached before this crash.
+  await until(() => errors.some((message) => message.includes('stopped after repeated crash')))
   await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_repeated_crash')
+  expect(service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
   await expect(service.query(root, 'a.ts', 'diagnostics')).rejects.toThrow('lsp_repeated_crash')
 })
 it('uses fake install transports without network and refuses corrupt Rust binaries', async () => {

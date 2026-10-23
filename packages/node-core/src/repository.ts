@@ -561,6 +561,16 @@ export class RepositoryService {
   fileRoot(id: string) {
     const target = this.get(id)
     this.checkEdit(target)
+    return this.checkedFileRoot(target)
+  }
+  /** Read-only consumers use catalogue read permission, never repository edit approval. */
+  readRoot(id: string) {
+    const target = this.get(id)
+    if (!target.active) throw new ChannelError('stale_resource')
+    this.checkRead(target)
+    return this.checkedFileRoot(target)
+  }
+  private checkedFileRoot(target: Target) {
     try {
       if (
         realpathSync(target.path) !== target.path ||

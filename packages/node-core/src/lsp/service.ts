@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync, existsSync } from 'node:fs'
-import { extname, relative, isAbsolute, resolve, join, dirname } from 'node:path'
+import { extname, relative, isAbsolute, resolve, join, dirname, sep } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { LspDiagnosticSchema, LspRangeSchema, type LspDiagnostic } from '@abele/node-protocol'
@@ -26,6 +26,8 @@ type Slot = {
   crashes: number
   failed: boolean
   tsserver?: string
+  diagnosticProvider?: { identifier?: string }
+  pulls?: Map<string, boolean>
 }
 export type LspOptions = {
   idleMs?: number
@@ -64,6 +66,7 @@ export class LspService {
   private diagnostics = new Map<string, Map<Language, LspDiagnostic[]>>()
   private closed = false
   private activity = new Map<string, number>()
+  private failures = new Map<string, Map<Language, { path: string; reason: string }>>()
   private pending = new Set<{
     root: string
     path: string
@@ -76,6 +79,57 @@ export class LspService {
   ) {}
   private key(root: string, language: Language) {
     return root + '\0' + language
+  }
+  lastFailure(root: string, language: string) {
+    return this.failures.get(root)?.get(language as Language)?.reason
+  }
+  private rememberFailure(root: string, path: string, error: unknown) {
+    if (this.closed) return
+    const reason = error instanceof Error ? error.message.split(':')[0]! : 'lsp_failed'
+    if (
+      /^(cancelled|untrusted_folder|stale_revision|unsafe_path|not_found|unauthorized|resource_busy|lsp_closed)$/.test(
+        reason
+      )
+    )
+      return
+    const safeReason =
+      reason.length <= 128 && /^(lsp_[a-z_]+|output_limit)$/.test(reason) ? reason : 'lsp_failed'
+    const extension = extname(path).slice(1)
+    const failures =
+      this.failures.get(root) ?? new Map<Language, { path: string; reason: string }>()
+    const notices: string[] = []
+    for (const [language, spec] of Object.entries(servers))
+      if (
+        (spec.extensions as readonly string[]).includes(extension) &&
+        this.allowed(root, language as Language) &&
+        (language !== 'eslint' || projectEslint(root)) &&
+        (this.options.command
+          ? this.options.command(language as Language)
+          : discover(this.state, language as Language))
+      ) {
+        const previous = failures.get(language as Language)
+        if (previous?.path !== path || previous.reason !== safeReason)
+          notices.push(language + ' analysis request failed: ' + safeReason)
+        failures.set(language as Language, { path, reason: safeReason })
+      }
+    if (failures.size) {
+      if (!this.failures.has(root) && this.failures.size >= 128)
+        this.failures.delete(this.failures.keys().next().value!)
+      this.failures.set(root, failures)
+    }
+    for (const message of notices) {
+      try {
+        this.options.error?.(root, message)
+      } catch {
+        /* Preserve the analysis error if the catalog is unavailable. */
+      }
+    }
+  }
+  private recovered(root: string, path: string, languages: string[]) {
+    const failures = this.failures.get(root)
+    for (const language of languages)
+      if (failures?.get(language as Language)?.path === path) failures.delete(language as Language)
+    if (!failures?.size) this.failures.delete(root)
   }
   private allowed(root: string, language: Language) {
     return !projectCodeServers.has(language) || this.options.trusted?.(root) === true
@@ -133,10 +187,18 @@ export class LspService {
   }
   private uriPath(root: string, uri: unknown) {
     if (typeof uri !== 'string' || !uri.startsWith('file:')) throw new Error('unsafe_path')
-    const path = relative(root, fileURLToPath(uri)).split('\\').join('/')
+    // Servers may use a different macOS spelling (/var vs /private/var, case, root alias).
+    // Confine the actual target, then apply the same file boundary as document requests.
+    const path = relative(realpathSync.native(root), realpathSync.native(fileURLToPath(uri)))
+      .split(sep)
+      .join('/')
     if (!path || path.startsWith('../') || isAbsolute(path)) throw new Error('unsafe_path')
     this.options.check(root, path)
     return path
+  }
+  private documentPath(root: string, path: string) {
+    // Validate the supplied path before resolving case, so document symlinks stay forbidden.
+    return this.uriPath(root, pathToFileURL(this.options.check(root, path)).href)
   }
   private setDiagnostics(slot: Slot, path: string, items: LspDiagnostic[]) {
     const key = slot.root + '\0' + path
@@ -158,6 +220,86 @@ export class LspService {
     }
     return result
   }
+  private diagnosticItems(language: Language, raw: unknown): LspDiagnostic[] {
+    const items: LspDiagnostic[] = []
+    for (const item of (Array.isArray(raw) ? raw : []).slice(0, 256)) {
+      if (!item || typeof item !== 'object') continue
+      const parsed = LspDiagnosticSchema.safeParse({
+        range: item.range,
+        message: String(item.message).slice(0, 4096),
+        source: language,
+        ...(item.severity ? { severity: item.severity } : {}),
+        ...(item.code !== undefined ? { code: item.code } : {}),
+      })
+      if (parsed.success) items.push(parsed.data)
+    }
+    return items
+  }
+  private pullDiagnostics(slot: Slot, doc: Document) {
+    if (
+      this.closed ||
+      this.slots.get(this.key(slot.root, slot.language)) !== slot ||
+      !slot.diagnosticProvider ||
+      !this.allowed(slot.root, slot.language)
+    )
+      return
+    const pulls = (slot.pulls ??= new Map())
+    if (pulls.has(doc.path)) {
+      pulls.set(doc.path, true)
+      return
+    }
+    pulls.set(doc.path, false)
+    const connection = slot.connection
+    void connection
+      .request('textDocument/diagnostic', {
+        textDocument: { uri: pathToFileURL(resolve(slot.root, doc.path)).href },
+        ...slot.diagnosticProvider,
+      })
+      .then((report) => {
+        if (
+          this.closed ||
+          this.slots.get(this.key(slot.root, slot.language)) !== slot ||
+          slot.connection !== connection ||
+          slot.docs.get(doc.path) !== doc ||
+          !this.allowed(slot.root, slot.language)
+        )
+          return
+        this.options.check(slot.root, doc.path)
+        if (report?.kind === 'full')
+          this.setDiagnostics(slot, doc.path, this.diagnosticItems(slot.language, report.items))
+      })
+      .catch((error) => {
+        if (
+          !this.closed &&
+          this.slots.get(this.key(slot.root, slot.language)) === slot &&
+          slot.connection === connection &&
+          this.allowed(slot.root, slot.language)
+        ) {
+          console.warn('[Abele LSP] diagnostic request failed', {
+            root: slot.root,
+            language: slot.language,
+            detail: String(error instanceof Error ? error.message : error).slice(0, 512),
+          })
+          try {
+            this.options.error?.(slot.root, slot.language + ' diagnostic request failed')
+          } catch {
+            /* The catalog may be unavailable during shutdown. */
+          }
+        }
+      })
+      .finally(() => {
+        const again = pulls.get(doc.path)
+        pulls.delete(doc.path)
+        const current = slot.docs.get(doc.path)
+        if (
+          again &&
+          current &&
+          !this.closed &&
+          this.slots.get(this.key(slot.root, slot.language)) === slot
+        )
+          this.pullDiagnostics(slot, current)
+      })
+  }
   private start(slot: Slot, command: { command: string; args: string[] }) {
     if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
     const c = (slot.connection = new LspConnection(
@@ -176,32 +318,25 @@ export class LspService {
         const path = this.uriPath(slot.root, params.uri)
         const doc = slot.docs.get(path)
         if (!doc || (params.version !== undefined && params.version !== doc.version)) return
-        const items: LspDiagnostic[] = []
-        for (const raw of (Array.isArray(params.diagnostics) ? params.diagnostics : []).slice(
-          0,
-          256
-        )) {
-          const parsed = LspDiagnosticSchema.safeParse({
-            range: raw.range,
-            message: String(raw.message).slice(0, 4096),
-            source: slot.language,
-            ...(raw.severity ? { severity: raw.severity } : {}),
-            ...(raw.code !== undefined ? { code: raw.code } : {}),
-          })
-          if (parsed.success) items.push(parsed.data)
-        }
-        this.setDiagnostics(slot, path, items)
+        this.setDiagnostics(slot, path, this.diagnosticItems(slot.language, params.diagnostics))
       } catch {
         /* Ignore out-of-root or malformed server data. */
       }
     }
     c.onRequest = (method, params) => {
+      if (method === 'workspace/diagnostic/refresh') {
+        for (const doc of slot.docs.values()) this.pullDiagnostics(slot, doc)
+        return null
+      }
       if (method === 'workspace/configuration')
         return (params.items ?? []).slice(0, 32).map(() =>
           slot.language === 'eslint'
             ? {
                 validate: 'on',
                 run: 'onType',
+                experimental: { useFlatConfig: false },
+                options: {},
+                workspaceFolder: { uri: pathToFileURL(slot.root).href, name: 'workspace' },
                 workingDirectory: { directory: slot.root, '!cwd': false },
                 nodePath: join(slot.root, 'node_modules'),
                 useESLintClass: true,
@@ -301,9 +436,14 @@ export class LspService {
         rootUri: pathToFileURL(slot.root).href,
         workspaceFolders: [{ uri: pathToFileURL(slot.root).href, name: 'workspace' }],
         capabilities: {
-          workspace: { configuration: true, workspaceFolders: true },
+          workspace: {
+            configuration: true,
+            workspaceFolders: true,
+            diagnostics: { refreshSupport: true },
+          },
           textDocument: {
             publishDiagnostics: { versionSupport: true },
+            diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
             hover: { contentFormat: ['plaintext'] },
           },
         },
@@ -319,8 +459,16 @@ export class LspService {
               }
             : {},
       })
-      .then(() => {
+      .then((result) => {
         if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
+        const provider = result?.capabilities?.diagnosticProvider
+        slot.diagnosticProvider = provider
+          ? {
+              ...(typeof provider.identifier === 'string'
+                ? { identifier: provider.identifier }
+                : {}),
+            }
+          : undefined
         c.notify('initialized', {})
         for (const doc of slot.docs.values()) this.sendOpen(slot, doc)
       })
@@ -344,6 +492,7 @@ export class LspService {
         text: doc.text,
       },
     })
+    this.pullDiagnostics(slot, doc)
   }
   private async active<T>(root: string, work: () => Promise<T>) {
     this.activity.set(root, (this.activity.get(root) ?? 0) + 1)
@@ -383,13 +532,22 @@ export class LspService {
     owner: string | null = 'local'
   ) {
     // Opens/updates are idempotent per owner. null is background analysis, not a visible view.
-    // Only the root alias is resolved. check() still refuses symlinks below it.
+    // Check document confinement before resolving filesystem spelling.
     root = realpathSync(root)
+    path = this.documentPath(root, path)
     return this.active(root, () =>
       this.owned(root, path, owner, signal, (signal) =>
         this.openDocument(root, path, text, version, signal, owner)
       )
     )
+      .then((result) => {
+        this.recovered(root, path, result.servers)
+        return result
+      })
+      .catch((error) => {
+        this.rememberFailure(root, path, error)
+        throw error
+      })
   }
   private async openDocument(
     root: string,
@@ -482,18 +640,20 @@ export class LspService {
       if (owner !== null) owners.add(owner)
       const doc = { path, text, version: next, languageId, owners }
       slot.docs.set(path, doc)
-      if (previous)
+      if (previous) {
         slot.connection.notify('textDocument/didChange', {
           textDocument: { uri: pathToFileURL(target).href, version: next },
           contentChanges: [{ text }],
         })
-      else this.sendOpen(slot, doc)
+        this.pullDiagnostics(slot, doc)
+      } else this.sendOpen(slot, doc)
       opened.push(language)
     }
     return { servers: opened }
   }
   closeDocument(root: string, path: string, owner = 'local') {
     root = realpathSync(root)
+    path = this.documentPath(root, path)
     this.options.check(root, path)
     // Cancel older acquisitions even when initialization has not created a document yet.
     for (const pending of this.pending)
@@ -532,11 +692,15 @@ export class LspService {
     owner = 'local'
   ) {
     root = realpathSync(root)
+    path = this.documentPath(root, path)
     return this.active(root, () =>
       this.owned(root, path, owner, signal, (signal) =>
         this.queryDocument(root, path, method, position, signal, owner)
       )
-    )
+    ).catch((error) => {
+      this.rememberFailure(root, path, error)
+      throw error
+    })
   }
   private async queryDocument(
     root: string,
@@ -643,6 +807,7 @@ export class LspService {
   }
   async stop() {
     this.closed = true
+    this.failures.clear()
     for (const pending of this.pending) pending.controller.abort()
     await Promise.all([...this.slots.values()].map((s) => this.remove(s)))
     this.diagnostics.clear()
@@ -653,6 +818,8 @@ export class LspService {
     try {
       canonical = realpathSync(root)
     } catch {}
+    this.failures.delete(root)
+    this.failures.delete(canonical)
     this.activity.delete(root)
     this.activity.delete(canonical)
     await Promise.all(
