@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync, existsSync } from 'node:fs'
 import { extname, relative, isAbsolute, resolve, join, dirname, sep } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+import { totalmem } from 'node:os'
 import { execFile } from 'node:child_process'
 import { LspDiagnosticSchema, LspRangeSchema, type LspDiagnostic } from '@abele/node-protocol'
 import { LspConnection } from './connection.js'
@@ -25,6 +26,7 @@ type Slot = {
   cancelRestart?: () => void
   crashes: number
   failed: boolean
+  failure?: { code: string; message: string }
   tsserver?: string
   diagnosticProvider?: { identifier?: string }
   pulls?: Map<string, boolean>
@@ -77,15 +79,41 @@ export class LspService {
     private state: string,
     private options: LspOptions
   ) {}
+  private memoryLimit() {
+    const configured = this.options.memoryMB
+    return configured && Number.isFinite(configured) && configured > 0
+      ? Math.floor(configured)
+      : Math.max(1024, Math.min(6144, Math.floor(totalmem() / 1024 / 1024 / 4)))
+  }
+  private heapLimit() {
+    return Math.max(1, Math.floor(this.memoryLimit() / 2))
+  }
+  failureMessage(root: string, language: string) {
+    return (
+      this.slots.get(this.key(root, language as Language))?.failure?.message ??
+      this.lastFailure(root, language)
+    )
+  }
+  private slotError(slot: Slot) {
+    return new Error(
+      (slot.failure?.code ?? 'lsp_repeated_crash') + ': ' + (slot.failure?.message ?? slot.language)
+    )
+  }
   private key(root: string, language: Language) {
     return root + '\0' + language
   }
   lastFailure(root: string, language: string) {
-    return this.failures.get(root)?.get(language as Language)?.reason
+    return (
+      this.slots.get(this.key(root, language as Language))?.failure?.code ??
+      this.failures.get(root)?.get(language as Language)?.reason
+    )
   }
   private rememberFailure(root: string, path: string, error: unknown) {
     if (this.closed) return
     const reason = error instanceof Error ? error.message.split(':')[0]! : 'lsp_failed'
+    // Slot failures are already scoped to the actual server. Do not blame the
+    // other analyzers that happen to support the same document extension.
+    if ([...this.slots.values()].some((s) => s.root === root && s.failure?.code === reason)) return
     if (
       /^(cancelled|untrusted_folder|stale_revision|unsafe_path|not_found|unauthorized|resource_busy|lsp_closed)$/.test(
         reason
@@ -306,11 +334,34 @@ export class LspService {
       command.command,
       command.args,
       slot.root,
-      Math.min(384, this.options.memoryMB ?? 1024)
+      this.heapLimit()
     ))
     c.onNotification = (method, params) => {
       if (!this.allowed(slot.root, slot.language)) {
         void this.remove(slot)
+        return
+      }
+      // typescript-language-server forwards its worker's stderr and exit as LSP
+      // logs, then stays alive. Treat that worker exit as a server crash too.
+      if (
+        slot.language === 'typescript' &&
+        method === 'window/logMessage' &&
+        params?.type === 1 &&
+        typeof params.message === 'string'
+      ) {
+        const fatal = /FATAL ERROR:[^\r\n]*/.exec(params.message)?.[0]
+        if (fatal) c.exitInfo.stderr = (c.exitInfo.stderr + '\n' + fatal.slice(0, 512)).slice(-2048)
+        const exited =
+          /\[tsserver\] Exited\. Code: (null|-?\d+)\. Signal: (null|SIG[A-Z0-9]+)\s*$/.exec(
+            params.message
+          )
+        if (exited) {
+          c.exitInfo.stderr = (
+            c.exitInfo.stderr +
+            `\nError: TypeScript worker exited (exit ${exited[1]}, signal ${exited[2]})`
+          ).slice(-2048)
+          c.kill('SIGKILL')
+        }
         return
       }
       if (method !== 'textDocument/publishDiagnostics') return
@@ -362,6 +413,10 @@ export class LspService {
         void this.remove(slot)
         return
       }
+      if (slot.failure?.code === 'lsp_memory_limit') {
+        slot.failed = true
+        return
+      }
       if (slot.crashes++ === 0) {
         this.options.error?.(
           slot.root,
@@ -393,6 +448,11 @@ export class LspService {
         slot.ready.catch(() => {})
       } else {
         slot.failed = true
+        slot.failure = {
+          code: 'lsp_repeated_crash',
+          message:
+            'The language server stopped' + this.exitDetail(c) + '. Restart analysis to try again.',
+        }
         this.options.error?.(
           slot.root,
           slot.language + ' stopped after repeated crash' + this.exitDetail(c)
@@ -415,12 +475,21 @@ export class LspService {
           const rss = rows
             .filter(([pid]) => pids.has(pid))
             .reduce((sum, row) => sum + (row[2] ?? 0), 0)
-          const limit = this.options.memoryMB ?? 1024
+          if (
+            this.closed ||
+            slot.connection !== c ||
+            slot.failed ||
+            this.slots.get(this.key(slot.root, slot.language)) !== slot
+          )
+            return
+          const limit = this.memoryLimit()
           if (rss > limit * 1024) {
-            this.options.error?.(
-              slot.root,
-              `${slot.language} exceeded process-tree memory limit: ${Math.ceil(rss / 1024)} MB / ${limit} MB`
-            )
+            slot.failure = {
+              code: 'lsp_memory_limit',
+              message: `The language server exceeded its ${limit} MB process-tree memory limit (${Math.ceil(rss / 1024)} MB used). Raise ABELE_LSP_MEMORY_MB on the node and restart analysis.`,
+            }
+            slot.failed = true
+            this.options.error?.(slot.root, slot.failure.message)
             c.kill('SIGKILL')
           }
         })
@@ -450,7 +519,7 @@ export class LspService {
         initializationOptions:
           slot.language === 'typescript'
             ? {
-                maxTsServerMemory: Math.min(384, this.options.memoryMB ?? 1024),
+                maxTsServerMemory: this.heapLimit(),
                 tsserver: {
                   useSyntaxServer: 'never',
                   ...(slot.tsserver ? { path: slot.tsserver } : {}),
@@ -461,6 +530,7 @@ export class LspService {
       })
       .then((result) => {
         if (!this.allowed(slot.root, slot.language)) throw new Error('untrusted_folder')
+        slot.failure = undefined
         const provider = result?.capabilities?.diagnosticProvider
         slot.diagnosticProvider = provider
           ? {
@@ -479,9 +549,27 @@ export class LspService {
   }
   private exitDetail(connection: LspConnection) {
     const { code, signal, stderr } = connection.exitInfo
-    // Details stay in the local log, not the catalog or a remote error payload.
+    // Only bounded server error lines are exposed; omit source excerpts and stack frames.
     console.warn('[Abele LSP] server exited', { code, signal, stderr })
-    return ` (exit ${code ?? 'unknown'}, signal ${signal ?? 'none'})`
+    const lines = stderr
+      .split(/\r?\n/)
+      .filter(
+        (line) =>
+          /error|fatal|exception|ENOMEM|heap out of memory/i.test(line) &&
+          !/^\s*(at |[0-9]+[ :|])/.test(line)
+      )
+      .slice(-3)
+      .map((line) =>
+        line
+          .replace(/[\x00-\x1f\x7f]/g, ' ')
+          .replace(
+            /(token|password|secret|api[_-]?key|authorization)\s*[:=]\s*\S+/gi,
+            '$1=[redacted]'
+          )
+          .slice(0, 200)
+      )
+      .join('; ')
+    return ` (exit ${code ?? 'unknown'}, signal ${signal ?? 'none'})${lines ? ': ' + lines : ''}`
   }
   private sendOpen(slot: Slot, doc: Document) {
     slot.connection.notify('textDocument/didOpen', {
@@ -615,7 +703,25 @@ export class LspService {
         }
         slot.ready.catch(() => {})
       }
-      if (slot.failed) throw new Error('lsp_repeated_crash: ' + language)
+      if (slot.failed) {
+        slot.failed = false
+        slot.crashes = 0
+        const restarting = slot
+        const previous = slot.connection
+        slot.ready = (async () => {
+          await previous.stop()
+          if (this.closed || this.slots.get(key) !== restarting) throw new Error('lsp_closed')
+          restarting.failure = undefined
+          await this.start(restarting, {
+            command: previous.child.spawnfile,
+            args: previous.child.spawnargs.slice(1),
+          })
+        })().catch((error) => {
+          restarting.failed = true
+          throw error
+        })
+        slot.ready.catch(() => {})
+      }
       this.touch(slot)
       await waitFor(slot.ready, signal)
       if (signal?.aborted) throw new Error('cancelled')
@@ -721,7 +827,7 @@ export class LspService {
     if (method === 'diagnostics') {
       for (const s of this.slots.values())
         if (s.root === root && s.docs.has(path)) {
-          if (s.failed) throw new Error('lsp_repeated_crash: ' + s.language)
+          if (s.failed) throw this.slotError(s)
           this.touch(s)
         }
       return { diagnostics: this.merged(root, path) }
@@ -729,7 +835,8 @@ export class LspService {
     const slot = [...this.slots.values()].find(
       (s) => s.root === root && s.language !== 'eslint' && s.docs.has(path)
     )
-    if (!slot || slot.failed) {
+    if (slot?.failed) throw this.slotError(slot)
+    if (!slot) {
       const extension = extname(path).slice(1)
       if (
         [...projectCodeServers].some(

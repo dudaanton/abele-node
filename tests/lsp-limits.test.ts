@@ -200,18 +200,20 @@ it('keeps repeated crashes visible to RPC callers and scoped status despite extr
     await expect(f.rpc('lsp.v1.open', params)).resolves.toEqual({ servers: ['typescript'] })
     slot.connection.notify('crash', {})
     await expect.poll(() => hasNotice('stopped after repeated crash')).toBe(true)
-    await expect(f.rpc('lsp.v1.open', params)).rejects.toMatchObject({
+    await expect(f.rpc('lsp.v1.diagnostics', params)).rejects.toMatchObject({
       code: 'lsp_unavailable',
       details: { reason: 'lsp_repeated_crash' },
     })
     expect(await f.status(worktree_id)).toMatchObject({
       found: true,
-      diagnostic: expect.stringContaining('lsp_repeated_crash'),
+      diagnostic: expect.stringContaining('exit 1'),
     })
     await expect(f.rpc('lsp.v1.diagnostics', params)).rejects.toMatchObject({
       code: 'lsp_unavailable',
       details: { reason: 'lsp_repeated_crash' },
     })
+    await expect(f.rpc('lsp.v1.open', params)).resolves.toEqual({ servers: ['typescript'] })
+    expect(await f.status(worktree_id)).not.toHaveProperty('diagnostic')
   } finally {
     await f.stop()
   }

@@ -72,14 +72,20 @@ These are optional runtime installations, not new node package dependencies.
 
 A server starts when a supported document opens or a language query needs it. Devices and
 sessions share one process per server and canonical root; ESLint runs alongside TypeScript.
-Servers stop after three minutes without document activity or queries, even if a document
-was left open by a disconnected client. A subsequent query reopens it from disk. Configure
-`ABELE_LSP_IDLE_MS` and `ABELE_LSP_MEMORY_MB` in the node environment (defaults: 180000 and
-384). There are at most 16 server processes and 64 documents per server, with a 512 KiB file
+Servers stop after 30 minutes without owned documents or active queries.
+A subsequent query reopens them from disk. Configure `ABELE_LSP_IDLE_MS` (default 1800000)
+and `ABELE_LSP_MEMORY_MB` in the node environment. The latter caps each server's complete
+process tree: by default one quarter of machine RAM, between 1024 and 6144 MB. JavaScript
+and TypeScript worker heaps use half that budget (up to 3072 MB by default). For example, a machine with
+24 GB or more RAM gets a 3072 MB heap and a 6144 MB tree cap. Explicit positive memory
+settings override the tree budget. There are at most 16 server processes and 64 documents per server, with a 512 KiB file
 limit. JS heaps and TypeScript worker heaps are limited; total process-tree RSS is checked
 every five seconds. Shutdown stops the server's process group, including child workers.
-A crash restarts once and reopens documents; a second crash is reported through `lsp.status`.
-Idle eviction resets that lifecycle on the next open.
+A crash restarts once and reopens documents; a second crash is reported through `lsp.status`
+with its exit code, signal and bounded error lines from stderr (common credential fields redacted).
+A memory watchdog stop is reported separately, with the limit and the setting to raise it;
+it does not consume the crash retry. Restart analysis (an explicit document open) restarts a
+failed slot. Queries alone preserve its failure. Idle eviction also resets the lifecycle.
 
 Protocol capability `lsp_v1` exposes versioned `lsp.v1.status`, `install`, `open`, `close`,
 `definition`, `hover`, `references`, `symbols`, `diagnostics`, and `cancel`. Document methods

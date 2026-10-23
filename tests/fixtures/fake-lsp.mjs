@@ -89,7 +89,24 @@ process.stdin.on('data', (bytes) => {
       })
     } else if (m.method === 'echo') send({ id: m.id, result: m.params })
     else if (m.method === 'exit') process.exit(0)
-    else if (m.method === 'crash') process.exit(1)
-    else if (m.id !== undefined && m.method !== 'wait') send({ id: m.id, result: null })
+    else if (m.method === 'crash') {
+      process.stderr.write('Error: fixture failure token=private-value\n', () => process.exit(1))
+    } else if (m.method === 'workerCrash') {
+      send({
+        method: 'window/logMessage',
+        params: {
+          type: 1,
+          message:
+            '[lspserver] [tsclient] FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+        },
+      })
+      send({
+        method: 'window/logMessage',
+        params: {
+          type: 1,
+          message: '[lspserver] [tsclient] [tsserver] Exited. Code: null. Signal: SIGABRT',
+        },
+      })
+    } else if (m.id !== undefined && m.method !== 'wait') send({ id: m.id, result: null })
   }
 })

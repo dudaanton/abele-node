@@ -23,7 +23,7 @@ export class NodeLsp {
   constructor(private r: ResourceServices) {
     this.service = new LspService(r.core.stateDir, {
       idleMs: Number(process.env.ABELE_LSP_IDLE_MS) || 30 * 60 * 1000,
-      memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || 1024,
+      memoryMB: Number(process.env.ABELE_LSP_MEMORY_MB) || undefined,
       trusted: (root) => this.trusted(root),
       read: (root, path) => {
         const ref = this.roots.get(root)
@@ -202,7 +202,7 @@ export class NodeLsp {
     if (method === 'lsp.v1.status') {
       const rows = await status(this.r.core.stateDir, root, !!root && this.trusted(root))
       return rows.map((row) => {
-        const failure = root && !row.reason && this.service.lastFailure(root, row.language)
+        const failure = root && !row.reason && this.service.failureMessage(root, row.language)
         return failure
           ? {
               ...row,

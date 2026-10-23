@@ -297,11 +297,37 @@ it('restarts once after a crash and reports a repeated crash', async () => {
       { timeout: 10000 }
     )
     .toBe(true)
-  await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_repeated_crash')
   await expect
     .poll(() => service.lastFailure(root, 'typescript'), { timeout: 10000 })
     .toBe('lsp_repeated_crash')
   await expect(service.query(root, 'a.ts', 'diagnostics')).rejects.toThrow('lsp_repeated_crash')
+  expect(service.failureMessage(root, 'typescript')).toContain('exit 1')
+  expect(service.failureMessage(root, 'typescript')).toContain('Error: fixture failure')
+  expect(service.failureMessage(root, 'typescript')).not.toContain('private-value')
+  await expect(service.open(root, 'a.ts')).resolves.toEqual({ servers: ['typescript'] })
+  expect(service.lastFailure(root, 'typescript')).toBeUndefined()
+})
+it('restarts and reports a crashed TypeScript worker even when its LSP wrapper stays alive', async () => {
+  const root = temp()
+  writeFileSync(join(root, 'a.ts'), '')
+  const service = new LspService(root, {
+    trusted: () => true,
+    check: (base, path) => join(base, path),
+    command: () => ({ command: process.execPath, args: [fixture] }),
+  })
+  cleanups.push(() => service.stop())
+  await service.open(root, 'a.ts')
+  const slot = [...(service as any).slots.values()][0]
+  const previous = slot.connection
+  previous.notify('workerCrash', {})
+  await expect.poll(() => slot.connection !== previous, { timeout: 5000 }).toBe(true)
+  await service.open(root, 'a.ts')
+  slot.connection.notify('workerCrash', {})
+  await expect.poll(() => service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
+  expect(service.failureMessage(root, 'typescript')).toContain('heap out of memory')
+  expect(service.failureMessage(root, 'typescript')).toContain('SIGABRT')
+  await expect(service.query(root, 'a.ts', 'hover')).rejects.toThrow('lsp_repeated_crash')
+  await expect(service.open(root, 'a.ts')).resolves.toEqual({ servers: ['typescript'] })
 })
 it('uses fake install transports without network and refuses corrupt Rust binaries', async () => {
   const root = temp(),
