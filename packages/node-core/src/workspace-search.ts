@@ -12,6 +12,7 @@ interface Cursor {
   offset: number
   omissions: string[]
   expires: number
+  scan?: { files: string[]; next: number; line: number }
 }
 /** Same bounded, terminable matcher as Git search; plain files remain target-relative. */
 export class WorkspaceSearchService {
@@ -34,7 +35,7 @@ export class WorkspaceSearchService {
     for (const [id, c] of this.cursors) if (c.expires < Date.now()) this.cursors.delete(id)
     const { cursor: _cursor, limit: _limit, ...query } = p
     const key = createHash('sha256').update(JSON.stringify(query)).digest('hex')
-    const page = (rows: Match[], offset: number, omissions: string[]) => {
+    const page = (rows: Match[], offset: number, omissions: string[], scan?: Cursor['scan']) => {
       this.check(actor, id)
       const entries: Match[] = []
       let bytes = 1024
@@ -45,7 +46,7 @@ export class WorkspaceSearchService {
       }
       offset += entries.length
       let cursor: string | null = null
-      if (offset < rows.length) {
+      if (offset < rows.length || scan) {
         if (this.cursors.size >= 32) throw new ChannelError('resource_busy')
         cursor = randomUUID()
         this.cursors.set(cursor, {
@@ -56,20 +57,23 @@ export class WorkspaceSearchService {
           offset,
           omissions,
           expires: Date.now() + 600000,
+          scan,
         })
       }
       return { entries, cursor, incomplete: omissions.length > 0, omissions }
     }
+    let saved: Cursor | undefined
     if (p.cursor) {
       const c = this.cursors.get(String(p.cursor))
       if (!c || c.owner !== actor.installation_id || c.workspace !== id || c.key !== key)
         throw new ChannelError('stale_cursor')
-      return page(c.rows, c.offset, c.omissions)
+      if (c.offset < c.rows.length || !c.scan) return page(c.rows, c.offset, c.omissions, c.scan)
+      saved = c
     }
     if (this.workers.size >= 4) throw new ChannelError('resource_busy')
     const deadline = Date.now() + 5000,
       omissions = new Set<string>(),
-      files: string[] = []
+      files: string[] = saved?.scan?.files ?? []
     let inspected = 0
     const walk = (path: string, depth: number) => {
       if (depth > 32 || inspected++ >= 10000 || files.length >= 10000 || Date.now() > deadline) {
@@ -91,7 +95,7 @@ export class WorkspaceSearchService {
         after = listing.next ?? undefined
       } while (after)
     }
-    walk('', 0)
+    if (!saved) walk('', 0)
     const worker = new Worker(searchWorker, {
       eval: true,
       resourceLimits: { maxOldGenerationSizeMb: 32, stackSizeMb: 2 },
@@ -128,6 +132,8 @@ export class WorkspaceSearchService {
       })
     const rows: Match[] = []
     let scanned = 0,
+      next = saved?.scan?.next ?? 0,
+      line = saved?.scan?.line ?? 0,
       bytes = 0
     try {
       const init = await call({
@@ -139,19 +145,19 @@ export class WorkspaceSearchService {
       })
       if (init.error) throw new ChannelError('unsupported_search_syntax')
       const filtered = await call({ filter_paths: files })
-      for (let i = 0; i < files.length; i++) {
-        if (!filtered.included[i]) continue
+      for (; next < files.length; next++) {
+        if (!filtered.included[next]) continue
         if (
           Date.now() > deadline ||
           scanned++ >= 1000 ||
           bytes >= 4 * 1024 * 1024 ||
           rows.length >= 1000
         ) {
-          omissions.add('search budget; incomplete coverage')
+          omissions.add('search budget; continue with cursor')
           break
         }
         this.check(actor, id)
-        const path = files[i]!,
+        const path = files[next]!,
           content = p.mode === 'filename' ? null : this.r.files.read(id, path)
         if (
           content?.binary ||
@@ -163,7 +169,7 @@ export class WorkspaceSearchService {
         }
         const text = content ? this.r.files.bytes(id, content.content_id!).toString('utf8') : ''
         bytes += Buffer.byteLength(text)
-        const found = await call({ path, text, max: 1000 - rows.length })
+        const found = await call({ path, text, max: 1000 - rows.length, start: line })
         for (const match of found.matches)
           rows.push({
             path,
@@ -172,6 +178,11 @@ export class WorkspaceSearchService {
             content_id: content?.content_id ?? null,
           })
         if (found.truncated) omissions.add('matches or line text truncated')
+        line = found.next ?? 0
+        if (found.next !== undefined) {
+          omissions.add('search budget; continue with cursor')
+          break
+        }
       }
     } catch (e) {
       if (!(e instanceof ChannelError) || e.code !== 'search_deadline') throw e
@@ -180,7 +191,7 @@ export class WorkspaceSearchService {
       this.workers.delete(worker)
       await worker.terminate()
     }
-    return page(rows, 0, [...omissions])
+    return page(rows, 0, [...omissions], next < files.length ? { files, next, line } : undefined)
   }
   async stop() {
     this.stopped = true

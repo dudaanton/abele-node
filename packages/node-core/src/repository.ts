@@ -170,7 +170,7 @@ interface Continuation {
   expires: number
   extra: Record<string, unknown>
   omissions: string[]
-  scan?: { files: TreeEntry[]; next: number }
+  scan?: { files: TreeEntry[]; next: number; line?: number }
 }
 interface Comparison {
   owner: string
@@ -2711,6 +2711,7 @@ export class RepositoryService {
       omissions = new Set<string>(),
       rows: unknown[] = []
     let next = saved?.scan?.next ?? 0,
+      line = saved?.scan?.line ?? 0,
       bytes = 0
     const pageParams = { ...p, cursor: undefined }
     const finish = () =>
@@ -2721,7 +2722,7 @@ export class RepositoryService {
         rows,
         {},
         [...omissions],
-        next < files.length ? { files, next } : undefined
+        next < files.length ? { files, next, line } : undefined
       )
     // All regular expressions, including glob matching, run off the event loop in a killable worker.
     const worker = new Worker(searchWorker, {
@@ -2823,11 +2824,17 @@ export class RepositoryService {
           path: file.path,
           text: content ? decodeGit(content) : '',
           max: 1000 - rows.length,
+          start: line,
         })
         if (found.matches.length && content) content_id = this.retain(target, content)
         for (const match of found.matches)
           rows.push({ path: file.path, line: match.line, text: match.text, content_id })
         if (found.truncated) omissions.add('matches or line text truncated')
+        line = found.next ?? 0
+        if (found.next !== undefined) {
+          omissions.add('scan limit; continue with cursor to cover remaining matches')
+          break
+        }
       }
       if (revision.kind === 'working') await this.observation(actor, target, revision)
       return finish()
@@ -3370,39 +3377,57 @@ export class RepositoryService {
   }
 }
 
-export const searchWorker = `
+export const searchWorker = String.raw`
 const { parentPort } = require('node:worker_threads');
 let query, mode, sensitive, expression, glob;
+const compileGlob = pattern => {
+  let source = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        i++;
+        if (pattern[i + 1] === '/') { i++; source += '(?:.*/)?'; }
+        else source += '.*';
+      } else source += '[^/]*';
+    } else if (c === '?') source += '[^/]';
+    else if (c === '{') source += '(?:';
+    else if (c === '}') source += ')';
+    else if (c === ',') source += '|';
+    else source += c.replace(/[.+^$()|[\]\\]/g, '\\$&');
+  }
+  const re = new RegExp('^' + source + '$');
+  return path => re.test(pattern.includes('/') ? path : path.slice(path.lastIndexOf('/') + 1));
+};
 parentPort.on('message', data => {
   if (data.init) {
     try {
       query = data.query; mode = data.mode; sensitive = data.case_sensitive;
       if (mode === 'regex') expression = new RegExp(query, sensitive ? '' : 'i');
       if (data.path_glob) {
-        const escaped = data.path_glob.replace(/[.+^$(){}|[\]\\\\]/g, '\\\\$&').replace(/\\*\\*/g, '\\u0001').replace(/\\*/g, '[^/]*').replace(/\\?/g, '[^/]').replace(/\\u0001/g, '.*');
-        glob = new RegExp('^' + escaped + '$');
+        glob = compileGlob(data.path_glob);
       }
       parentPort.postMessage({ ok: true });
     } catch { parentPort.postMessage({ error: true }); }
     return;
   }
   if (data.filter_paths) {
-    parentPort.postMessage({ included: data.filter_paths.map(path => !glob || glob.test(path)) });
+    parentPort.postMessage({ included: data.filter_paths.map(path => !glob || glob(path)) });
     return;
   }
-  const matches = []; let truncated = false;
-  if (!glob || glob.test(data.path)) {
+  const matches = []; let truncated = false, next;
+  if (!glob || glob(data.path)) {
     const match = text => mode === 'regex' ? expression.test(text) : (sensitive ? text : text.toLowerCase()).includes(sensitive ? query : query.toLowerCase());
     if (mode === 'filename') { if (match(data.path)) matches.push({ line: 0, text: data.path }); }
     else {
-      const lines = data.text.split('\\n');
-      for (let i = 0; i < lines.length; i++) if (match(lines[i])) {
-        if (matches.length >= data.max) { truncated = true; break; }
+      const lines = data.text.split('\n');
+      for (let i = data.start || 0; i < lines.length; i++) if (match(lines[i])) {
+        if (matches.length >= data.max) { truncated = true; next = i; break; }
         if (lines[i].length > 4096) truncated = true;
         matches.push({ line: i + 1, text: lines[i].slice(0,4096) });
       }
     }
   }
-  parentPort.postMessage({ matches, truncated });
+  parentPort.postMessage({ matches, truncated, next });
 });
 `

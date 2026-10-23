@@ -517,7 +517,7 @@ it('bounds huge trees before publication, huge blobs before loading, and skips b
   expect(Buffer.byteLength(JSON.stringify(largePage))).toBeLessThanOrEqual(32768)
 })
 
-it('retains at most 1000 matches and returns byte-bounded pages with explicit truncation', async () => {
+it('retains at most 1000 matches per scan and returns byte-bounded pages with explicit truncation', async () => {
   const s = await setup()
   writeFileSync(
     join(s.repo, 'file'),
@@ -535,15 +535,25 @@ it('retains at most 1000 matches and returns byte-bounded pages with explicit tr
   for (;;) {
     expect(page.entries.length).toBeLessThanOrEqual(100)
     expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(32768)
-    expect(page.incomplete).toBe(true)
-    expect(page.omissions).toContain('matches or line text truncated')
+    // The first scan is cut at 1000 rows; its buffered pages retain the notice.
+    // A new scan resumes the file, so its final 100 rows are complete.
+    if (matches < 1000) {
+      expect(page.incomplete).toBe(true)
+      expect(page.omissions).toContain('matches or line text truncated')
+    } else {
+      expect(page.incomplete).toBe(false)
+      expect(page.omissions).toEqual([])
+    }
+    for (const cursor of (s.core.resources.repository as any).cursors.values())
+      expect(cursor.rows.length).toBeLessThanOrEqual(1000)
     matches += page.entries.length
     lines.push(...page.entries.map((e: any) => e.line))
     if (!page.cursor) break
     page = await s.request('repository.v1.search', { ...params, cursor: page.cursor })
   }
-  expect(matches).toBe(1000)
-  expect(new Set(lines).size).toBe(1000)
+  expect(matches).toBe(1100)
+  expect(lines).toEqual(Array.from({ length: 1100 }, (_, i) => i + 1))
+  expect(new Set(lines).size).toBe(1100)
 })
 
 it('fences cached reads and isolates observations, comparisons, continuations and retained bytes across targets/authorities', async () => {
