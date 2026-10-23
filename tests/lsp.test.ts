@@ -1,4 +1,5 @@
-import { it, expect, afterEach } from 'vitest'
+import { it, expect, afterEach, vi } from 'vitest'
+import { once } from 'node:events'
 import {
   installPlan,
   install,
@@ -322,8 +323,24 @@ it('restarts and reports a crashed TypeScript worker even when its LSP wrapper s
   previous.notify('workerCrash', {})
   await expect.poll(() => slot.connection !== previous, { timeout: 5000 }).toBe(true)
   await service.open(root, 'a.ts')
+  // ChildProcess 'close' waits for stdio as well as process exit. Reproduce a
+  // busy CI host taking longer than expect.poll's default one-second deadline.
+  const child = slot.connection.child
+  const emit = child.emit.bind(child)
+  const delayedClose = vi.spyOn(child, 'emit').mockImplementation((event, ...args) => {
+    if (event === 'close') {
+      setTimeout(() => emit(event, ...args), 1200)
+      return true
+    }
+    return emit(event, ...args)
+  })
+  cleanups.push(() => {
+    delayedClose.mockRestore()
+  })
+  const closed = once(child, 'close', { signal: AbortSignal.timeout(5000) })
   slot.connection.notify('workerCrash', {})
-  await expect.poll(() => service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
+  await closed
+  expect(service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
   expect(service.failureMessage(root, 'typescript')).toContain('heap out of memory')
   expect(service.failureMessage(root, 'typescript')).toContain('SIGABRT')
   await expect(service.query(root, 'a.ts', 'hover')).rejects.toThrow('lsp_repeated_crash')
