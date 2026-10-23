@@ -259,7 +259,8 @@ it.each(['direct', 'symlinked'] as const)(
   }
 )
 it('restarts once after a crash and reports a repeated crash', async () => {
-  const root = temp(),
+  // Match the canonical key used by open/query even when the runner's TMPDIR is an alias.
+  const root = realpathSync(temp()),
     log = join(root, 'frames'),
     errors: string[] = []
   writeFileSync(join(root, 'a.ts'), '')
@@ -274,12 +275,15 @@ it('restarts once after a crash and reports a repeated crash', async () => {
   })
   cleanups.push(() => service.stop())
   await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_exited')
-  await until(
-    () =>
-      readFileSync(log, 'utf8')
-        .split('\n')
-        .filter((line) => line === 'initialize').length === 2
-  )
+  await expect
+    .poll(
+      () =>
+        readFileSync(log, 'utf8')
+          .split('\n')
+          .filter((line) => line === 'initialize').length,
+      { timeout: 10000 }
+    )
+    .toBe(2)
   await service.open(root, 'a.ts')
   // Trigger a second crash through a deterministic fake definition request.
   const slot = [...(service as any).slots.values()][0]
@@ -287,9 +291,16 @@ it('restarts once after a crash and reports a repeated crash', async () => {
   slot.connection.notify('crash', {})
   // Request-failure reporting adds a notice for the initial failed open. Wait for the
   // second process exit itself, rather than a count already reached before this crash.
-  await until(() => errors.some((message) => message.includes('stopped after repeated crash')))
+  await expect
+    .poll(
+      () => errors.some((message) => message.startsWith('typescript stopped after repeated crash')),
+      { timeout: 10000 }
+    )
+    .toBe(true)
   await expect(service.open(root, 'a.ts')).rejects.toThrow('lsp_repeated_crash')
-  expect(service.lastFailure(root, 'typescript')).toBe('lsp_repeated_crash')
+  await expect
+    .poll(() => service.lastFailure(root, 'typescript'), { timeout: 10000 })
+    .toBe('lsp_repeated_crash')
   await expect(service.query(root, 'a.ts', 'diagnostics')).rejects.toThrow('lsp_repeated_crash')
 })
 it('uses fake install transports without network and refuses corrupt Rust binaries', async () => {

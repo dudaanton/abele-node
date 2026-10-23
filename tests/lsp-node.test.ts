@@ -122,7 +122,9 @@ it.each(['status', 'open'] as const)(
         input: { path: 'a.ts' },
       })
       await core.resources.lsp.afterEdit(session.session_id)
-      expect(readFileSync(join(dir, 'server.log'), 'utf8')).toContain('textDocument/didChange')
+      await expect
+        .poll(() => readFileSync(join(dir, 'server.log'), 'utf8'), { timeout: 10000 })
+        .toContain('textDocument/didChange')
       await expect
         .poll(() => client.diagnostics(ref, 'a.ts'))
         .toEqual([expect.objectContaining({ source: 'typescript' })])
