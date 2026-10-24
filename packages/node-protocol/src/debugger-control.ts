@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import {
   DebuggerMethodSchemas,
@@ -57,7 +58,7 @@ export const DebuggerGrantInputSchema = z
     target_id: id,
     debug_session_id: id,
     incarnation: id,
-    expires_at: z.string().datetime(),
+    expires_at: WireTimestampSchema,
     actions: z.array(DebuggerActionSchema).min(1).max(10),
     mode: DebuggerModeSchema.optional(),
   })
@@ -163,7 +164,7 @@ export type DebuggerLaunchTargetsResult = z.infer<typeof DebuggerLaunchTargetsRe
 const absolute = z.string().min(1).max(4096)
 export const DebuggerProgramSchema = z
   .object({
-    pid: z.number().int().positive(),
+    pid: z.number().multipleOf(1).positive(),
     port: z.number().int().min(1).max(65535),
     command: z.string().max(256),
     cwd: absolute.nullable(),

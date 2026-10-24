@@ -1004,8 +1004,29 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         'issues' in error
       ) {
         const fields = (
-          error as { issues: { path: (string | number)[]; message: string }[] }
-        ).issues.map((issue) => issue.path.join('.') || issue.message)
+          error as {
+            issues: {
+              path: (string | number)[]
+              message: string
+              code: string
+              keys?: string[]
+              expected?: string
+            }[]
+          }
+        ).issues.map((issue) => {
+          if (issue.path.length) return issue.path.join('.')
+          // These messages are exposed as command-context error fields. Keep
+          // their existing wire spelling across the Zod major-version change.
+          if (issue.code === 'unrecognized_keys')
+            return `Unrecognized key(s) in object: ${issue.keys!.map((key) => `'${key}'`).join(', ')}`
+          if (issue.code === 'invalid_type') {
+            const received = raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw
+            return received === 'undefined'
+              ? 'Required'
+              : `Expected ${issue.expected}, received ${received}`
+          }
+          return issue.message
+        })
         throw new ChannelError(
           'invalid_params',
           'Invalid command context parameters: ' + fields.join(', '),

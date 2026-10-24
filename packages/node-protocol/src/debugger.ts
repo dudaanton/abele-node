@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { ExecutionTargetSchema } from './turn.js'
 
@@ -72,7 +73,10 @@ export const DebuggerTargetSchema = z
         pid: threadId,
         ownership_id: id,
         start_identity: z.string().min(1).max(256),
-        executable_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+        executable_sha256: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .regex(/^[a-f0-9]{64}$/),
       })
       .strict()
       .optional(),
@@ -242,7 +246,7 @@ export const DebuggerSnapshotSchema = z
     breakpoint_revision: seq,
     event_seq: seq,
     stop_epoch: seq,
-    observed_at: z.string().datetime(),
+    observed_at: WireTimestampSchema,
     target: DebuggerTargetSchema,
     lifecycle: z.enum([
       'configuring',
@@ -271,7 +275,7 @@ export const DebuggerExitInfoResultSchema = z
   .object({ exit_code: z.number().int().safe().nullable() })
   .strict()
 export const DebuggerSessionInfoResultSchema = z
-  .object({ started_at: z.string().datetime().nullable() })
+  .object({ started_at: WireTimestampSchema.nullable() })
   .strict()
 export const DebuggerSourcesResultSchema = z
   .object({
@@ -327,9 +331,9 @@ export const DebuggerEventSchema = z
     state_revision: seq,
     breakpoint_revision: seq,
     stop_epoch: seq,
-    observed_at: z.string().datetime(),
+    observed_at: WireTimestampSchema,
     kind: id,
-    data: z.unknown(),
+    data: z.unknown().optional(),
     truncated: z.boolean(),
   })
   .strict()
@@ -382,9 +386,10 @@ export const DebuggerReceiptSchema = z
     code: id.optional(),
     proposal_hash: z
       .string()
+      .max(16 * 1024 * 1024)
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
-    completed_at: z.string().datetime(),
+    completed_at: WireTimestampSchema,
     snapshot: DebuggerSnapshotSchema,
   })
   .strict()
@@ -417,7 +422,7 @@ export const DebuggerHistoryEntrySchema = DebuggerHistoryInputSchema.extend({
   history_seq: seq,
   event_seq: seq,
   stop: DebuggerStopSchema.nullable(),
-  observed_at: z.string().datetime(),
+  observed_at: WireTimestampSchema,
   incarnation: id,
   stop_epoch: seq,
   state_revision: seq,

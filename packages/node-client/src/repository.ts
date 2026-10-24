@@ -128,7 +128,9 @@ export class RepositoryClient {
   }
   /** Omit subscription_id to acquire; pass this consumer's last ID to replace its lease. */
   async watch(params: RepositoryParams<'repository.v1.watch'>) {
-    return RepositoryWatchSchema.parse(await this.call('repository.v1.watch', params))
+    return RepositoryWatchSchema.parse(
+      await this.call('repository.v1.watch', { ...params, explicit_renewal: true })
+    )
   }
   async unwatch(params: RepositoryParams<'repository.v1.unwatch'>) {
     return RepositoryUnwatchSchema.parse(await this.call('repository.v1.unwatch', params))

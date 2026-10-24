@@ -2,10 +2,15 @@ import { z } from 'zod'
 
 const id = z.string().min(1).max(128)
 // UTF-16 bound also bounds UTF-8 to at most 256 KiB.
-const json = z.record(z.unknown()).refine((v) => JSON.stringify(v).length <= 65536)
+const json = z
+  .record(z.string().max(16 * 1024 * 1024), z.unknown())
+  .refine((v) => JSON.stringify(v).length <= 65536)
 export const ObsidianToolSchema = z
   .object({
-    name: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/),
+    name: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/),
     description: z.string().max(16384),
     inputSchema: json,
     mode: z.enum(['off', 'ask', 'auto']),
@@ -68,7 +73,7 @@ export const ObsidianToolsMethodSchemas = {
   'obsidian.tools.v1.delegate.history': invocation
     .extend({
       branch_id: id,
-      after_seq: z.number().int().min(0).default(0),
+      after_seq: z.number().multipleOf(1).min(0).default(0),
       limit: z.number().int().min(1).max(128).default(64),
     })
     .strict(),
@@ -84,7 +89,9 @@ export const ObsidianToolsMethodSchemas = {
       vault_id: id,
       platform: z.enum(['desktop', 'mobile']),
       label: z.string().max(128).optional(),
-      revisions: z.record(id).refine((v) => Object.keys(v).length <= 256),
+      revisions: z
+        .record(z.string().max(16 * 1024 * 1024), id)
+        .refine((v) => Object.keys(v).length <= 256),
     })
     .strict(),
   'obsidian.tools.v1.poll': z.object({ client_id: id }).strict(),

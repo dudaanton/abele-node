@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 
 const id = z.string().min(1).max(128)
@@ -38,6 +39,7 @@ export const SessionSettingsSchema = z
     /** A configuration name the node offers in its capabilities, never a path. */
     account: z
       .string()
+      .max(16 * 1024 * 1024)
       .regex(/^[a-z0-9][a-z0-9_-]{0,31}$/)
       .optional(),
     permission_mode: z.enum(SESSION_PERMISSION_MODES).optional(),
@@ -102,7 +104,7 @@ export const LiveSessionStateSchema = z
     process: z.enum(['none', 'starting', 'idle', 'running', 'stopping']),
     run_id: id.nullable(),
     turn: z
-      .object({ turn_id: id, trigger: z.string().max(32), started_at: z.string().datetime() })
+      .object({ turn_id: id, trigger: z.string().max(32), started_at: WireTimestampSchema })
       .strict()
       .nullable(),
     background_tasks: z.array(BackgroundTaskSchema).max(256),
@@ -110,29 +112,29 @@ export const LiveSessionStateSchema = z
     compacting: z.boolean(),
     settings: z
       .object({
-        model: z.string(),
-        effort: z.string(),
-        account: z.string(),
-        permission_mode: z.string(),
+        model: z.string().max(16 * 1024 * 1024),
+        effort: z.string().max(16 * 1024 * 1024),
+        account: z.string().max(16 * 1024 * 1024),
+        permission_mode: z.string().max(16 * 1024 * 1024),
         continue_after_compaction: z.boolean(),
-        continuation_text: z.string(),
+        continuation_text: z.string().max(16 * 1024 * 1024),
         messaging: z.boolean(),
       })
       .strict(),
     /** What the running process was started with or switched to; null without a process. */
     process_settings: z
       .object({
-        model: z.string(),
-        effort: z.string(),
-        account: z.string(),
-        permission_mode: z.string(),
+        model: z.string().max(16 * 1024 * 1024),
+        effort: z.string().max(16 * 1024 * 1024),
+        account: z.string().max(16 * 1024 * 1024),
+        permission_mode: z.string().max(16 * 1024 * 1024),
       })
       .strict()
       .nullable(),
     /** Effort or account changed while the process could not be restarted yet. */
     restart_pending: z.boolean(),
-    watchers: z.number().int().min(0),
-    idle_since: z.string().datetime().nullable(),
+    watchers: z.number().multipleOf(1).min(0),
+    idle_since: WireTimestampSchema.nullable(),
   })
   .strict()
 export type LiveSessionState = z.infer<typeof LiveSessionStateSchema>
@@ -155,7 +157,7 @@ export const LiveEventPayloads = {
       reattached: z.boolean().optional(),
       native_session_id: z.string().max(256).nullable().optional(),
       reason: z.string().max(256).nullable().optional(),
-      exit_code: z.number().int().nullable().optional(),
+      exit_code: z.number().multipleOf(1).nullable().optional(),
       lost_tasks: z.array(BackgroundTaskSchema).max(256).optional(),
     })
     .strict(),
@@ -170,7 +172,7 @@ export const LiveEventPayloads = {
       final_reply: z
         .object({
           message_id: id,
-          event_seqs: z.array(z.number().int().positive()),
+          event_seqs: z.array(z.number().multipleOf(1).positive()).max(65536),
         })
         .strict()
         .nullable(),

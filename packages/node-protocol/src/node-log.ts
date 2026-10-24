@@ -1,10 +1,11 @@
+import { WireTimestampSchema, WireOffsetTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 
 export const NodeLogMethodSchemas = {
   'node.log.v1.tail': z
     .object({
       limit: z.number().int().min(1).max(1000).default(200),
-      since: z.string().datetime({ offset: true }).optional(),
+      since: WireOffsetTimestampSchema.optional(),
       level: z.enum(['all', 'warnings_and_errors']).default('all'),
     })
     .strict(),
@@ -15,9 +16,9 @@ export const NodeLogTailSchema = z
       .array(
         z
           .object({
-            time: z.string().datetime().nullable(),
+            time: WireTimestampSchema.nullable(),
             level: z.enum(['debug', 'info', 'warn', 'error', 'unknown']),
-            text: z.string(),
+            text: z.string().max(16 * 1024 * 1024),
             source: z.enum(['stdout', 'stderr']),
           })
           .strict()

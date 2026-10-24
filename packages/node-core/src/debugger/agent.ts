@@ -45,13 +45,14 @@ const toolName = (method: string) =>
 // Only the existing bounded Zod contract subset is converted. Admission ALWAYS
 // uses the strict Zod parser, never this provider-facing descriptive schema.
 function jsonSchema(schema: any): Record<string, any> {
-  const d = schema._def
-  switch (d.typeName) {
-    case 'ZodOptional':
+  const d = schema.def
+  const checks = (d.checks ?? []).map((check: any) => check._zod.def)
+  switch (d.type) {
+    case 'optional':
       return jsonSchema(d.innerType)
-    case 'ZodDefault':
-      return { ...jsonSchema(d.innerType), default: d.defaultValue() }
-    case 'ZodObject': {
+    case 'default':
+      return { ...jsonSchema(d.innerType), default: d.defaultValue }
+    case 'object': {
       const shape = schema.shape
       return {
         type: 'object',
@@ -64,32 +65,38 @@ function jsonSchema(schema: any): Record<string, any> {
         additionalProperties: false,
       }
     }
-    case 'ZodArray':
+    case 'array':
       return {
         type: 'array',
-        items: jsonSchema(d.type),
-        ...(d.maxLength ? { maxItems: d.maxLength.value } : {}),
+        items: jsonSchema(d.element),
+        ...Object.fromEntries(
+          checks
+            .filter((c: any) => c.check === 'max_length')
+            .map((c: any) => ['maxItems', c.maximum])
+        ),
       }
-    case 'ZodEnum':
-      return { type: 'string', enum: d.values }
-    case 'ZodBoolean':
+    case 'enum':
+      return { type: 'string', enum: schema.options }
+    case 'boolean':
       return { type: 'boolean' }
-    case 'ZodString':
+    case 'string':
       return {
         type: 'string',
         ...Object.fromEntries(
-          d.checks
-            .filter((c: any) => ['min', 'max'].includes(c.kind))
-            .map((c: any) => [c.kind === 'min' ? 'minLength' : 'maxLength', c.value])
+          checks
+            .filter((c: any) => ['min_length', 'max_length'].includes(c.check))
+            .map((c: any) =>
+              c.check === 'min_length' ? ['minLength', c.minimum] : ['maxLength', c.maximum]
+            )
         ),
       }
-    case 'ZodNumber':
+    case 'number':
       return {
-        type: d.checks.some((c: any) => c.kind === 'int') ? 'integer' : 'number',
+        type: schema.isInt ? 'integer' : 'number',
         ...Object.fromEntries(
-          d.checks
-            .filter((c: any) => ['min', 'max'].includes(c.kind))
-            .map((c: any) => [c.kind === 'min' ? 'minimum' : 'maximum', c.value])
+          checks
+            .filter((c: any) => ['greater_than', 'less_than'].includes(c.check))
+            .map((c: any) => [c.check === 'greater_than' ? 'minimum' : 'maximum', c.value])
         ),
       }
     default:

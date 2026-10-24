@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import {
   CommitSchema,
@@ -21,7 +22,7 @@ export const RepositoryRevisionSchema = z.discriminatedUnion('kind', [
       kind: z.literal('working'),
       observation_id: id,
       head: CommitSchema.nullable(),
-      observed_at: z.string().datetime(),
+      observed_at: WireTimestampSchema,
     })
     .strict(),
 ])
@@ -37,11 +38,17 @@ export const WorktreeEntrySchema = z
     identity: z
       .object({
         canonical_path: z.string().max(4096),
-        fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+        fingerprint: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .regex(/^[a-f0-9]{64}$/),
       })
       .strict()
       .optional(),
-    branch: z.string().nullable(),
+    branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     detached: z.boolean(),
     head: CommitSchema.nullable(),
     availability: z.enum(['available', 'missing', 'unavailable', 'bare']),
@@ -55,49 +62,59 @@ export type WorktreeEntry = z.infer<typeof WorktreeEntrySchema>
 export const RepositoryTreeEntrySchema = z
   .object({
     path,
-    name: z.string(),
+    name: z.string().max(16 * 1024 * 1024),
     kind: z.enum(['file', 'directory', 'symlink', 'submodule']),
     oid: CommitSchema.nullable(),
-    size: z.number().int().nonnegative().nullable(),
+    size: z.number().multipleOf(1).nonnegative().nullable(),
   })
   .strict()
 export const RepositoryCommitSchema = z
   .object({
     commit: CommitSchema,
-    parents: z.array(CommitSchema),
-    author: z.string(),
-    email: z.string(),
-    authored_at: z.string(),
-    subject: z.string(),
-    message: z.string(),
+    parents: z.array(CommitSchema).max(65536),
+    author: z.string().max(16 * 1024 * 1024),
+    email: z.string().max(16 * 1024 * 1024),
+    authored_at: z.string().max(16 * 1024 * 1024),
+    subject: z.string().max(16 * 1024 * 1024),
+    message: z.string().max(16 * 1024 * 1024),
   })
   .strict()
 export const RepositoryChangeSchema = z
   .object({
     path: file,
-    status: z.string(),
-    index: z.string().optional(),
-    worktree: z.string().optional(),
+    status: z.string().max(16 * 1024 * 1024),
+    index: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    worktree: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
   })
   .strict()
 export const RepositoryBlameLineSchema = z
   .object({
-    line: z.number().int().positive(),
-    original_line: z.number().int().positive(),
+    line: z.number().multipleOf(1).positive(),
+    original_line: z.number().multipleOf(1).positive(),
     commit: CommitSchema.nullable(),
-    author: z.string(),
-    text: z.string(),
+    author: z.string().max(16 * 1024 * 1024),
+    text: z.string().max(16 * 1024 * 1024),
   })
   .strict()
 export const RepositorySearchMatchSchema = z
   .object({
     path: file,
-    line: z.number().int().nonnegative(),
-    text: z.string(),
+    line: z.number().multipleOf(1).nonnegative(),
+    text: z.string().max(16 * 1024 * 1024),
     content_id: id.nullable(),
   })
   .strict()
-const page = { cursor: id.nullable(), incomplete: z.boolean(), omissions: z.array(z.string()) }
+const page = {
+  cursor: id.nullable(),
+  incomplete: z.boolean(),
+  omissions: z.array(z.string().max(16 * 1024 * 1024)).max(65536),
+}
 export const WorktreePageSchema = z
   .object({ entries: z.array(WorktreeEntrySchema).max(256), ...page })
   .strict()
@@ -112,7 +129,7 @@ export const ChangeDetailSchema = z
     kind: z.enum(['M', 'A', 'D', 'R', 'conflict']),
     stage: z.enum(['unstaged', 'staged', 'partly']),
     change_id: id,
-    changed_at: z.string().datetime(),
+    changed_at: WireTimestampSchema,
     time_basis: z.literal('observed'),
   })
   .strict()
@@ -132,14 +149,20 @@ export const RepositoryRefsPageSchema = z
       .array(
         z
           .object({
-            name: z.string(),
+            name: z.string().max(16 * 1024 * 1024),
             commit: CommitSchema.nullable(),
-            symbolic: z.string().nullable(),
+            symbolic: z
+              .string()
+              .max(16 * 1024 * 1024)
+              .nullable(),
           })
           .strict()
       )
       .max(256),
-    default_branch: z.string().nullable(),
+    default_branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     ...page,
   })
   .strict()
@@ -161,7 +184,7 @@ export const RepositoryComparisonSchema = z
 export const RepositoryBlobSchema = z
   .object({
     content_id: id.nullable(),
-    size: z.number().int().nonnegative(),
+    size: z.number().multipleOf(1).nonnegative(),
     binary: z.boolean(),
     requires_larger_load: z.boolean(),
     too_large: z.boolean(),
@@ -182,12 +205,19 @@ export const RepositoryInvalidationSchema = z
   })
   .strict()
 export const RepositorySettingsSchema = z
-  .object({ project_id: id, external_read: z.boolean(), default_branch: z.string().nullable() })
+  .object({
+    project_id: id,
+    external_read: z.boolean(),
+    default_branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
+  })
   .strict()
 export const RepositoryUnwatchSchema = z.object({ removed: z.literal(true) }).strict()
 /** Where a change-stream client stands: the node run's stream and the last batch applied. */
 export const RepositoryChangesCursorSchema = z
-  .object({ stream_id: id, revision: z.number().int().nonnegative() })
+  .object({ stream_id: id, revision: z.number().multipleOf(1).nonnegative() })
   .strict()
 export type RepositoryChangesCursor = z.infer<typeof RepositoryChangesCursorSchema>
 /**
@@ -198,7 +228,7 @@ export type RepositoryChangesCursor = z.infer<typeof RepositoryChangesCursorSche
 export const RepositoryWatchSchema = z
   .object({
     subscription_id: id,
-    expires_at: z.string().datetime(),
+    expires_at: WireTimestampSchema,
     refresh_required: z.boolean(),
     changes: RepositoryChangesCursorSchema.optional(),
   })
@@ -217,7 +247,10 @@ export type RepositoryTreeChange = z.infer<typeof RepositoryTreeChangeSchema>
 export const RepositoryGitChangeSchema = z
   .object({
     head: CommitSchema.nullable(),
-    branch: z.string().nullable(),
+    branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     detached: z.boolean(),
     status: z
       .array(z.object({ path: file, entry: StatusEntrySchema.nullable() }).strict())
@@ -228,7 +261,7 @@ const batch = {
   project_id: id,
   worktree_id: id,
   stream_id: id,
-  revision: z.number().int().positive(),
+  revision: z.number().multipleOf(1).positive(),
 }
 /** `repository.changed`. Revisions count up by one per stream; anything else is a gap. */
 export const RepositoryChangeBatchSchema = z.discriminatedUnion('complete', [
@@ -283,7 +316,7 @@ export const RepositoryMethodSchemas = {
     .object({
       ...target,
       recovery_path: RelativePathSchema,
-      offset: z.number().int().nonnegative().default(0),
+      offset: z.number().multipleOf(1).nonnegative().default(0),
       length: z.number().int().min(1).max(131072).default(131072),
     })
     .strict(),
@@ -311,7 +344,7 @@ export const RepositoryMethodSchemas = {
     .object({
       ...target,
       content_id: id,
-      offset: z.number().int().nonnegative().default(0),
+      offset: z.number().multipleOf(1).nonnegative().default(0),
       length: z.number().int().min(1).max(131072).default(131072),
     })
     .strict(),
@@ -359,6 +392,8 @@ export const RepositoryMethodSchemas = {
     .object({
       ...target,
       subscription_id: id.optional(),
+      // Opt into independent acquisitions before the first renewal by ID.
+      explicit_renewal: z.boolean().optional(),
       changes: RepositoryChangesCursorSchema.nullable().optional(),
     })
     .strict(),

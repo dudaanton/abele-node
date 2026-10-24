@@ -14,7 +14,10 @@ const branch = z
   .min(1)
   .max(256)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/)
-const commit = z.string().regex(/^[a-f0-9]{40,64}$/)
+const commit = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{40,64}$/)
 
 /** These methods create exact owner prompts; authentication never implies execution approval. */
 export const ManagerMethodSchemas = {
@@ -32,7 +35,7 @@ export const ManagerMethodSchemas = {
       command: text.optional(),
       cwd: z.string().min(1).max(4096).optional(),
       env: z
-        .record(z.string().max(32768))
+        .record(z.string().max(16 * 1024 * 1024), z.string().max(32768))
         .refine((e) => Object.keys(e).length <= 128)
         .optional(),
       timeout_ms: z.number().int().min(1).max(2147483647).optional(),
@@ -79,9 +82,8 @@ export const CommandContextMethodSchemas = {
       (p) => (p.project_id !== undefined) !== (p.worktree_id !== undefined),
       'Supply exactly one project_id or worktree_id'
     ),
-  'command.context.v1.prepare': ManagerMethodSchemas['command.v1.run']
-    .innerType()
-    .innerType()
+  'command.context.v1.prepare': z
+    .object(ManagerMethodSchemas['command.v1.run'].shape)
     .omit({ session_id: true, project_id: true, worktree_id: true })
     .extend({
       ...contextBinding,
@@ -133,15 +135,25 @@ export const ManagerRunSchema = z
       'failed',
       'outcome_unknown',
     ]),
-    reason: z.string().optional(),
-    stdout: z.string(),
-    stderr: z.string(),
+    reason: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    stdout: z.string().max(16 * 1024 * 1024),
+    stderr: z.string().max(16 * 1024 * 1024),
     stdout_truncated: z.boolean(),
     stderr_truncated: z.boolean(),
-    exit_code: z.number().int().nullable().optional(),
-    signal: z.string().nullable().optional(),
+    exit_code: z.number().multipleOf(1).nullable().optional(),
+    signal: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable()
+      .optional(),
     head: commit.optional(),
-    conflicting_files: z.array(z.string()).optional(),
+    conflicting_files: z
+      .array(z.string().max(16 * 1024 * 1024))
+      .max(65536)
+      .optional(),
   })
   .strict()
 export type ManagerRun = z.infer<typeof ManagerRunSchema>
@@ -159,7 +171,7 @@ export const CommandContextRunSchema = ManagerRunSchema.extend({
   context_id: id,
   permission_mode: z.enum(['ask', 'bypass']),
   justification: z.string().max(512).optional(),
-  approval: z.record(z.unknown()).nullable(),
+  approval: z.record(z.string().max(16 * 1024 * 1024), z.unknown()).nullable(),
 }).strict()
 export type CommandContext = z.infer<typeof CommandContextSchema>
 export type CommandContextRun = z.infer<typeof CommandContextRunSchema>

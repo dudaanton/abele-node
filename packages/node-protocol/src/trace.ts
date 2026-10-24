@@ -3,8 +3,14 @@
 import { z } from 'zod'
 
 const id = z.string().min(1).max(128)
-const runId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/)
-const stepId = z.string().regex(/^t\d{4,9}$/)
+const runId = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/)
+const stepId = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^t\d{4,9}$/)
 const name = z.string().min(1).max(256)
 const path = z.string().min(1).max(1024)
 
@@ -33,12 +39,18 @@ export type TracePointInput = z.infer<typeof TracePointSchema>
 export const TraceShapeSchema: z.ZodType<TraceShape> = z.lazy(() =>
   z
     .object({
-      key: z.string().optional(),
-      type: z.string(),
-      count: z.number().int().optional(),
+      key: z
+        .string()
+        .max(16 * 1024 * 1024)
+        .optional(),
+      type: z.string().max(16 * 1024 * 1024),
+      count: z.number().multipleOf(1).optional(),
       optional: z.boolean().optional(),
-      example: z.string().optional(),
-      children: z.array(TraceShapeSchema).optional(),
+      example: z
+        .string()
+        .max(16 * 1024 * 1024)
+        .optional(),
+      children: z.array(TraceShapeSchema).max(65536).optional(),
     })
     .strict()
 )
@@ -53,116 +65,165 @@ export interface TraceShape {
 
 export const TraceValueMetaSchema = z
   .object({
-    name: z.string(),
+    name: z.string().max(16 * 1024 * 1024),
     format: z.enum(['json', 'xml', 'text', 'number']),
-    bytes: z.number().int().nonnegative(),
-    brief: z.string(),
+    bytes: z.number().multipleOf(1).nonnegative(),
+    brief: z.string().max(16 * 1024 * 1024),
     /** The same content as the value of that name at the step before. */
     same: z.boolean().optional(),
     masked: z.boolean().optional(),
-    failed: z.string().optional(),
+    failed: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
   })
   .strict()
 export type TraceValueMeta = z.infer<typeof TraceValueMetaSchema>
 
 export const TraceStepSchema = z
   .object({
-    id: z.string(),
+    id: z.string().max(16 * 1024 * 1024),
     kind: z.enum(['probe', 'error', 'http', 'browser-lost']),
-    ts: z.string(),
+    ts: z.string().max(16 * 1024 * 1024),
     at: z.number(),
-    label: z.string(),
-    point: z.string().optional(),
+    label: z.string().max(16 * 1024 * 1024),
+    point: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     place: z
-      .object({ file: z.string(), line: z.number().int(), fn: z.string().optional() })
+      .object({
+        file: z.string().max(16 * 1024 * 1024),
+        line: z.number().multipleOf(1),
+        fn: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .optional(),
+      })
       .strict()
       .optional(),
-    stack: z.array(z.string()).optional(),
+    stack: z
+      .array(z.string().max(16 * 1024 * 1024))
+      .max(65536)
+      .optional(),
     paused_ms: z.number().optional(),
-    status: z.number().int().optional(),
-    host: z.string().optional(),
+    status: z.number().multipleOf(1).optional(),
+    host: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     direction: z.enum(['incoming', 'outgoing']).optional(),
     duration_ms: z.number().nonnegative().optional(),
-    chain: z.string().optional(),
+    chain: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     /** Under its request only because it ran while the request was out. */
     by_time: z.boolean().optional(),
     /** A request sent from the project's saved requests. */
     sent: z.boolean().optional(),
     marked: z.boolean().optional(),
-    values: z.array(TraceValueMetaSchema),
+    values: z.array(TraceValueMetaSchema).max(65536),
   })
   .strict()
 export type TraceStep = z.infer<typeof TraceStepSchema>
 
 export const TraceRunSummarySchema = z
   .object({
-    id: z.string(),
-    name: z.string(),
-    debug_session_id: z.string(),
-    started_at: z.string(),
+    id: z.string().max(16 * 1024 * 1024),
+    name: z.string().max(16 * 1024 * 1024),
+    debug_session_id: z.string().max(16 * 1024 * 1024),
+    started_at: z.string().max(16 * 1024 * 1024),
     length_ms: z.number().optional(),
     state: z.enum(['recording', 'done', 'cut']),
-    steps: z.number().int(),
-    bytes: z.number().int(),
+    steps: z.number().multipleOf(1),
+    bytes: z.number().multipleOf(1),
   })
   .strict()
 export type TraceRunSummary = z.infer<typeof TraceRunSummarySchema>
 
 export const TracePointCopySchema = z
   .object({
-    breakpoint_id: z.string(),
-    file: z.string(),
-    line: z.number().int(),
-    take: z.array(z.string()),
-    when: z.string().optional(),
-    note: z.string().optional(),
+    breakpoint_id: z.string().max(16 * 1024 * 1024),
+    file: z.string().max(16 * 1024 * 1024),
+    line: z.number().multipleOf(1),
+    take: z.array(z.string().max(16 * 1024 * 1024)).max(65536),
+    when: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    note: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     /** How many steps it gave in this run. */
-    hits: z.number().int(),
+    hits: z.number().multipleOf(1),
     /** What it took the last time, in a line. */
-    last: z.string().optional(),
+    last: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
   })
   .strict()
 
 export const TraceMarkSchema = z
   .object({
-    step: z.string(),
-    name: z.string().optional(),
-    path: z.string().optional(),
-    comment: z.string(),
-    tags: z.array(z.string()).optional(),
-    at: z.string().optional(),
+    step: z.string().max(16 * 1024 * 1024),
+    name: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    path: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    comment: z.string().max(16 * 1024 * 1024),
+    tags: z
+      .array(z.string().max(16 * 1024 * 1024))
+      .max(65536)
+      .optional(),
+    at: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
   })
   .strict()
 
 export const TraceRunResultSchema = z
   .object({
     run: TraceRunSummarySchema,
-    points: z.array(TracePointCopySchema),
-    steps: z.array(TraceStepSchema),
+    points: z.array(TracePointCopySchema).max(65536),
+    steps: z.array(TraceStepSchema).max(65536),
     /** Where the next page of steps starts, when there is one. */
-    next: z.number().int().optional(),
-    marks: z.array(TraceMarkSchema),
-    folder: z.string(),
+    next: z.number().multipleOf(1).optional(),
+    marks: z.array(TraceMarkSchema).max(65536),
+    folder: z.string().max(16 * 1024 * 1024),
   })
   .strict()
 export type TraceRunResult = z.infer<typeof TraceRunResultSchema>
 
 export const TracePageSchema = z
   .object({
-    lines: z.array(z.string()),
-    next: z.number().int().optional(),
+    lines: z.array(z.string().max(16 * 1024 * 1024)).max(65536),
+    next: z.number().multipleOf(1).optional(),
     truncated: z.boolean(),
-    total: z.number().int(),
+    total: z.number().multipleOf(1),
   })
   .strict()
 
 export const TraceChangeSchema = z
   .object({
-    path: z.string(),
+    path: z.string().max(16 * 1024 * 1024),
     kind: z.enum(['added', 'removed', 'type', 'value']),
-    before: z.string().optional(),
-    after: z.string().optional(),
-    count: z.number().int(),
+    before: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    after: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    count: z.number().multipleOf(1),
   })
   .strict()
 
@@ -173,9 +234,14 @@ export const TraceValueResultSchema = z
     page: TracePageSchema.optional(),
     changes: z
       .object({
-        against: z.object({ step: z.string(), name: z.string() }).strict(),
-        summary: z.string(),
-        changes: z.array(TraceChangeSchema),
+        against: z
+          .object({
+            step: z.string().max(16 * 1024 * 1024),
+            name: z.string().max(16 * 1024 * 1024),
+          })
+          .strict(),
+        summary: z.string().max(16 * 1024 * 1024),
+        changes: z.array(TraceChangeSchema).max(65536),
       })
       .strict()
       .optional(),
@@ -184,23 +250,35 @@ export const TraceValueResultSchema = z
 export type TraceValueResult = z.infer<typeof TraceValueResultSchema>
 
 export const TraceHitSchema = z
-  .object({ step: z.string(), name: z.string(), path: z.string() })
+  .object({
+    step: z.string().max(16 * 1024 * 1024),
+    name: z.string().max(16 * 1024 * 1024),
+    path: z.string().max(16 * 1024 * 1024),
+  })
   .strict()
 
 export const TraceTrailSchema = z
   .object({
-    value: z.string(),
-    stops: z.array(
-      z
-        .object({
-          step: z.string(),
-          name: z.string(),
-          path: z.string(),
-          change: z.string().optional(),
-        })
-        .strict()
-    ),
-    lost_after: z.string().optional(),
+    value: z.string().max(16 * 1024 * 1024),
+    stops: z
+      .array(
+        z
+          .object({
+            step: z.string().max(16 * 1024 * 1024),
+            name: z.string().max(16 * 1024 * 1024),
+            path: z.string().max(16 * 1024 * 1024),
+            change: z
+              .string()
+              .max(16 * 1024 * 1024)
+              .optional(),
+          })
+          .strict()
+      )
+      .max(65536),
+    lost_after: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
   })
   .strict()
 export type TraceTrail = z.infer<typeof TraceTrailSchema>
@@ -227,7 +305,7 @@ export const TraceMethodSchemas = {
   'trace.v1.run': z
     .object({
       ...run,
-      from: z.number().int().min(0).optional(),
+      from: z.number().multipleOf(1).min(0).optional(),
       through: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
       kind: z
         .array(z.enum(['probe', 'error', 'http', 'browser-lost']))
@@ -243,7 +321,7 @@ export const TraceMethodSchemas = {
       name,
       view: z.enum(['shape', 'page', 'slice', 'changes']),
       path: path.optional(),
-      from: z.number().int().min(0).optional(),
+      from: z.number().multipleOf(1).min(0).optional(),
       against: z.object({ step: stepId, name }).strict().optional(),
       cap,
     })
@@ -273,16 +351,22 @@ export const TraceMethodSchemas = {
 export type TraceMethod = keyof typeof TraceMethodSchemas
 
 export const TraceFolderResultSchema = z
-  .object({ folder: z.string(), chosen: z.boolean() })
+  .object({ folder: z.string().max(16 * 1024 * 1024), chosen: z.boolean() })
   .strict()
 export const TraceStatusResultSchema = TraceFolderResultSchema.extend({
   recording: z
-    .object({ run_id: z.string(), steps: z.number().int(), started_at: z.string() })
+    .object({
+      run_id: z.string().max(16 * 1024 * 1024),
+      steps: z.number().multipleOf(1),
+      started_at: z.string().max(16 * 1024 * 1024),
+    })
     .strict()
     .nullable(),
 }).strict()
-export const TracePointsResultSchema = z.object({ points: z.array(TracePointSchema) }).strict()
+export const TracePointsResultSchema = z
+  .object({ points: z.array(TracePointSchema).max(65536) })
+  .strict()
 export const TraceRunsResultSchema = TraceFolderResultSchema.extend({
-  runs: z.array(TraceRunSummarySchema),
+  runs: z.array(TraceRunSummarySchema).max(65536),
 }).strict()
-export const TraceHitsResultSchema = z.object({ hits: z.array(TraceHitSchema) }).strict()
+export const TraceHitsResultSchema = z.object({ hits: z.array(TraceHitSchema).max(65536) }).strict()

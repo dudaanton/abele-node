@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { NodeLogMethodSchemas } from './node-log.js'
 import { ChatMethodSchemas } from './chat.js'
@@ -61,7 +62,10 @@ import {
 export * from './resources.js'
 export { RecordSchema, EventSchema, RequestSchema, ErrorSchema } from '@abele/channel-protocol'
 const id = z.string().min(1).max(128)
-export const AgentIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,31}$/)
+export const AgentIdSchema = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-z0-9][a-z0-9_-]{0,31}$/)
 export const SeqSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export const FakeStepSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('echo') }).strict(),
@@ -99,15 +103,19 @@ export const PromptSchema = z
     run_id: id,
     revision: z.literal(1),
     action_digest: z.string().length(64),
-    expires_at: z.number().int(),
+    expires_at: z.number().multipleOf(1),
     state: z.enum(['pending', 'resolved', 'expired', 'invalidated']),
     choice: z.enum(['allow', 'deny']).nullable(),
     installation_id: id.nullable(),
     delivered: z.boolean(),
     tool_use_id: id.optional(),
-    native_session_id: z.string().uuid().optional(),
+    native_session_id: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+      .optional(),
     tool_name: z.string().min(1).max(256).optional(),
-    input: z.record(z.unknown()).optional(),
+    input: z.record(z.string().max(16 * 1024 * 1024), z.unknown()).optional(),
     title: z.string().max(4096).optional(),
     options: z.array(z.string().max(4096)).max(256).optional(),
     value: z.string().max(32768).nullable().optional(),
@@ -129,7 +137,7 @@ export const SessionSchema = z
     native_session_file: z.string().min(1).max(4096).optional(),
     /** The ACP agent a session of provider `acp` runs, by its configured name. */
     agent: AgentIdSchema.optional(),
-    created_at: z.string().datetime(),
+    created_at: WireTimestampSchema,
     workspace_id: id.nullable().optional(),
     /** The owner's choices for a long-lived session; absent means the node's defaults. */
     settings: SessionSettingsSchema.optional(),
@@ -141,7 +149,11 @@ export const SessionSchema = z
       s.provider === 'codex' ||
       s.provider === 'acp' ||
       s.native_session_id === undefined ||
-      z.string().uuid().safeParse(s.native_session_id).success,
+      z
+        .string()
+        .max(16 * 1024 * 1024)
+        .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+        .safeParse(s.native_session_id).success,
     { message: 'Native ID must be a UUID for this provider', path: ['native_session_id'] }
   )
   .refine((s) => (s.provider === 'acp') === (s.agent !== undefined), {
@@ -152,12 +164,12 @@ export const SessionDeletedSchema = z.object({ session_id: id, deleted: z.litera
 export const CapabilitySchema = z.discriminatedUnion('status', [
   z.object({
     status: z.literal('supported'),
-    evidence: z.string(),
+    evidence: z.string().max(16 * 1024 * 1024),
     breakpoint_hit_condition: z.boolean().optional(),
     breakpoint_enabled: z.boolean().optional(),
   }),
-  z.object({ status: z.literal('unsupported'), reason: z.string() }),
-  z.object({ status: z.literal('unverified'), reason: z.string() }),
+  z.object({ status: z.literal('unsupported'), reason: z.string().max(16 * 1024 * 1024) }),
+  z.object({ status: z.literal('unverified'), reason: z.string().max(16 * 1024 * 1024) }),
 ])
 export const ErrorCodeSchema = z.enum([
   'unauthorized',
@@ -235,7 +247,10 @@ const EventPayloads = {
   'content.delta': z
     .object({
       run_id: id,
-      text: z.string().optional(),
+      text: z
+        .string()
+        .max(16 * 1024 * 1024)
+        .optional(),
       artifact_id: id.optional(),
       size: SeqSchema.optional(),
     })

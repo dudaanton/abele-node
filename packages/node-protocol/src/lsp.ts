@@ -42,7 +42,7 @@ export const LspMethodSchemas = {
         .string()
         .max(512 * 1024)
         .optional(),
-      version: z.number().int().min(0).optional(),
+      version: z.number().multipleOf(1).min(0).optional(),
     })
     .strict(),
   'lsp.v1.close': z.object(document).strict(),
@@ -54,8 +54,14 @@ export const LspMethodSchemas = {
 }
 export const LspDiagnosticsSchema = z
   .object({
-    workspace_id: z.string().optional(),
-    worktree_id: z.string().optional(),
+    workspace_id: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
+    worktree_id: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     path: RelativePathSchema,
     diagnostics: z.array(LspDiagnosticSchema).max(256),
   })
@@ -78,7 +84,11 @@ export const LspSymbolsResultSchema = z
     symbols: z
       .array(
         z
-          .object({ name: z.string().max(256), kind: z.number().int(), range: LspRangeSchema })
+          .object({
+            name: z.string().max(256),
+            kind: z.number().multipleOf(1),
+            range: LspRangeSchema,
+          })
           .strict()
       )
       .max(128),
@@ -88,18 +98,39 @@ export const LspStatusSchema = z
   .array(
     z
       .object({
-        language: z.string(),
-        server: z.string().nullable(),
-        version: z.string().nullable(),
+        language: z.string().max(16 * 1024 * 1024),
+        server: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .nullable(),
+        version: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .nullable(),
         found: z.boolean(),
-        diagnostic: z.string().optional(),
+        diagnostic: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .optional(),
         reason: z.literal('untrusted_folder').optional(),
-        project_eslint: z.string().optional(),
+        project_eslint: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .optional(),
       })
       .strict()
   )
   .max(16)
 export const LspInstallResultSchema = z
-  .array(z.object({ language: z.string(), message: z.string() }).strict())
+  .array(
+    z
+      .object({
+        language: z.string().max(16 * 1024 * 1024),
+        message: z.string().max(16 * 1024 * 1024),
+      })
+      .strict()
+  )
   .max(16)
-export const LspOpenResultSchema = z.object({ servers: z.array(z.string()).max(16) }).strict()
+export const LspOpenResultSchema = z
+  .object({ servers: z.array(z.string().max(16 * 1024 * 1024)).max(16) })
+  .strict()

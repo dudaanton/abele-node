@@ -1,7 +1,10 @@
 import { z } from 'zod'
 
 // Fixed P-256 public coordinates, not an arbitrary JWK/algorithm supplied by a peer.
-const Coordinate = z.string().regex(/^[A-Za-z0-9_-]{43}$/)
+const Coordinate = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[A-Za-z0-9_-]{43}$/)
 export const PublicKeySchema = z
   .object({ kty: z.literal('EC'), crv: z.literal('P-256'), x: Coordinate, y: Coordinate })
   .strict()
@@ -10,8 +13,14 @@ export interface DeviceIdentity {
   public_key: PublicKey
   private_key: CryptoKey
 }
-export const FingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/)
-const Nonce = z.string().regex(/^[a-f0-9]{64}$/)
+export const FingerprintSchema = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{64}$/)
+const Nonce = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{64}$/)
 const Id = z.string().min(1).max(128)
 export const InviteSchema = z
   .object({
@@ -20,7 +29,7 @@ export const InviteSchema = z
     node_fingerprint: FingerprintSchema,
     invite_id: Id,
     secret: Nonce,
-    expires_at: z.number().int().positive(),
+    expires_at: z.number().multipleOf(1).positive(),
   })
   .strict()
 export type PairingInvite = z.infer<typeof InviteSchema>
@@ -63,9 +72,12 @@ export const ChallengeSchema = z
     installation_id: Id,
     device_fingerprint: FingerprintSchema,
     purpose: z.enum(['connect', 'claim']),
-    expires_at: z.number().int().positive(),
+    expires_at: z.number().multipleOf(1).positive(),
     node_key: PublicKeySchema,
-    signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
+    signature: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[A-Za-z0-9_-]{86}$/),
   })
   .strict()
 export type DeviceChallenge = z.infer<typeof ChallengeSchema>
@@ -75,7 +87,10 @@ export const PairedRecordSchemas = [
   z
     .object({
       kind: z.literal('paired.proof'),
-      signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
+      signature: z
+        .string()
+        .max(16 * 1024 * 1024)
+        .regex(/^[A-Za-z0-9_-]{86}$/),
       // Enrollment credentials are sent only AFTER verifying the pinned node challenge.
       invite: InviteSchema.optional(),
       device_name: DeviceNameSchema.optional(),

@@ -193,6 +193,7 @@ interface Comparison {
   expires: number
 }
 interface Subscription {
+  explicitRenewal: boolean
   owner: AuthorityContext
   target: Target
   fingerprint: string
@@ -212,6 +213,7 @@ interface Subscription {
 
 /** Repository targets deliberately do not enter the managed-workspace/provider tables. */
 export class RepositoryService {
+  private explicitRenewalInstallations = new Set<string>()
   deleteFault?: () => void
   deletionProbe: ProcessProbe = systemProcessProbe
   private objectCache = new RepositoryObjectCache()
@@ -2947,7 +2949,8 @@ export class RepositoryService {
     actor: AuthorityContext,
     target: Target,
     cursor?: { stream_id: string; revision: number } | null,
-    subscriptionId?: string
+    subscriptionId?: string,
+    explicitRenewal = false
   ) {
     const changes = cursor !== undefined
     for (const [key, s] of this.subscriptions) if (s.expires < Date.now()) this.unwatch(key)
@@ -2959,7 +2962,18 @@ export class RepositoryService {
         prior.target.worktree_id !== target.worktree_id)
     )
       throw new ChannelError('unauthorized')
-    const renewed = (other: Subscription) => other === prior
+    if (explicitRenewal || subscriptionId !== undefined) {
+      this.explicitRenewalInstallations.add(actor.installation_id)
+      if (prior) prior.explicitRenewal = true
+    }
+    const legacy = !this.explicitRenewalInstallations.has(actor.installation_id)
+    const renewed = (other: Subscription) =>
+      other === prior ||
+      (legacy &&
+        !this.explicitRenewalInstallations.has(actor.installation_id) &&
+        !other.explicitRenewal &&
+        other.owner.installation_id === actor.installation_id &&
+        other.target.worktree_id === target.worktree_id)
     // The lease being renewed keeps publishing until this one takes over: dropped now, a batch
     // made while the new one is observed would reach nobody and force the client to reread.
     if ([...this.subscriptions.values()].filter((other) => !renewed(other)).length >= 16)
@@ -2969,6 +2983,7 @@ export class RepositoryService {
       const watched = await this.watchFingerprint(target)
       id = randomUUID()
       s = {
+        explicitRenewal: !legacy,
         owner: actor,
         target,
         fingerprint: watched.cheap,
@@ -2998,6 +3013,7 @@ export class RepositoryService {
     }
     for (const [key, current] of this.subscriptions) if (renewed(current)) this.unwatch(key)
     if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
+    s.explicitRenewal = this.explicitRenewalInstallations.has(actor.installation_id)
     this.subscriptions.set(id, s)
     // Decided as the subscription takes over, so no batch falls between the answer and it.
     const follows = changes
@@ -3350,7 +3366,8 @@ export class RepositoryService {
               actor,
               target,
               p.changes as { stream_id: string; revision: number } | null | undefined,
-              p.subscription_id as string | undefined
+              p.subscription_id as string | undefined,
+              p.explicit_renewal === true
             )
             break
           case 'repository.v1.unwatch': {
@@ -3394,6 +3411,7 @@ export class RepositoryService {
     }
   }
   revoked(installation: string) {
+    this.explicitRenewalInstallations.delete(installation)
     this.clearObjectCache()
     for (const [id, s] of this.subscriptions)
       if (s.owner.installation_id === installation) this.unwatch(id)
@@ -3405,6 +3423,7 @@ export class RepositoryService {
   }
   async stop() {
     this.stopped = true
+    this.explicitRenewalInstallations.clear()
     for (const reader of [...this.readers]) reader.cancel()
     for (const monitor of this.monitors.values()) monitor.close()
     this.monitors.clear()

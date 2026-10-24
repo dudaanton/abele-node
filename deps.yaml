@@ -28,14 +28,14 @@ dependencies:
   - {
       name: zod,
       ecosystem: npm,
-      version: '3.25.76',
-      released: 2025-07-08,
-      installed: 2026-10-06,
-      checked: 2026-10-06,
+      version: '4.6.6',
+      released: 2026-10-11,
+      installed: 2026-10-24,
+      checked: 2026-10-24,
       downloads_month: 1261303206,
       project_age_days: 2403,
       vulns_at_install: [],
-      why: 'Runtime validation of network and durable records',
+      why: 'Runtime validation; fixes oversized-array memory exhaustion GHSA-mrhx-c7xc-m3w5',
     }
   - {
       name: fastify,

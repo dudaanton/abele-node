@@ -14,7 +14,11 @@ const text = z.string().max(65536)
 const parent = { parent_tool_call_id: id.nullable().optional() }
 /** Text cut to fit a journal record; the provider's own record keeps the whole of it. */
 const truncated = { truncated: z.boolean().optional() }
-const message = { message_id: id, block: z.number().int().min(0).nullable().optional(), ...parent }
+const message = {
+  message_id: id,
+  block: z.number().multipleOf(1).min(0).nullable().optional(),
+  ...parent,
+}
 
 export const TOOL_KINDS = [
   'read',
@@ -31,7 +35,7 @@ export const TOOL_KINDS = [
 export const TOOL_STATUSES = ['pending', 'in_progress', 'completed', 'failed'] as const
 export const ToolLocationSchema = z.object({
   path: z.string().min(1).max(4096),
-  line: z.number().int().min(0).nullable().optional(),
+  line: z.number().multipleOf(1).min(0).nullable().optional(),
 })
 export const ToolContentSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('content'), text, ...truncated }),
@@ -54,7 +58,7 @@ const tool = {
   content: z.array(ToolContentSchema).max(64).optional(),
   /** The agent's own tool name, for a renderer that knows it better. */
   name: z.string().max(256).optional(),
-  raw_input: z.record(z.unknown()).optional(),
+  raw_input: z.record(z.string().max(16 * 1024 * 1024), z.unknown()).optional(),
 }
 export const PlanEntrySchema = z.object({
   content: z.string().max(4096),
@@ -188,7 +192,7 @@ export const SessionCommandsSchema = z.object({
   session_id: z.string().min(1).max(128),
   commands: z.array(SessionCommandSchema).max(512),
   /** The journal position of the update the list came from; 0 before the agent reported any. */
-  seq: z.number().int().min(0),
+  seq: z.number().multipleOf(1).min(0),
 })
 export type SessionCommands = z.infer<typeof SessionCommandsSchema>
 export function isKnownSessionUpdate(update: { kind?: unknown }): update is SessionUpdate {

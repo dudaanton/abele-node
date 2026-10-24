@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { CommitSchema, RelativePathSchema } from './files.js'
 import {
@@ -25,10 +26,14 @@ export const DirectoryPageSchema = z
     directory_id: id,
     path: AbsolutePathSchema,
     parent_path: AbsolutePathSchema.nullable(),
-    entries: z.array(z.object({ name: z.string(), path: AbsolutePathSchema }).strict()).max(256),
+    entries: z
+      .array(
+        z.object({ name: z.string().max(16 * 1024 * 1024), path: AbsolutePathSchema }).strict()
+      )
+      .max(256),
     cursor: id.nullable(),
     incomplete: z.boolean(),
-    omissions: z.array(z.string()),
+    omissions: z.array(z.string().max(16 * 1024 * 1024)).max(65536),
   })
   .strict()
 export const DirectoryCreatedSchema = z.object({ path: AbsolutePathSchema }).strict()
@@ -37,11 +42,14 @@ export const WorktreeSelectionSchema = z
   .strict()
 export const DivergenceSchema = z
   .object({
-    base_ref: z.string().nullable(),
+    base_ref: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     base_commit: CommitSchema.nullable(),
     head_commit: CommitSchema.nullable(),
-    ahead: z.number().int().nonnegative().nullable(),
-    behind: z.number().int().nonnegative().nullable(),
+    ahead: z.number().multipleOf(1).nonnegative().nullable(),
+    behind: z.number().multipleOf(1).nonnegative().nullable(),
     reason: z.enum(['ok', 'default_branch_required', 'unborn_head', 'unborn_base']),
   })
   .strict()
@@ -50,7 +58,7 @@ export const WorktreeDeletionSchema = z
     worktree_id: id,
     state: z.enum(['deleted', 'conflict', 'not_applied', 'outcome_unknown']),
     reconciliation: z.enum(['applied_as_observed', 'not_applied', 'unresolved']).optional(),
-    observed_at: z.string().datetime().optional(),
+    observed_at: WireTimestampSchema.optional(),
     reason: z.string().max(128).optional(),
     reservation_retained: z.boolean().optional(),
   })
@@ -65,7 +73,10 @@ export const WorkspaceWatchInvalidationSchema = z
 const file = RelativePathSchema.refine(
   (p) => p.length > 0 && !p.split('/').some((s) => s.toLowerCase() === '.git')
 )
-const contentId = z.string().regex(/^[a-f0-9]{64}$/)
+const contentId = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{64}$/)
 export const DirectoryManifestSchema = z
   .object({
     content_id: contentId,
@@ -194,7 +205,7 @@ export type NodePathParams<M extends NodePathMethod> = z.input<(typeof NodePathM
 const workspaceBatch = {
   workspace_id: id,
   stream_id: id,
-  revision: z.number().int().positive(),
+  revision: z.number().multipleOf(1).positive(),
 }
 /**
  * `workspace.files_changed`: a plain folder's numbered batches, for a watcher that asked with

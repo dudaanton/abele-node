@@ -13,8 +13,9 @@
     "dist"
   ],
   "dependencies": {
-    "@abele/node-protocol": "0.0.0",
+    "@abele/channel-client": "0.0.0",
     "@abele/channel-protocol": "0.0.0",
-    "@abele/channel-client": "0.0.0"
+    "@abele/node-protocol": "0.0.0",
+    "zod": "4.6.6"
   }
 }

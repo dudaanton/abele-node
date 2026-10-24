@@ -157,8 +157,8 @@ export const PairingControlSchema = z.discriminatedUnion('action', [
   z
     .object({
       action: z.literal('pairing.issue'),
-      endpoint: z.string(),
-      label: z.string(),
+      endpoint: z.string().max(16 * 1024 * 1024),
+      label: z.string().max(16 * 1024 * 1024),
       installation_id: Id.optional(),
     })
     .strict(),

@@ -1,3 +1,5 @@
+import { WireTimestampSchema } from './timestamp.js'
+export { WireTimestampSchema, WireOffsetTimestampSchema } from './timestamp.js'
 import { z } from 'zod'
 import { PairedRecordSchemas, type PublicKey } from './paired.js'
 export * from './paired.js'
@@ -18,7 +20,11 @@ export const Id = z.string().min(1).max(128)
 export const Sequence = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export const Version = z.object({ major: z.literal(0), minor: z.literal(0) }).strict()
 export const ErrorSchema = z
-  .object({ code: Id, message: z.string().max(2048), details: z.record(z.unknown()).default({}) })
+  .object({
+    code: Id,
+    message: z.string().max(2048),
+    details: z.record(z.string().max(16 * 1024 * 1024), z.unknown()).default({}),
+  })
   .strict()
 export const EventSchema = z
   .object({
@@ -32,8 +38,8 @@ export const EventSchema = z
       z.object({ kind: z.literal('installation'), installation_id: Id }).strict(),
       z.object({ kind: z.literal('provider'), provider: Id, session_id: Id }).strict(),
     ]),
-    at: z.string().datetime(),
-    data: z.unknown(),
+    at: WireTimestampSchema,
+    data: z.unknown().optional(),
   })
   .strict()
 export const RequestSchema = z
@@ -42,7 +48,7 @@ export const RequestSchema = z
     request_id: Id,
     operation_id: Id.optional(),
     method: Id,
-    params: z.unknown(),
+    params: z.unknown().optional(),
   })
   .strict()
 const ResponseSchema = z
@@ -67,7 +73,7 @@ export const WelcomeSchema = z
     node_id: Id,
     installation_id: Id,
     instance_id: Id,
-    methods: z.array(Id),
+    methods: z.array(Id).max(65536),
     limits: z
       .object({
         record_bytes: Sequence,
@@ -93,7 +99,10 @@ export const RecordSchema = z.union([
     .object({
       kind: z.literal('auth'),
       profile: z.literal('local-token-v1'),
-      token: z.string().regex(/^[a-f0-9]{64}$/),
+      token: z
+        .string()
+        .max(16 * 1024 * 1024)
+        .regex(/^[a-f0-9]{64}$/),
     })
     .strict(),
   z.object({ kind: z.literal('authenticated'), installation_id: Id }).strict(),

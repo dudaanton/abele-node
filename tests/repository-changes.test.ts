@@ -45,7 +45,12 @@ async function setup() {
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let operation = 0
   const request = async (method: string, params: unknown = {}, id?: string) =>
-    (await core.request(actor, method, params, id ?? `fixture-${++operation}`)) as any
+    (await core.request(
+      actor,
+      method,
+      method === 'repository.v1.watch' ? { ...(params as object), explicit_renewal: true } : params,
+      id ?? `fixture-${++operation}`
+    )) as any
   const project = await request('project.register', { path: repo, trust: 'untrusted' })
   await request('project.repository_settings', {
     project_id: project.project_id,
@@ -104,6 +109,60 @@ function baseline(
     ...extra,
   }
 }
+
+it('replaces 50 legacy renewals without stealing an explicit lease', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  let modern = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  modern = await s.request('repository.v1.watch', {
+    worktree_id: s.root,
+    changes: null,
+    subscription_id: modern.subscription_id,
+  })
+  const legacy = s.core.authority.authenticate(s.core.createToken('legacy').token)
+  // Leave one slot for the old plugin; renewals must work even at capacity.
+  for (let i = 0; i < 14; i++)
+    await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  for (let i = 0; i < 50; i++) {
+    await s.core.request(
+      legacy,
+      'repository.v1.watch',
+      {
+        worktree_id: s.root,
+        changes: null,
+      },
+      'legacy-' + i
+    )
+    expect(repository.subscriptions.size).toBe(16)
+    expect(
+      [...repository.subscriptions.values()].filter(
+        (lease: any) => lease.owner.installation_id === legacy.installation_id
+      )
+    ).toHaveLength(1)
+    expect(repository.subscriptions.has(modern.subscription_id)).toBe(true)
+  }
+  const before = s.core.head('catalog')
+  writeFileSync(join(s.repo, 'file'), 'legacy edit')
+  await wait(() => s.batches(before).length >= 2)
+  const events = s.core.read('catalog', before).filter((e) => e.type === 'repository.changed')
+  expect(new Set(events.map((e) => JSON.stringify(e.actor))).size).toBe(2)
+}, 60000)
+
+it('protects a legacy lease once its caller uses explicit renewal', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  const call = (params: object) =>
+    repository.request(s.actor, 'repository.v1.watch', {
+      worktree_id: s.root,
+      ...params,
+    })
+  const initial = await call({})
+  const renewed = await call({ subscription_id: initial.subscription_id })
+  await call({})
+  await call({})
+  expect(repository.subscriptions.has(renewed.subscription_id)).toBe(true)
+  expect(repository.subscriptions.size).toBe(3)
+})
 
 it('retains consumer A when B stops and reads a same-size dirty edit', async () => {
   const s = await setup()

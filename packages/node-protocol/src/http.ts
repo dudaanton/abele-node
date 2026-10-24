@@ -21,7 +21,10 @@ const envName = z
   .min(1)
   .max(64)
   .regex(/^(?!.*\.local$)[A-Za-z0-9][A-Za-z0-9 ._-]*$/i)
-const sendId = z.string().regex(/^s[0-9a-z]{6,40}$/)
+const sendId = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^s[0-9a-z]{6,40}$/)
 
 export const HTTP_VERSION = 1 as const
 export const HTTP_V1_CAPABILITY = {
@@ -69,7 +72,7 @@ export type HttpRequestDoc = z.infer<typeof HttpRequestDocSchema>
 
 export const HttpLastSchema = z
   .object({
-    status: z.number().int().optional(),
+    status: z.number().multipleOf(1).optional(),
     failed: z.boolean().optional(),
     unknown: z.boolean().optional(),
   })
@@ -77,10 +80,10 @@ export const HttpLastSchema = z
 
 export const HttpRequestSummarySchema = z
   .object({
-    id: z.string(),
-    name: z.string(),
+    id: z.string().max(16 * 1024 * 1024),
+    name: z.string().max(16 * 1024 * 1024),
     method: HttpMethodSchema,
-    url: z.string(),
+    url: z.string().max(16 * 1024 * 1024),
     last: HttpLastSchema.optional(),
   })
   .strict()
@@ -107,20 +110,32 @@ export const HttpEnvironmentSchema = z
     /** Adds `X-Abele-Step` to what is sent into a recording, so a record point can take it. */
     step_header: z.boolean().optional(),
     /** Values from `<name>.local.json`, which stays on this machine and out of git. */
-    local: z.array(z.string()).optional(),
+    local: z
+      .array(z.string().max(16 * 1024 * 1024))
+      .max(65536)
+      .optional(),
   })
   .strict()
 export type HttpEnvironmentDoc = z.infer<typeof HttpEnvironmentSchema>
 
 export const HttpResponseSchema = z
   .object({
-    status: z.number().int(),
-    reason: z.string(),
-    ms: z.number().int().nonnegative(),
-    bytes: z.number().int().nonnegative(),
-    headers: z.array(z.object({ key: z.string(), value: z.string() }).strict()),
+    status: z.number().multipleOf(1),
+    reason: z.string().max(16 * 1024 * 1024),
+    ms: z.number().multipleOf(1).nonnegative(),
+    bytes: z.number().multipleOf(1).nonnegative(),
+    headers: z
+      .array(
+        z
+          .object({
+            key: z.string().max(16 * 1024 * 1024),
+            value: z.string().max(16 * 1024 * 1024),
+          })
+          .strict()
+      )
+      .max(65536),
     /** The start of the body; the rest is read with `http.v1.body`. */
-    body: z.string(),
+    body: z.string().max(16 * 1024 * 1024),
     /** More of the body is on the node than came here. */
     more: z.boolean().optional(),
     /** The body was longer than the node keeps, and was cut. */
@@ -133,28 +148,44 @@ export const HttpOutcomeSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('sending') }).strict(),
   z.object({ state: z.literal('answered'), response: HttpResponseSchema }).strict(),
   /** It never reached the server. */
-  z.object({ state: z.literal('failed'), reason: z.string() }).strict(),
+  z.object({ state: z.literal('failed'), reason: z.string().max(16 * 1024 * 1024) }).strict(),
   /** No answer in time, or the line went mid-way: it may have gone through. Never sent again. */
   z
-    .object({ state: z.literal('unknown'), reason: z.string(), after_ms: z.number().int() })
+    .object({
+      state: z.literal('unknown'),
+      reason: z.string().max(16 * 1024 * 1024),
+      after_ms: z.number().multipleOf(1),
+    })
     .strict(),
 ])
 export type HttpOutcomeDoc = z.infer<typeof HttpOutcomeSchema>
 
 export const HttpSendSummarySchema = z
   .object({
-    id: z.string(),
-    at: z.string(),
-    environment: z.string().optional(),
+    id: z.string().max(16 * 1024 * 1024),
+    at: z.string().max(16 * 1024 * 1024),
+    environment: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .optional(),
     method: HttpMethodSchema,
-    url: z.string(),
-    status: z.number().int().optional(),
+    url: z.string().max(16 * 1024 * 1024),
+    status: z.number().multipleOf(1).optional(),
     failed: z.boolean().optional(),
     unknown: z.boolean().optional(),
-    ms: z.number().int().optional(),
-    bytes: z.number().int().optional(),
+    ms: z.number().multipleOf(1).optional(),
+    bytes: z.number().multipleOf(1).optional(),
     /** Sent into a recording: the run and its step. */
-    run: z.object({ run_id: z.string(), step: z.string().optional() }).strict().optional(),
+    run: z
+      .object({
+        run_id: z.string().max(16 * 1024 * 1024),
+        step: z
+          .string()
+          .max(16 * 1024 * 1024)
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
 export type HttpSendSummary = z.infer<typeof HttpSendSummarySchema>
@@ -164,7 +195,7 @@ export const HttpSendStatusSchema = z
     send: HttpSendSummarySchema,
     outcome: HttpOutcomeSchema,
     /** Steps the record points took while it was out, when it went into a recording. */
-    code_steps: z.number().int().optional(),
+    code_steps: z.number().multipleOf(1).optional(),
   })
   .strict()
 
@@ -235,7 +266,7 @@ export const HttpMethodSchemas = {
     .strict(),
   /** One page of a kept answer's body. */
   'http.v1.body': z
-    .object({ ...project, send_id: sendId, from: z.number().int().min(0).optional() })
+    .object({ ...project, send_id: sendId, from: z.number().multipleOf(1).min(0).optional() })
     .strict(),
 } as const
 export const HttpDestinationResultSchema = z
@@ -249,13 +280,24 @@ export type HttpMethodNameV1 = keyof typeof HttpMethodSchemas
 
 export const HttpListResultSchema = z
   .object({
-    folder: z.string(),
-    collections: z.array(
-      z.object({ name: z.string(), requests: z.array(HttpRequestSummarySchema) }).strict()
-    ),
-    environments: z.array(z.string()),
+    folder: z.string().max(16 * 1024 * 1024),
+    collections: z
+      .array(
+        z
+          .object({
+            name: z.string().max(16 * 1024 * 1024),
+            requests: z.array(HttpRequestSummarySchema).max(65536),
+          })
+          .strict()
+      )
+      .max(65536),
+    environments: z.array(z.string().max(16 * 1024 * 1024)).max(65536),
   })
   .strict()
 export const HttpBodyPageSchema = z
-  .object({ text: z.string(), next: z.number().int().optional(), bytes: z.number().int() })
+  .object({
+    text: z.string().max(16 * 1024 * 1024),
+    next: z.number().multipleOf(1).optional(),
+    bytes: z.number().multipleOf(1),
+  })
   .strict()

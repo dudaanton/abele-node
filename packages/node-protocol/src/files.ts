@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { ExpectedExecutionTargetSchema, TargetChangedRefusalSchema } from './turn.js'
 const id = z.string().min(1).max(128)
@@ -11,26 +12,35 @@ export const RelativePathSchema = z
       (p === '' || p.split('/').every((s) => s !== '' && s !== '.' && s !== '..'))
   )
 const path = RelativePathSchema.refine((p) => p.length > 0)
-export const CommitSchema = z.string().regex(/^[a-f0-9]{40,64}$/)
+export const CommitSchema = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{40,64}$/)
 export const DiffModeSchema = z.enum(['staged', 'unstaged', 'head', 'base', 'commit'])
 export type DiffMode = z.infer<typeof DiffModeSchema>
 export const FileEntrySchema = z
   .object({
-    name: z.string(),
+    name: z.string().max(16 * 1024 * 1024),
     path: RelativePathSchema,
     kind: z.enum(['file', 'directory', 'symlink', 'other']),
-    size: z.number().int().nonnegative(),
+    size: z.number().multipleOf(1).nonnegative(),
   })
   .strict()
 export const FilePageSchema = z
-  .object({ entries: z.array(FileEntrySchema).max(256), next: z.string().nullable() })
+  .object({
+    entries: z.array(FileEntrySchema).max(256),
+    next: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
+  })
   .strict()
 export const FileContentSchema = z
   .object({
     workspace_id: id,
     path,
     content_id: id.nullable(),
-    size: z.number().int().nonnegative(),
+    size: z.number().multipleOf(1).nonnegative(),
     binary: z.boolean(),
     large: z.boolean(),
     too_large: z.boolean(),
@@ -38,8 +48,8 @@ export const FileContentSchema = z
   .strict()
 export const ContentChunkSchema = z
   .object({
-    offset: z.number().int().nonnegative(),
-    total: z.number().int().nonnegative(),
+    offset: z.number().multipleOf(1).nonnegative(),
+    total: z.number().multipleOf(1).nonnegative(),
     base64: z.string().max(180000),
   })
   .strict()
@@ -53,8 +63,8 @@ export const DiffSnapshotSchema = z
     merge_base: CommitSchema.nullable(),
     commit: CommitSchema.nullable(),
     content_id: id,
-    size: z.number().int().nonnegative(),
-    created_at: z.string().datetime(),
+    size: z.number().multipleOf(1).nonnegative(),
+    created_at: WireTimestampSchema,
   })
   .strict()
 export type DiffSnapshot = z.infer<typeof DiffSnapshotSchema>
@@ -65,9 +75,12 @@ export const ReviewAnchorSchema = z
     diff_id: id,
     path,
     side: z.enum(['old', 'new']),
-    start_line: z.number().int().positive(),
-    end_line: z.number().int().positive(),
-    context_hash: z.string().regex(/^[a-f0-9]{64}$/),
+    start_line: z.number().multipleOf(1).positive(),
+    end_line: z.number().multipleOf(1).positive(),
+    context_hash: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[a-f0-9]{64}$/),
     comment: z.string().min(1).max(2000),
   })
   .strict()
@@ -86,14 +99,17 @@ export const ReviewResultSchema = z.union([
   z
     .object({
       input_id: id,
-      accepted_seq: z.number().int().nonnegative(),
-      stale: z.array(z.boolean()),
+      accepted_seq: z.number().multipleOf(1).nonnegative(),
+      stale: z.array(z.boolean()).max(65536),
     })
     .strict(),
   TargetChangedRefusalSchema,
 ])
 export type ReviewResult = z.infer<typeof ReviewResultSchema>
-const contentId = z.string().regex(/^[a-f0-9]{64}$/)
+const contentId = z
+  .string()
+  .max(16 * 1024 * 1024)
+  .regex(/^[a-f0-9]{64}$/)
 export const FileWriteSchema = z
   .object({
     workspace_id: id,
@@ -143,7 +159,7 @@ export const WorkspaceInvalidationSchema = z
   .strict()
 const workspace = { workspace_id: id }
 const chunk = {
-  offset: z.number().int().nonnegative().default(0),
+  offset: z.number().multipleOf(1).nonnegative().default(0),
   length: z.number().int().min(1).max(131072).default(131072),
 }
 export const FileMethodSchemas = {
@@ -170,7 +186,7 @@ export const FileMethodSchemas = {
   'workspace.log': z
     .object({
       ...workspace,
-      offset: z.number().int().nonnegative().default(0),
+      offset: z.number().multipleOf(1).nonnegative().default(0),
       limit: z.number().int().min(1).max(100).default(50),
     })
     .strict(),

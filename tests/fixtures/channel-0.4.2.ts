@@ -1,4 +1,4 @@
-import { z } from 'zod'
+import { z } from 'zod/v3'
 
 // Frozen from release 0.4.2 (43f38bd). Do not import current protocol validators:
 // these fixtures must keep the strict wire contract shipped in existing clients.

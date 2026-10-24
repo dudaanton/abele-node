@@ -3,9 +3,13 @@ const id = z.string().min(1).max(128)
 export const ActionSchema = z
   .object({
     tool_use_id: id,
-    native_session_id: z.string().uuid().optional(),
+    native_session_id: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+      .optional(),
     tool_name: z.string().min(1).max(256),
-    input: z.record(z.unknown()),
+    input: z.record(z.string().max(16 * 1024 * 1024), z.unknown()),
     kind: z.enum(['permission', 'select', 'confirm', 'input', 'trust']).optional(),
     title: z.string().max(4096).optional(),
     options: z.array(z.string().max(4096)).max(256).optional(),
@@ -14,8 +18,8 @@ export const ActionSchema = z
   .strict()
 export const IdentitySchema = z
   .object({
-    pid: z.number().int().min(2),
-    group: z.number().int().min(2),
+    pid: z.number().multipleOf(1).min(2),
+    group: z.number().multipleOf(1).min(2),
     fingerprint: z.string().min(1).max(65535),
   })
   .strict()
@@ -27,11 +31,13 @@ export const DebuggerToolSchema = z
       .max(128)
       .regex(/^(?:lsp|(?:debug|node)_[a-z0-9_]+|obsidian_[A-Za-z][A-Za-z0-9_]{0,63})$/),
     description: z.string().max(16384),
-    inputSchema: z.record(z.unknown()),
+    inputSchema: z.record(z.string().max(16 * 1024 * 1024), z.unknown()),
   })
   .strict()
 const sharedWorkerMessages = [
-  z.object({ kind: z.literal('debugger_call'), id, name: id, args: z.unknown() }).strict(),
+  z
+    .object({ kind: z.literal('debugger_call'), id, name: id, args: z.unknown().optional() })
+    .strict(),
   z.object({ kind: z.literal('debugger_cancel'), id }).strict(),
   z
     .object({
@@ -39,7 +45,7 @@ const sharedWorkerMessages = [
       event: z
         .object({
           type: z.string().min(1).max(256).startsWith('pi.'),
-          data: z.record(z.unknown()),
+          data: z.record(z.string().max(16 * 1024 * 1024), z.unknown()),
         })
         .strict(),
     })
@@ -73,7 +79,11 @@ export const ConfigurationSchema = z
   .object({
     cwd: z.string().min(1).max(4096),
     sessionDir: z.string().min(1).max(4096),
-    native_session_id: z.string().uuid().optional(),
+    native_session_id: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+      .optional(),
     native_session_file: z.string().max(4096).optional(),
     agentDir: z.string().min(1).max(4096),
     provider: z.string().max(128),
@@ -89,7 +99,7 @@ export const ConfigurationSchema = z
   })
   .strict()
 export const ParentMessageSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('debugger_result'), id, result: z.unknown() }).strict(),
+  z.object({ kind: z.literal('debugger_result'), id, result: z.unknown().optional() }).strict(),
   z
     .object({
       kind: z.literal('start'),
@@ -99,7 +109,7 @@ export const ParentMessageSchema = z.discriminatedUnion('kind', [
     })
     .strict(),
   z.object({ kind: z.literal('stop') }).strict(),
-  z.object({ kind: z.literal('ack'), bytes: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal('ack'), bytes: z.number().multipleOf(1).nonnegative() }).strict(),
   z
     .object({
       kind: z.literal('answer'),
@@ -124,7 +134,7 @@ export const LiveConfigurationSchema = z
   .object({ hostModule: z.string().min(1).max(4096), config: ConfigurationSchema })
   .strict()
 export const LiveParentMessageSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('debugger_result'), id, result: z.unknown() }).strict(),
+  z.object({ kind: z.literal('debugger_result'), id, result: z.unknown().optional() }).strict(),
   z
     .object({
       kind: z.literal('input'),
@@ -141,7 +151,7 @@ export const LiveParentMessageSchema = z.discriminatedUnion('kind', [
       kind: z.literal('control'),
       id,
       subtype: z.string().min(1).max(64),
-      params: z.record(z.unknown()),
+      params: z.record(z.string().max(16 * 1024 * 1024), z.unknown()),
     })
     .strict(),
   /** A daemon (re)attached: ask again whatever still waits on one. */
@@ -160,7 +170,7 @@ export const LiveWorkerMessageSchema = z.discriminatedUnion('kind', [
       kind: z.literal('control_result'),
       id,
       ok: z.boolean(),
-      result: z.record(z.unknown()).optional(),
+      result: z.record(z.string().max(16 * 1024 * 1024), z.unknown()).optional(),
       error: z.string().max(256).optional(),
     })
     .strict(),

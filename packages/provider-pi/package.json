@@ -13,11 +13,11 @@
     "dist"
   ],
   "dependencies": {
+    "@abele/node-protocol": "0.0.0",
+    "@abele/provider-claude": "0.0.0",
     "@abele/provider-contract": "0.0.0",
     "@earendil-works/pi-coding-agent": "0.87.0",
     "brace-expansion": "5.0.12",
-    "zod": "3.25.76",
-    "@abele/provider-claude": "0.0.0",
-    "@abele/node-protocol": "0.0.0"
+    "zod": "4.6.6"
   }
 }

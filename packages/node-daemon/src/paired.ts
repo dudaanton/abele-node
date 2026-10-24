@@ -40,6 +40,7 @@ export const PairedListenerSchema = z
   .object({
     endpoint: z
       .string()
+      .max(16 * 1024 * 1024)
       .transform((s) => {
         try {
           const url = new URL(s)

@@ -1,8 +1,9 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { RepositoryRefSchema } from './refs.js'
 const id = z.string().min(1).max(128)
 const path = z.string().min(1).max(4096)
-const timestamp = z.string().datetime()
+const timestamp = WireTimestampSchema
 export const TrustSchema = z.enum(['untrusted', 'trusted'])
 export const ProjectSchema = z
   .object({
@@ -26,6 +27,7 @@ export const WorkspaceSchema = z
     branch: z.string().max(256).nullable(),
     base_commit: z
       .string()
+      .max(16 * 1024 * 1024)
       .regex(/^[a-f0-9]{40,64}$/)
       .nullable(),
     state: z.enum(['provisioning', 'ready', 'removing', 'removed', 'needs_attention']),
@@ -75,15 +77,21 @@ export const WorkspaceStatusSchema = z
   .object({
     workspace_id: id,
     entries: z.array(StatusEntrySchema).max(256),
-    next_offset: z.number().int().min(0).nullable(),
+    next_offset: z.number().multipleOf(1).min(0).nullable(),
   })
   .strict()
 export const WorkspaceDiffSchema = z
   .object({
     workspace_id: id,
-    head_commit: z.string().regex(/^[a-f0-9]{40,64}$/),
-    base_commit: z.string().nullable(),
-    diff: z.string(),
+    head_commit: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .regex(/^[a-f0-9]{40,64}$/),
+    base_commit: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
+    diff: z.string().max(16 * 1024 * 1024),
   })
   .strict()
 const page = { after_id: id.optional(), limit: z.number().int().min(1).max(256).default(256) }
@@ -118,7 +126,7 @@ export const ResourceMethodSchemas = {
   'workspace.status': z
     .object({
       workspace_id: id,
-      offset: z.number().int().min(0).default(0),
+      offset: z.number().multipleOf(1).min(0).default(0),
       limit: z.number().int().min(1).max(256).default(256),
     })
     .strict(),

@@ -157,11 +157,16 @@ const conflicts = z
   .object({
     state: z.literal('conflicts'),
     operation,
-    base_ref: z.string().nullable(),
-    conflicted_paths: z.array(z.string()).max(1000),
+    base_ref: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
+    conflicted_paths: z.array(z.string().max(16 * 1024 * 1024)).max(1000),
   })
   .strict()
-const person = z.object({ name: z.string(), email: z.string() }).strict()
+const person = z
+  .object({ name: z.string().max(16 * 1024 * 1024), email: z.string().max(16 * 1024 * 1024) })
+  .strict()
 
 export const GitIndexResultSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('applied'), head }).strict(),
@@ -170,7 +175,11 @@ export const GitIndexResultSchema = z.discriminatedUnion('state', [
 ])
 export const GitDiscardResultSchema = z.discriminatedUnion('state', [
   z
-    .object({ state: z.literal('applied'), head, discarded: z.array(z.string()).max(1000) })
+    .object({
+      state: z.literal('applied'),
+      head,
+      discarded: z.array(z.string().max(16 * 1024 * 1024)).max(1000),
+    })
     .strict(),
   failed,
   unknown,
@@ -189,7 +198,7 @@ export const GitUpdateResultSchema = z.discriminatedUnion('state', [
       strategy: z.enum(['rebase', 'fast-forward']),
       previous_head: head,
       head,
-      base_ref: z.string(),
+      base_ref: z.string().max(16 * 1024 * 1024),
       base_commit: CommitSchema,
       changed: z.boolean(),
     })
@@ -214,9 +223,9 @@ export const GitPushResultSchema = z.discriminatedUnion('state', [
   z
     .object({
       state: z.literal('pushed'),
-      remote: z.string(),
-      branch: z.string(),
-      upstream: z.string(),
+      remote: z.string().max(16 * 1024 * 1024),
+      branch: z.string().max(16 * 1024 * 1024),
+      upstream: z.string().max(16 * 1024 * 1024),
       set_upstream: z.boolean(),
       commit: CommitSchema,
     })
@@ -226,21 +235,21 @@ export const GitPushResultSchema = z.discriminatedUnion('state', [
 ])
 const upstream = z
   .object({
-    ref: z.string(),
-    remote: z.string(),
-    branch: z.string(),
+    ref: z.string().max(16 * 1024 * 1024),
+    remote: z.string().max(16 * 1024 * 1024),
+    branch: z.string().max(16 * 1024 * 1024),
     /** The local remote-tracking commit: the lease for a forced push. */
     commit: CommitSchema.nullable(),
-    ahead: z.number().int().nonnegative().nullable(),
-    behind: z.number().int().nonnegative().nullable(),
+    ahead: z.number().multipleOf(1).nonnegative().nullable(),
+    behind: z.number().multipleOf(1).nonnegative().nullable(),
   })
   .strict()
-const refs = z.array(z.string()).max(1000)
+const refs = z.array(z.string().max(16 * 1024 * 1024)).max(1000)
 export const GitFetchResultSchema = z.discriminatedUnion('state', [
   z
     .object({
       state: z.literal('fetched'),
-      remote: z.string(),
+      remote: z.string().max(16 * 1024 * 1024),
       pruned: z.boolean(),
       updated: refs,
       removed: refs,
@@ -254,7 +263,7 @@ export const GitCreateBranchResultSchema = z.discriminatedUnion('state', [
   z
     .object({
       state: z.literal('created'),
-      branch: z.string(),
+      branch: z.string().max(16 * 1024 * 1024),
       commit: CommitSchema,
       switched: z.boolean(),
       head,
@@ -266,28 +275,40 @@ export const GitCreateBranchResultSchema = z.discriminatedUnion('state', [
 export const GitForgeSchema = z
   .object({
     kind: z.enum(['github', 'gitlab', 'other']),
-    host: z.string(),
-    owner: z.string(),
-    name: z.string(),
+    host: z.string().max(16 * 1024 * 1024),
+    owner: z.string().max(16 * 1024 * 1024),
+    name: z.string().max(16 * 1024 * 1024),
   })
   .strict()
 export const GitInfoSchema = z
   .object({
     head,
-    branch: z.string().nullable(),
+    branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     detached: z.boolean(),
     operation: z
       .object({
         kind: z.enum(['rebase', 'merge', 'cherry-pick', 'revert']),
-        conflicted_paths: z.array(z.string()).max(1000),
+        conflicted_paths: z.array(z.string().max(16 * 1024 * 1024)).max(1000),
       })
       .strict()
       .nullable(),
     upstream: upstream.nullable(),
-    default_branch: z.string().nullable(),
+    default_branch: z
+      .string()
+      .max(16 * 1024 * 1024)
+      .nullable(),
     remotes: z
       .array(
-        z.object({ name: z.string(), url: z.string(), forge: GitForgeSchema.nullable() }).strict()
+        z
+          .object({
+            name: z.string().max(16 * 1024 * 1024),
+            url: z.string().max(16 * 1024 * 1024),
+            forge: GitForgeSchema.nullable(),
+          })
+          .strict()
       )
       .max(32),
     author: person.nullable(),

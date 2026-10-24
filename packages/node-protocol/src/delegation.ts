@@ -1,3 +1,4 @@
+import { WireTimestampSchema } from '@abele/channel-protocol'
 import { z } from 'zod'
 import { Id, Sequence } from '@abele/channel-protocol'
 import { ExpectedExecutionTargetSchema, TurnAdmissionResultSchema } from './turn.js'
@@ -48,7 +49,7 @@ export const DelegationGrantSchema = z
       .max(4),
     actions: z.array(DelegationActionSchema).min(1).max(5),
     allow_fake: z.boolean(),
-    created_at: z.string().datetime(),
+    created_at: WireTimestampSchema,
     revoked: z.boolean(),
   })
   .strict()
@@ -68,7 +69,7 @@ export const DelegationSchema = z
     state: DelegationStateSchema,
     tool_permissions: ToolPermissionsSchema.optional(),
     reason: z.string().min(1).max(1024).optional(),
-    created_at: z.string().datetime(),
+    created_at: WireTimestampSchema,
   })
   .strict()
 export type Delegation = z.infer<typeof DelegationSchema>
@@ -87,6 +88,7 @@ export const DelegationStatusSchema = DelegationSchema.extend({
         })
         .strict()
     )
+    .max(65536)
     .default([]),
 })
 export type DelegationStatus = z.infer<typeof DelegationStatusSchema>

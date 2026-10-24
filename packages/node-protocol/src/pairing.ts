@@ -27,7 +27,7 @@ export const PairingListEntrySchema = z
     fingerprint: FingerprintSchema,
     state: z.enum(['pending', 'confirmed', 'revoked']),
     device_name: z.string().max(128),
-    created_at: z.number().int().nonnegative(),
+    created_at: z.number().multipleOf(1).nonnegative(),
   })
   .strict()
 export type PairingListEntry = z.infer<typeof PairingListEntrySchema>
