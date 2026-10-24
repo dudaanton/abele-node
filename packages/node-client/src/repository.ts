@@ -126,6 +126,7 @@ export class RepositoryClient {
   async search(params: RepositoryParams<'repository.v1.search'>) {
     return RepositorySearchPageSchema.parse(await this.call('repository.v1.search', params))
   }
+  /** Omit subscription_id to acquire; pass this consumer's last ID to replace its lease. */
   async watch(params: RepositoryParams<'repository.v1.watch'>) {
     return RepositoryWatchSchema.parse(await this.call('repository.v1.watch', params))
   }

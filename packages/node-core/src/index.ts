@@ -880,6 +880,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           evidence:
             'repository.v1.watch changes cursor; repository.changed numbered tree and git batches; explicit incomplete',
         },
+        repository_watch_renewal_v1: {
+          status: 'supported',
+          evidence: 'repository.v1.watch subscription_id; independent leases; exact owned renewal',
+        },
         workspace_changes_v1: {
           status: 'supported',
           evidence:

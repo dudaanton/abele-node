@@ -2946,13 +2946,20 @@ export class RepositoryService {
   private async subscribe(
     actor: AuthorityContext,
     target: Target,
-    cursor?: { stream_id: string; revision: number } | null
+    cursor?: { stream_id: string; revision: number } | null,
+    subscriptionId?: string
   ) {
     const changes = cursor !== undefined
-    const renewed = (other: Subscription) =>
-      other.owner.installation_id === actor.installation_id &&
-      other.target.worktree_id === target.worktree_id
     for (const [key, s] of this.subscriptions) if (s.expires < Date.now()) this.unwatch(key)
+    const prior = subscriptionId === undefined ? undefined : this.subscriptions.get(subscriptionId)
+    if (
+      subscriptionId !== undefined &&
+      (!prior ||
+        prior.owner.installation_id !== actor.installation_id ||
+        prior.target.worktree_id !== target.worktree_id)
+    )
+      throw new ChannelError('unauthorized')
+    const renewed = (other: Subscription) => other === prior
     // The lease being renewed keeps publishing until this one takes over: dropped now, a batch
     // made while the new one is observed would reach nobody and force the client to reread.
     if ([...this.subscriptions.values()].filter((other) => !renewed(other)).length >= 16)
@@ -2977,6 +2984,11 @@ export class RepositoryService {
       // Initial fingerprinting yields to token revocation, opt-out and shutdown.
       // Recheck before allocating timers/handles, not just when publishing the first hint.
       if (this.stopped) throw new ChannelError('resource_busy')
+      if (
+        prior &&
+        (prior.expires < Date.now() || this.subscriptions.get(subscriptionId!) !== prior)
+      )
+        throw new ChannelError('unauthorized')
       this.checkRead(target)
       this.checkPublication(actor, { worktree_id: target.worktree_id })
     } catch (error) {
@@ -3017,6 +3029,7 @@ export class RepositoryService {
         reason
       )
       if (!batch) return
+      const sent = new Set<string>()
       // One revision, sent to every change watcher of this worktree.
       for (const [key, other] of this.subscriptions) {
         if (!other.changes || other.target.worktree_id !== target.worktree_id) continue
@@ -3024,6 +3037,7 @@ export class RepositoryService {
           this.r.core.authority.check(other.owner, 'publish', target.worktree_id)
           if (target.kind === 'external' && !this.config(target.project_id).external_read)
             throw new ChannelError('unauthorized')
+          if (sent.has(other.owner.installation_id)) continue
           this.r.core.append(
             'catalog',
             'repository.changed',
@@ -3037,6 +3051,7 @@ export class RepositoryService {
             }
           )
           this.changes.sent(target.worktree_id, other.owner.installation_id, batch.revision)
+          sent.add(other.owner.installation_id)
         } catch {
           this.unwatch(key)
         }
@@ -3334,7 +3349,8 @@ export class RepositoryService {
             result = await this.subscribe(
               actor,
               target,
-              p.changes as { stream_id: string; revision: number } | null | undefined
+              p.changes as { stream_id: string; revision: number } | null | undefined,
+              p.subscription_id as string | undefined
             )
             break
           case 'repository.v1.unwatch': {

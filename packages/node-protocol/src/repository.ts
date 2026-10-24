@@ -356,7 +356,11 @@ export const RepositoryMethodSchemas = {
     })
     .strict(),
   'repository.v1.watch': z
-    .object({ ...target, changes: RepositoryChangesCursorSchema.nullable().optional() })
+    .object({
+      ...target,
+      subscription_id: id.optional(),
+      changes: RepositoryChangesCursorSchema.nullable().optional(),
+    })
     .strict(),
   'repository.v1.unwatch': z.object({ ...target, subscription_id: id }).strict(),
 } as const

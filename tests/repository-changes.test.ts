@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { existsSync } from 'node:fs'
+import { RepositoryClient } from '../packages/node-client/src/repository.js'
 import { diffBaselines, type ChangeBaseline } from '../packages/node-core/src/repository-changes.js'
 import {
   RepositoryChangeBatchSchema,
@@ -13,8 +15,11 @@ import {
 
 const dirs: string[] = [],
   cores: NodeCore[] = []
+const gitExecutable = existsSync('/Library/Developer/CommandLineTools/usr/bin/git')
+  ? '/Library/Developer/CommandLineTools/usr/bin/git'
+  : '/usr/bin/git'
 const git = (cwd: string, ...args: string[]) => {
-  const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
+  const r = spawnSync(gitExecutable, args, { cwd, encoding: 'utf8' })
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
@@ -35,6 +40,7 @@ async function setup() {
   git(repo, 'worktree', 'add', '-b', 'side', linked)
   const core = new NodeCore(join(dir, 'state'))
   cores.push(core)
+  Object.defineProperty(core.resources.git, 'executable', { value: gitExecutable })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let operation = 0
   const request = async (method: string, params: unknown = {}, id?: string) =>
@@ -98,6 +104,145 @@ function baseline(
   }
 }
 
+it('retains consumer A when B stops and reads a same-size dirty edit', async () => {
+  const s = await setup()
+  writeFileSync(join(s.repo, 'file'), 'stage1\n')
+  git(s.repo, 'add', 'file')
+  writeFileSync(join(s.repo, 'file'), 'dirty3\n')
+  const a = new RepositoryClient(s.request),
+    b = new RepositoryClient(s.request)
+  const first = await a.watch({ worktree_id: s.root, changes: null })
+  const second = await b.watch({ worktree_id: s.root, changes: null })
+  await b.unwatch({ worktree_id: s.root, subscription_id: second.subscription_id })
+  expect((s.core.resources.repository as any).subscriptions.has(first.subscription_id)).toBe(true)
+  const before = s.core.head('catalog')
+  writeFileSync(join(s.repo, 'file'), 'dirty4\n')
+  await wait(() => s.batches(before).length > 0)
+  expect(RepositoryChangeBatchSchema.safeParse(s.batches(before)[0]).success).toBe(true)
+  const observation = await a.observe({ worktree_id: s.root })
+  const blob = await a.blob({ worktree_id: s.root, revision: observation.revision, path: 'file' })
+  const content = await a.content({ worktree_id: s.root, content_id: blob.content_id! })
+  expect(Buffer.from(content.base64, 'base64').toString()).toBe('dirty4\n')
+}, 60000)
+
+it('isolates failed acquisition and renewal and rejects foreign or missing renewal IDs', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  expect(s.core.discovery().supported_capabilities).toContain('repository_watch_renewal_v1')
+  const a = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  const b = await s.request('repository.v1.watch', { worktree_id: s.root })
+  const other = s.core.authority.authenticate(s.core.createToken('other').token)
+  await expect(
+    s.core.request(
+      other,
+      'repository.v1.watch',
+      {
+        worktree_id: s.root,
+        subscription_id: a.subscription_id,
+      },
+      'foreign-renewal'
+    )
+  ).rejects.toThrow('unauthorized')
+  await expect(
+    s.request('repository.v1.watch', {
+      worktree_id: s.external,
+      subscription_id: a.subscription_id,
+    })
+  ).rejects.toThrow('unauthorized')
+  await expect(
+    s.request('repository.v1.watch', {
+      worktree_id: s.root,
+      subscription_id: 'missing',
+    })
+  ).rejects.toThrow('unauthorized')
+  const fingerprint = vi.spyOn(repository, 'watchFingerprint')
+  fingerprint.mockRejectedValueOnce(new Error('fixture acquisition'))
+  await expect(s.request('repository.v1.watch', { worktree_id: s.root })).rejects.toThrow()
+  expect(repository.subscriptions.size).toBe(2)
+  fingerprint.mockRejectedValueOnce(new Error('fixture renewal'))
+  await expect(
+    s.request('repository.v1.watch', {
+      worktree_id: s.root,
+      subscription_id: b.subscription_id,
+    })
+  ).rejects.toThrow()
+  expect([...repository.subscriptions.keys()]).toEqual([a.subscription_id])
+})
+
+it('bounds old-client leases and replaces only the explicit lease at capacity without leaks', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  let lease = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  for (let i = 1; i < 16; i++) await s.request('repository.v1.watch', { worktree_id: s.root })
+  await expect(s.request('repository.v1.watch', { worktree_id: s.root })).rejects.toThrow(
+    'resource_busy'
+  )
+  for (let i = 0; i < 4; i++) {
+    const old = repository.subscriptions.get(lease.subscription_id)
+    lease = await s.request('repository.v1.watch', {
+      worktree_id: s.root,
+      subscription_id: lease.subscription_id,
+      changes: lease.changes,
+    })
+    expect(repository.subscriptions.size).toBe(16)
+    expect([...repository.subscriptions.values()]).not.toContain(old)
+    expect(old.timer?._destroyed).toBeTruthy()
+  }
+  repository.subscriptions.get(lease.subscription_id).expires = Date.now() - 1
+  await expect(
+    s.request('repository.v1.watch', {
+      worktree_id: s.root,
+      subscription_id: lease.subscription_id,
+    })
+  ).rejects.toThrow('unauthorized')
+  await s.request('repository.v1.watch', { worktree_id: s.root })
+  expect(repository.subscriptions.size).toBe(16)
+})
+
+it('sends one batch per installation with independent stream and legacy leases', async () => {
+  const s = await setup()
+  await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  await s.request('repository.v1.watch', { worktree_id: s.root })
+  const other = s.core.authority.authenticate(s.core.createToken('other').token)
+  await s.core.request(
+    other,
+    'repository.v1.watch',
+    { worktree_id: s.root, changes: null },
+    'other'
+  )
+  const before = s.core.head('catalog')
+  writeFileSync(join(s.repo, 'file'), 'edited\n')
+  await wait(() => s.batches(before).length >= 2)
+  const events = s.core.read('catalog', before).filter((e) => e.type === 'repository.changed')
+  expect(events).toHaveLength(2)
+  expect(new Set(events.map((e) => JSON.stringify(e.actor))).size).toBe(2)
+  expect((s.core.resources.repository as any).subscriptions.size).toBe(4)
+  await wait(() => s.core.read('catalog', before).some((e) => e.type === 'repository.invalidated'))
+}, 60000)
+
+it('retries a batch on another lease after append fails for the first', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  const first = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  const second = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  const append = s.core.append.bind(s.core)
+  let failed = false
+  vi.spyOn(s.core, 'append').mockImplementation((...args) => {
+    if (args[1] === 'repository.changed' && !failed) {
+      failed = true
+      throw new Error('fixture append failure')
+    }
+    return append(...args)
+  })
+  const before = s.core.head('catalog')
+  writeFileSync(join(s.repo, 'file'), 'edited\n')
+  await wait(() => s.batches(before).length > 0)
+  expect(failed).toBe(true)
+  expect(repository.subscriptions.has(first.subscription_id)).toBe(false)
+  expect(repository.subscriptions.has(second.subscription_id)).toBe(true)
+}, 60000)
+
 it('describes a stream batch and keeps the legacy watch lease shape', () => {
   const lease = { subscription_id: 'lease', expires_at: new Date().toISOString() }
   expect(RepositoryWatchSchema.parse({ ...lease, refresh_required: true })).toEqual({
@@ -113,6 +258,7 @@ it('describes a stream batch and keeps the legacy watch lease shape', () => {
   ).toEqual({ stream_id: 'stream', revision: 4 })
   const watch = RepositoryMethodSchemas['repository.v1.watch']
   expect(watch.parse({ worktree_id: 'w' })).toEqual({ worktree_id: 'w' })
+  expect(watch.parse({ worktree_id: 'w', subscription_id: 'lease' }).subscription_id).toBe('lease')
   expect(watch.parse({ worktree_id: 'w', changes: null }).changes).toBeNull()
   expect(watch.parse({ worktree_id: 'w', changes: { stream_id: 's', revision: 2 } })).toBeTruthy()
   const batch = {
@@ -279,6 +425,7 @@ it('continues a renewed lease without a reread and asks for one after a gap', as
   const revision = s.batches(before).at(-1).revision
   const renewed = await s.request('repository.v1.watch', {
     worktree_id: s.root,
+    subscription_id: first.subscription_id,
     changes: { stream_id: first.changes.stream_id, revision },
   })
   expect(renewed).toMatchObject({
@@ -345,6 +492,7 @@ it('keeps sending batches while a lease is renewed', async () => {
   })
   const renewing = s.request('repository.v1.watch', {
     worktree_id: s.root,
+    subscription_id: first.subscription_id,
     changes: first.changes,
   })
   await wait(() => reached)

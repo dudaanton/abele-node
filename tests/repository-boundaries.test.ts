@@ -4,10 +4,14 @@ import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, renameSync
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { parseWorktrees, GitRunner } from '../packages/node-core/src/git.js'
+import { existsSync } from 'node:fs'
 const dirs: string[] = [],
   cores: NodeCore[] = []
+const gitExecutable = existsSync('/Library/Developer/CommandLineTools/usr/bin/git')
+  ? '/Library/Developer/CommandLineTools/usr/bin/git'
+  : '/usr/bin/git'
 const git = (cwd: string, ...args: string[]) => {
-  const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
+  const r = spawnSync(gitExecutable, args, { cwd, encoding: 'utf8' })
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
@@ -29,6 +33,7 @@ async function setup(unborn = false) {
   }
   const core = new NodeCore(join(dir, 'state'))
   cores.push(core)
+  Object.defineProperty(core.resources.git, 'executable', { value: gitExecutable })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let operation = 0
   const request = async (method: string, params: unknown = {}) =>
@@ -318,7 +323,7 @@ it('rechecks publication when revocation happens during an otherwise successful 
     s.request('repository.v1.blob', { worktree_id: s.worktree_id, revision, path: 'file' })
   ).rejects.toThrow('unauthorized')
 })
-it('coalesces watcher leases and reports overflow and disappearing worktrees before stopping them', async () => {
+it('renews an explicit watcher lease and reports overflow and disappearing worktrees before stopping it', async () => {
   const s = await setup(),
     linked = join(s.dir, 'linked')
   git(s.repo, 'worktree', 'add', '-b', 'side', linked)
@@ -331,7 +336,10 @@ it('coalesces watcher leases and reports overflow and disappearing worktrees bef
   ).entries.find((e: any) => e.kind === 'external').worktree_id
   const repository = s.core.resources.repository as any
   const old = await s.request('repository.v1.watch', { worktree_id })
-  const active = await s.request('repository.v1.watch', { worktree_id })
+  const active = await s.request('repository.v1.watch', {
+    worktree_id,
+    subscription_id: old.subscription_id,
+  })
   expect(repository.subscriptions.size).toBe(1)
   expect(repository.subscriptions.has(old.subscription_id)).toBe(false)
   const subscription = repository.subscriptions.get(active.subscription_id)
