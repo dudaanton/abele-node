@@ -1,9 +1,23 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  existsSync,
+  watch,
+  type FSWatcher,
+} from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 
 import { createHash } from 'node:crypto'
+
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>()
+  return { ...fs, watch: vi.fn(fs.watch) }
+})
 
 const cleanup: (() => Promise<void>)[] = []
 afterEach(async () => {
@@ -304,13 +318,25 @@ it('keeps watcher reconciliation behind queued foreground edits and reads', asyn
     .spyOn(service, 'watchFingerprint')
     .mockResolvedValue({ cheap: 'same', refs: [] })
   vi.spyOn(service, 'watchVisible').mockResolvedValue('same')
+  const filesystemHints: (() => void)[] = []
+  vi.mocked(watch).mockImplementation(((_path: unknown, listener: () => void) => {
+    filesystemHints.push(listener)
+    return Object.assign(new EventEmitter(), {
+      close: vi.fn(),
+      ref: vi.fn(),
+      unref: vi.fn(),
+    }) as FSWatcher
+  }) as typeof watch)
   await service.subscribe(s.actor, target)
+  expect(filesystemHints).toHaveLength(2)
   fingerprint.mockClear()
   const active = Array.from({ length: 4 }, (_, i) => s.read(i))
   await Promise.resolve()
   const work = vi.fn(async () => {})
   const edit = service.editJob(work)
   const later = s.read(4)
+  // Exercise both hint sources while foreground work owns the queue.
+  filesystemHints[0]!()
   await vi.advanceTimersByTimeAsync(2_000)
   expect(fingerprint).not.toHaveBeenCalled()
   s.finish.shift()!()
@@ -318,9 +344,15 @@ it('keeps watcher reconciliation behind queued foreground edits and reads', asyn
   expect(work).toHaveBeenCalledOnce()
   await Promise.resolve()
   expect(s.started).toEqual([0, 1, 2, 3, 4])
+  expect(fingerprint).not.toHaveBeenCalled()
   s.finish.splice(0).forEach((finish) => finish())
   await Promise.all([...active, later])
   await vi.advanceTimersByTimeAsync(2_000)
   expect(fingerprint).toHaveBeenCalledOnce()
+  // A later filesystem hint may legitimately reconcile again; no native
+  // watcher is attached, so its timing is entirely under this test's control.
+  filesystemHints[0]!()
+  await vi.advanceTimersByTimeAsync(100)
+  expect(fingerprint).toHaveBeenCalledTimes(2)
   expect(service.active).toBe(0)
 })

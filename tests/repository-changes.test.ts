@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
@@ -132,42 +133,156 @@ it('isolates failed acquisition and renewal and rejects foreign or missing renew
   const a = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
   const b = await s.request('repository.v1.watch', { worktree_id: s.root })
   const other = s.core.authority.authenticate(s.core.createToken('other').token)
-  await expect(
-    s.core.request(
-      other,
-      'repository.v1.watch',
-      {
-        worktree_id: s.root,
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await expect(
+      s.core.request(
+        other,
+        'repository.v1.watch',
+        {
+          worktree_id: s.root,
+          subscription_id: a.subscription_id,
+        },
+        `foreign-renewal-${attempt}`
+      )
+    ).rejects.toThrow('unauthorized')
+    await expect(
+      s.request('repository.v1.watch', {
+        worktree_id: s.external,
         subscription_id: a.subscription_id,
-      },
-      'foreign-renewal'
+      })
+    ).rejects.toThrow('unauthorized')
+    await expect(
+      s.request('repository.v1.watch', {
+        worktree_id: s.root,
+        subscription_id: 'missing',
+      })
+    ).rejects.toThrow('unauthorized')
+  }
+  // watchFingerprint is shared with background reconciliation. A one-shot mock can
+  // be consumed by a watcher instead of the request whose failure we are testing.
+  const failure = new AsyncLocalStorage<Error>()
+  const original = repository.watchFingerprint.bind(repository)
+  const fingerprint = vi.spyOn(repository, 'watchFingerprint').mockImplementation((target) => {
+    const error = failure.getStore()
+    return error ? Promise.reject(error) : original(target)
+  })
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const calls = fingerprint.mock.calls.length
+    repository.subscriptions
+      .get(a.subscription_id)
+      .watchers[0].emit('error', new Error('fixture hint'))
+    await wait(() => fingerprint.mock.calls.length > calls)
+    const error = new Error('fixture acquisition')
+    await expect(
+      failure.run(error, () =>
+        s.request('repository.v1.watch', {
+          worktree_id: s.root,
+        })
+      )
+    ).rejects.toBe(error)
+    expect(repository.subscriptions.size).toBe(2)
+  }
+  const error = new Error('fixture renewal')
+  await expect(
+    failure.run(error, () =>
+      s.request('repository.v1.watch', {
+        worktree_id: s.root,
+        subscription_id: b.subscription_id,
+      })
     )
-  ).rejects.toThrow('unauthorized')
-  await expect(
-    s.request('repository.v1.watch', {
-      worktree_id: s.external,
-      subscription_id: a.subscription_id,
-    })
-  ).rejects.toThrow('unauthorized')
-  await expect(
-    s.request('repository.v1.watch', {
-      worktree_id: s.root,
-      subscription_id: 'missing',
-    })
-  ).rejects.toThrow('unauthorized')
-  const fingerprint = vi.spyOn(repository, 'watchFingerprint')
-  fingerprint.mockRejectedValueOnce(new Error('fixture acquisition'))
-  await expect(s.request('repository.v1.watch', { worktree_id: s.root })).rejects.toThrow()
-  expect(repository.subscriptions.size).toBe(2)
-  fingerprint.mockRejectedValueOnce(new Error('fixture renewal'))
-  await expect(
-    s.request('repository.v1.watch', {
-      worktree_id: s.root,
-      subscription_id: b.subscription_id,
-    })
-  ).rejects.toThrow()
+  ).rejects.toBe(error)
   expect([...repository.subscriptions.keys()]).toEqual([a.subscription_id])
 })
+
+it('rechecks a held renewal after expiry, unwatch or a competing replacement', async () => {
+  const s = await setup(),
+    repository = s.core.resources.repository as any
+  const a = await s.request('repository.v1.watch', { worktree_id: s.root })
+  const other = s.core.authority.authenticate(s.core.createToken('other').token)
+  const held = new AsyncLocalStorage<{ entered: boolean; release: Promise<void> }>()
+  const original = repository.watchFingerprint.bind(repository)
+  vi.spyOn(repository, 'watchFingerprint').mockImplementation(async (target) => {
+    const gate = held.getStore()
+    if (gate) {
+      gate.entered = true
+      await gate.release
+    }
+    return original(target)
+  })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const action of ['expiry', 'unwatch', 'replacement']) {
+      const b = await s.request('repository.v1.watch', { worktree_id: s.root })
+      let release!: () => void
+      const gate = {
+        entered: false,
+        release: new Promise<void>((r) => {
+          release = r
+        }),
+      }
+      const renewing = held.run(gate, () =>
+        s.request('repository.v1.watch', {
+          worktree_id: s.root,
+          subscription_id: b.subscription_id,
+        })
+      )
+      const rejected = expect(renewing).rejects.toThrow('unauthorized')
+      let replacement: { subscription_id: string } | undefined
+      try {
+        await wait(() => gate.entered)
+        // Invalid renewals must not bypass ownership while another acquisition is
+        // suspended. These all cross request parsing and the real dispatch path.
+        await expect(
+          s.core.request(
+            other,
+            'repository.v1.watch',
+            {
+              worktree_id: s.root,
+              subscription_id: b.subscription_id,
+            },
+            `foreign-held-${attempt}-${action}`
+          )
+        ).rejects.toThrow('unauthorized')
+        await expect(
+          s.request('repository.v1.watch', {
+            worktree_id: s.external,
+            subscription_id: b.subscription_id,
+          })
+        ).rejects.toThrow('unauthorized')
+        await expect(
+          s.request('repository.v1.watch', {
+            worktree_id: s.root,
+            subscription_id: 'missing',
+          })
+        ).rejects.toThrow('unauthorized')
+        if (action === 'expiry')
+          repository.subscriptions.get(b.subscription_id).expires = Date.now() - 1
+        else if (action === 'unwatch')
+          await s.request('repository.v1.unwatch', {
+            worktree_id: s.root,
+            subscription_id: b.subscription_id,
+          })
+        else
+          replacement = await s.request('repository.v1.watch', {
+            worktree_id: s.root,
+            subscription_id: b.subscription_id,
+          })
+      } finally {
+        release()
+        await rejected
+      }
+      expect(repository.subscriptions.has(a.subscription_id)).toBe(true)
+      expect(repository.subscriptions.has(b.subscription_id)).toBe(false)
+      if (replacement) {
+        expect(repository.subscriptions.has(replacement.subscription_id)).toBe(true)
+        await s.request('repository.v1.unwatch', {
+          worktree_id: s.root,
+          subscription_id: replacement.subscription_id,
+        })
+      }
+      expect([...repository.subscriptions.keys()]).toEqual([a.subscription_id])
+    }
+  }
+}, 60000)
 
 it('bounds old-client leases and replaces only the explicit lease at capacity without leaks', async () => {
   const s = await setup(),
