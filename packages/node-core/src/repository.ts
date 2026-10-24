@@ -246,10 +246,11 @@ export class RepositoryService {
   private workers = new Set<Worker>()
   private reconciliations = new Set<Promise<void>>()
   private active = 0
-  // Watchers share the four-job ceiling, but may occupy only one slot. Waiting
-  // readers get released slots before either new edits or background checks.
+  // Watchers share the four-job ceiling, but may occupy only one slot. Foreground
+  // reads and edits wait in arrival order ahead of background checks.
   private backgroundActive = 0
-  private readers: { grant: () => void; cancel: () => void }[] = []
+  private editActive = false
+  private readers: { edit: boolean; grant: () => void; cancel: () => void }[] = []
   private stopped = false
   constructor(private r: ResourceServices) {
     const version = r.core.db
@@ -668,10 +669,11 @@ export class RepositoryService {
       if (!config.external_read || !approval?.enabled) throw new ChannelError('unauthorized')
     }
   }
-  private acquireRead(): Promise<void> {
+  private acquireRead(timeoutMs = this.r.git.timeoutMs, edit = false): Promise<void> {
     if (this.stopped) return Promise.reject(new ChannelError('resource_busy'))
-    if (this.active < 4 && !this.readers.length) {
+    if (this.active < 4 && !this.readers.length && (!edit || !this.editActive)) {
       this.active++
+      if (edit) this.editActive = true
       return Promise.resolve()
     }
     return new Promise((resolve, reject) => {
@@ -681,9 +683,11 @@ export class RepositoryService {
         if (index >= 0) this.readers.splice(index, 1)
       }
       const reader = {
+        edit,
         grant: () => {
           remove()
           this.active++
+          if (edit) this.editActive = true
           resolve()
         },
         cancel: () => {
@@ -694,22 +698,33 @@ export class RepositoryService {
       const timer = setTimeout(() => {
         remove()
         reject(new ChannelError('git_timeout'))
-      }, this.r.git.timeoutMs)
+        this.drainJobs()
+      }, timeoutMs)
       this.readers.push(reader)
     })
   }
-  private releaseJob() {
+  private releaseJob(edit = false) {
     this.active--
-    while (!this.stopped && this.active < 4 && this.readers.length) this.readers[0]!.grant()
+    if (edit) this.editActive = false
+    this.drainJobs()
+  }
+  private drainJobs() {
+    while (!this.stopped && this.active < 4 && this.readers.length) {
+      const next = this.readers[0]!
+      if (next.edit && this.editActive) break
+      next.grant()
+    }
   }
   private async editJob<T>(work: () => Promise<T>) {
-    if (this.stopped || this.active >= 4 || this.readers.length)
-      throw new ChannelError('resource_busy')
-    this.active++
+    const deadline = Date.now() + 15000
+    await this.acquireRead(15000, true)
     try {
-      return await this.r.git.bounded(15000, work)
+      if (this.stopped) throw new ChannelError('resource_busy')
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new ChannelError('git_timeout')
+      return await this.r.git.bounded(remaining, work)
     } finally {
-      this.releaseJob()
+      this.releaseJob(true)
     }
   }
   async prepareEdit(actor: AuthorityContext, id: string, path: string) {
