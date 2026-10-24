@@ -261,6 +261,53 @@ export class ChangeStreams {
     }
   }
   /** The next batch, or null when nothing a client shows has changed. */
+  refreshFiles(
+    worktree: string,
+    paths: Iterable<string>,
+    stat: (path: string) => { stamp: string; size: number } | null
+  ) {
+    const stream = this.streams.get(worktree)
+    if (!stream) return Promise.resolve(null)
+    const task = stream.queue.then(() => {
+      if (!stream.baseline) return null
+      const updates = new Map<
+        string,
+        ChangeBaseline['entries'] extends Map<string, infer Row> ? Row : never
+      >()
+      const entries: RepositoryTreeChange[] = []
+      for (const path of paths) {
+        const old = stream.baseline.entries.get(path)
+        if (old?.entry.kind !== 'file') continue
+        const current = stat(path)
+        if (!current) continue // removals/type changes require the full reconciliation
+        const entry = { ...old.entry, size: current.size }
+        const signature = JSON.stringify([entry, current.stamp])
+        if (signature === old.signature) continue
+        updates.set(path, {
+          entry,
+          signature,
+          identity: current.stamp.split(':').slice(0, 2).join(':'),
+        })
+        entries.push({ change: 'modified', entry })
+      }
+      if (
+        !entries.length ||
+        entries.length > this.limit ||
+        Buffer.byteLength(JSON.stringify(entries)) > 192 * 1024
+      )
+        return null
+      for (const [path, row] of updates) stream.baseline.entries.set(path, row)
+      // File metadata can reach open views before the expensive whole-tree/Git scan.
+      // That scan follows and publishes status, membership and any other changes.
+      return {
+        stream_id: stream.stream_id,
+        revision: ++stream.revision,
+        body: { complete: true as const, entries, git: null },
+      }
+    })
+    stream.queue = task.catch(() => {})
+    return task
+  }
   advance(
     worktree: string,
     compute: () => Promise<ChangeBaseline>,

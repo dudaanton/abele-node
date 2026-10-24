@@ -36,8 +36,11 @@ import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
 import { WorktreeMonitor, pathMetadata, sourceMetadata } from './worktree-monitor.js'
+import { debuglog } from 'node:util'
 import { ChangeStreams, baselineOf } from './repository-changes.js'
 import { decodeGit, parseWorktrees as parseGitWorktrees, type GitCommand } from './git.js'
+
+const watchDebug = debuglog('abele-repository-watch')
 
 // Git may retain a logical path after a worktree pool moves behind a symlink.
 // Resolve at discovery, before workspace matching and identity pinning. All later
@@ -209,6 +212,8 @@ interface Subscription {
   changes: boolean
   monitor?: WorktreeMonitor
   detach?: () => void
+  run?: (reason: 'filesystem' | 'reconciliation' | 'overflow') => void
+  schedule?: () => void
 }
 
 /** Repository targets deliberately do not enter the managed-workspace/provider tables. */
@@ -244,6 +249,14 @@ export class RepositoryService {
   private cursors = new Map<string, Continuation>()
   private comparisons = new Map<string, Comparison>()
   private subscriptions = new Map<string, Subscription>()
+  private watchProbes = new Map<
+    string,
+    {
+      recent: Set<string>
+      stamps?: Map<string, string | null>
+      scan?: Iterator<[string, string | null]>
+    }
+  >()
   readonly changes = new ChangeStreams(() => randomUUID())
   private workers = new Set<Worker>()
   private reconciliations = new Set<Promise<void>>()
@@ -864,6 +877,11 @@ export class RepositoryService {
     return { ...row, readGeneration: this.readGenerations.get(row.project_id) ?? 0 }
   }
   private dropMonitor(id: string) {
+    const probe = this.watchProbes.get(id)
+    if (probe) {
+      probe.stamps = undefined
+      probe.scan = undefined
+    }
     this.monitors.get(id)?.close()
     this.monitors.delete(id)
     this.snapshots.delete(id + ':false')
@@ -920,6 +938,11 @@ export class RepositoryService {
     else monitor.releaseBaseline()
   }
   private evictSnapshot(snapshot: WorkingSnapshot) {
+    for (const probe of this.watchProbes.values())
+      if (probe.stamps === snapshot.stamps) {
+        probe.stamps = undefined
+        probe.scan = undefined
+      }
     for (const [key, state] of this.snapshots) if (state === snapshot) this.snapshots.delete(key)
     for (const [id, observation] of this.observations)
       if (observation.snapshot === snapshot) this.observations.delete(id)
@@ -2339,6 +2362,14 @@ export class RepositoryService {
       String(p.path),
       p.larger ? 16 * 1024 * 1024 : 1024 * 1024
     )
+    if ((p.revision as RepositoryRevision).kind === 'working') {
+      const probe = this.watchProbe(target.worktree_id)
+      probe.recent.delete(String(p.path))
+      probe.recent.add(String(p.path))
+      // The protocol has no tab-close signal. Retain a bounded working-file read set;
+      // older reads still participate in the rotating safety scan and native hints.
+      while (probe.recent.size > 128) probe.recent.delete(probe.recent.values().next().value!)
+    }
     let binary = false
     if (result.bytes) {
       try {
@@ -2884,7 +2915,10 @@ export class RepositoryService {
     if (!s) return
     if (s.timer) clearInterval(s.timer)
     if (s.pending) clearTimeout(s.pending)
-    for (const w of s.watchers) w.close()
+    if (
+      ![...this.subscriptions].some(([key, other]) => key !== id && other.watchers === s.watchers)
+    )
+      for (const w of s.watchers) w.close()
     s.detach?.()
     this.subscriptions.delete(id)
     if (
@@ -2898,6 +2932,46 @@ export class RepositoryService {
   private async changeBaseline(target: Target) {
     const snapshot = await this.workingState(target)
     return baselineOf(snapshot, snapshot.monitor.gitdir)
+  }
+  private watchProbe(worktree: string) {
+    let probe = this.watchProbes.get(worktree)
+    if (!probe) {
+      probe = { recent: new Set<string>() }
+      this.watchProbes.set(worktree, probe)
+      if (this.watchProbes.size > 32)
+        for (const key of this.watchProbes.keys()) {
+          if ([...this.subscriptions.values()].some((lease) => lease.target.worktree_id === key))
+            continue
+          this.watchProbes.delete(key)
+          break
+        }
+    }
+    return probe
+  }
+  /** Bounded, shared safety net for lost native hints. Never enumerate ignored output. */
+  private watchNeedsReconcile(target: Target) {
+    const snapshot = this.snapshots.get(target.worktree_id + ':false')
+    if (!snapshot || snapshot.monitor.closed) return true
+    if (snapshot.signature !== snapshot.monitor.signature()) return true
+    const probe = this.watchProbe(target.worktree_id)
+    for (const path of probe.recent)
+      if (pathMetadata(join(target.path, path)) !== (snapshot.stamps.get(path) ?? null)) return true
+    if (probe.stamps !== snapshot.stamps) {
+      probe.stamps = snapshot.stamps
+      probe.scan = snapshot.stamps.entries()
+    }
+    // Bound idle work independently of repository size. A full traversal progresses over
+    // many ticks; recently read working files are checked on every tick above.
+    for (let i = 0; i < 128; i++) {
+      const next = probe.scan!.next()
+      if (next.done) {
+        probe.scan = snapshot.stamps.entries()
+        break
+      }
+      const [path, stamp] = next.value
+      if (pathMetadata(join(target.path, path)) !== stamp) return true
+    }
+    return false
   }
   private async watchFingerprint(target: Target) {
     const monitor = await this.monitor(target)
@@ -3011,10 +3085,20 @@ export class RepositoryService {
       for (const [key, current] of this.subscriptions) if (renewed(current)) this.unwatch(key)
       throw error
     }
-    for (const [key, current] of this.subscriptions) if (renewed(current)) this.unwatch(key)
-    if (this.subscriptions.size >= 16) throw new ChannelError('resource_busy')
+    if ([...this.subscriptions.values()].filter((other) => !renewed(other)).length >= 16)
+      throw new ChannelError('resource_busy')
+    // Transfer native handles before retiring the old lease. Repeatedly stopping and
+    // starting FSEvents for the same paths is expensive, even with shared reconciliation.
+    if (changes) {
+      const existing = [...this.subscriptions.values()].find(
+        (other) => other.changes && other.target.worktree_id === target.worktree_id
+      )
+      if (existing) s.watchers = existing.watchers
+    }
     s.explicitRenewal = this.explicitRenewalInstallations.has(actor.installation_id)
     this.subscriptions.set(id, s)
+    for (const [key, current] of this.subscriptions)
+      if (key !== id && renewed(current)) this.unwatch(key)
     // Decided as the subscription takes over, so no batch falls between the answer and it.
     const follows = changes
       ? this.changes.follow(target.worktree_id, actor.installation_id, cursor ?? null)
@@ -3044,7 +3128,16 @@ export class RepositoryService {
         () => this.changeBaseline(target),
         reason
       )
+      deliver(batch, reason)
+    }
+    const deliver = (batch: Awaited<ReturnType<ChangeStreams['advance']>>, reason: string) => {
       if (!batch) return
+      watchDebug(
+        'batch worktree=%s revision=%d reason=%s',
+        target.worktree_id,
+        batch.revision,
+        reason
+      )
       const sent = new Set<string>()
       // One revision, sent to every change watcher of this worktree.
       for (const [key, other] of this.subscriptions) {
@@ -3067,6 +3160,12 @@ export class RepositoryService {
             }
           )
           this.changes.sent(target.worktree_id, other.owner.installation_id, batch.revision)
+          watchDebug(
+            'sent worktree=%s revision=%d installation=%s',
+            target.worktree_id,
+            batch.revision,
+            other.owner.installation_id
+          )
           sent.add(other.owner.installation_id)
         } catch {
           this.unwatch(key)
@@ -3081,6 +3180,7 @@ export class RepositoryService {
       s.detach = monitor.listen((overflow) => (overflow ? run('overflow') : schedule()))
     }
     const reconcile = async (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
+      const started = performance.now()
       if (this.stopped || !this.subscriptions.has(id)) return
       if (s.expires < Date.now()) {
         this.unwatch(id)
@@ -3104,6 +3204,20 @@ export class RepositoryService {
         this.r.core.authority.check(actor, 'resource', target.worktree_id)
         await this.validate(target)
         if (changes) await attach()
+        if (changes && reason !== 'overflow') {
+          const recent = this.watchProbe(target.worktree_id).recent
+          const batch = await this.changes.refreshFiles(target.worktree_id, recent, (path) => {
+            try {
+              const full = this.checked(target, path)
+              const info = lstatSync(full)
+              const stamp = pathMetadata(full)
+              return info.isFile() && stamp ? { stamp, size: info.size } : null
+            } catch {
+              return null
+            }
+          })
+          deliver(batch, 'open-file')
+        }
         const watched = await this.watchFingerprint(target)
         if (this.stopped || !this.subscriptions.has(id)) return
         if (s.expires < Date.now()) {
@@ -3111,12 +3225,12 @@ export class RepositoryService {
           return
         }
         if (changes) {
-          // A stream watcher diffs what clients show, so any hint is worth a look; an unchanged
-          // view sends no batch.
-          if (watched.cheap !== s.fingerprint || reason === 'overflow' || reason === 'filesystem') {
-            s.fingerprint = watched.cheap
-            await publish(reason === 'overflow' ? 'overflow' : 'change')
-          }
+          // FSEvents may delay or lose hints, including after acquisition/renewal.
+          // The cheap signature does not stat visible files: an in-place edit can leave it
+          // unchanged forever. workingState validates their metadata even on a cache hit,
+          // so reconcile after either a native hint or a changed bounded metadata probe.
+          s.fingerprint = watched.cheap
+          await publish(reason === 'overflow' ? 'overflow' : 'change')
         } else if (watched.cheap !== s.fingerprint || reason === 'overflow') {
           s.fingerprint = watched.cheap
           const visible = await this.watchVisible(target, watched)
@@ -3144,6 +3258,12 @@ export class RepositoryService {
         }
         this.unwatch(id)
       } finally {
+        watchDebug(
+          'reconcile worktree=%s reason=%s elapsed_ms=%d',
+          target.worktree_id,
+          reason,
+          performance.now() - started
+        )
         s.checking = false
         this.backgroundActive--
         this.releaseJob()
@@ -3155,10 +3275,38 @@ export class RepositoryService {
       }
     }
     const run = (reason: 'filesystem' | 'reconciliation' | 'overflow') => {
+      if (this.stopped || !this.subscriptions.has(id)) return
+      if (s.expires < Date.now()) {
+        this.unwatch(id)
+        return
+      }
+      if (changes) {
+        // All leases receive the shared stream. Only its current first lease does the work;
+        // renewal/unwatch transfers this role without resetting the polling cursor.
+        const leader = [...this.subscriptions].find(
+          ([, other]) => other.changes && other.target.worktree_id === target.worktree_id
+        )
+        if (leader?.[0] !== id) {
+          if (reason !== 'reconciliation') leader?.[1].run?.(reason)
+          return
+        }
+        if (reason === 'reconciliation' && !s.dirty) {
+          const started = performance.now()
+          const needed = this.watchNeedsReconcile(target)
+          watchDebug(
+            'probe worktree=%s elapsed_ms=%d needed=%s',
+            target.worktree_id,
+            performance.now() - started,
+            needed
+          )
+          if (!needed) return
+        }
+      }
       const task = this.r.git.detached(15000, () => reconcile(reason))
       this.reconciliations.add(task)
       void task.finally(() => this.reconciliations.delete(task)).catch(() => {})
     }
+    s.run = run
     const schedule = () => {
       if (!s.pending)
         s.pending = setTimeout(() => {
@@ -3166,24 +3314,35 @@ export class RepositoryService {
           run('filesystem')
         }, 100)
     }
+    s.schedule = schedule
     const project = this.r.projects.get(target.project_id)
     // Fixed watcher budget. Nonrecursive platforms rely on reconciliation for nested changes.
-    for (const path of [
-      ...new Set([target.path, project.git_common_dir!, join(target.path, '.git')]),
-    ]) {
-      try {
-        const w = watch(path, schedule)
-        w.on('error', () => {
-          run('overflow')
-        })
-        s.watchers.push(w)
-      } catch {
-        /* reconciliation is authoritative */
+    if (!changes || !s.watchers.length)
+      for (const path of [
+        ...new Set([target.path, project.git_common_dir!, join(target.path, '.git')]),
+      ]) {
+        try {
+          // Native callbacks outlive the lease that created them; select the current owner.
+          const leader = () =>
+            [...this.subscriptions.values()].find(
+              (other) => other.changes && other.target.worktree_id === target.worktree_id
+            )
+          const w = watch(path, () => (changes ? leader()?.schedule?.() : schedule()))
+          w.on('error', () => {
+            if (changes) leader()?.run?.('overflow')
+            else run('overflow')
+          })
+          s.watchers.push(w)
+        } catch {
+          /* reconciliation is authoritative */
+        }
       }
-    }
-    s.timer = setInterval(() => {
-      run('reconciliation')
-    }, 2000)
+    s.timer = setInterval(
+      () => {
+        run('reconciliation')
+      },
+      changes ? 500 : 2000
+    )
     if (!stream) {
       notify('reconnect')
       return {
@@ -3428,6 +3587,7 @@ export class RepositoryService {
     for (const monitor of this.monitors.values()) monitor.close()
     this.monitors.clear()
     this.snapshots.clear()
+    this.watchProbes.clear()
     this.clearObjectCache()
     for (const id of this.subscriptions.keys()) this.unwatch(id)
     this.changes.clear()

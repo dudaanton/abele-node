@@ -1,6 +1,9 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { EventEmitter } from 'node:events'
+import { closeRepositoryFixtures } from './helpers/close-repository-fixtures.js'
+import { watch } from 'node:fs'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
@@ -16,6 +19,10 @@ import {
 
 const dirs: string[] = [],
   cores: NodeCore[] = []
+vi.mock('node:fs', async (original) => {
+  const fs = await original<typeof import('node:fs')>()
+  return { ...fs, watch: vi.fn(fs.watch) }
+})
 const gitExecutable = existsSync('/Library/Developer/CommandLineTools/usr/bin/git')
   ? '/Library/Developer/CommandLineTools/usr/bin/git'
   : '/usr/bin/git'
@@ -69,12 +76,9 @@ async function setup() {
 }
 afterEach(async () => {
   vi.restoreAllMocks()
-  for (const c of cores.splice(0)) {
-    await c.resources.stop()
-    c.close()
-  }
-  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
-})
+  vi.mocked(watch).mockReset()
+  await closeRepositoryFixtures(cores, dirs)
+}, 60000)
 // A batch follows a hint within one reconciliation, which a slow machine may stretch to its
 // whole 15 s git budget, plus the 2 s reconciliation tick; a lost batch still fails here.
 async function wait(predicate: () => boolean) {
@@ -91,6 +95,55 @@ const entry = (path: string, kind: 'file' | 'directory', size: number | null = 1
   oid: null,
   size: kind === 'directory' ? null : size,
 })
+
+it.each([false, true])(
+  'delivers immediate nested edits to independent leases within a second (lost hints: %s)',
+  async (lostHints) => {
+    if (lostHints)
+      vi.mocked(watch).mockImplementation(() => {
+        const watcher = new EventEmitter()
+        return Object.assign(watcher, { close() {} }) as ReturnType<typeof watch>
+      })
+    const s = await setup()
+    const a = new RepositoryClient(s.request),
+      b = new RepositoryClient(s.request)
+    let first = await a.watch({ worktree_id: s.root, changes: null })
+    const second = await b.watch({ worktree_id: s.root, changes: null })
+    const repository = s.core.resources.repository as any
+    const latencies: number[] = []
+    for (let i = 0; i < 4; i++) {
+      if (i)
+        first = await a.watch({
+          worktree_id: s.root,
+          subscription_id: first.subscription_id,
+          changes: { stream_id: first.changes!.stream_id, revision: i },
+        })
+      // Also exercise a quiet, already-armed lease after its initial reconciliation.
+      if (i % 2) await new Promise((resolve) => setTimeout(resolve, 350))
+      const before = s.core.head('catalog'),
+        started = performance.now()
+      writeFileSync(join(s.repo, 'src', 'sample.ts'), `edit ${i}\n`)
+      await wait(
+        () =>
+          s
+            .batches(before)
+            .some((batch) =>
+              batch.entries?.some(
+                (row: any) => row.change === 'modified' && row.entry.path === 'src/sample.ts'
+              )
+            ) || performance.now() - started > 1200
+      )
+      const elapsed = performance.now() - started
+      latencies.push(elapsed)
+      expect(s.batches(before), `delivery latency ${elapsed.toFixed(1)} ms`).toHaveLength(1)
+      expect(elapsed).toBeLessThan(1000)
+      expect(repository.subscriptions.has(first.subscription_id)).toBe(true)
+      expect(repository.subscriptions.has(second.subscription_id)).toBe(true)
+    }
+    console.info('repository watch delivery ms', { lostHints, latencies })
+  },
+  60000
+)
 function baseline(
   rows: [string, 'file' | 'directory', string, number?][],
   extra: Partial<ChangeBaseline> = {}
@@ -109,6 +162,60 @@ function baseline(
     ...extra,
   }
 }
+
+it('shares native watch handles across acquisition and legacy renewal until the last lease closes', async () => {
+  vi.mocked(watch).mockImplementation((...args) => {
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn() })
+    const listener = args.at(-1)
+    if (typeof listener === 'function') watcher.on('change', listener)
+    return watcher as unknown as ReturnType<typeof watch>
+  })
+  const s = await setup()
+  const first = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
+  const repository = s.core.resources.repository as any
+  const handles = [...repository.subscriptions.get(first.subscription_id).watchers]
+  const allocated = vi.mocked(watch).mock.calls.length
+  const legacy = s.core.authority.authenticate(s.core.createToken('legacy').token)
+  let renewed: any
+  for (let i = 0; i < 5; i++)
+    renewed = await s.core.request(
+      legacy,
+      'repository.v1.watch',
+      {
+        worktree_id: s.root,
+        changes: null,
+      },
+      'shared-' + i
+    )
+  expect(vi.mocked(watch).mock.calls.length).toBe(allocated)
+  for (const handle of handles) expect(handle.close).not.toHaveBeenCalled()
+  await s.request('repository.v1.unwatch', {
+    worktree_id: s.root,
+    subscription_id: first.subscription_id,
+  })
+  for (const handle of handles) expect(handle.close).not.toHaveBeenCalled()
+  // The remaining lease also transfers ownership across a renewal on its own.
+  renewed = await s.core.request(
+    legacy,
+    'repository.v1.watch',
+    { worktree_id: s.root, changes: null },
+    'shared-last'
+  )
+  expect(vi.mocked(watch).mock.calls.length).toBe(allocated)
+  const scheduling = vi.spyOn(repository.subscriptions.get(renewed.subscription_id), 'schedule')
+  handles[0].emit('change', 'change', 'file')
+  expect(scheduling).toHaveBeenCalledTimes(1)
+  await s.core.request(
+    legacy,
+    'repository.v1.unwatch',
+    {
+      worktree_id: s.root,
+      subscription_id: renewed.subscription_id,
+    },
+    'shared-stop'
+  )
+  for (const handle of handles) expect(handle.close).toHaveBeenCalledTimes(1)
+})
 
 it('replaces 50 legacy renewals without stealing an explicit lease', async () => {
   const s = await setup(),
