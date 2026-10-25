@@ -54,7 +54,7 @@ export class ExecutionTargetService {
     // Fake-provider leases have no OS cleanup obligation. Real leases survive until reconcile proves cleanup.
     r.core.db
       .prepare(
-        "DELETE FROM execution_target_leases WHERE session_id IN (SELECT session_id FROM sessions WHERE json_extract(body,'$.provider')='fake')"
+        "DELETE FROM execution_target_leases WHERE EXISTS (SELECT 1 FROM sessions WHERE sessions.session_id=execution_target_leases.session_id AND json_extract(body,'$.provider')='fake')"
       )
       .run()
   }

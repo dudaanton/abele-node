@@ -84,8 +84,17 @@ export class ObsidianTools {
     core.db
       .exec(`CREATE TABLE IF NOT EXISTS obsidian_tool_config(session_id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS obsidian_tool_revisions(session_id TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY(session_id,revision));
-      INSERT OR IGNORE INTO obsidian_tool_revisions SELECT session_id,json_extract(body,'$.revision') FROM obsidian_tool_config;
+      CREATE TABLE IF NOT EXISTS obsidian_tool_migrations(migration TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS obsidian_tool_invocations(invocation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL, call_id TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(session_id,run_id,call_id));`)
+    if (
+      !core.db
+        .prepare("SELECT 1 FROM obsidian_tool_migrations WHERE migration='revisions_backfilled'")
+        .get()
+    )
+      core.db.exec(`BEGIN IMMEDIATE;
+        INSERT OR IGNORE INTO obsidian_tool_revisions SELECT session_id,json_extract(body,'$.revision') FROM obsidian_tool_config;
+        INSERT INTO obsidian_tool_migrations VALUES('revisions_backfilled');
+        COMMIT;`)
     this.delegateHost = new ObsidianDelegateHost(core, {
       config: (id) => this.config(id),
       save: (i) => this.save(i),

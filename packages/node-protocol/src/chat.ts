@@ -15,8 +15,18 @@ export const ChatFileChangeSchema = z
   })
   .strict()
 const checkpoint = { session_id: id, checkpoint_id: id }
+export const ChatCheckpointsRequestSchema = z
+  .object({
+    session_id: id,
+    before_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    after_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(100).default(100),
+  })
+  .strict()
+  .refine((p) => p.before_seq === undefined || p.after_seq === undefined)
+export type ChatCheckpointsRequest = z.input<typeof ChatCheckpointsRequestSchema>
 export const ChatMethodSchemas = {
-  'chat.checkpoints': z.object({ session_id: id }).strict(),
+  'chat.checkpoints': ChatCheckpointsRequestSchema,
   'chat.preview': z.object(checkpoint).strict(),
   'chat.restore': z
     .object({

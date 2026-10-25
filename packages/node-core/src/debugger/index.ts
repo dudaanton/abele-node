@@ -79,7 +79,9 @@ export class DebuggerService {
       'CREATE TABLE IF NOT EXISTS debug_session_times(debug_session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL)'
     )
     this.historyStore = new DebuggerHistoryStore(core)
-    this.recover()
+    core.db.exec(
+      'CREATE TABLE IF NOT EXISTS debug_recovery_epochs(debug_session_id TEXT PRIMARY KEY, epoch TEXT NOT NULL)'
+    )
   }
   capabilities() {
     return this.enabled ? { debugger_v1: DEBUGGER_V1_CAPABILITY } : {}
@@ -95,12 +97,18 @@ export class DebuggerService {
     this.requireEnabled()
     this.core.assertAuditStorageAvailable()
   }
+  private readonly recoveryEpoch = randomUUID()
   private load(session: string): DebuggerSnapshot {
     const row = this.core.db
       .prepare('SELECT body FROM debug_sessions WHERE debug_session_id=?')
       .get(session)
     if (!row) throw new ChannelError('not_found')
-    return DebuggerSnapshotSchema.parse(JSON.parse(String(row.body)))
+    const state = DebuggerSnapshotSchema.parse(JSON.parse(String(row.body)))
+    const recovered = this.core.db
+      .prepare('SELECT epoch FROM debug_recovery_epochs WHERE debug_session_id=?')
+      .get(session)
+    if (recovered?.epoch === this.recoveryEpoch) return state
+    return this.transition(state, { kind: 'recovery', incarnation: randomUUID() })
   }
   create(target: DebuggerTarget): DebuggerSnapshot {
     this.requireEnabled()
@@ -134,6 +142,9 @@ export class DebuggerService {
       this.core.db
         .prepare('INSERT INTO debug_sessions(debug_session_id,body) VALUES(?,?)')
         .run(snapshot.debug_session_id, JSON.stringify(snapshot))
+      this.core.db
+        .prepare('INSERT OR REPLACE INTO debug_recovery_epochs VALUES(?,?)')
+        .run(snapshot.debug_session_id, this.recoveryEpoch)
     })
     return snapshot
   }
@@ -229,7 +240,11 @@ export class DebuggerService {
       data: JSON.parse(payload.json!),
       truncated: payload.truncated,
     })
-    this.core.transaction(() => {
+    const commit = () => {
+      if (observation.kind === 'recovery')
+        this.core.db
+          .prepare('INSERT OR REPLACE INTO debug_recovery_epochs VALUES(?,?)')
+          .run(state.debug_session_id, this.recoveryEpoch)
       if (observation.kind === 'exited')
         this.core.db
           .prepare('INSERT OR REPLACE INTO debug_exit_codes VALUES(?,?)')
@@ -247,7 +262,9 @@ export class DebuggerService {
       this.core.db
         .prepare('DELETE FROM debug_events WHERE debug_session_id=? AND event_seq<=?')
         .run(state.debug_session_id, state.event_seq - DEBUGGER_LIMITS.replay_events)
-    })
+    }
+    if (this.core.db.isTransaction) commit()
+    else this.core.transaction(commit)
     if (state.stop_epoch !== previous.stop_epoch || state.incarnation !== previous.incarnation)
       this.expireHandles(state.debug_session_id)
     for (const listener of [...(this.listeners.get(state.debug_session_id) ?? [])]) {
@@ -386,12 +403,6 @@ export class DebuggerService {
   }
   private expireHandles(session: string) {
     for (const [id, value] of this.handles) if (value.session === session) this.handles.delete(id)
-  }
-  private recover() {
-    for (const row of this.core.db.prepare('SELECT body FROM debug_sessions').all()) {
-      const state = DebuggerSnapshotSchema.parse(JSON.parse(String(row.body)))
-      this.transition(state, { kind: 'recovery', incarnation: randomUUID() })
-    }
   }
   /** Node-owned coordinator evidence; never changes execution revision. */
   controlPending(session: string, commands: string[], approvals: string[]) {

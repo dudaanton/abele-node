@@ -934,13 +934,8 @@ export class ProviderSessions {
         this.stopping = true
       }
     })
-    const rows = this.core.db.prepare('SELECT body FROM prompts WHERE run_id=?').all(run_id) as {
-      body: string
-    }[]
-    for (const row of rows) {
-      const p = PromptSchema.parse(JSON.parse(row.body))
-      if (p.state === 'pending') this.core.resolvePrompt(p, 'invalidated', 'deny', null)
-    }
+    for (const p of this.core.pendingPrompts(undefined, run_id))
+      this.core.resolvePrompt(p, 'invalidated', 'deny', null)
   }
   private permission(
     input: Input,

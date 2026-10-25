@@ -71,6 +71,9 @@ export function createSdkDouble({
     getEntries() {
       return [...this.entries]
     }
+    _rewriteFile() {
+      writeFileSync(this.file, [this.header, ...this.entries].map(JSON.stringify).join('\n') + '\n')
+    }
     getLeafId() {
       return this.leaf
     }

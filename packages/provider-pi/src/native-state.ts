@@ -6,9 +6,53 @@ import {
   readSync,
   fsyncSync,
   fchmodSync,
+  renameSync,
+  unlinkSync,
+  statSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
 import type { SessionManager } from '@earendil-works/pi-coding-agent'
+import { randomUUID } from 'node:crypto'
+
+export function markAppendOnlyNative(file: string) {
+  const stat = statSync(file, { bigint: true })
+  writeFileSync(file + '.checkpoint-safe', `${stat.dev}:${stat.ino}`, { mode: 0o600 })
+}
+/** SDK 0.87.0 appends normal entries, but _rewriteFile truncates in place during
+ * migration/fork. Replace that one writer before opening any session. Public
+ * header/entry accessors preserve its exact serialization order. */
+export function installAtomicNativeWrites(Manager: unknown): boolean {
+  const prototype = (Manager as { prototype?: Record<string, unknown> }).prototype
+  if (!prototype || typeof prototype._rewriteFile !== 'function') return false
+  const key = Symbol.for('abele.atomic-pi-native-writes.v1')
+  if ((prototype as Record<symbol, unknown>)[key]) return true
+  prototype._rewriteFile = function (this: SessionManager) {
+    const file = this.getSessionFile()
+    if (!this.isPersisted() || !file) return
+    const temporary = file + '.' + randomUUID() + '.tmp'
+    const fd = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600
+    )
+    try {
+      writeFileSync(fd, JSON.stringify(this.getHeader()) + '\n')
+      for (const entry of this.getEntries()) writeFileSync(fd, JSON.stringify(entry) + '\n')
+      fsyncSync(fd)
+      renameSync(temporary, file)
+      markAppendOnlyNative(file)
+    } catch (error) {
+      try {
+        unlinkSync(temporary)
+      } catch {}
+      throw error
+    } finally {
+      closeSync(fd)
+    }
+  }
+  ;(prototype as Record<symbol, unknown>)[key] = true
+  return true
+}
 type NativeState = Pick<
   SessionManager,
   | 'getSessionFile'

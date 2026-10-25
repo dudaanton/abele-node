@@ -77,6 +77,17 @@ export class SessionMessageTools implements DebuggerToolBridge {
           type: 'object',
           properties: {
             all: { type: 'boolean', description: 'Also chats without a running process.' },
+            after_id: {
+              type: 'string',
+              maxLength: 128,
+              description: 'Continue after next_after_id, including after an empty filtered page.',
+            },
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: LISTED,
+              description: 'Maximum candidates to inspect (default 100).',
+            },
           },
           additionalProperties: false,
         },
@@ -124,16 +135,14 @@ export class SessionMessageTools implements DebuggerToolBridge {
     this.closed = true
     this.inner?.close()
   }
-  private owned() {
-    return (
-      this.core.db
-        .prepare(
-          'SELECT body FROM sessions WHERE session_id NOT IN (SELECT session_id FROM deleted_sessions) AND session_id NOT IN (SELECT session_id FROM delegations)'
-        )
-        .all() as { body: string }[]
-    )
-      .map((row) => SessionSchema.parse(JSON.parse(row.body)))
-      .filter((s) => this.live.handles(s.session_id))
+  private ownedSession(id: string) {
+    const row = this.core.db
+      .prepare(
+        'SELECT body FROM sessions WHERE session_id=? AND session_id NOT IN (SELECT session_id FROM deleted_sessions) AND session_id NOT IN (SELECT session_id FROM delegations)'
+      )
+      .get(id)
+    if (!row || !this.live.handles(id)) return undefined
+    return SessionSchema.parse(JSON.parse(String(row.body)))
   }
   private project(session_id: string) {
     try {
@@ -149,30 +158,40 @@ export class SessionMessageTools implements DebuggerToolBridge {
   }
   private list(args: unknown) {
     const parsed = z
-      .object({ all: z.boolean().optional() })
+      .object({
+        all: z.boolean().optional(),
+        after_id: z.string().min(1).max(128).optional(),
+        limit: z.number().int().min(1).max(LISTED).default(LISTED),
+      })
       .strict()
       .safeParse(args ?? {})
     if (!parsed.success) return { code: 'invalid_params' }
-    const sessions = this.owned()
-      .map((s) => ({ session: s, state: this.live.state(s.session_id) }))
-      .filter(
-        ({ session, state }) =>
-          parsed.data.all ||
-          state.process !== 'none' ||
-          session.session_id === this.sender.session_id
+    const p = parsed.data
+    const ids = [...new Set([this.sender.session_id, ...this.live.runningSessionIds()])]
+    const rows = this.core.db
+      .prepare(
+        `SELECT session_id,body FROM sessions WHERE session_id>? AND session_id NOT IN (SELECT session_id FROM deleted_sessions) AND session_id NOT IN (SELECT session_id FROM delegations)${p.all ? '' : ` AND session_id IN (${ids.map(() => '?').join(',')})`} ORDER BY session_id LIMIT ?`
       )
-      .sort((a, b) => b.session.created_at.localeCompare(a.session.created_at))
-      .slice(0, LISTED)
+      .all(p.after_id ?? '', ...(p.all ? [] : ids), p.limit)
+    const sessions = rows
+      .filter((row) => this.live.handles(String(row.session_id)))
+      .map((row) => ({
+        session: SessionSchema.parse(JSON.parse(String(row.body))),
+        state: this.live.state(String(row.session_id)),
+      }))
       .map(({ session, state }) => ({
         session_id: session.session_id,
         title: session.title,
         project: this.project(session.session_id),
         process: state.process,
-        waiting_for_owner: this.core.prompts(session.session_id).some((p) => p.state === 'pending'),
+        waiting_for_owner: this.core.hasPendingPrompt(session.session_id),
         messaging: state.settings.messaging,
         self: session.session_id === this.sender.session_id,
       }))
-    return { sessions }
+    return {
+      sessions,
+      next_after_id: rows.length === p.limit ? String(rows.at(-1)!.session_id) : null,
+    }
   }
   private send(args: unknown) {
     const parsed = z
@@ -182,7 +201,7 @@ export class SessionMessageTools implements DebuggerToolBridge {
     if (!parsed.success) return { code: 'invalid_params' }
     const { session_id, text } = parsed.data
     if (session_id === this.sender.session_id) return { code: 'invalid_target' }
-    const target = this.owned().find((s) => s.session_id === session_id)
+    const target = this.ownedSession(session_id)
     if (!target) return { code: 'not_found' }
     const refusal = messageRefusal(this.live, this.sender.session_id, session_id)
     if (refusal) return { code: refusal }

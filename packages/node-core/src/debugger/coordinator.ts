@@ -662,7 +662,9 @@ export class DebuggerCoordinator {
               ]
             : [p.conversation_id, p.limit ?? 128])
         )
-        .map((r) => JSON.parse(String(r.body)))
+        .map(
+          (r) => this.core.debugger.snapshot(JSON.parse(String(r.body)).debug_session_id).snapshot
+        )
       return this.core.debuggerLaunches.reconcileSessions(snapshots)
     }
     // Replay has exactly one resource identity: the validated cursor. A second

@@ -16,13 +16,20 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { ChannelError, type AuthorityContext } from '@abele/channel-protocol'
+import { ChannelError, LIMITS, type AuthorityContext } from '@abele/channel-protocol'
 import {
   RelativePathSchema,
   ChatMethodSchemas,
   type ChatRestoreRequest,
+  type ChatCheckpointsRequest,
 } from '@abele/node-protocol'
 import { canonical, type NodeCore } from './index.js'
+import {
+  captureNative,
+  nativeHeader as readNativeHeader,
+  writeNative,
+  type NativeCheckpoint,
+} from './native-checkpoints.js'
 
 type FileState = { bytes: string; mode: number }
 export type FileSnapshot = Record<string, FileState>
@@ -153,7 +160,7 @@ type Checkpoint = {
   input_id: string
   root: string
   binding: unknown
-  native: string
+  native: NativeCheckpoint
   files: FileSnapshot
   seq: number
   exclude_input_ids: string[]
@@ -168,7 +175,7 @@ export class ChatCheckpoints {
     if (session.provider !== 'pi' || !session.native_session_file) return
     try {
       const root = this.core.resources.lsp.sessionRoot(session_id)
-      const native = this.native(session_id, session.native_session_file)
+      const native = captureNative(this.core.stateDir, session_id, session.native_session_file)
       const checkpoint: Checkpoint = {
         checkpoint_id: randomUUID(),
         input_id,
@@ -190,9 +197,22 @@ export class ChatCheckpoints {
         digest(checkpoint.binding) !== digest(this.core.resources.targets.currentTarget(session_id))
       )
         throw new ChannelError('stale_revision')
-      this.core.db
-        .prepare('INSERT INTO chat_checkpoints VALUES(?,?,?)')
-        .run(checkpoint.checkpoint_id, session_id, JSON.stringify(checkpoint))
+      this.core.transaction(() => {
+        this.core.db
+          .prepare('INSERT INTO chat_checkpoints VALUES(?,?,?)')
+          .run(checkpoint.checkpoint_id, session_id, JSON.stringify(checkpoint))
+        this.core.db.prepare('INSERT INTO chat_checkpoint_summaries VALUES(?,?,?,?)').run(
+          checkpoint.checkpoint_id,
+          session_id,
+          checkpoint.seq,
+          JSON.stringify({
+            checkpoint_id: checkpoint.checkpoint_id,
+            input_id,
+            before_seq: checkpoint.seq,
+            exclude_input_ids: checkpoint.exclude_input_ids,
+          })
+        )
+      })
       this.core.append(
         session_id,
         'chat.checkpoint',
@@ -214,23 +234,6 @@ export class ChatCheckpoints {
           reason: error instanceof Error ? error.message.slice(0, 256) : 'checkpoint_failed',
         }
       )
-    }
-  }
-  private native(session: string, file: string) {
-    const parent = join(this.core.stateDir, 'pi-sessions', session)
-    if (
-      dirname(file) !== parent ||
-      realpathSync(parent) !== parent ||
-      lstatSync(file).isSymbolicLink()
-    )
-      throw new ChannelError('unsafe_path')
-    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW)
-    try {
-      if (!fstatSync(fd).isFile() || fstatSync(fd).size > MAX)
-        throw new ChannelError('output_limit')
-      return readFileSync(fd, 'utf8')
-    } finally {
-      closeSync(fd)
     }
   }
   private checkpoint(session: string, checkpoint: string) {
@@ -273,20 +276,29 @@ export class ChatCheckpoints {
         throw new ChannelError('outcome_unknown')
     }
     if (session.provider !== 'pi') throw new ChannelError('unsupported_method')
-    if (method === 'chat.checkpoints')
-      return (
-        this.core.db
-          .prepare('SELECT body FROM chat_checkpoints WHERE session_id=? ORDER BY rowid')
-          .all(p.session_id) as { body: string }[]
-      ).map((r) => {
-        const c = JSON.parse(r.body) as Checkpoint
-        return {
-          checkpoint_id: c.checkpoint_id,
-          input_id: c.input_id,
-          before_seq: c.seq,
-          exclude_input_ids: c.exclude_input_ids,
+    if (method === 'chat.checkpoints') {
+      const page = parsed.data as ChatCheckpointsRequest
+      const forward = page.after_seq !== undefined
+      const cursor = page.after_seq ?? page.before_seq
+      const rows: { body: string }[] = []
+      let bytes = 2
+      const result = this.core.db
+        .prepare(
+          `SELECT body FROM chat_checkpoint_summaries WHERE session_id=?${cursor === undefined ? '' : ` AND seq${forward ? '>' : '<'}?`} ORDER BY seq ${forward ? 'ASC' : 'DESC'} LIMIT ?`
+        )
+        .iterate(p.session_id, ...(cursor === undefined ? [] : [cursor]), page.limit ?? 100)
+      for (const row of result) {
+        const body = String(row.body)
+        bytes += Buffer.byteLength(body) + 1
+        if (bytes > LIMITS.record_bytes - 1024) {
+          if (!rows.length) throw new ChannelError('output_limit')
+          break
         }
-      })
+        rows.push({ body })
+      }
+      if (!forward) rows.reverse()
+      return rows.map((r) => JSON.parse(r.body))
+    }
     if (!p.checkpoint_id) throw new ChannelError('invalid_params')
     const checkpoint = this.checkpoint(p.session_id, p.checkpoint_id)
     const root = this.core.resources.lsp.sessionRoot(p.session_id)
@@ -354,8 +366,7 @@ export class ChatCheckpoints {
     )
       throw new ChannelError('stale_revision')
     // Validate conversation data before any filesystem effect.
-    const [header, ...entries] = checkpoint.native.trimEnd().split('\n')
-    const nativeHeader = JSON.parse(header!)
+    const { value: nativeHeader } = readNativeHeader(this.core.stateDir, checkpoint.native)
     if (nativeHeader.type !== 'session') throw new ChannelError('invalid_pi_native_state')
     const originalFiles = p.restore_files
       ? await snapshotFiles(root, Object.keys(checkpoint.files))
@@ -407,12 +418,7 @@ export class ChatCheckpoints {
       if (realpathSync(dir) !== dir) throw new ChannelError('unsafe_path')
       const native_id = randomUUID(),
         file = join(dir, native_id + '.jsonl')
-      writeFileSync(
-        file,
-        [JSON.stringify({ ...nativeHeader, id: native_id, cwd: root }), ...entries].join('\n') +
-          '\n',
-        { mode: 0o600, flag: 'wx' }
-      )
+      writeNative(this.core.stateDir, checkpoint.native, file, native_id, root)
       const updated = { ...destination, native_session_id: native_id, native_session_file: file }
       return this.core.commitOperation(actor, method, parsed.data, operation, () => {
         this.core.db

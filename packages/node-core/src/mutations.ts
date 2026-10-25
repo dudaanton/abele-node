@@ -12,7 +12,6 @@ import {
   readFileSync,
   readSync,
   opendirSync,
-  readdirSync,
   unlinkSync,
   mkdirSync,
   chmodSync,
@@ -802,43 +801,55 @@ export class FileMutationCoordinator {
       return result
     }, true)
   }
-  private sweepRecoveryDirectory() {
-    const root = join(this.r.core.stateDir, 'file-recovery')
-    let stat: ReturnType<typeof lstatSync>
-    try {
-      stat = lstatSync(root)
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return
-      throw e
-    }
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ChannelError('unsafe_path')
-    const referenced = new Set(
-      (
-        this.r.core.db
-          .prepare(
-            'SELECT path FROM file_recovery_copies UNION ALL SELECT path FROM repository_recovery_copies'
-          )
-          .all() as { path: string }[]
-      ).map((row) => row.path)
-    )
-    const visit = (directory: string, relative: string) => {
-      for (const entry of readdirSync(directory, { withFileTypes: true })) {
-        const target = join(directory, entry.name),
-          path = relative + '/' + entry.name
-        if (entry.isDirectory()) visit(target, path)
-        else if (!referenced.has(path)) {
-          // Before the row/intent commit, a crash can leave full or partial orphan files.
-          // They are never recovery references and cannot consume the durable quota.
-          unlinkSync(target)
-          this.syncDirectory(target)
-        }
+  private recoverySweep?: { directory: ReturnType<typeof opendirSync>; relative: string }[]
+  close() {
+    for (const cursor of this.recoverySweep ?? []) cursor.directory.closeSync()
+    this.recoverySweep = []
+  }
+  /** Orphan cleanup is maintenance, not a reason to read all retained copies at boot. */
+  sweepRecoveryFiles() {
+    if (!this.recoverySweep) {
+      const root = join(this.r.core.stateDir, 'file-recovery')
+      this.recoverySweep = []
+      try {
+        const stat = lstatSync(root)
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ChannelError('unsafe_path')
+        this.recoverySweep.push({ directory: opendirSync(root), relative: 'file-recovery' })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+        throw error
       }
     }
-    visit(root, 'file-recovery')
+    for (let remaining = 128; remaining > 0 && this.recoverySweep.length; remaining--) {
+      const cursor = this.recoverySweep.at(-1)!
+      const entry = cursor.directory.readSync()
+      if (!entry) {
+        cursor.directory.closeSync()
+        this.recoverySweep.pop()
+        continue
+      }
+      const path = cursor.relative + '/' + entry.name
+      const target = join(this.r.core.stateDir, path)
+      if (entry.isDirectory()) {
+        if (realpathSync(target) !== target) throw new ChannelError('unsafe_path')
+        this.recoverySweep.push({ directory: opendirSync(target), relative: path })
+      } else if (
+        !this.r.core.db
+          .prepare(
+            'SELECT 1 FROM file_recovery_copies WHERE path=? UNION ALL SELECT 1 FROM repository_recovery_copies WHERE path=? LIMIT 1'
+          )
+          .get(path, path)
+      ) {
+        unlinkSync(target)
+        this.syncDirectory(target)
+      }
+    }
   }
   recover() {
-    this.sweepRecoveryDirectory()
-    for (const row of this.r.core.db.prepare('SELECT * FROM file_mutations').all() as IntentRow[]) {
+    this.sweepRecoveryFiles()
+    for (const row of this.r.core.db
+      .prepare('SELECT * FROM file_mutations')
+      .iterate() as Iterable<IntentRow>) {
       const raw = JSON.parse(row.body) as Intent | OperationIntent
       if (raw.kind === 'file_operation') {
         const params = FileOperationMethodSchemas[raw.method].parse(raw.params)

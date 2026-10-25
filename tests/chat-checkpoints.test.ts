@@ -21,7 +21,7 @@ import {
 import { NodeCore, GitRunner, PiProviderAdapter } from '@abele/node-core'
 import { sessionUpdatesOf } from '@abele/node-protocol'
 
-it('persists pi conversation checkpoints across reopening the node and retries without changing files', async () => {
+async function checkCheckpointRestores(appendOnly: boolean) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'chat-core-'))),
     root = join(dir, 'root'),
     stateDir = join(dir, 'state')
@@ -41,7 +41,11 @@ it('persists pi conversation checkpoints across reopening the node and retries w
     const catalog = await request('repository.v1.worktrees', { project_id: project.project_id })
     const target = { kind: 'worktree', worktree_id: catalog.entries[0].worktree_id }
     await request('project.execution', { project_id: project.project_id, target, enabled: true })
-    const session = await request('session.create', { provider: 'pi', title: 'checkpoint', target })
+    const session = await request('session.create', {
+      provider: 'pi',
+      title: 'checkpoint',
+      target,
+    })
     const nativeDir = join(stateDir, 'pi-sessions', session.session_id)
     mkdirSync(nativeDir, { recursive: true })
     const file = join(nativeDir, 'original.jsonl')
@@ -72,6 +76,10 @@ it('persists pi conversation checkpoints across reopening the node and retries w
       message_id: input.input_id,
       text: 'original prompt',
     })
+    if (appendOnly) {
+      const stat = statSync(file, { bigint: true })
+      writeFileSync(file + '.checkpoint-safe', `${stat.dev}:${stat.ino}`)
+    }
     // No provider is started in this test: capture the same boundary the dispatcher uses.
     await core.chatCheckpoints.capture(session.session_id, input.input_id)
     core.db.prepare("UPDATE inputs SET state='completed' WHERE input_id=?").run(input.input_id)
@@ -79,6 +87,8 @@ it('persists pi conversation checkpoints across reopening the node and retries w
     expect(checkpoint.input_id).toBe(input.input_id)
     expect(checkpoint.exclude_input_ids).toContain(input.input_id)
     writeFileSync(join(root, 'file'), 'after')
+    // An upgrade backfills metadata without changing the retained restore snapshot.
+    core.db.exec('DROP TABLE chat_checkpoint_summaries')
     await core.resources.stop()
     core.close()
     core = new NodeCore(stateDir, options)
@@ -155,7 +165,11 @@ it('persists pi conversation checkpoints across reopening the node and retries w
     core.close()
     rmSync(dir, { recursive: true, force: true })
   }
-})
+}
+it.each([false, true])(
+  'persists pi conversation checkpoints across reopening the node and retries without changing files (append-only: %s)',
+  checkCheckpointRestores
+)
 
 it('previews creations, edits and deletions, refuses stale/changed previews, restores only explicitly', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'chat-checkpoint-')))

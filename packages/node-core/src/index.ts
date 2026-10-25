@@ -460,12 +460,54 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     }
     if (version < 19)
       this.db.exec(`BEGIN IMMEDIATE;
+      DROP TRIGGER IF EXISTS delegation_repair_insert;
+      DROP TRIGGER IF EXISTS delegation_repair_release;
+      DROP TRIGGER IF EXISTS delegation_repair_reserved;
       ALTER TABLE workspace_leases RENAME TO workspace_leases_single;
       CREATE TABLE workspace_leases(workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), session_id TEXT PRIMARY KEY REFERENCES sessions(session_id));
       INSERT INTO workspace_leases SELECT * FROM workspace_leases_single;
       DROP TABLE workspace_leases_single;
       CREATE INDEX workspace_leases_workspace ON workspace_leases(workspace_id);
       PRAGMA user_version=19; COMMIT;`)
+    // Historical rows must not participate in recovery or active-work lookups.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS inputs_session_state ON inputs(session_id,state,ordinal);
+      CREATE INDEX IF NOT EXISTS inputs_run_state ON inputs(run_id,state,ordinal);
+      CREATE INDEX IF NOT EXISTS inputs_state ON inputs(state,ordinal);
+      CREATE INDEX IF NOT EXISTS provider_runs_active ON provider_runs(state,run_id) WHERE state='active';
+      CREATE INDEX IF NOT EXISTS prompts_pending ON prompts(prompt_id) WHERE json_extract(body,'$.state')='pending';
+      CREATE INDEX IF NOT EXISTS prompts_run_pending ON prompts(run_id,prompt_id) WHERE json_extract(body,'$.state')='pending';
+      CREATE INDEX IF NOT EXISTS prompts_session_state ON prompts(session_id,json_extract(body,'$.state'),prompt_id);
+      CREATE INDEX IF NOT EXISTS prompts_run_action ON prompts(run_id,json_extract(body,'$.action_digest'));
+      CREATE INDEX IF NOT EXISTS delegations_workspace ON delegations(json_extract(body,'$.workspace_id'));
+      CREATE INDEX IF NOT EXISTS delegations_active ON delegations(json_extract(body,'$.state'));
+      CREATE INDEX IF NOT EXISTS debug_operations_outcome ON debug_operations(json_extract(body,'$.receipt.outcome'));
+    `)
+    // A durable repair queue tracks only missing reservations; history stays off startup.
+    if (
+      !this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delegation_lease_repairs'"
+        )
+        .get()
+    )
+      this.db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE delegation_lease_repairs(session_id TEXT PRIMARY KEY);
+        INSERT INTO delegation_lease_repairs SELECT session_id FROM delegations
+          WHERE json_extract(body,'$.workspace_id') IS NOT NULL
+          AND json_extract(body,'$.workspace_id') NOT IN (SELECT workspace_id FROM workspace_leases);
+        COMMIT;`)
+    // Reinstall dependencies after a lease-table rebuild, including an existing repair queue.
+    this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS delegation_repair_insert AFTER INSERT ON delegations
+          WHEN json_extract(new.body,'$.workspace_id') IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM workspace_leases WHERE workspace_id=json_extract(new.body,'$.workspace_id'))
+          BEGIN INSERT OR IGNORE INTO delegation_lease_repairs VALUES(new.session_id); END;
+        CREATE TRIGGER IF NOT EXISTS delegation_repair_release AFTER DELETE ON workspace_leases
+          BEGIN INSERT OR IGNORE INTO delegation_lease_repairs SELECT session_id FROM delegations WHERE json_extract(body,'$.workspace_id')=old.workspace_id; END;
+        CREATE TRIGGER IF NOT EXISTS delegation_repair_reserved AFTER INSERT ON workspace_leases
+          BEGIN DELETE FROM delegation_lease_repairs WHERE session_id=new.session_id; END;
+        `)
     // Additive execution intent store, like the auxiliary replay/checkpoint tables below.
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS session_owner_stops(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), generation INTEGER NOT NULL CHECK(generation>0), stopped INTEGER NOT NULL CHECK(stopped IN (0,1)))'
@@ -480,6 +522,22 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS chat_checkpoints(checkpoint_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, body TEXT NOT NULL)'
     )
+    // Backfill once, atomically. Listing must never load native logs or file snapshots.
+    if (
+      !this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_checkpoint_summaries'"
+        )
+        .get()
+    )
+      this.db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE chat_checkpoint_summaries(checkpoint_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL);
+        INSERT INTO chat_checkpoint_summaries SELECT checkpoint_id, session_id, json_extract(body,'$.seq'),
+          json_object('checkpoint_id',checkpoint_id,'input_id',json_extract(body,'$.input_id'),
+            'before_seq',json_extract(body,'$.seq'),'exclude_input_ids',json_extract(body,'$.exclude_input_ids'))
+          FROM chat_checkpoints;
+        CREATE INDEX chat_checkpoints_session_seq ON chat_checkpoint_summaries(session_id,seq);
+        COMMIT;`)
     const identity = this.db.prepare("SELECT value FROM meta WHERE key='node_id'").get() as
       Row | undefined
     this.node_id = identity ? String(identity.value) : randomUUID()
@@ -487,6 +545,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     this.authority = new AuthorityService(this.db)
     this.pairing = new PairingService(this)
     this.delegations = new DelegationService(this)
+    let resources: ResourceServices | undefined
     try {
       this.debugger = new DebuggerService(this, options.debuggerEnabled)
       this.debuggerControl = new DebuggerCoordinator(this)
@@ -495,7 +554,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.authority.subscribeInvalidation(() => {
         if (!this.closed) this.debuggerControl.notifyPermissions()
       })
-      this.resources = new ResourceServices(this, options.worktreeRoot, options.git)
+      this.resources = resources = new ResourceServices(this, options.worktreeRoot, options.git)
       this.manager = new ManagerService(this, options.allowBypass === true)
       this.obsidianTools = new ObsidianTools(this)
       this.resources.mutations.recover()
@@ -508,6 +567,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           })
       )
     } catch (error) {
+      resources?.mutations.close()
       this.db.close()
       throw error
     }
@@ -526,10 +586,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           reason: 'daemon_restart',
         })
       }
-      for (const row of this.db
-        .prepare("SELECT body FROM prompts WHERE json_extract(body,'$.state')='pending'")
-        .all() as Row[]) {
-        const prompt = PromptSchema.parse(JSON.parse(String(row.body)))
+      for (const prompt of this.pendingPrompts()) {
         if (prompt.run_id.startsWith('obsidian:')) continue
         this.resolvePrompt(prompt, 'invalidated', 'deny', null)
       }
@@ -547,22 +604,6 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       options.live
     )
     this.claude = this.execution
-    // Legacy sessions remain Ask instead of adopting a new bypass default.
-    this.transaction(() => {
-      for (const row of this.db.prepare('SELECT session_id,body FROM sessions').all()) {
-        const session = SessionSchema.parse(JSON.parse(String(row.body)))
-        const permission_mode =
-          session.settings?.permission_mode ?? session.tool_permissions?.permission_mode ?? 'manual'
-        const tool_permissions = this.claude.permissionPolicy(session.provider, {
-          ...session.settings,
-          permission_mode,
-        })
-        this.db
-          .prepare('UPDATE sessions SET body=? WHERE session_id=?')
-          .run(JSON.stringify({ ...session, tool_permissions }), String(row.session_id))
-        this.delegations.permissionsChanged(String(row.session_id), tool_permissions)
-      }
-    })
     this.protectFiles()
   }
   private watchers = new Map<string, number>()
@@ -594,6 +635,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   close() {
     if (!this.closed) {
+      this.resources?.mutations.close()
       this.obsidianTools.close()
       void this.resources?.lsp.stop()
       this.trace.close()
@@ -961,11 +1003,53 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     if (!row) throw new ChannelError('not_found')
     return PromptSchema.parse(JSON.parse(String(row.body)))
   }
-  prompts(session: string): Prompt[] {
+  /** Bounded historical page; internal recovery uses pendingPrompts instead. */
+  prompts(
+    session: string,
+    options: { state?: string; after_id?: string; limit?: number } = {}
+  ): Prompt[] {
     this.head(session)
-    return (
-      this.db.prepare('SELECT body FROM prompts WHERE session_id=?').all(session) as Row[]
-    ).map((r) => PromptSchema.parse(JSON.parse(String(r.body))))
+    const limit = options.limit ?? 100
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+      throw new ChannelError('invalid_params')
+    const rows = this.db
+      .prepare(
+        `SELECT body FROM prompts WHERE session_id=? AND prompt_id>?${options.state ? " AND json_extract(body,'$.state')=?" : ''} ORDER BY prompt_id LIMIT ?`
+      )
+      .all(session, options.after_id ?? '', ...(options.state ? [options.state] : []), limit)
+    return rows.map((r) => PromptSchema.parse(JSON.parse(String(r.body))))
+  }
+  pendingPromptCount(session: string) {
+    return Number(
+      this.db
+        .prepare(
+          "SELECT count(*) AS n FROM prompts WHERE session_id=? AND json_extract(body,'$.state')='pending'"
+        )
+        .get(session)!.n
+    )
+  }
+  hasPendingPrompt(session: string) {
+    return !!this.db
+      .prepare(
+        "SELECT 1 FROM prompts WHERE session_id=? AND json_extract(body,'$.state')='pending' LIMIT 1"
+      )
+      .get(session)
+  }
+  /** Keyset batches allow callers to resolve every pending prompt without loading history. */
+  *pendingPrompts(session?: string, run?: string): Generator<Prompt> {
+    let after = ''
+    for (;;) {
+      const rows = this.db
+        .prepare(
+          `SELECT body,prompt_id FROM prompts WHERE ${session ? 'session_id=? AND ' : ''}json_extract(body,'$.state')='pending' AND prompt_id>?${run ? ' AND run_id=?' : ''} ORDER BY prompt_id LIMIT 100`
+        )
+        .all(...(session ? [session] : []), after, ...(run ? [run] : []))
+      if (!rows.length) return
+      for (const row of rows) {
+        after = String(row.prompt_id)
+        yield PromptSchema.parse(JSON.parse(String(row.body)))
+      }
+    }
   }
   request(
     actor: AuthorityContext,
@@ -1267,13 +1351,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         this.head(String(p.session_id))
         const rows = this.db
           .prepare(
-            "SELECT body FROM prompts WHERE session_id=? AND prompt_id>? AND (? IS NULL OR json_extract(body,'$.state')=?) ORDER BY prompt_id LIMIT ?"
+            `SELECT body FROM prompts WHERE session_id=? AND prompt_id>?${p.state ? " AND json_extract(body,'$.state')=?" : ''} ORDER BY prompt_id LIMIT ?`
           )
           .all(
             String(p.session_id),
             String(p.after_id ?? ''),
-            p.state ? String(p.state) : null,
-            p.state ? String(p.state) : null,
+            ...(p.state ? [String(p.state)] : []),
             Number(p.limit)
           ) as Row[]
         const page: Prompt[] = []
@@ -1664,7 +1747,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
         outcome: 'unknown',
         reason: 'stopped_by_owner',
       })
-      for (const prompt of this.prompts(session))
+      for (const prompt of this.pendingPrompts(session, String(p.run_id)))
         if (prompt.state === 'pending' && prompt.run_id === p.run_id)
           this.resolvePrompt(prompt, 'invalidated', 'deny', null)
       return { run_id: p.run_id, state: 'interrupted' }
@@ -1672,17 +1755,31 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
     throw new ChannelError('unsupported_method')
   }
   session(id: string) {
+    return this.readSession(id, false)
+  }
+  /** Retained audit views may read tombstoned chats; catalog and execution use session(). */
+  retainedSession(id: string) {
+    return this.readSession(id, true)
+  }
+  private readSession(id: string, retained: boolean) {
     const row = this.db
       .prepare(
-        'SELECT body FROM sessions WHERE session_id=? AND session_id NOT IN (SELECT session_id FROM deleted_sessions)'
+        `SELECT body FROM sessions WHERE session_id=?${retained ? '' : ' AND session_id NOT IN (SELECT session_id FROM deleted_sessions)'}`
       )
       .get(id) as Row | undefined
     if (!row) throw new ChannelError('not_found')
     const stop = this.db
       .prepare('SELECT generation,stopped FROM session_owner_stops WHERE session_id=?')
       .get(id)
+    const stored = SessionSchema.parse(JSON.parse(String(row.body)))
+    const policy = this.execution?.permissionPolicy(stored.provider, {
+      ...stored.settings,
+      permission_mode:
+        stored.settings?.permission_mode ?? stored.tool_permissions?.permission_mode ?? 'manual',
+    })
     return SessionSchema.parse({
-      ...JSON.parse(String(row.body)),
+      ...stored,
+      ...(policy ? { tool_permissions: policy } : {}),
       ...(stop
         ? {
             stop_generation: Number(stop.generation),
@@ -1737,7 +1834,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           this.resources.targets.settle(session_id, String(input.run_id))
       }
     }
-    for (const prompt of this.prompts(session_id))
+    for (const prompt of this.pendingPrompts(session_id))
       if (prompt.state === 'pending') this.resolvePrompt(prompt, 'invalidated', 'deny', null)
     this.delegations.ownerStopped(session_id, stop_generation)
     this.obsidianTools.cancelRunInTransaction(session_id, authority.installation_id)
@@ -1811,12 +1908,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
   }
   /** One durable worker per session; at most four sessions execute per tick. No socket participates. */
   tick(now = Date.now()) {
+    this.resources.mutations.sweepRecoveryFiles()
     this.transaction(() => {
       this.delegations.settle()
-      for (const row of this.db
-        .prepare("SELECT body FROM prompts WHERE json_extract(body,'$.state')='pending'")
-        .all() as Row[]) {
-        const prompt = PromptSchema.parse(JSON.parse(String(row.body)))
+      for (const prompt of this.pendingPrompts()) {
         if (prompt.expires_at <= now) this.resolvePrompt(prompt, 'expired', 'deny', null)
       }
       const sessions = this.db
@@ -1892,9 +1987,12 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           }
           if (action.kind === 'permission') {
             const action_digest = digest(canonical({ run: input.run_id, step, action }))
-            let prompt = this.prompts(String(input.session_id)).find(
-              (p) => p.run_id === input.run_id && p.action_digest === action_digest
-            )
+            const row = this.db
+              .prepare(
+                "SELECT body FROM prompts WHERE run_id=? AND json_extract(body,'$.action_digest')=? LIMIT 1"
+              )
+              .get(input.run_id!, action_digest)
+            let prompt = row ? PromptSchema.parse(JSON.parse(String(row.body))) : undefined
             if (!prompt) {
               prompt = PromptSchema.parse({
                 prompt_id: randomUUID(),

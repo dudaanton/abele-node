@@ -192,12 +192,18 @@ export class DelegationService {
   }
   /** Repair pre-reservation children, including cancelled ones, without stealing another session's lease. */
   repairLeases() {
-    for (const row of this.core.db
-      .prepare(
-        'SELECT * FROM delegations WHERE session_id NOT IN (SELECT session_id FROM deleted_sessions)'
-      )
-      .all() as Row[]) {
-      const d = DelegationSchema.parse(JSON.parse(row.body))
+    for (const candidate of this.core.db
+      .prepare('SELECT session_id FROM delegation_lease_repairs')
+      .iterate()) {
+      const id = String(candidate.session_id)
+      this.core.db.prepare('DELETE FROM delegation_lease_repairs WHERE session_id=?').run(id)
+      const row = this.core.db
+        .prepare(
+          'SELECT * FROM delegations WHERE session_id=? AND session_id NOT IN (SELECT session_id FROM deleted_sessions)'
+        )
+        .get(id)
+      if (!row) continue
+      const d = DelegationSchema.parse(JSON.parse(String(row.body)))
       const session = this.core.session(d.session_id)
       if (
         !d.workspace_id ||
@@ -337,16 +343,15 @@ export class DelegationService {
       const { d } = this.access(actor, String(p.delegation_id), 'status')
       return DelegationStatusSchema.parse({
         ...d,
+        tool_permissions: this.core.retainedSession(d.session_id).tool_permissions,
         worktree_id: d.workspace_id
           ? this.core.resources.repository.worktreeForWorkspace(d.workspace_id)
           : null,
         session_head_seq: this.core.head(d.session_id),
         mailbox_head_seq: this.core.head(d.mailbox_stream_id),
-        pending_human_prompts: this.core.prompts(d.session_id).filter((p) => p.state === 'pending')
-          .length,
+        pending_human_prompts: this.core.pendingPromptCount(d.session_id),
         pending_prompts: this.core
-          .prompts(d.session_id)
-          .filter((p) => p.state === 'pending')
+          .prompts(d.session_id, { state: 'pending' })
           .map((p) => ({ prompt_id: p.prompt_id, run_id: p.run_id, expires_at: p.expires_at })),
       })
     }
@@ -611,7 +616,7 @@ export class DelegationService {
             ? 'interrupted'
             : 'delivery_unknown'
       )
-    for (const prompt of this.core.prompts(d.session_id))
+    for (const prompt of this.core.pendingPrompts(d.session_id))
       if (prompt.state === 'pending') this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)
     d.state = 'cancelled'
     this.save(d)

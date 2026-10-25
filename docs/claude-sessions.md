@@ -167,10 +167,17 @@ the end: `stream.head { stream_id }` returns `{ head_seq }`, the client subscrib
 Owner sessions get two agent tools from the node (on the same MCP server as the node's
 other tools):
 
-- `node_sessions { all? }` lists the owner's chats on this node: `session_id`, `title`,
+- `node_sessions { all?, after_id?, limit? }` lists the owner's chats on this node: `session_id`, `title`,
   `project`, `process` (`none`, `starting`, `idle`, `running`, `stopping`),
   `waiting_for_owner` (a permission question is open), `messaging`, `self`. Without `all`,
-  only chats with a running process.
+  only chats with a running process. Results are ordered by `session_id`, with
+  `{sessions, next_after_id}` returned. The default and maximum `limit` is 100;
+  it bounds inspected candidates as well as returned rows. Pass `next_after_id`
+  back as `after_id` until it is null, including after an empty filtered page.
+  Unsupported providers and delegated/deleted chats are excluded. The default
+  view queries current process slots; `all: true` pages the durable catalog.
+  Pending-prompt indicators use an indexed existence check. Sending to a known
+  session ID does a point lookup and does not enumerate the catalog.
 - `node_session_send { session_id, text }` queues `text` as a message to that chat and
   returns `{ input_id, session_id, title, state: queued, process }`. A chat with no process
   is started. Refusals come back as `{ code }`: `messaging_off`, `invalid_target` (itself),

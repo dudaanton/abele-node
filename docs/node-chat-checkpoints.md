@@ -28,7 +28,7 @@ the SDK's ExtensionError. Arbitrary Error objects and stacks are not exported.
 ## Checkpoints
 
 Version 1 supports long-lived **pi** chats. Before dispatching an idle chat's next
-input, the node stores an immutable native conversation copy and a file snapshot.
+input, the node stores an immutable native conversation prefix and a file snapshot.
 Steering inputs belong to the running turn; there is no independent mid-turn restore.
 `chat.checkpoint` carries `checkpoint_id`, `input_id`, `before_seq`, and `exclude_input_ids`
 (inputs already accepted but not yet part of the native context). Capture failure
@@ -36,15 +36,23 @@ writes `chat.checkpoint.unavailable` with a reason, and does not prevent the cha
 Older turns without checkpoints cannot be restored by this API.
 
 Files are tracked and non-ignored untracked regular files, including binary content and
-permission bits. Limits: 4,096 files, 32 MiB of encoded file data, 32 MiB native log,
-and five seconds for Git enumeration. Git metadata, ignored dependencies/build output,
+permission bits. Limits: 4,096 files, 32 MiB of encoded file data,
+and five seconds for Git enumeration. A 32 MiB native limit applies only to
+legacy hosts using inline copies; upgraded hosts capture native logs of any length
+without copying them. Git metadata, ignored dependencies/build output,
 symlinks, and empty directories are not snapshotted. A visible symlink or exceeded
 limit makes the checkpoint unavailable rather than silently incomplete. Parent directories
 are created when needed during restoration; empty directories are left behind.
 
 Methods are exported through node-protocol and `NodeClient.chat`:
 
-- `chat.checkpoints {session_id}` → `[{checkpoint_id,input_id,before_seq,exclude_input_ids}]`.
+- `chat.checkpoints {session_id,before_seq?,after_seq?,limit?}` →
+  `[{checkpoint_id,input_id,before_seq,exclude_input_ids}]`.
+  `limit` defaults to 100 and must be an integer from 1 through 100. Cursors are
+  nonnegative safe integers, exclusive, and mutually exclusive. Without a cursor,
+  return the latest page; `before_seq` returns the nearest older page;
+  `after_seq` returns the earliest newer page. Every returned page is in ascending
+  `before_seq` order. The old `{session_id}` request remains valid, now capped.
 - `chat.preview {session_id,checkpoint_id}` → `{preview_id,changes,files}`.
   Each change carries `{path,current,checkpoint}`: SHA-256 of the current and target
   file content/mode states, including absence. `files` carries before/after base64
@@ -87,6 +95,78 @@ not an atomic filesystem transaction: an I/O failure can leave a partially resto
 set. After a disconnected or failed restore, inspect disk and request a fresh preview;
 do not silently retry a file rollback. Crash recovery of interrupted multi-file restores
 and native-copy garbage collection remain future work.
+
+### Paging checkpoints
+
+The SDK method is `client.chat.checkpoints(session_id, options?)`, where options is
+`{before_seq?: number, after_seq?: number, limit?: number}`; it returns the same
+array of checkpoint metadata as the wire method. Existing one-argument calls work.
+To open a chat, fetch the latest page. To load older checkpoints, pass the first
+item's `before_seq` as the next request's `before_seq`. To catch up after new
+checkpoint events, pass the last known `before_seq` as `after_seq`, then advance
+that cursor to the last returned item. Continue until an empty page, deduplicating
+by `checkpoint_id`. Responses also stop before the channel record byte budget;
+a short page alone does not establish the end. An individual metadata record
+that cannot fit returns `output_limit`.
+
+Checkpoint snapshots are retained permanently for preview/rewind/branch by ID;
+paging removes no history. Listing reads a separate small metadata table using a
+`(session_id,seq)` index and a SQL limit, without loading native logs or file data.
+Existing databases receive an atomic, one-time backfill of metadata and its index
+on first startup after upgrading. That backfill reads existing snapshots once and
+can take time on large databases; subsequent opens do not repeat it.
+
+### Related read audit
+
+The public `session.list`, `prompt.list`, journal `stream.read`, and `job.list`
+already use SQL page limits/cursors (journal and job responses also have byte
+bounds). `session.state.background_tasks` retains at most 256 current tasks rather
+than task history. Client letters and internal messages are replayed through the
+paged session journal; the internal message queue is capped at 16.
+
+`node_sessions` now pages its candidates and resolves sends by ID; see
+[agent messaging](claude-sessions.md). Internal prompt existence/count queries
+select pending rows through indexes. Historical prompt reads are capped at 100,
+and invalidation/recovery iterates pending prompts in keyset batches of 100 so
+it processes every active prompt without materializing completed history.
+`delegation.status` reports the exact pending count with at most 100 prompt
+summaries; use the paged `prompt.list` API to load additional summaries.
+
+Restart derives session permission policies on access rather than rewriting every
+session. Debugger state similarly receives its recovery incarnation on first
+access, before it can expose a cached stop or accept a command. Manager commands,
+provider runs, input queues, pending prompts, and debugger operation recovery use
+indexed active-state queries. Missing delegation reservations have a durable repair
+queue maintained with lease changes, instead of a scan through retained children.
+First-upgrade index creation/backfills still read history once; normal restart cost
+depends on outstanding work, not completed sessions/turns. Actual pending operations
+must still be reconciled. Orphan recovery cleanup inspects at most 128 directory
+entries at startup and per normal node tick, uses indexed point lookups, and closes
+its directory cursors on shutdown. Referenced file recovery retains its existing
+32-copy quota per workspace. Obsidian revision backfill also runs only once.
+
+### Native prefix capture
+
+The upgraded pi host appends native JSONL normally and atomically replaces its file
+on SDK rewrites. Checkpoints retain one hard link per source inode in the private
+state directory and record its byte boundary. Later appends cannot enter an older
+restore, and later rewrites cannot change its retained inode. Capturing reads only
+the writer marker and final byte, fsyncs newly written data, and stores a small
+reference; it never reads or serializes the conversation. Hard links require the
+managed session and archive directories to remain on the same filesystem.
+Capture work is independent of historical length; flushing new turn data still
+depends on that turn's new bytes. File snapshots retain their fixed bounds above.
+
+Restore/branch creates a new log from exactly the selected prefix, rewrites its
+header, and streams the rest with a 128 KiB buffer. Restore intentionally costs
+O(selected history), while routine capture does not. Existing inline checkpoints
+remain restorable. Old running hosts without the append-only writer marker retain
+bounded inline capture until restarted; oversized logs report
+`pi_checkpoint_writer_upgrade_required` instead of recording an unsafe reference.
+The atomic rewrite adapter is checked against pinned pi SDK 0.87.0; an unknown
+writer implementation fails host startup rather than risking historical snapshots.
+Native archive garbage collection and the provider SDK's own history loading on
+process start remain outside this capture optimization.
 
 ## LSP failure boundary
 

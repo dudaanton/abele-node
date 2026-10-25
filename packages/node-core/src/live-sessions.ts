@@ -152,6 +152,10 @@ export class LiveSessions {
       !this.core.db.prepare('SELECT 1 FROM delegations WHERE session_id=?').get(session_id)
     )
   }
+  /** At most maxLive process slots; listing must not enumerate durable session history. */
+  runningSessionIds() {
+    return [...this.slots.keys()]
+  }
   effective(session_id: string): Effective {
     const session = this.core.session(session_id)
     const defaults = this.adapter(session.provider)?.sessionDefaults?.() ?? {
@@ -260,7 +264,7 @@ export class LiveSessions {
     slot.compaction = undefined
     slot.continueAfterTurn = undefined
     this.core.append(session_id, 'turn.interrupt_requested', actor, { run_id })
-    for (const prompt of this.core.prompts(session_id))
+    for (const prompt of this.core.pendingPrompts(session_id, run_id))
       if (prompt.state === 'pending' && prompt.run_id === run_id)
         this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)
     queueMicrotask(() => {
@@ -536,7 +540,7 @@ export class LiveSessions {
           "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered')"
         )
         .get(slot.session_id) &&
-      !this.core.prompts(slot.session_id).some((p) => p.state === 'pending')
+      !this.core.hasPendingPrompt(slot.session_id)
     )
   }
   private deleted(session_id: string) {
@@ -1146,7 +1150,7 @@ export class LiveSessions {
               outcome,
               final_reply,
             })
-          for (const prompt of this.core.prompts(session_id))
+          for (const prompt of this.core.pendingPrompts(session_id, run_id))
             if (prompt.state === 'pending' && prompt.run_id === run_id)
               this.core.resolvePrompt(prompt, 'invalidated', 'deny', null)
           slot.turn = undefined

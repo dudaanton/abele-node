@@ -75,9 +75,16 @@ export class ManagerService {
     core.db.exec(
       'CREATE TABLE IF NOT EXISTS command_context_prompts(prompt_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES streams(stream_id), run_id TEXT NOT NULL, body TEXT NOT NULL)'
     )
-    for (const row of core.db.prepare('SELECT body FROM manager_runs').all() as {
+    core.db.exec(
+      "CREATE INDEX IF NOT EXISTS manager_runs_active ON manager_runs(json_extract(body,'$.state'))"
+    )
+    for (const row of core.db
+      .prepare(
+        "SELECT body FROM manager_runs WHERE json_extract(body,'$.state') IN ('pending_approval','running')"
+      )
+      .iterate() as Iterable<{
       body: string
-    }[]) {
+    }>) {
       const run = JSON.parse(row.body) as Run
       if (
         !terminal(run) &&

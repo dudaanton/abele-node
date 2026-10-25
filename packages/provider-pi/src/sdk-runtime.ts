@@ -2,7 +2,11 @@
 import type * as PiSdk from '@earendil-works/pi-coding-agent'
 import { lstatSync, chmodSync, existsSync, realpathSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
-import { materializeNativeState } from './native-state.js'
+import {
+  materializeNativeState,
+  installAtomicNativeWrites,
+  markAppendOnlyNative,
+} from './native-state.js'
 import { normalizeResponsesInput } from './responses-input.js'
 import { randomUUID } from 'node:crypto'
 import type { HostProcessHooks } from './processes.js'
@@ -61,6 +65,7 @@ export async function createSdkHost(
       throw new Error('invalid_pi_session_file')
   }
   let manager: PiSdk.SessionManager
+  if (!installAtomicNativeWrites(SessionManager)) throw new Error('unsupported_pi_native_writer')
   if (config.native_session_file) {
     checkFile(config.native_session_file)
     if (!existsSync(config.native_session_file)) throw new Error('pi_native_context_missing')
@@ -227,6 +232,7 @@ export async function createSdkHost(
       if (event.type === 'pi.session.bound') {
         checkFile(String(event.data.native_session_file))
         materializeNativeState(runtime.session.sessionManager)
+        markAppendOnlyNative(String(event.data.native_session_file))
       }
       emit(event)
     },
