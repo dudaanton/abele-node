@@ -28,6 +28,7 @@ import {
   captureNative,
   nativeHeader as readNativeHeader,
   writeNative,
+  NativeCheckpointRoot,
   type NativeCheckpoint,
 } from './native-checkpoints.js'
 
@@ -70,7 +71,7 @@ function readFile(root: string, path: string): FileState | undefined {
 }
 /** Tracked and non-ignored untracked files; dependencies and Git metadata are never copied. */
 export async function snapshotFiles(root: string, include: string[] = []): Promise<FileSnapshot> {
-  if (realpathSync(root) !== root) throw new ChannelError('unsafe_path')
+  root = realpathSync(root)
   const { stdout } = await exec(
     'git',
     [
@@ -100,6 +101,7 @@ export async function snapshotFiles(root: string, include: string[] = []): Promi
     }
   )
   const paths = stdout.split('\0').filter(Boolean)
+  if (realpathSync(root) !== root) throw new ChannelError('unsafe_path')
   const files: FileSnapshot = Object.create(null)
   let bytes = 0
   for (const path of [...new Set([...paths, ...include])].sort()) {
@@ -129,8 +131,10 @@ export async function restoreFiles(
   changes: ReturnType<typeof previewFiles>,
   beforeWrite?: () => void
 ) {
+  root = realpathSync(root)
   const actual = previewFiles(before, await snapshotFiles(root, Object.keys(before)))
   beforeWrite?.()
+  if (realpathSync(root) !== root) throw new ChannelError('unsafe_path')
   if (JSON.stringify(changes) !== JSON.stringify(actual)) throw new ChannelError('stale_revision')
   // Validate every target before the first write. Never traverse or replace a symlink.
   for (const change of actual) target(root, change.path)
@@ -169,13 +173,17 @@ type Checkpoint = {
 /** Pi conversation copies are immutable; restoring creates a new native session file. */
 export class ChatCheckpoints {
   readonly busy = new Set<string>()
-  constructor(private core: NodeCore) {}
+  private readonly nativeRoot: NativeCheckpointRoot
+  constructor(private core: NodeCore) {
+    // NodeCore already pinned this path at startup; do not follow a later substitution.
+    this.nativeRoot = new NativeCheckpointRoot(core.stateDir, { canonical: true })
+  }
   async capture(session_id: string, input_id: string) {
     const session = this.core.session(session_id)
     if (session.provider !== 'pi' || !session.native_session_file) return
     try {
-      const root = this.core.resources.lsp.sessionRoot(session_id)
-      const native = captureNative(this.core.stateDir, session_id, session.native_session_file)
+      const root = realpathSync(this.core.resources.lsp.sessionRoot(session_id))
+      const native = captureNative(this.nativeRoot, session_id, session.native_session_file)
       const checkpoint: Checkpoint = {
         checkpoint_id: randomUUID(),
         input_id,
@@ -193,7 +201,7 @@ export class ChatCheckpoints {
         ).map((i) => i.input_id),
       }
       if (
-        this.core.resources.lsp.sessionRoot(session_id) !== root ||
+        realpathSync(this.core.resources.lsp.sessionRoot(session_id)) !== root ||
         digest(checkpoint.binding) !== digest(this.core.resources.targets.currentTarget(session_id))
       )
         throw new ChannelError('stale_revision')
@@ -301,7 +309,7 @@ export class ChatCheckpoints {
     }
     if (!p.checkpoint_id) throw new ChannelError('invalid_params')
     const checkpoint = this.checkpoint(p.session_id, p.checkpoint_id)
-    const root = this.core.resources.lsp.sessionRoot(p.session_id)
+    const root = realpathSync(this.core.resources.lsp.sessionRoot(p.session_id))
     if (
       root !== checkpoint.root ||
       digest(checkpoint.binding) !== digest(this.core.resources.targets.currentTarget(p.session_id))
@@ -313,7 +321,7 @@ export class ChatCheckpoints {
     )
     const checkBinding = () => {
       if (
-        this.core.resources.lsp.sessionRoot(p.session_id) !== root ||
+        realpathSync(this.core.resources.lsp.sessionRoot(p.session_id)) !== root ||
         digest(checkpoint.binding) !==
           digest(this.core.resources.targets.currentTarget(p.session_id))
       )
@@ -366,7 +374,7 @@ export class ChatCheckpoints {
     )
       throw new ChannelError('stale_revision')
     // Validate conversation data before any filesystem effect.
-    const { value: nativeHeader } = readNativeHeader(this.core.stateDir, checkpoint.native)
+    const { value: nativeHeader } = readNativeHeader(this.nativeRoot, checkpoint.native)
     if (nativeHeader.type !== 'session') throw new ChannelError('invalid_pi_native_state')
     const originalFiles = p.restore_files
       ? await snapshotFiles(root, Object.keys(checkpoint.files))
@@ -418,7 +426,7 @@ export class ChatCheckpoints {
       if (realpathSync(dir) !== dir) throw new ChannelError('unsafe_path')
       const native_id = randomUUID(),
         file = join(dir, native_id + '.jsonl')
-      writeNative(this.core.stateDir, checkpoint.native, file, native_id, root)
+      writeNative(this.nativeRoot, checkpoint.native, file, native_id, root)
       const updated = { ...destination, native_session_id: native_id, native_session_file: file }
       return this.core.commitOperation(actor, method, parsed.data, operation, () => {
         this.core.db

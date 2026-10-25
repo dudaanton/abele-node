@@ -13,33 +13,46 @@ import {
   unlinkSync,
   fsyncSync,
 } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { ChannelError } from '@abele/channel-protocol'
 
 export type NativeCheckpoint = string | { file: string; bytes: number }
 const LEGACY_MAX = 32 * 1024 * 1024
 const HEADER_MAX = 65536
-function directory(state: string) {
-  const dir = join(state, 'native-checkpoints')
+/** A store pins its trusted root once; later ancestor aliases cannot redirect it. */
+export class NativeCheckpointRoot {
+  readonly path: string
+  constructor(state: string, options: { canonical?: boolean } = {}) {
+    this.path = options.canonical ? state : realpathSync(state)
+  }
+}
+type Root = string | NativeCheckpointRoot
+function pinned(state: Root) {
+  return typeof state === 'string' ? new NativeCheckpointRoot(state) : state
+}
+function directory(state: Root) {
+  const root = pinned(state).path
+  if (realpathSync(root) !== root) throw new ChannelError('unsafe_path')
+  const dir = join(root, 'native-checkpoints')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   if (realpathSync(dir) !== dir) throw new ChannelError('unsafe_path')
   return dir
 }
-function referencePath(state: string, ref: Exclude<NativeCheckpoint, string>) {
+function referencePath(state: Root, ref: Exclude<NativeCheckpoint, string>) {
   if (!/^[0-9]+-[0-9]+\.jsonl$/.test(ref.file) || !Number.isSafeInteger(ref.bytes) || ref.bytes < 1)
     throw new ChannelError('invalid_pi_native_state')
   return join(directory(state), ref.file)
 }
 /** The pi host marks writers whose rewrites use atomic replacement. Appends never
  * change a checkpoint's prefix; replacement leaves its hard-linked inode intact. */
-export function captureNative(state: string, session: string, file: string): NativeCheckpoint {
-  const parent = join(state, 'pi-sessions', session)
-  if (
-    dirname(file) !== parent ||
-    realpathSync(parent) !== parent ||
-    lstatSync(file).isSymbolicLink()
-  )
-    throw new ChannelError('unsafe_path')
+export function captureNative(state: Root, session: string, file: string): NativeCheckpoint {
+  state = pinned(state)
+  const parent = join(state.path, 'pi-sessions', session)
+  if (realpathSync(dirname(file)) !== parent) throw new ChannelError('unsafe_path')
+  // Resolve trusted ancestors, never the final file. Open only the pinned path,
+  // so a later alias change cannot redirect the lstat, marker, or hard link.
+  file = join(parent, basename(file))
+  if (lstatSync(file).isSymbolicLink()) throw new ChannelError('unsafe_path')
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const stat = fstatSync(fd, { bigint: true })
@@ -93,7 +106,7 @@ export function captureNative(state: string, session: string, file: string): Nat
     closeSync(fd)
   }
 }
-function openReference(state: string, native: Exclude<NativeCheckpoint, string>) {
+function openReference(state: Root, native: Exclude<NativeCheckpoint, string>) {
   const fd = openSync(referencePath(state, native), constants.O_RDONLY | constants.O_NOFOLLOW)
   const stat = fstatSync(fd)
   if (!stat.isFile() || stat.size < native.bytes) {
@@ -110,7 +123,7 @@ function header(bytes: Buffer, allowEnd = false) {
   if (value.type !== 'session') throw new ChannelError('invalid_pi_native_state')
   return { value, offset: Math.min(nl + 1, bytes.length) }
 }
-export function nativeHeader(state: string, native: NativeCheckpoint) {
+export function nativeHeader(state: Root, native: NativeCheckpoint) {
   if (typeof native === 'string')
     return header(Buffer.from(native.slice(0, HEADER_MAX)), native.length < HEADER_MAX)
   const fd = openReference(state, native)
@@ -124,12 +137,13 @@ export function nativeHeader(state: string, native: NativeCheckpoint) {
 }
 /** Restoring is deliberately O(selected prefix), with fixed working memory. */
 export function writeNative(
-  state: string,
+  state: Root,
   native: NativeCheckpoint,
   destination: string,
   id: string,
   cwd: string
 ) {
+  state = pinned(state)
   const { value, offset } = nativeHeader(state, native)
   const output = openSync(
     destination,

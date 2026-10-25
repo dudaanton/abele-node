@@ -147,6 +147,11 @@ its directory cursors on shutdown. Referenced file recovery retains its existing
 
 ### Native prefix capture
 
+Trusted state and repository roots are pinned to physical paths before use, so
+macOS temporary-directory ancestor aliases such as `/var` are supported. Native
+files still require a regular final component opened with `O_NOFOLLOW`; substituted
+session/archive directories and later replacement of pinned roots are refused.
+
 The upgraded pi host appends native JSONL normally and atomically replaces its file
 on SDK rewrites. Checkpoints retain one hard link per source inode in the private
 state directory and record its byte boundary. Later appends cannot enter an older
