@@ -7,6 +7,7 @@ import { watch } from 'node:fs'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, renameSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { WatchService } from '../packages/node-core/src/watch-service.js'
 import { existsSync } from 'node:fs'
 import { RepositoryClient } from '../packages/node-client/src/repository.js'
 import { diffBaselines, type ChangeBaseline } from '../packages/node-core/src/repository-changes.js'
@@ -31,7 +32,7 @@ const git = (cwd: string, ...args: string[]) => {
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-async function setup() {
+async function setup(directWatch = false) {
   mkdirSync('.scratch', { recursive: true })
   const dir = mkdtempSync(resolve('.scratch/repository-changes-'))
   dirs.push(dir)
@@ -47,6 +48,11 @@ async function setup() {
   git(repo, 'commit', '-m', 'fixture')
   git(repo, 'worktree', 'add', '-b', 'side', linked)
   const core = new NodeCore(join(dir, 'state'))
+  // Only fake native-handle assertions bypass the platform's real owner.
+  if (directWatch)
+    Object.defineProperty(core.resources, 'watchers', {
+      value: new WatchService({ platform: 'linux' }),
+    })
   cores.push(core)
   Object.defineProperty(core.resources.git, 'executable', { value: gitExecutable })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
@@ -104,7 +110,7 @@ it.each([false, true])(
         const watcher = new EventEmitter()
         return Object.assign(watcher, { close() {} }) as ReturnType<typeof watch>
       })
-    const s = await setup()
+    const s = await setup(lostHints)
     const a = new RepositoryClient(s.request),
       b = new RepositoryClient(s.request)
     let first = await a.watch({ worktree_id: s.root, changes: null })
@@ -170,7 +176,7 @@ it('shares native watch handles across acquisition and legacy renewal until the 
     if (typeof listener === 'function') watcher.on('change', listener)
     return watcher as unknown as ReturnType<typeof watch>
   })
-  const s = await setup()
+  const s = await setup(true)
   const first = await s.request('repository.v1.watch', { worktree_id: s.root, changes: null })
   const repository = s.core.resources.repository as any
   const handles = [...repository.subscriptions.get(first.subscription_id).watchers]

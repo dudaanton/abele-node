@@ -23,6 +23,7 @@ import {
   type LoadedSourceEvidence,
 } from './loaded-sources.js'
 import { processStartIdentity } from './process.js'
+import { compilerBuildProof } from './build-proof.js'
 
 /** What starts a program under a debugger. The native JS profile in production; a scripted one
  * in tests. It refuses while no audited adapter is installed. */
@@ -59,6 +60,9 @@ type StartParams = {
   program: string
   npm_script?: string
   argv: string[]
+  runtime_argv?: string[]
+  cwd?: string
+  env?: Record<string, string>
   stop_on_entry?: boolean
   sources: string[]
 }
@@ -98,7 +102,7 @@ function within(root: string, path: string | null) {
 
 /** Starts a program of a chat's folder for its owner and puts every session of it under the shared
  * coordinator, which is also what records a run while a session has record points. The program
- * runs with the node's own Node, an empty environment and no shell; it waits on its first line. */
+ * runs with the node's own Node, explicit environment overrides and no shell. */
 export class DebuggerLaunches {
   private readonly runs = new Set<LaunchedRun>()
   private readonly sessions = new Map<string, DapSession>()
@@ -528,11 +532,13 @@ export class DebuggerLaunches {
     const digests = await sourceDigests(sources)
     const run = await this.profile.launch(
       {
-        cwd: root,
+        cwd: await launchWorkingDirectory(root, program, p.cwd),
+        workspace_root: root,
         executable: process.execPath,
         program,
         argv: resolved.argv,
-        env: {},
+        env: p.env ?? {},
+        ...(p.runtime_argv === undefined ? {} : { runtime_argv: p.runtime_argv }),
         ...(p.stop_on_entry === undefined ? {} : { stop_on_entry: p.stop_on_entry }),
       },
       target,
@@ -676,7 +682,7 @@ export class DebuggerLaunches {
       program.pid,
       script ?? undefined,
       new Map(loaded),
-      loaded.mapped.size ? { runtime: loaded, candidates } : undefined
+      loaded.mapped.size || loaded.stale.size ? { runtime: loaded, candidates } : undefined
     )
     const target: DebuggerTarget = {
       ...place,
@@ -712,7 +718,7 @@ export class DebuggerLaunches {
       sources,
       digests,
       candidates,
-      inlineRuntime: loaded.mapped.size > 0,
+      inlineRuntime: loaded.mapped.size > 0 || loaded.stale.size > 0,
       pending: 0,
     })
     const result = await this.adopt(run, root, sources, false)
@@ -926,7 +932,7 @@ async function sourceDigests(sources: ReadonlyMap<string, string>) {
   return digests
 }
 
-async function admitSources(
+export async function admitSources(
   root: string,
   admitted: Map<string, string>,
   asked: string[],
@@ -939,7 +945,17 @@ async function admitSources(
   const refused: DebuggerAddSourcesResult['refused'] = []
   const started = pid === undefined ? undefined : await processStartedAt(pid)
   for (const path of asked) {
-    const refuse = (code: string) => refused.push({ path, code })
+    const refuse = (code: string) =>
+      refused.push({
+        path,
+        code,
+        ...(code === 'debugger_build_changed'
+          ? {
+              message:
+                'The build on disk differs from the running program. Restart the program to use this build.',
+            }
+          : {}),
+      })
     const lexical = resolve(root, path)
     if (/^([\\/]|[A-Za-z]:)/.test(path) || !within(root, lexical) || lexical === root) {
       refuse('debugger_source_outside_folder')
@@ -976,6 +992,10 @@ async function admitSources(
       continue
     }
     const digest = await sourceDigest(full)
+    if (provisional?.runtime.stale.has(full)) {
+      refuse('debugger_build_changed')
+      continue
+    }
     if (
       provisional?.candidates.has(full) &&
       provisional.runtime.scripts.has(full) &&
@@ -1043,10 +1063,26 @@ async function loadedAsIs(pid: number, script: string | undefined) {
 
 const MAP_SCAN = { entries: 4096, depth: 8, bytes: 8 * 1024 * 1024 }
 
+/** Resolve an explicit folder-relative cwd, otherwise use the entry's nearest package. */
+export async function launchWorkingDirectory(root: string, program: string, asked?: string) {
+  if (asked !== undefined) {
+    const path = resolve(root, asked)
+    if (!within(root, path)) throw new ChannelError('debugger_path_escape')
+    const physical = await realpath(path)
+    if (!within(root, physical)) throw new ChannelError('debugger_path_escape')
+    if (!(await stat(physical)).isDirectory()) throw new ChannelError('debugger_cwd_unavailable')
+    return physical
+  }
+  for (let dir = dirname(program); within(root, dir); dir = dirname(dir)) {
+    if ((await stat(join(dir, 'package.json')).catch(() => undefined))?.isFile()) return dir
+    if (dir === root) break
+  }
+  return root
+}
+
 /** The sources that are not proven to be what runs. JavaScript is, as it is on disk; anything else
- * only when a source map under the registered folder lists it and carries its text or was
- * written after it last changed. */
-async function unbuilt(root: string, sources: string[]) {
+ * only when a source map under the registered folder carries its matching text. */
+export async function unbuilt(root: string, sources: string[]) {
   const pending = new Set(sources.filter((path) => !/\.[cm]?js$/.test(path)))
   if (!pending.size) return pending
   let budget = MAP_SCAN.entries
@@ -1095,7 +1131,7 @@ async function unbuilt(root: string, sources: string[]) {
         const fresh =
           typeof text === 'string'
             ? text === (await readFile(source, 'utf8'))
-            : info.mtimeMs >= (await stat(source)).mtimeMs
+            : await compilerBuildProof(root, source, path)
         if (fresh) pending.delete(source)
       }
     } catch {

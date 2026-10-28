@@ -1,5 +1,14 @@
 # Repository read performance (0.4.4 work)
 
+On macOS, folder leases, repository leases and recursive worktree monitors share
+process-owned filesystem watches by path and recursion mode. Lease renewal and
+unwatch only change logical ownership on the request loop. Unused native watches
+are closed after 30 seconds in the child, where a slow FSEvents registration or
+close cannot stall health or channel requests. Worktree snapshots use conservative
+validation until the child confirms all watches are installed. Resource shutdown
+kills the owned child directly: terminating a worker thread can still wait for a
+blocked native FSEvents call. Linux keeps its direct native watcher lifecycle.
+
 ## Reproduction
 
 Build, then run `node scripts/benchmark-repository.mjs <local-clone-source>`.

@@ -235,7 +235,7 @@ export class HttpService {
           } catch {
             // Not an address: the step says the method and what was written.
           }
-          const step = chain.close({
+          const step = await chain.close({
             label: `${p.method} ${pathOf(kept.url)}`,
             ...(outcome.state === 'answered' ? { status: outcome.response.status } : {}),
             ...(host ? { host } : {}),

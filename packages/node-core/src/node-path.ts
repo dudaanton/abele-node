@@ -9,8 +9,6 @@ import {
   realpathSync,
   readdirSync,
   mkdirSync,
-  watch,
-  type FSWatcher,
   type Stats,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -26,6 +24,7 @@ import {
 import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
 import type { ChangeBaseline } from './repository-changes.js'
+import type { WatchHandle } from './watch-service.js'
 const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex')
 const identity = (path: string) => {
   const s = lstatSync(path)
@@ -53,7 +52,7 @@ interface Lease {
   fingerprint: string
   expires: number
   timer: NodeJS.Timeout
-  watcher?: FSWatcher
+  watcher?: WatchHandle
   pending?: NodeJS.Timeout
   /** A change-stream watcher: gets numbered `workspace.files_changed` batches instead of hints. */
   changes: boolean
@@ -417,7 +416,7 @@ export class NodePathService {
     const position = changes ? streams.position(streamKey(workspace)) : undefined
     if (changes) streams.watched(streamKey(workspace))
     try {
-      l.watcher = watch(w.path, () => {
+      l.watcher = this.r.watchers.watch(w.path, false, () => {
         if (!l.pending)
           l.pending = setTimeout(() => {
             l.pending = undefined

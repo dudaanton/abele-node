@@ -126,9 +126,17 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       folder,
       program: 'app.js',
       argv: ['one'],
+      runtime_argv: ['--import=tsx'],
+      cwd: '.',
+      env: { DEBUG: 'acceptance' },
       stop_on_entry: false,
     })
-    expect(configs[0]).toMatchObject({ stop_on_entry: false })
+    expect(configs[0]).toMatchObject({
+      stop_on_entry: false,
+      runtime_argv: ['--import=tsx'],
+      cwd: dir,
+      env: { DEBUG: 'acceptance' },
+    })
     expect(runs[0]!.snapshot.target.conversation_id).toBeNull()
     expect(core.debuggerControl.methods()).toContain('debugger.v1.addSources')
     const added = await request('debugger.v1.addSources', {

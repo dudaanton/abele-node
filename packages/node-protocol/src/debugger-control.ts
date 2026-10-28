@@ -107,6 +107,17 @@ export const DebuggerStartSchema = z
     npm_script: z.string().min(1).max(256).optional(),
     stop_on_entry: z.boolean().optional(),
     argv: z.array(z.string().max(8192)).max(256).default([]),
+    runtime_argv: z.array(z.string().max(8192)).max(64).optional(),
+    cwd: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((v) => !v.includes('\0'))
+      .optional(),
+    env: z
+      .record(z.string().max(256), z.string().max(8192))
+      .refine((v) => Object.keys(v).length <= 256)
+      .optional(),
     sources: z.array(relativePath).max(255).default([]),
   })
   .strict()
@@ -138,7 +149,17 @@ export const DebuggerAddSourcesResultSchema = z
   .object({
     incarnation: id,
     sources: DebuggerStartResultSchema.shape.sources,
-    refused: z.array(z.object({ path: z.string().max(4096), code: id }).strict()).max(256),
+    refused: z
+      .array(
+        z
+          .object({
+            path: z.string().max(4096),
+            code: id,
+            message: z.string().max(4096).optional(),
+          })
+          .strict()
+      )
+      .max(256),
   })
   .strict()
 export type DebuggerAddSourcesResult = z.infer<typeof DebuggerAddSourcesResultSchema>

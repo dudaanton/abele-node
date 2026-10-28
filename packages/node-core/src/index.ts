@@ -638,6 +638,7 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
       this.resources?.mutations.close()
       this.obsidianTools.close()
       void this.resources?.lsp.stop()
+      void this.resources?.watchers.stop()
       this.trace.close()
       this.http.close()
       this.manager.close()

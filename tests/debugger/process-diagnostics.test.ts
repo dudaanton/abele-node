@@ -4,6 +4,31 @@ import { describe, expect, it } from 'vitest'
 import { OwnedDebugProcess } from '../../packages/node-core/src/debugger/process.js'
 
 describe('adapter subprocess diagnostics', () => {
+  it('waits for stderr drain after an early exit', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null,
+    })
+    const owner = new (OwnedDebugProcess as any)(child, { pid: 999998 }, async () => 'fixture')
+    const startup = owner.waitForText(/listening/)
+    child.exitCode = 1
+    child.emit('exit')
+    await expect(startup).rejects.toThrow('debugger_process_exited')
+    let drained = false
+    const close = owner.waitForClose().then(() => {
+      drained = true
+    })
+    await Promise.resolve()
+    expect(drained).toBe(false)
+    child.stderr.write('ERR_MODULE_NOT_FOUND\n')
+    child.emit('close')
+    await close
+    expect(owner.diagnostics).toMatchObject({ exit_code: 1, stderr: 'ERR_MODULE_NOT_FOUND\n' })
+    child.stdout.destroy()
+    child.stderr.destroy()
+  })
   it('retains bounded stderr separately from startup stdout and reports exit after streams close', () => {
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),

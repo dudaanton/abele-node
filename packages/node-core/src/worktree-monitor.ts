@@ -1,4 +1,5 @@
-import { watch, lstatSync, readFileSync, realpathSync, type FSWatcher } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import type { WatchFactory, WatchHandle } from './watch-service.js'
 import { join, basename, relative } from 'node:path'
 
 export function pathMetadata(path: string): string | null {
@@ -24,7 +25,9 @@ export function sourceMetadata(path: string): string | null {
  * If setup fails, callers use the conservative full-validation route instead.
  */
 export class WorktreeMonitor {
-  private watchers: FSWatcher[] = []
+  private watchers: WatchHandle[] = []
+  private readonly starting = new Set<WatchHandle>()
+  private watchFailed = false
   private baseline: ReadonlyMap<string, string | null> = new Map()
   private ignoreBaseline: ReadonlyMap<string, string | null> = new Map()
   private gitBaseline: ReadonlyMap<string, string | null> = new Map()
@@ -43,18 +46,35 @@ export class WorktreeMonitor {
   constructor(
     readonly root: string,
     readonly gitdir: string,
-    readonly common: string
+    readonly common: string,
+    watch: WatchFactory
   ) {
     for (const path of new Set([root, gitdir, common])) {
       try {
-        const watcher = watch(path, { recursive: true }, (_event, name) => this.changed(path, name))
+        const watcher = watch(path, true, (_event, name) => this.changed(path, name))
+        if (!watcher.ready) {
+          this.reliable = false
+          this.starting.add(watcher)
+          watcher.on('ready', () => {
+            if (this.closed) return
+            this.starting.delete(watcher)
+            if (this.starting.size || this.watchFailed) return
+            // A snapshot captured before the owner installed its watches must
+            // take the full validation route, even after hints become reliable.
+            this.generation++
+            this.reliable = true
+            for (const listener of this.listeners) listener(false)
+          })
+        }
         watcher.on('error', () => {
+          this.watchFailed = true
           this.generation++
           this.reliable = false
           for (const listener of this.listeners) listener(true)
         })
         this.watchers.push(watcher)
       } catch {
+        this.watchFailed = true
         this.reliable = false
       }
     }
@@ -279,6 +299,7 @@ export class WorktreeMonitor {
     this.generation++
     for (const watcher of this.watchers) watcher.close()
     this.watchers = []
+    this.starting.clear()
     this.listeners.clear()
   }
 }

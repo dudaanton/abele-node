@@ -13,12 +13,13 @@ import { holdJsStartup } from './js-startup.js'
 
 export type JsLaunch = {
   cwd: string
+  workspace_root?: string
   executable: string
   program: string
   argv: string[]
   env: Record<string, string>
   stop_on_entry?: boolean
-  runtime_argv?: ('--test' | '--enable-source-maps' | '--test-concurrency=1')[]
+  runtime_argv?: string[]
 }
 export type JsAttach = { address: '127.0.0.1'; port: number; target_pid: number }
 function exact(config: object, allowed: string[]) {
@@ -39,8 +40,40 @@ async function confined(root: string, path: string) {
     throw new Error('debugger_path_escape')
   return physical
 }
+/** Literal Node flags only. Entry replacement, eval, inspector binding and arbitrary
+ * NODE_OPTIONS would bypass the owned entry/loopback inspector contract. Loaders
+ * execute project code under the same explicit launch authority as the entry. */
+function validRuntimeArguments(args: string[]): boolean {
+  if (!Array.isArray(args) || args.length > 64) return false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (typeof arg !== 'string' || arg.includes('\0') || Buffer.byteLength(arg) > 8192) return false
+    if (['--test', '--enable-source-maps', '--test-concurrency=1'].includes(arg)) continue
+    const match = /^(--import|--loader|--require|--conditions)(?:=(.*))?$/.exec(arg)
+    if (!match) return false
+    const value = match[2] ?? args[++i]
+    if (
+      typeof value !== 'string' ||
+      !value ||
+      value.startsWith('-') ||
+      value.includes('\0') ||
+      Buffer.byteLength(value) > 8192
+    )
+      return false
+  }
+  return true
+}
 export async function validateJsLaunch(config: JsLaunch): Promise<JsLaunch> {
-  exact(config, ['cwd', 'executable', 'program', 'argv', 'env', 'runtime_argv', 'stop_on_entry'])
+  exact(config, [
+    'cwd',
+    'workspace_root',
+    'executable',
+    'program',
+    'argv',
+    'env',
+    'runtime_argv',
+    'stop_on_entry',
+  ])
   if (
     (config.stop_on_entry !== undefined && typeof config.stop_on_entry !== 'boolean') ||
     typeof config.cwd !== 'string' ||
@@ -64,16 +97,13 @@ export async function validateJsLaunch(config: JsLaunch): Promise<JsLaunch> {
         Buffer.byteLength(value) > 8192
     ) ||
     config.env.NODE_OPTIONS !== undefined ||
-    (config.runtime_argv &&
-      (!Array.isArray(config.runtime_argv) ||
-        config.runtime_argv.length > 3 ||
-        config.runtime_argv.some(
-          (v) => !['--test', '--enable-source-maps', '--test-concurrency=1'].includes(v)
-        )))
+    (config.runtime_argv !== undefined && !validRuntimeArguments(config.runtime_argv))
   )
     throw new Error('invalid_debugger_configuration')
   const cwd = await realpath(config.cwd),
     executable = await realpath(config.executable)
+  const root = config.workspace_root === undefined ? cwd : await realpath(config.workspace_root)
+  await confined(root, cwd)
   // B2's audited native host runtime only; no silently installed interpreters,
   // package managers, arbitrary shell preparation, or VS Code tasks.
   if (executable !== (await realpath(process.execPath)))
@@ -82,7 +112,7 @@ export async function validateJsLaunch(config: JsLaunch): Promise<JsLaunch> {
     ...config,
     cwd,
     executable,
-    program: await confined(cwd, config.program),
+    program: await confined(root, config.program),
     argv: [...config.argv],
     env: { ...config.env },
   }
@@ -152,7 +182,7 @@ export class JsDebugProfile {
   ): Promise<NativeJsRun> {
     this.requireEnabled()
     const config = await validateJsLaunch(raw)
-    const sources = await this.sources(config.cwd, config.program, chosen)
+    const sources = await this.sources(config.workspace_root ?? config.cwd, config.program, chosen)
     this.service.assertEffectsAvailable()
     const owner = await OwnedDebugProcess.spawn(
       config.executable,
@@ -236,10 +266,13 @@ export class JsDebugProfile {
       }
     } catch (error) {
       await owner.terminate().catch(() => {})
+      await owner.waitForClose?.(1000).catch(() => {})
       const message = error instanceof Error ? error.message : String(error)
       throw new ChannelError(error instanceof ChannelError ? error.code : message, message, {
         ...(error instanceof ChannelError ? error.details : {}),
         stderr: owner.diagnostics.stderr,
+        exit_code: owner.diagnostics.exit_code,
+        signal: owner.diagnostics.signal,
       })
     }
   }
@@ -305,6 +338,13 @@ export class JsDebugProfile {
       // workers/forks, package-manager commands or arbitrary adapter defaults.
       this.service.assertEffectsAvailable()
       rootDap = await connect()
+      if (owner) {
+        const transport = rootDap
+        const exited = () => transport.close(new Error('debugger_process_exited'))
+        owner.on('close', exited)
+        transport.onClose(() => owner.off('close', exited))
+        if (owner.alive === false) exited()
+      }
       const state = this.service.create({
         ...target,
         adapter_profile: 'js-ts-native',

@@ -18,6 +18,52 @@ afterEach(() => {
 const started = new Date('2026-01-02T03:04:05.000Z')
 
 describe('a run on disk', () => {
+  it('drains accepted asynchronous values and steps before closing a run', async () => {
+    const root = scratch(),
+      store = new TraceStore(root)
+    const writer = store.create({ session: 'async', points: [] })
+    const text = JSON.stringify({ data: 'x'.repeat(200000) })
+    const record = writer.recordAsync(async () => {
+      const value = await writer.valueAsync('value', text)
+      return writer.appendAsync({ kind: 'probe', at: 1, label: 'async', values: [value] })
+    })
+    await writer.closeAsync('done', 5)
+    await record
+    const result = store.read(writer.id)
+    expect(result.run).toMatchObject({ state: 'done', steps: 1 })
+    expect(store.text(writer.id, result.steps[0]!.values[0]!)).toBe(text)
+  })
+  it('serves a large timeline page without blocking the event loop and reuses its index', async () => {
+    const root = scratch(),
+      store = new TraceStore(root)
+    const writer = store.create({ session: 'large', points: [] })
+    const lines =
+      Array.from({ length: 30000 }, (_, i) =>
+        JSON.stringify({
+          id: `t${i}`,
+          ts: started.toISOString(),
+          kind: 'probe',
+          at: i,
+          label: `step ${i}`,
+          values: [],
+        })
+      ).join('\n') + '\n'
+    appendFileSync(join(root, writer.id, 'timeline.jsonl'), lines)
+    let ticks = 0
+    const timer = setInterval(() => ticks++, 5)
+    try {
+      const first = await store.page(writer.id, 0, 10)
+      expect(first.steps).toHaveLength(10)
+      expect(ticks).toBeGreaterThan(0)
+      const before = performance.now()
+      const next = await store.page(writer.id, 20000, 10)
+      expect(next.steps[0]?.label).toBe('step 20000')
+      expect(performance.now() - before).toBeLessThan(750)
+    } finally {
+      clearInterval(timer)
+      await store.close()
+    }
+  })
   it('names new runs in local time and preserves the ISO instant', () => {
     const date = new Date('2026-01-02T23:04:05Z')
     date.getFullYear = () => 2026

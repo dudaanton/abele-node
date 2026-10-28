@@ -11,6 +11,7 @@ import {
 import { EventEmitter } from 'node:events'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { WatchService } from '../packages/node-core/src/watch-service.js'
 
 import { createHash } from 'node:crypto'
 
@@ -30,6 +31,10 @@ function setup() {
   mkdirSync('.scratch', { recursive: true })
   const dir = mkdtempSync(resolve('.scratch/read-queue-'))
   const core = new NodeCore(dir)
+  // Inject direct Linux hints so the fake fs.watch callbacks remain controllable.
+  Object.defineProperty(core.resources, 'watchers', {
+    value: new WatchService({ platform: 'linux' }),
+  })
   cleanup.push(async () => {
     await core.resources.stop()
     core.close()

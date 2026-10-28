@@ -22,7 +22,7 @@ it.each(['debugger_startup_handoff_lost', 'debugger_program_ended'])(
     await writeFile(join(dir, 'main.js'), '')
     const owner = Object.assign(new EventEmitter(), {
       evidence: {},
-      diagnostics: { stderr: 'initial stderr' },
+      diagnostics: { stderr: 'initial stderr', exit_code: 1, signal: null },
       waitForText: async () => ['ws://127.0.0.1:1234/id', '1234'],
       terminate: vi.fn(async () => {
         owner.diagnostics.stderr += '\nfinal fatal error'
@@ -64,7 +64,7 @@ it.each(['debugger_startup_handoff_lost', 'debugger_program_ended'])(
         )
       ).rejects.toMatchObject({
         code: reason,
-        details: { stderr: 'initial stderr\nfinal fatal error' },
+        details: { stderr: 'initial stderr\nfinal fatal error', exit_code: 1, signal: null },
       })
       expect(close).toHaveBeenCalledOnce()
       expect(owner.terminate).toHaveBeenCalledOnce()

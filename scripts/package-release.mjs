@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyWorkspaceRuntime } from './workspace-runtime.mjs'
+import { pruneTypeScriptRuntime } from './typescript-runtime.mjs'
 
 const root = resolve('.')
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version
@@ -80,14 +81,14 @@ try {
   }
   strip(staging)
   // A dev dependency accidentally reintroduced by npm/shrinkwrap must fail packaging.
-  for (const name of [
-    'typescript',
-    'vitest',
-    'vite',
-    '@rolldown/binding',
-    'lightningcss',
-    'prettier',
-  ]) {
+  // TypeScript is now a pinned runtime dependency for isolated build-content proof.
+  if (
+    JSON.parse(readFileSync(join(staging, 'node_modules/typescript/package.json'), 'utf8'))
+      .version !== '5.9.3'
+  )
+    throw new Error('build_proof_compiler_version_mismatch')
+  pruneTypeScriptRuntime(staging)
+  for (const name of ['vitest', 'vite', '@rolldown/binding', 'lightningcss', 'prettier']) {
     if (existsSync(join(staging, 'node_modules', name)))
       throw new Error(`dev_dependency_in_release:${name}`)
   }

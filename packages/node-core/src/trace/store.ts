@@ -12,9 +12,18 @@ import {
   renameSync,
   rmSync,
   writeFileSync,
+  statSync,
+  openSync,
+  closeSync,
+  readSync,
 } from 'node:fs'
+import { Worker } from 'node:worker_threads'
+import { appendFile, mkdir, writeFile, rename } from 'node:fs/promises'
+import { promisify } from 'node:util'
+import type { TraceRunResult } from '@abele/node-protocol'
+import { ChannelError } from '@abele/channel-protocol'
 import { join } from 'node:path'
-import { gunzipSync, gzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync, gzip } from 'node:zlib'
 import { briefOf, formatOf, TRACE_PARSE_LIMIT, type TraceFormat } from './values.js'
 
 /** A value this small lives in its step rather than in a file. */
@@ -96,6 +105,12 @@ export interface TraceMark {
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const SHA = /^[a-f0-9]{64}$/
+const pack = promisify(gzip)
+async function writeAtomicAsync(path: string, text: string | Buffer) {
+  const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
+  await writeFile(tmp, text, { mode: 0o600 })
+  await rename(tmp, path)
+}
 
 const pad = (n: number, w = 2) => String(n).padStart(w, '0')
 const runId = (d: Date) =>
@@ -126,7 +141,10 @@ function readJsonl<T>(path: string): T[] {
 /** Writes one run while it is being recorded. */
 export class TraceRunWriter {
   private count = 0
+  private committed = 0
   private size = 0
+  private writes: Promise<unknown> = Promise.resolve()
+  private readonly records = new Set<Promise<unknown>>()
   constructor(
     private readonly dir: string,
     private readonly meta: TraceRunMeta
@@ -135,7 +153,7 @@ export class TraceRunWriter {
     return this.meta.id
   }
   get steps() {
-    return this.count
+    return this.committed
   }
   get startedAt() {
     return Date.parse(this.meta.started_at)
@@ -177,6 +195,82 @@ export class TraceRunWriter {
     return { name, format: 'text', bytes: 0, sha256: '', failed: reason.slice(0, 512) }
   }
 
+  async valueAsync(
+    name: string,
+    text: string,
+    format: TraceFormat = formatOf(text)
+  ): Promise<TraceStoredValue> {
+    const bytes = Buffer.byteLength(text),
+      sha256 = createHash('sha256').update(text).digest('hex')
+    const brief = briefOf(
+      text.length > TRACE_PARSE_LIMIT ? text.slice(0, 4096) : text,
+      format,
+      true
+    )
+    if (bytes <= TRACE_INLINE_BYTES) return { name, format, bytes, sha256, brief, inline: text }
+    const blobs = join(this.dir, 'blobs'),
+      packed = bytes > TRACE_PACK_BYTES
+    const file = join(blobs, packed ? `${sha256}.gz` : sha256)
+    const write = this.writes.then(async () => {
+      if (existsSync(file)) return
+      await mkdir(blobs, { recursive: true, mode: 0o700 })
+      await writeAtomicAsync(file, packed ? await pack(text) : text)
+      this.size += bytes
+    })
+    this.writes = write
+    await write
+    return { name, format, bytes, sha256, brief }
+  }
+
+  appendAsync(
+    step: Omit<TraceStoredStep, 'id' | 'ts'> & { ts?: string }
+  ): Promise<TraceStoredStep> {
+    const full: TraceStoredStep = {
+      id: `t${pad(++this.count, 4)}`,
+      ts: step.ts ?? new Date(this.startedAt + step.at).toISOString(),
+      ...step,
+    }
+    const write = this.writes.then(async () => {
+      await appendFile(join(this.dir, 'timeline.jsonl'), `${JSON.stringify(full)}\n`, {
+        mode: 0o600,
+      })
+      this.meta.steps = ++this.committed
+      this.meta.bytes = this.size
+      return full
+    })
+    this.writes = write
+    return write
+  }
+
+  async closeAsync(state: 'done' | 'cut', lengthMs: number) {
+    await this.flush()
+    this.meta.state = state
+    this.meta.length_ms = lengthMs
+    this.meta.ended_at = new Date(this.startedAt + lengthMs).toISOString()
+    this.meta.steps = this.committed
+    this.meta.bytes = this.size
+    try {
+      await writeAtomicAsync(join(this.dir, 'run.json'), JSON.stringify(this.meta, null, 2))
+    } catch (error) {
+      // An ended run can be deleted while its last metadata write is draining.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || existsSync(this.dir)) throw error
+    }
+  }
+
+  recordAsync<T>(work: () => Promise<T>): Promise<T> {
+    const record = Promise.resolve().then(work)
+    this.records.add(record)
+    record.then(
+      () => this.records.delete(record),
+      () => this.records.delete(record)
+    )
+    return record
+  }
+  async flush() {
+    while (this.records.size) await Promise.all(this.records)
+    await this.writes
+  }
+
   append(step: Omit<TraceStoredStep, 'id' | 'ts'> & { ts?: string }): TraceStoredStep {
     const full: TraceStoredStep = {
       id: `t${pad(++this.count, 4)}`,
@@ -184,7 +278,7 @@ export class TraceRunWriter {
       ...step,
     }
     appendFileSync(join(this.dir, 'timeline.jsonl'), `${JSON.stringify(full)}\n`, { mode: 0o600 })
-    this.meta.steps = this.count
+    this.meta.steps = ++this.committed
     this.meta.bytes = this.size
     return full
   }
@@ -202,14 +296,144 @@ export class TraceRunWriter {
     this.meta.state = state
     this.meta.length_ms = lengthMs
     this.meta.ended_at = new Date(this.startedAt + lengthMs).toISOString()
-    this.meta.steps = this.count
+    this.meta.steps = this.committed
     this.meta.bytes = this.size
     writeAtomic(join(this.dir, 'run.json'), JSON.stringify(this.meta, null, 2))
   }
 }
 
 export class TraceStore {
+  private worker?: Worker
+  private sequence = 0
+  private readonly pending = new Map<
+    number,
+    { resolve: (value: any) => void; reject: (error: Error) => void }
+  >()
+  private readonly timelines = new Map<
+    string,
+    { ino: number; size: number; mtime: number; rows: TraceStoredStep[] }
+  >()
   constructor(readonly root: string) {}
+
+  large(id: string) {
+    return (
+      (statSync(join(this.dir(id), 'timeline.jsonl'), { throwIfNoEntry: false })?.size ?? 0) >
+      128 * 1024
+    )
+  }
+  hasLargeTimeline() {
+    return (
+      existsSync(this.root) &&
+      readdirSync(this.root).some((id) => {
+        try {
+          return this.large(id)
+        } catch {
+          return false
+        }
+      })
+    )
+  }
+  page(
+    id: string,
+    from: number,
+    limit: number,
+    kinds?: string[],
+    through?: number
+  ): Promise<TraceRunResult> {
+    this.dir(id)
+    return this.readOperation('run', { id, from, limit, kinds, through })
+  }
+  readOperation<T>(operation: string, params: Record<string, unknown>): Promise<T> {
+    if (!this.worker) {
+      const sibling = new URL('./page-worker.js', import.meta.url)
+      const worker = (this.worker = new Worker(
+        existsSync(sibling) ? sibling : new URL('../../dist/trace/page-worker.js', import.meta.url),
+        { workerData: { root: this.root }, resourceLimits: { maxOldGenerationSizeMb: 256 } }
+      ))
+      worker.on('message', ({ seq, result, error, code }) => {
+        const pending = this.pending.get(seq)
+        this.pending.delete(seq)
+        if (error) pending?.reject(code ? new ChannelError(code, error) : new Error(error))
+        else pending?.resolve(result)
+        if (!this.pending.size) worker.unref()
+      })
+      const failed = (error: Error) => {
+        if (this.worker !== worker) return
+        this.worker = undefined
+        for (const p of this.pending.values()) p.reject(error)
+        this.pending.clear()
+      }
+      worker.on('error', failed)
+      worker.on('exit', () => failed(new Error('trace_reader_closed')))
+    }
+    this.worker.ref()
+    if (this.pending.size >= 16) return Promise.reject(new Error('trace_reader_busy'))
+    return new Promise((resolve, reject) => {
+      const seq = ++this.sequence
+      this.pending.set(seq, { resolve, reject })
+      this.worker!.postMessage({ seq, operation, params })
+    })
+  }
+  async close() {
+    const worker = this.worker
+    this.worker = undefined
+    for (const pending of this.pending.values()) pending.reject(new Error('trace_reader_closed'))
+    this.pending.clear()
+    if (worker) await worker.terminate()
+  }
+
+  /** The parsed prefix is indexed once, then only newly appended complete lines
+   * are read. Large-file callers use this in the reader worker, off the host loop. */
+  private timeline(id: string): TraceStoredStep[] {
+    const path = join(this.dir(id), 'timeline.jsonl'),
+      info = statSync(path, { throwIfNoEntry: false })
+    if (!info) {
+      this.timelines.delete(id)
+      return []
+    }
+    let cached = this.timelines.get(id)
+    if (
+      !cached ||
+      cached.ino !== info.ino ||
+      info.size < cached.size ||
+      (info.size === cached.size && cached.mtime !== info.mtimeMs)
+    ) {
+      cached = { ino: info.ino, size: 0, mtime: info.mtimeMs, rows: [] }
+      this.timelines.set(id, cached)
+      if (this.timelines.size > 4) this.timelines.delete(this.timelines.keys().next().value!)
+    }
+    if (info.size > cached.size) {
+      const fd = openSync(path, 'r'),
+        buffer = Buffer.alloc(64 * 1024)
+      let offset = cached.size,
+        carry = Buffer.alloc(0)
+      try {
+        while (offset < info.size) {
+          const count = readSync(fd, buffer, 0, Math.min(buffer.length, info.size - offset), offset)
+          if (!count) break
+          offset += count
+          const data = Buffer.concat([carry, buffer.subarray(0, count)])
+          let start = 0
+          for (let i = 0; i < data.length; i++)
+            if (data[i] === 10) {
+              try {
+                cached.rows.push(JSON.parse(data.subarray(start, i).toString('utf8')))
+              } catch {
+                /* Cut/corrupt line. */
+              }
+              cached.size += i - start + 1
+              start = i + 1
+            }
+          carry = Buffer.from(data.subarray(start))
+        }
+      } finally {
+        closeSync(fd)
+      }
+      // Do not index an unfinished tail: a writer may complete it on the next read.
+    }
+    cached.mtime = info.mtimeMs
+    return cached.rows
+  }
 
   private dir(id: string) {
     if (!RUN_ID.test(id) || !existsSync(join(this.root, id, 'run.json')))
@@ -245,7 +469,7 @@ export class TraceStore {
     const dir = this.dir(id)
     const meta = JSON.parse(readFileSync(join(dir, 'run.json'), 'utf8')) as TraceRunMeta
     // A run still marked as recording counts its steps from the timeline itself.
-    if (meta.state === 'recording') meta.steps = readJsonl(join(dir, 'timeline.jsonl')).length
+    if (meta.state === 'recording') meta.steps = this.timeline(id).length
     return meta
   }
 
@@ -264,7 +488,7 @@ export class TraceStore {
 
   read(id: string): { run: TraceRunMeta; steps: TraceStoredStep[] } {
     const run = this.meta(id)
-    return { run, steps: readJsonl<TraceStoredStep>(join(this.dir(id), 'timeline.jsonl')) }
+    return { run, steps: this.timeline(id) }
   }
 
   /** The whole text of a stored value. */

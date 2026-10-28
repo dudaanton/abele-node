@@ -56,6 +56,7 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
   private text = ''
   private stderr = ''
   private processError: string | undefined
+  private closed = false
   get diagnostics() {
     return {
       pid: this.pid,
@@ -96,7 +97,10 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
       this.emit('exit')
     })
     // Unlike exit, close follows the final stderr bytes.
-    child.on('close', () => this.emit('close', this.diagnostics))
+    child.on('close', () => {
+      this.closed = true
+      this.emit('close', this.diagnostics)
+    })
   }
   static async spawn(
     executable: string,
@@ -191,6 +195,21 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
         reject(new Error('debugger_exit_timeout'))
       }, timeoutMs)
       this.once('exit', exit)
+    })
+  }
+  /** Exit precedes the last stderr bytes; diagnostics are complete at close. */
+  waitForClose(timeoutMs = 1000): Promise<void> {
+    if (this.closed) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const close = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        this.off('close', close)
+        reject(new Error('debugger_close_timeout'))
+      }, timeoutMs)
+      this.once('close', close)
     })
   }
   private async signal(signal: NodeJS.Signals) {

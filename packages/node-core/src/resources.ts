@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto'
+import { WatchService } from './watch-service.js'
 import {
   chmodSync,
   existsSync,
@@ -628,6 +629,7 @@ export class ResourceServices {
   readonly ready: Promise<unknown>
   readonly search = new WorkspaceSearchService(this)
   readonly nodePath: NodePathService
+  readonly watchers = new WatchService()
   readonly targets: ExecutionTargetService
   readonly git: GitRunner
   readonly repository: RepositoryService
@@ -769,6 +771,7 @@ export class ResourceServices {
     await this.ready
     await this.search.stop()
     await this.repository.stop()
+    await this.watchers.stop()
     await this.jobs.stop()
   }
   /** Read-only preparation; reservation and its provisioning job commit with the caller's receipt. */

@@ -88,6 +88,8 @@ export class DapSession {
   private capabilities: Record<string, any> = {}
   private readonly breakpointIds = new Map<number, { id: string; revision: number }>()
   private readonly installedBreakpoints = new Map<string, { signature: string; results: any[] }>()
+  private readonly pendingProofs = new Set<string>()
+  private proofRetry?: NodeJS.Timeout
   private breakpointSyncs = 0
   private readonly deferredStops = new Map<
     number | undefined,
@@ -134,6 +136,7 @@ export class DapSession {
   private readonly sourcePaths = new Map<string, string>()
   readonly sources: ReadonlyMap<string, string> = this.sourcePaths
   private readonly stepping = new Set<number>()
+  private readonly executing = new Set<number>()
   /** Launch-owned content evidence; admission is not a permanent promise about disk contents. */
   validateSource?: (path: string) => Promise<void>
   provisionalSource?: (path: string) => boolean
@@ -166,6 +169,8 @@ export class DapSession {
     dap.onClose((error) => {
       this.settleStartup(error)
       this.lifetime.abort()
+      clearTimeout(this.proofRetry)
+      this.pendingProofs.clear()
       debuggerLog('DAP closed', () => ({
         session: this.id,
         incarnation: this.incarnation,
@@ -438,13 +443,18 @@ export class DapSession {
           results = list(body.breakpoints)
         }
         if (results.length !== requested.length) throw new Error('dap_breakpoint_count')
+        let provisionalProof: string | undefined
         if (
           results.some((r) => r.verified) &&
           this.provisionalSource?.(this.sources.get(source)!)
         ) {
-          const proof = await this.verifyProvisionalSource(this.sources.get(source)!)
-          if (proof)
-            results = results.map((result) => ({ ...result, verified: false, message: proof }))
+          provisionalProof = await this.verifyProvisionalSource(this.sources.get(source)!)
+          if (provisionalProof)
+            results = results.map((result) => ({
+              ...result,
+              verified: false,
+              message: provisionalProof,
+            }))
         }
         results = results.map((result, i) => ({
           ...this.breakpointResult(requested[i]!.breakpoint_id, result),
@@ -452,8 +462,7 @@ export class DapSession {
         }))
         if (!live(this.snapshot) || this.ending) return
         if (this.snapshot.breakpoint_revision === revision) {
-          if (!results.some((r) => /^debugger_source_(changed|no_map)$/.test(r.message ?? '')))
-            this.installedBreakpoints.set(source, { signature, results })
+          if (!provisionalProof) this.installedBreakpoints.set(source, { signature, results })
           for (const [id, bp] of this.breakpointIds)
             if (
               state.breakpoints.find((r) => r.breakpoint_id === bp.id)?.source_id === source ||
@@ -1057,10 +1066,13 @@ export class DapSession {
     else if (singleThread) this.stepping.delete(thread)
     else this.stepping.clear()
     try {
+      this.executing.add(thread)
       await this.request(command, { threadId: toDap(thread), singleThread }, { beforeDispatch })
     } catch (error) {
       this.stepping.delete(thread)
       throw error
+    } finally {
+      this.executing.delete(thread)
     }
     return this.snapshot
   }
@@ -1140,7 +1152,7 @@ export class DapSession {
     }
   }
   private hitBreakpoints(raw: unknown): string[] {
-    if (!Array.isArray(raw)) return []
+    if (!Array.isArray(raw) || raw.length > 256) return []
     const points = raw.slice(0, 256).map((id) => this.breakpointIds.get(id))
     // Unknown or mixed hits remain ordinary stops. A numeric adapter id must
     // never impersonate a logical record-point id with the same spelling.
@@ -1148,8 +1160,7 @@ export class DapSession {
       (bp) =>
         bp?.revision === this.snapshot.breakpoint_revision &&
         this.snapshot.breakpoints.some(
-          (point) =>
-            point.breakpoint_id === bp.id && ['verified', 'relocated'].includes(point.status)
+          (point) => point.breakpoint_id === bp.id && point.enabled !== false
         )
     )
       ? points.map((bp) => bp!.id)
@@ -1260,6 +1271,18 @@ export class DapSession {
         break
       }
       case 'continued':
+        // A resume announcement can arrive after the resulting pause.
+        // While that request is still in flight, its newer stop is authoritative.
+        if (
+          this.snapshot.threads.some(
+            (t) =>
+              this.executing.has(t.thread_id) &&
+              t.status === 'stopped' &&
+              (body.allThreadsContinued === true ||
+                (dapThread(body.threadId) && fromDap(body.threadId) === t.thread_id))
+          )
+        )
+          break
         if (body.allThreadsContinued === true || body.threadId === undefined)
           this.deferredStops.clear()
         else this.deferredStops.delete(body.threadId)
@@ -1375,11 +1398,13 @@ export class DapSession {
   }
   private async verifyProvisionalSource(path: string): Promise<string | undefined> {
     try {
-      if (!this.verifyBreakpointSource) return 'debugger_source_unverified'
+      if (!this.verifyBreakpointSource) throw new Error('debugger_source_unverified')
       await this.verifyBreakpointSource(path)
+      this.pendingProofs.delete(path)
     } catch (error) {
-      const code = error instanceof Error ? error.message : 'debugger_source_unverified'
-      if (/^debugger_source_(changed|no_map)$/.test(code)) {
+      const code =
+        error instanceof Error && error.message ? error.message : 'debugger_source_unverified'
+      if (code) {
         for (const [id, source] of this.sources)
           if (source === path) this.installedBreakpoints.delete(id)
         await this.dap
@@ -1388,10 +1413,60 @@ export class DapSession {
             { source: { path }, breakpoints: [] },
             { timeoutMs: 250, signal: this.closedSignal }
           )
-          .catch(() => {})
+          .catch((error) => {
+            this.dap.close(error)
+            throw error
+          })
+      }
+      if (/^debugger_source_(pending|unverified)$/.test(code)) {
+        this.pendingProofs.add(path)
+        this.retryProvisionalSources()
       }
       return code
     }
+  }
+  private retryProvisionalSources() {
+    if (this.proofRetry || this.dap.closed || this.ending || !this.pendingProofs.size) return
+    this.proofRetry = setTimeout(async () => {
+      try {
+        let verified = false
+        for (const path of this.pendingProofs) {
+          if (this.dap.closed || this.ending || !live(this.snapshot)) return
+          if (
+            !this.snapshot.breakpoints.some(
+              (bp) => bp.enabled !== false && this.sources.get(bp.source_id) === path
+            )
+          ) {
+            this.pendingProofs.delete(path)
+            continue
+          }
+          try {
+            if (!this.verifyBreakpointSource) continue
+            // Do not reinstall an adapter breakpoint just to test its proof.
+            await this.verifyBreakpointSource(path)
+            if (this.dap.closed || this.ending) return
+            this.pendingProofs.delete(path)
+            verified = true
+          } catch (error) {
+            if (
+              !/^debugger_source_(pending|unverified)$/.test(
+                error instanceof Error ? error.message : ''
+              )
+            ) {
+              this.pendingProofs.delete(path)
+            }
+          }
+        }
+        if (verified && !this.dap.closed && !this.ending) await this.syncBreakpoints()
+      } catch (error) {
+        if (!this.dap.closed)
+          this.dap.close(error instanceof Error ? error : new Error(String(error)))
+      } finally {
+        this.proofRetry = undefined
+        this.retryProvisionalSources()
+      }
+    }, 250)
+    this.proofRetry.unref()
   }
 }
 

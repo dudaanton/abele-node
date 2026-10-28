@@ -65,6 +65,7 @@ type Listening = {
   cwd: string | null
   /** The OS gave the arguments joined by spaces, not one by one. */
   joined?: boolean
+  nodeOptions?: string
 }
 
 async function darwinListening(wildcard = false): Promise<Listening[]> {
@@ -93,10 +94,11 @@ async function darwinListening(wildcard = false): Promise<Listening[]> {
   }
   return Promise.all(
     [...found].map(async ([pid, ports]) => {
-      const [args, exe, cwd] = await Promise.all([
+      const [args, exe, cwd, environment] = await Promise.all([
         run('/bin/ps', ['-o', 'args=', '-p', String(pid)]),
         run('/bin/ps', ['-o', 'comm=', '-p', String(pid)]),
         run('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn']),
+        run('/bin/ps', ['eww', '-p', String(pid), '-o', 'command=']),
       ])
       const folder = cwd.split('\n').find((l) => l.startsWith('n'))
       // ps joins the arguments with spaces. Node's own path comes whole from comm; a program path
@@ -107,7 +109,16 @@ async function darwinListening(wildcard = false): Promise<Listening[]> {
         path && line.startsWith(path + ' ')
           ? [path, ...line.slice(path.length).trim().split(/\s+/).filter(Boolean)]
           : line.split(/\s+/).filter(Boolean)
-      return { pid, ports, argv, cwd: folder ? folder.slice(1) : null, joined: true }
+      return {
+        pid,
+        ports,
+        argv,
+        cwd: folder ? folder.slice(1) : null,
+        joined: true,
+        nodeOptions: /(?:^| )NODE_OPTIONS=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)/.exec(
+          environment
+        )?.[1],
+      }
     })
   )
 }
@@ -160,6 +171,10 @@ async function linuxListening(wildcard = false): Promise<Listening[]> {
         ports: held,
         argv: cmdline.split('\0').filter((s, i, all) => s || i < all.length - 1),
         cwd,
+        nodeOptions: (await readFile(`/proc/${pid}/environ`, 'utf8').catch(() => ''))
+          .split('\0')
+          .find((s) => s.startsWith('NODE_OPTIONS='))
+          ?.slice(13),
       })
     } catch {
       // Gone meanwhile, or another user's: not ours to attach to.
@@ -296,7 +311,9 @@ export async function inspectorPrograms(): Promise<InspectorProgram[]> {
   // Every port at once: the inspector answers at once, a server that does not keeps one waiting.
   const probes = listening
     .filter((p) => p.pid !== process.pid && !ownedDebugPids.has(p.pid))
-    .flatMap((p) => [...p.ports].map((port) => ({ p, port })))
+    .flatMap((p) =>
+      inspectorPorts(p.argv, [...p.ports], p.nodeOptions).map((port) => ({ p, port }))
+    )
   const answers = await Promise.all(probes.map(({ port }) => isInspector(port, 500)))
   const programs: InspectorProgram[] = probes
     .filter((_, i) => answers[i])
@@ -308,6 +325,37 @@ export async function inspectorPrograms(): Promise<InspectorProgram[]> {
       script: scriptOf(p.argv, p.cwd, p.joined ? isFile : undefined),
     }))
   return programs.sort((a, b) => a.pid - b.pid || a.port - b.port)
+}
+
+/** Only options before the entry belong to Node. Unknown dynamic ports are
+ * deliberately omitted rather than sending discovery traffic to an application. */
+export function inspectorPorts(argv: string[], listening: number[], nodeOptions = ''): number[] {
+  const args = [...nodeOptions.matchAll(/(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)].map(
+    (m) => m[1] ?? m[2] ?? m[3]!
+  )
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (!arg.startsWith('-') || arg === '--') break
+    args.push(arg)
+    if (VALUED.has(arg) && i + 1 < argv.length) args.push(argv[++i]!)
+  }
+  let enabled = false,
+    port = 9229
+  const parse = (value: string) => Number(/(?:^|:)(\d+)$/.exec(value)?.[1])
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (/^--inspect(?:-brk|-wait)?(?:=|$)/.test(arg)) {
+      enabled = true
+      if (arg.includes('=')) port = parse(arg.slice(arg.indexOf('=') + 1))
+    } else if (arg === '--inspect-port') port = parse(args[++i] ?? '')
+    else if (arg.startsWith('--inspect-port=')) port = parse(arg.slice(15))
+    else if (VALUED.has(arg)) i++
+  }
+  return enabled && port > 0 && listening.includes(port)
+    ? [port]
+    : enabled && port === 0 && listening.length === 1
+      ? [...listening]
+      : []
 }
 /** OS listener ownership only. Never sends application requests or inspector probes. */
 export async function applicationListeners(): Promise<{ pid: number; ports: number[] }[]> {

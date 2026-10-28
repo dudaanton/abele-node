@@ -7,6 +7,22 @@ infrastructure**: target startup arrived later as the owner's `debugger.v1.start
 
 ## Availability and RPC boundary
 
+Attach discovery selects inspector ports from Node runtime arguments and
+`NODE_OPTIONS` before probing them. A dynamic inspector with several listeners is
+omitted when its port cannot be identified; application ports are not scanned.
+For reliable discovery of a service with an HTTP listener, use an explicit inspector
+port such as `--inspect=9241`.
+
+Source maps with `sourcesContent` prove original source bytes directly. For ordinary
+TypeScript maps without embedded sources, the node's pinned TypeScript compiler
+re-emits the project in a worker without writing files. Both emitted JavaScript and
+map bytes must match the existing build. Source timestamps are not identity proof.
+Compiler differences or an unprovable transform leave the source unverified.
+For standalone TypeScript builds without a project configuration, a small set of
+compiler settings is checked against the existing JavaScript and map mappings.
+Relocating the map or replacing its trailing URL is allowed; changed executable
+code or mappings still fail verification.
+
 For an installer-managed background service, use `abele-node service debugger on`
 or `abele-node service debugger off`. The installer records this choice and keeps
 it through updates and reinstalls. Use `abele-node service debugger adopt` to

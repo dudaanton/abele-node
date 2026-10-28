@@ -230,7 +230,8 @@ export const HttpMethodSchemas = {
     .object({
       ...project,
       request_id: requestId.optional(),
-      environment: envName.optional(),
+      /** Display label for history, including environments supplied by project files. */
+      environment: z.string().min(1).max(512).optional(),
       method: HttpMethodSchema,
       url: z
         .string()

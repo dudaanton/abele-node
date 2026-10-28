@@ -93,6 +93,7 @@ interface Live {
   writer?: TraceRunWriter
   startedAt: number
   handled: Set<string>
+  ownedStops: Map<string, TracePoint[]>
   queue: Promise<void>
   off: () => void
   /** Requests out now, sent into this run: what the points take meanwhile stands under them. */
@@ -117,7 +118,7 @@ export interface TraceChain {
     status?: number
     host?: string
     values: { name: string; text?: string; failed?: string }[]
-  }): string | undefined
+  }): string | undefined | Promise<string | undefined>
 }
 
 const terminal: Record<string, 'done' | 'cut' | undefined> = {
@@ -150,6 +151,7 @@ export class TraceRecorder {
       session,
       startedAt: this.now(),
       handled: new Set(),
+      ownedStops: new Map(),
       queue: Promise.resolve(),
       off: () => {},
       chains: new Map(),
@@ -193,7 +195,7 @@ export class TraceRecorder {
       get steps() {
         return closed && !confirmed ? 0 : entry.steps
       },
-      close: (step) => {
+      close: async (step) => {
         if (closed) return undefined
         closed = true
         l.chains.delete(id)
@@ -227,21 +229,28 @@ export class TraceRecorder {
           if (exact.length === 1 && l.httpSteps.has(exact[0]!.id))
             return l.httpSteps.get(exact[0]!.id)
         }
-        return writer.append({
-          kind: 'http',
-          at,
-          label: step.label,
-          ...(step.status !== undefined ? { status: step.status } : {}),
-          ...(step.host ? { host: step.host } : {}),
-          chain: id,
-          sent: true,
-          ...(request ? { direction: 'incoming' as const } : {}),
-          values: step.values.map((v) =>
-            v.text !== undefined
-              ? writer.value(v.name, v.text)
-              : writer.failed(v.name, v.failed ?? 'Not taken')
-          ),
-        }).id
+        return writer.recordAsync(
+          async () =>
+            (
+              await writer.appendAsync({
+                kind: 'http',
+                at,
+                label: step.label,
+                ...(step.status !== undefined ? { status: step.status } : {}),
+                ...(step.host ? { host: step.host } : {}),
+                chain: id,
+                sent: true,
+                ...(request ? { direction: 'incoming' as const } : {}),
+                values: await Promise.all(
+                  step.values.map((v) =>
+                    v.text !== undefined
+                      ? writer.valueAsync(v.name, v.text)
+                      : writer.failed(v.name, v.failed ?? 'Not taken')
+                  )
+                ),
+              })
+            ).id
+        )
       },
     }
   }
@@ -264,9 +273,11 @@ export class TraceRecorder {
     await l.queue
   }
 
-  close() {
-    for (const l of [...this.live.values()]) this.detach(l, 'cut')
+  async close() {
+    const live = [...this.live.values()]
+    for (const l of live) this.detach(l, 'cut')
     this.offPoints()
+    await Promise.all(live.map((l) => l.queue))
   }
 
   private pointCopies(l: Live, snapshot: DebuggerSnapshot): TracePointCopy[] {
@@ -348,8 +359,9 @@ export class TraceRecorder {
     l.chains.clear()
     if (writer)
       l.queue = l.queue
-        .then(() => {
-          if (!writer.discardEmpty()) writer.close(state, this.now() - writer.startedAt)
+        .then(async () => {
+          await writer.flush()
+          if (!writer.discardEmpty()) await writer.closeAsync(state, this.now() - writer.startedAt)
         })
         .catch((error) => this.host.log?.('[trace] Could not close the run', error))
   }
@@ -370,7 +382,7 @@ export class TraceRecorder {
           const pending =
             typeof correlation === 'string' ? l.chains.get(correlation)?.request : undefined
           const sent = e.direction === 'incoming' && pending?.method === e.method
-          const recorded = writer.append({
+          const recorded = await writer.appendAsync({
             kind: 'http',
             at: e.started - writer.startedAt,
             label: `${e.method} ${url.pathname}${url.search}`,
@@ -381,7 +393,7 @@ export class TraceRecorder {
             direction: e.direction,
             duration_ms: Math.max(0, e.ended - e.started),
             values: [
-              writer.value(
+              await writer.valueAsync(
                 'request',
                 JSON.stringify({
                   method: e.method,
@@ -391,8 +403,8 @@ export class TraceRecorder {
                   truncated: !!e.request_truncated,
                 })
               ),
-              writer.value('response', e.response_body),
-              writer.value(
+              await writer.valueAsync('response', e.response_body),
+              await writer.valueAsync(
                 'http',
                 JSON.stringify({
                   direction: e.direction,
@@ -464,24 +476,48 @@ export class TraceRecorder {
       const key = `${snapshot.incarnation}:${snapshot.stop_epoch}:${thread.thread_id}`
       if (l.handled.has(key)) continue
       l.handled.add(key)
-      if (l.handled.size > 1024) l.handled.delete(l.handled.values().next().value!)
+      if (l.handled.size > 1024) {
+        const oldest = l.handled.values().next().value!
+        l.handled.delete(oldest)
+        l.ownedStops.delete(oldest)
+      }
       const hits = thread.stop.hit_breakpoint_ids
-      const points = hits.map((id) => this.host.points.get(l.session.id, id))
+      // Ownership belongs to this physical stop. Removing a trace point during
+      // capture must not turn its already-owned stop into a permanent pause.
+      const points = hits.map(
+        (id) =>
+          this.host.points.get(l.session.id, id) ??
+          l.ownedStops.get(key)?.find((point) => point.breakpoint_id === id)
+      )
       if (hits.length && points.every(Boolean)) {
+        l.ownedStops.set(key, points as TracePoint[])
         const stoppedAt = this.now()
         const id = thread.thread_id
         const writer = l.writer
         const chain = [...l.chains.entries()].pop()
         if (chain) chain[1].steps++
         const configuration = l.configuration
+        const confirmed = hits.every(
+          (hit) =>
+            this.host.points.get(l.session.id, hit) &&
+            snapshot.breakpoints.some(
+              (bp) => bp.breakpoint_id === hit && ['verified', 'relocated'].includes(bp.status)
+            )
+        )
+        const retry = () => {
+          l.handled.delete(key)
+          queueMicrotask(() => this.observe(l))
+        }
         const current = (resuming = false) => {
           const now = l.session.snapshot
+          // Configuration fences reads, not the obligation to resume this
+          // owned stop. A newer physical stop still invalidates continuation.
           return (
             this.live.get(l.session.id) === l &&
-            l.configuration === configuration &&
+            (resuming || l.configuration === configuration) &&
             now.incarnation === snapshot.incarnation &&
             now.stop_epoch === snapshot.stop_epoch + (resuming ? 1 : 0) &&
-            now.breakpoint_revision === snapshot.breakpoint_revision &&
+            (resuming || now.breakpoint_revision === snapshot.breakpoint_revision) &&
             now.threads.some(
               (t) => t.thread_id === id && t.status === (resuming ? 'unknown' : 'stopped')
             )
@@ -489,7 +525,17 @@ export class TraceRecorder {
         }
         l.queue = l.queue
           .then(() =>
-            this.capture(l, id, points as TracePoint[], stoppedAt, current, writer, chain)
+            this.capture(
+              l,
+              id,
+              points as TracePoint[],
+              stoppedAt,
+              current,
+              retry,
+              confirmed,
+              writer,
+              chain
+            )
           )
           .catch((error) => this.host.log?.('[trace] Could not record the stop', error))
       } else if (thread.stop.reason === 'exception' && l.writer) {
@@ -509,11 +555,13 @@ export class TraceRecorder {
     points: TracePoint[],
     stoppedAt: number,
     current: (resuming?: boolean) => boolean,
+    retry: () => void,
+    confirmed: boolean,
     writer?: TraceRunWriter,
     chain?: [string, { steps: number }]
   ) {
-    if (!current()) return
-    if (!writer) {
+    if (!current()) return retry()
+    if (!writer && confirmed) {
       this.ensureRun(l)
       writer = l.writer
     }
@@ -526,6 +574,7 @@ export class TraceRecorder {
     let stop: RecordedStop | undefined
     let failure: string | undefined
     try {
+      if (!confirmed) throw new Error('Record point not confirmed, skipped')
       stop = await l.session.recordStop(
         thread,
         [...takes].map(([name, expression]) => ({ name, expression })),
@@ -539,7 +588,7 @@ export class TraceRecorder {
       this.host.log?.('[trace] Record point could not be read', error)
     }
     const resumedAt = this.now()
-    if (!current()) return
+    if (!current()) return retry()
     try {
       await l.session.continue(thread, false, () => {
         if (!current(true)) throw new Error('trace_capture_stale')
@@ -548,6 +597,13 @@ export class TraceRecorder {
       // Left stopped: whoever looks at the session sees where it stands.
       this.host.log?.('[trace] Could not let the program go on', error)
     }
+    const skipped = !writer && !confirmed
+    if (skipped)
+      writer = this.host.storeFor(l.session.snapshot).create({
+        session: l.session.id,
+        started: new Date(stoppedAt),
+        points: this.pointCopies(l, l.session.snapshot),
+      })
     if (!writer) return
     const snapshot = l.session.snapshot
     const top = stop?.frames[0]
@@ -557,10 +613,12 @@ export class TraceRecorder {
     const file = top?.path ? this.place(snapshot, top.path) : point?.file
     const line = top?.line || point?.line
     const values = stop
-      ? stop.values.map((v) =>
-          v.error !== undefined || v.text === undefined
-            ? writer.failed(v.name, v.error ?? 'Not taken')
-            : writer.value(v.name, v.text)
+      ? await Promise.all(
+          stop.values.map(async (v) =>
+            v.error !== undefined || v.text === undefined
+              ? writer.failed(v.name, v.error ?? 'Not taken')
+              : await writer.valueAsync(v.name, v.text)
+          )
         )
       : [...takes.keys()].map((name) => writer.failed(name, failure ?? 'Not taken'))
     // Under the request out now, the newest when several are: placed by time, not proven.
@@ -569,12 +627,13 @@ export class TraceRecorder {
       .sort((a, b) =>
         a.direction === b.direction ? b.started - a.started : a.direction === 'incoming' ? -1 : 1
       )[0]
-    writer.append({
+    await writer.appendAsync({
       kind: 'probe',
       at: stoppedAt - writer.startedAt,
       ...(chain || http ? { chain: chain?.[0] ?? http!.id, by_time: true } : {}),
       ...(points[0] ? { point: points[0].breakpoint_id } : {}),
       label:
+        (!confirmed ? 'Record point not confirmed, skipped' : undefined) ??
         points.map((p) => p.note).find(Boolean) ??
         (file ? `${file.split('/').pop()}:${line}` : 'Record point'),
       ...(file && line ? { place: { file, line, ...(top?.name ? { fn: top.name } : {}) } } : {}),
@@ -588,6 +647,7 @@ export class TraceRecorder {
       paused_ms: Math.max(0, resumedAt - stoppedAt),
       values,
     })
+    if (skipped) await writer.closeAsync('done', this.now() - writer.startedAt)
   }
 }
 

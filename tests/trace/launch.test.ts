@@ -106,6 +106,7 @@ describe('starting a program under the debugger', () => {
     expect(profile.launched).toHaveLength(1)
     expect(profile.launched[0]!.config).toEqual({
       cwd: s.folder,
+      workspace_root: s.folder,
       executable: process.execPath,
       program: join(s.folder, 'src/page.js'),
       argv: [],
@@ -317,7 +318,7 @@ describe('starting a program under the debugger', () => {
     expect(s.core.debugger.snapshot(id).snapshot.thread_inventory).toBe('complete')
   })
 
-  it('takes TypeScript as what runs only through a map of its build that is not older than it', async () => {
+  it('takes TypeScript as what runs only through matching build content, regardless of timestamps', async () => {
     const profile = scriptedProfile(() => ({}))
     const s = await setup(profile.make())
     mkdirSync(join(s.folder, 'dist'))
@@ -335,13 +336,23 @@ describe('starting a program under the debugger', () => {
       return started.sources.map((x: any) => x.path)
     }
     expect(await start()).toEqual(['dist/total.js'])
-    const map = { version: 3, file: 'total.js', sources: ['../src/total.ts'], mappings: '' }
+    const map = {
+      version: 3,
+      file: 'total.js',
+      sources: ['../src/total.ts'],
+      sourcesContent: ['export const total = 1\n'],
+      mappings: '',
+    }
+    // A filename-only map is not content evidence for this hand-written build.
+    const { sourcesContent: _content, ...bare } = map
+    writeFileSync(join(s.folder, 'dist/total.js.map'), JSON.stringify(bare))
+    expect(await start()).toEqual(['dist/total.js'])
     writeFileSync(join(s.folder, 'dist/total.js.map'), JSON.stringify(map))
     expect(await start()).toEqual(['dist/total.js', 'src/total.ts'])
-    // The source changed after the build.
+    // A checkout touching identical source after the build does not change identity.
     const later = new Date(Date.now() + 60000)
     utimesSync(join(s.folder, 'src/total.ts'), later, later)
-    expect(await start()).toEqual(['dist/total.js'])
+    expect(await start()).toEqual(['dist/total.js', 'src/total.ts'])
     // A map that carries the text it was built from is judged by that text.
     writeFileSync(
       join(s.folder, 'dist/total.js.map'),

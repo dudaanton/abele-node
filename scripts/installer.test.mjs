@@ -17,12 +17,61 @@ import {
   lstat,
   readdir,
   rename,
+  cp,
 } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { pruneTypeScriptRuntime } from './typescript-runtime.mjs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const script = resolve('install.sh')
+test('production TypeScript keeps compiler emission and default libraries without CLI or server files', async () => {
+  const staging = await mkdtemp(join(tmpdir(), 'abele-compiler-runtime-'))
+  try {
+    const compiler = join(staging, 'node_modules/typescript')
+    await cp(resolve('node_modules/typescript'), compiler, { recursive: true })
+    await mkdir(join(staging, 'node_modules/.bin'))
+    for (const name of ['tsc', 'tsserver'])
+      await symlink(`../typescript/bin/${name}`, join(staging, 'node_modules/.bin', name))
+    pruneTypeScriptRuntime(staging)
+    assert.deepEqual((await readdir(compiler)).sort(), [
+      'LICENSE.txt',
+      'ThirdPartyNoticeText.txt',
+      'lib',
+      'package.json',
+    ])
+    const files = await readdir(join(compiler, 'lib'))
+    assert.ok(files.includes('typescript.js'))
+    assert.ok(files.includes('lib.es2022.d.ts'))
+    assert.deepEqual(
+      files.filter((name) => name !== 'typescript.js' && !/^lib(?:\..+)?\.d\.ts$/.test(name)),
+      []
+    )
+    for (const name of ['tsc', 'tsserver'])
+      await assert.rejects(lstat(join(staging, 'node_modules/.bin', name)))
+    const ts = createRequire(import.meta.url)(compiler)
+    const source = join(staging, 'source.ts')
+    await writeFile(source, 'export const values = new Map<string, number>();\n')
+    const program = ts.createProgram([source], {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.CommonJS,
+      sourceMap: true,
+      noEmitOnError: true,
+      types: [],
+    })
+    assert.equal(program.getSemanticDiagnostics().length, 0)
+    const output = new Map()
+    assert.equal(
+      program.emit(undefined, (file, text) => output.set(basename(file), text)).emitSkipped,
+      false
+    )
+    assert.match(output.get('source.js'), /new Map/)
+    assert.equal(JSON.parse(output.get('source.js.map')).sources[0], 'source.ts')
+  } finally {
+    await rm(staging, { recursive: true, force: true })
+  }
+})
 for (const platform of ['mac', 'linux']) {
   test(`service bypass opt-in survives update reinstall and disable-enable: ${platform}`, async () => {
     const h = await home(),
@@ -2784,11 +2833,35 @@ test(
       'release must bundle service crash recovery'
     )
     const forbidden =
-      /\.(map|tsbuildinfo)$|\/(test\.[^/]+|[^/]+\.(test|spec|tst)[.-][^/]+)$|\/(test|tests|__tests__|spec|probes)\/|\/node_modules\/(typescript|vitest|vite|prettier)\/|\.\/packages\/[^/]+\/src\//
+      /\.(map|tsbuildinfo)$|\/(test\.[^/]+|[^/]+\.(test|spec|tst)[.-][^/]+)$|\/(test|tests|__tests__|spec|probes)\/|\/node_modules\/(vitest|vite|prettier)\/|\.\/packages\/[^/]+\/src\//
     assert.deepEqual(
       listing.stdout.split('\n').filter((entry) => forbidden.test(entry)),
       []
     )
+    // TypeScript is a pinned runtime compiler for content-identity proof. Its
+    // createProgram API resolves default libraries; CLI/server assets are not used.
+    const compilerFiles = listing.stdout
+      .split('\n')
+      .filter((entry) => entry.startsWith('./node_modules/typescript/') && !entry.endsWith('/'))
+    const compilerAllowed =
+      /^\.\/node_modules\/typescript\/(?:package\.json|LICENSE\.txt|ThirdPartyNoticeText\.txt|lib\/(?:typescript\.js|lib(?:\..+)?\.d\.ts))$/
+    assert.deepEqual(
+      compilerFiles.filter((entry) => !compilerAllowed.test(entry)),
+      []
+    )
+    for (const file of [
+      'package.json',
+      'LICENSE.txt',
+      'ThirdPartyNoticeText.txt',
+      'lib/typescript.js',
+      'lib/lib.es2022.d.ts',
+    ])
+      assert.ok(
+        compilerFiles.includes(`./node_modules/typescript/${file}`),
+        `missing compiler runtime: ${file}`
+      )
+    for (const name of ['tsc', 'tsserver'])
+      assert.ok(!listing.stdout.split('\n').includes(`./node_modules/.bin/${name}`))
     const bytes = await readFile(tarball)
     const realVersion = basename(process.env.ABELE_INSTALLER_TARBALL).match(
       /^abele-node-(\d+\.\d+\.\d+)-/

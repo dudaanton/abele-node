@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:
 import { spawnSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { WatchService } from '../packages/node-core/src/watch-service.js'
 
 // Missing hints, but real disk, Git, timers and publication.
 vi.mock('node:fs', async (original) => ({
@@ -56,6 +57,10 @@ it('bounds idle polling with 50k visible files, 50k ignored files and three leas
     for (let j = 0; j < 100; j++) writeFileSync(join(folder, `${j}.js`), 'ignored\n')
   }
   const core = (fixture.core = new NodeCore(join(dir, 'state')))
+  // This lost-hint benchmark deliberately uses the fake fs.watch above, not OS handles.
+  Object.defineProperty(core.resources, 'watchers', {
+    value: new WatchService({ platform: 'linux' }),
+  })
   Object.defineProperty(core.resources.git, 'executable', { value: gitPath })
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let op = 0

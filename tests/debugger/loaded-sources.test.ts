@@ -12,6 +12,26 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+it('proves external maps by loaded build bytes and identifies a replaced build', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'external-map-')))
+  dirs.push(root)
+  const script = join(root, 'app.js'),
+    path = join(root, 'app.ts')
+  writeFileSync(path, 'const n: number = 1')
+  writeFileSync(script, 'const n = 1')
+  writeFileSync(
+    script + '.map',
+    JSON.stringify({ sources: ['app.ts'], sourcesContent: ['const n: number = 1'] })
+  )
+  inspector([
+    { url: pathToFileURL(script).href, source: 'const n = 1', sourceMapURL: 'app.js.map' },
+  ])
+  expect((await loadedSourceDigests(9229, root)).get(path)).toBe(hash('const n: number = 1'))
+  writeFileSync(script, 'const n = 2')
+  const stale = await loadedSourceDigests(9229, root)
+  expect(stale.has(path)).toBe(false)
+  expect(stale.stale.has(path)).toBe(true)
+})
 function inspector(scripts: { url: string; source: string; sourceMapURL?: string }[]) {
   vi.stubGlobal(
     'fetch',

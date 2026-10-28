@@ -53,13 +53,14 @@ export class DebuggerStateError extends Error {
  * One synchronous node writer commits state + replay evidence atomically. */
 export class DebuggerService {
   private readonly handles = new Map<string, Handle>()
-  private readonly listeners = new Map<string, Set<() => void>>()
+  private readonly listeners = new Map<string, Set<(observation: DebuggerObservation) => void>>()
   /** Trusted observation seam. Register synchronously BEFORE replaying a cursor.
    * Listeners see committed rows only; no queue of values is retained. */
-  subscribe(session: string, listener: () => void) {
+  subscribe(session: string, listener: (observation: DebuggerObservation) => void) {
     this.requireEnabled()
     this.load(session)
-    const listeners = this.listeners.get(session) ?? new Set<() => void>()
+    const listeners =
+      this.listeners.get(session) ?? new Set<(observation: DebuggerObservation) => void>()
     this.listeners.set(session, listeners)
     listeners.add(listener)
     return () => {
@@ -271,7 +272,7 @@ export class DebuggerService {
       // Observation publication cannot roll back committed evidence or prevent
       // delivery to the other independent observers.
       try {
-        listener()
+        listener(observation)
       } catch {}
     }
     return state

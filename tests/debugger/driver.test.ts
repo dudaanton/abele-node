@@ -61,6 +61,21 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it('keeps a step stop when the adapter sends continued before completing the same request', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      const step = f.session.step(1, 'in')
+      const request = f.w.messages.at(-1)
+      stopped(f.w)
+      f.w.send({
+        type: 'event',
+        event: 'continued',
+        body: { threadId: 1, allThreadsContinued: true },
+      })
+      f.w.reply(request)
+      await step
+      expect(f.session.snapshot.execution).toBe('stopped')
+    }))
   it('certifies an exception stop inventory even after an in-flight command guard expires', async () =>
     fixture(async (f) => {
       await ready(f)
@@ -1106,15 +1121,22 @@ describe('internal DAP session driver', () => {
             body: { breakpoint: { id: 9, verified: false, message: 'not loaded' } },
           })
         release()
+        if (mode === 'changed' || mode === 'no_map') {
+          await vi.waitFor(() =>
+            expect(f.w.messages.at(-1)).toMatchObject({
+              command: 'setBreakpoints',
+              arguments: { breakpoints: [] },
+            })
+          )
+          f.w.reply(f.w.messages.at(-1), { breakpoints: [] })
+        }
         await vi.waitFor(() =>
           expect(f.session.snapshot.breakpoints[0]?.status).toBe(
             mode === 'matched' ? 'verified' : mode === 'superseded' ? 'pending' : 'rejected'
           )
         )
         await vi.waitFor(() =>
-          expect(f.session.snapshot.threads[0]?.stop?.hit_breakpoint_ids).toEqual(
-            mode === 'matched' ? ['late'] : []
-          )
+          expect(f.session.snapshot.threads[0]?.stop?.hit_breakpoint_ids).toEqual(['late'])
         )
       })
   )

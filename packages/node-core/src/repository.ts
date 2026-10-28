@@ -13,8 +13,6 @@ import {
   readlinkSync,
   readdirSync,
   readSync,
-  watch,
-  type FSWatcher,
 } from 'node:fs'
 import { join, basename } from 'node:path'
 import { Worker } from 'node:worker_threads'
@@ -36,6 +34,7 @@ import type { ResourceServices } from './resources.js'
 import { canonical } from './index.js'
 import { RepositoryObjectCache } from './object-cache.js'
 import { WorktreeMonitor, pathMetadata, sourceMetadata } from './worktree-monitor.js'
+import type { WatchHandle } from './watch-service.js'
 import { debuglog } from 'node:util'
 import { ChangeStreams, baselineOf } from './repository-changes.js'
 import { decodeGit, parseWorktrees as parseGitWorktrees, type GitCommand } from './git.js'
@@ -203,7 +202,7 @@ interface Subscription {
   /** What a reader sees: announced only when this moves, never on a hint alone. */
   visible: string
   expires: number
-  watchers: FSWatcher[]
+  watchers: WatchHandle[]
   timer?: NodeJS.Timeout
   pending?: NodeJS.Timeout
   checking: boolean
@@ -1785,7 +1784,8 @@ export class RepositoryService {
         monitor = new WorktreeMonitor(
           target.path,
           gitdir,
-          this.r.projects.get(target.project_id).git_common_dir!
+          this.r.projects.get(target.project_id).git_common_dir!,
+          this.r.watchers.watch
         )
         this.monitors.set(target.worktree_id, monitor)
       }
@@ -3327,7 +3327,9 @@ export class RepositoryService {
             [...this.subscriptions.values()].find(
               (other) => other.changes && other.target.worktree_id === target.worktree_id
             )
-          const w = watch(path, () => (changes ? leader()?.schedule?.() : schedule()))
+          const w = this.r.watchers.watch(path, false, () =>
+            changes ? leader()?.schedule?.() : schedule()
+          )
           w.on('error', () => {
             if (changes) leader()?.run?.('overflow')
             else run('overflow')

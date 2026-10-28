@@ -61,16 +61,76 @@ async function fixture(frame: () => Record<string, unknown>) {
     recorder,
     until,
     breakpoint,
-    close() {
+    async close() {
       fake.stop()
-      recorder.close()
+      const drained = recorder.close()
       w.dap.close()
+      await drained
       core.close()
     },
   }
 }
 
 describe('a run recorded over a debugger session', () => {
+  it('continues a provisional record point without reading unconfirmed code', async () => {
+    const f = await fixture(() => ({ secret: 1 }))
+    try {
+      f.session.provisionalSource = () => true
+      f.session.verifyBreakpointSource = async () => {
+        throw new Error('debugger_source_pending')
+      }
+      const dapId = await f.breakpoint('provisional', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'provisional', take: ['secret'] }], [])
+      f.recorder.attach(f.session)
+      f.fake.hit([dapId])
+      await f.until(() => f.fake.running)
+      expect(
+        f.w.messages.some(
+          (m) => m.command === 'setBreakpoints' && m.arguments.breakpoints.length === 0
+        )
+      ).toBe(true)
+      const run = f.store.list()[0]!
+      await f.until(() => f.store.read(run.id).steps.length === 1)
+      expect(f.store.read(run.id).steps[0]).toMatchObject({
+        label: 'Record point not confirmed, skipped',
+      })
+      expect(f.w.messages.some((m) => m.command === 'evaluate' && 'frameId' in m.arguments)).toBe(
+        false
+      )
+      f.session.verifyBreakpointSource = async () => {
+        f.session.provisionalSource = () => false
+      }
+      await f.until(() => f.session.snapshot.breakpoints[0]?.status === 'verified')
+      expect(
+        f.w.messages.filter((m) => m.command === 'setBreakpoints').at(-1).arguments.breakpoints
+      ).toHaveLength(1)
+    } finally {
+      await f.close()
+    }
+  })
+  it('retries a record stop when the breakpoint revision changes during capture', async () => {
+    const f = await fixture(() => ({ value: 1 }))
+    try {
+      const dapId = await f.breakpoint('point', 4)
+      f.points.set(f.session.id, [{ breakpoint_id: 'point', take: ['value'] }], [])
+      f.recorder.attach(f.session)
+      const original = f.session.recordStop.bind(f.session)
+      vi.spyOn(f.session, 'recordStop').mockImplementationOnce(async (...args) => {
+        f.core.debugger.patchBreakpoints(
+          f.session.id,
+          f.session.snapshot.breakpoint_revision,
+          [{ breakpoint_id: 'point', source_id: 'source', line: 4 }],
+          []
+        )
+        return original(...args)
+      })
+      f.fake.hit([dapId])
+      await f.until(() => f.fake.running)
+      expect(f.w.messages.some((m) => m.command === 'continue')).toBe(true)
+    } finally {
+      await f.close()
+    }
+  })
   it('keeps concurrent identical requests distinct by exact exchange identity', async () => {
     const traffic: any[] = []
     const f = await fixture(() => ({
@@ -105,8 +165,8 @@ describe('a run recorded over a debugger session', () => {
           response_body: id,
         })
       await f.recorder.flushHttp(f.session.id)
-      const firstStep = first.close({ label: 'POST /events', values: [] })
-      const secondStep = second.close({ label: 'POST /events', values: [] })
+      const firstStep = await first.close({ label: 'POST /events', values: [] })
+      const secondStep = await second.close({ label: 'POST /events', values: [] })
       expect(firstStep).not.toBe(secondStep)
       const rows = f.store.read(first.runId).steps
       expect(rows).toHaveLength(2)
@@ -119,7 +179,7 @@ describe('a run recorded over a debugger session', () => {
         sent: true,
       })
     } finally {
-      f.close()
+      await f.close()
     }
   })
   it('starts no HTTP-only recording for rejected points and starts when a point binds', async () => {
@@ -153,6 +213,7 @@ describe('a run recorded over a debugger session', () => {
       result(false)
       expect(f.session.snapshot.breakpoints[0]!.status).toBe('pending')
       expect(f.recorder.recording(f.session.id)?.run_id).toBe(run)
+      expect(f.recorder.chain(f.session.id)?.runId).toBe(run)
       result(false, 'debugger_source_no_map')
       expect(f.session.snapshot.breakpoints[0]!.status).toBe('rejected')
       expect(f.recorder.recording(f.session.id)).toBeUndefined()
@@ -171,7 +232,7 @@ describe('a run recorded over a debugger session', () => {
       )
       expect(f.recorder.recording(f.session.id)).toBeUndefined()
     } finally {
-      f.close()
+      await f.close()
     }
   })
   it('keeps one sent row only when the captured request has this send exact correlation id', async () => {
@@ -205,7 +266,7 @@ describe('a run recorded over a debugger session', () => {
         response_body: 'ok',
       })
       await f.recorder.flushHttp(f.session.id)
-      const step = chain.close({ label: 'POST /events', status: 201, values: [] })
+      const step = await chain.close({ label: 'POST /events', status: 201, values: [] })
       const rows = f.store.read(chain.runId).steps
       expect(rows).toHaveLength(1)
       expect(rows[0]).toMatchObject({
@@ -215,10 +276,10 @@ describe('a run recorded over a debugger session', () => {
         direction: 'incoming',
       })
     } finally {
-      f.close()
+      await f.close()
     }
   })
-  it('fences automatic continuation again after publishing its execution intent', async () => {
+  it('continues an owned record stop when its point is removed during execution intent', async () => {
     const f = await fixture(() => ({}))
     try {
       const id = await f.breakpoint('record', 4)
@@ -234,14 +295,15 @@ describe('a run recorded over a debugger session', () => {
       try {
         f.fake.hit([id])
         await f.recorder.settled(f.session.id)
+        await f.until(() => f.fake.running)
         expect(changed).toBe(true)
-        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
-        expect(f.fake.running).toBe(false)
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(1)
+        expect(f.fake.running).toBe(true)
       } finally {
         off()
       }
     } finally {
-      f.close()
+      await f.close()
     }
   })
   it.each(['breakpoint', 'record-point'])(
@@ -270,14 +332,15 @@ describe('a run recorded over a debugger session', () => {
         })
         f.fake.hit([id])
         await f.recorder.settled(f.session.id)
+        await f.until(() => f.fake.running)
         expect(changed).toBe(true)
         expect(
           f.w.messages.filter((m) => m.command === 'evaluate' && 'frameId' in m.arguments)
         ).toHaveLength(1)
-        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(1)
       } finally {
         vi.restoreAllMocks()
-        f.close()
+        await f.close()
       }
     }
   )
@@ -292,7 +355,7 @@ describe('a run recorded over a debugger session', () => {
       expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
       expect(f.session.snapshot.threads[0]!.stop!.hit_breakpoint_ids).toEqual([])
     } finally {
-      f.close()
+      await f.close()
     }
   })
   it('updates active run points without losing earlier steps, with either configuration order', async () => {
@@ -320,7 +383,7 @@ describe('a run recorded over a debugger session', () => {
       expect(f.store.read(run).run.points[1]).toMatchObject({ take: ['1 as n'], note: 'updated' })
       expect(f.recorder.recording(f.session.id)!.run_id).toBe(run)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -357,13 +420,13 @@ describe('a run recorded over a debugger session', () => {
         expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(2)
       } finally {
         vi.restoreAllMocks()
-        f.close()
+        await f.close()
       }
     }
   )
 
   it.each(['breakpoint', 'record-point', 'new-stop'])(
-    'does not resume a capture overtaken by a %s mutation',
+    'preserves capture safety when overtaken by a %s mutation',
     async (mutation) => {
       const f = await fixture(() => ({ value: 1 }))
       try {
@@ -390,14 +453,17 @@ describe('a run recorded over a debugger session', () => {
         f.fake.hit([dapId])
         await f.until(() => changed)
         await f.recorder.settled(f.session.id)
+        if (mutation !== 'new-stop') await f.until(() => f.fake.running)
         expect(
           f.w.messages.filter((m) => m.command === 'evaluate' && 'frameId' in m.arguments)
         ).toHaveLength(0)
-        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
-        expect(f.session.snapshot.execution).toBe('stopped')
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(
+          mutation === 'new-stop' ? 0 : 1
+        )
+        expect(f.session.snapshot.execution).toBe(mutation === 'new-stop' ? 'stopped' : 'running')
       } finally {
         vi.restoreAllMocks()
-        f.close()
+        await f.close()
       }
     }
   )
@@ -411,21 +477,21 @@ describe('a run recorded over a debugger session', () => {
         method: 'GET',
         url: 'http://localhost:4399/events',
       })!
-      expect(chain.close({ label: 'GET /events', status: 404, values: [] })).toBeUndefined()
+      expect(await chain.close({ label: 'GET /events', status: 404, values: [] })).toBeUndefined()
       expect(f.store.read(chain.runId).steps).toEqual([])
       const invalid = f.recorder.chain(f.session.id, { method: 'GET', url: 'invalid address' })!
-      expect(invalid.close({ label: 'Invalid address', values: [] })).toBeUndefined()
+      expect(await invalid.close({ label: 'Invalid address', values: [] })).toBeUndefined()
       const unrelated = f.recorder.chain(f.session.id, {
         method: 'GET',
         url: 'http://localhost:4399/events',
       })!
       f.fake.hit([f.fake.lastBreakpointId()])
       await f.until(() => f.store.read(chain.runId).steps.length === 1)
-      expect(unrelated.close({ label: 'GET /events', values: [] })).toBeUndefined()
+      expect(await unrelated.close({ label: 'GET /events', values: [] })).toBeUndefined()
       expect(unrelated.steps).toBe(0)
       expect(f.store.read(chain.runId).steps.map((s) => s.kind)).toEqual(['probe'])
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -458,7 +524,7 @@ describe('a run recorded over a debugger session', () => {
       const resume = f.session.continue.bind(f.session)
       f.session.continue = async (...args) => {
         const result = await resume(...args)
-        chain.close({ label: 'POST /carts', values: [] })
+        await chain.close({ label: 'POST /carts', values: [] })
         return result
       }
       f.fake.hit([dapId])
@@ -469,7 +535,7 @@ describe('a run recorded over a debugger session', () => {
       })
       expect(chain.steps).toBe(1)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -510,7 +576,7 @@ describe('a run recorded over a debugger session', () => {
         steps: [expect.objectContaining({ kind: 'http' })],
       })
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -563,7 +629,7 @@ describe('a run recorded over a debugger session', () => {
         f.w.messages.some((m) => m.command === 'evaluate' && !('frameId' in m.arguments))
       ).toBe(true)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -586,7 +652,7 @@ describe('a run recorded over a debugger session', () => {
       await f.until(() => f.store.read(run).run.state === 'done')
       expect(f.store.read(run).steps).toHaveLength(1)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -599,7 +665,7 @@ describe('a run recorded over a debugger session', () => {
       await new Promise((r) => setTimeout(r, 10))
       expect(f.store.list()).toEqual([])
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -633,7 +699,7 @@ describe('a run recorded over a debugger session', () => {
       expect(JSON.parse(f.store.text(run.run_id, step.values[1]!))).toEqual({ items: [1, 2, 3] })
       expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(1)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -657,7 +723,7 @@ describe('a run recorded over a debugger session', () => {
       ).toEqual([])
       expect(asked.filter((c) => c === 'continue')).toHaveLength(1)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -676,7 +742,7 @@ describe('a run recorded over a debugger session', () => {
       expect(f.session.snapshot.execution).toBe('stopped')
       expect(f.store.read(f.recorder.recording(f.session.id)!.run_id).steps).toHaveLength(0)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -697,7 +763,7 @@ describe('a run recorded over a debugger session', () => {
       })
       await f.until(() => f.fake.running)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -721,7 +787,7 @@ describe('a run recorded over a debugger session', () => {
       expect(steps[0]!.values[0]).toMatchObject({ name: 'requestId', inline: 'req-1' })
       expect(steps[1]).toMatchObject({ kind: 'error', label: 'SampleError: no rows' })
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -742,7 +808,7 @@ describe('a run recorded over a debugger session', () => {
       expect(f.store.read(run).run.state).toBe('cut')
       expect(f.recorder.recording(f.session.id)).toBeUndefined()
     } finally {
-      f.close()
+      await f.close()
     }
   })
 
@@ -757,7 +823,7 @@ describe('a run recorded over a debugger session', () => {
       expect(f.recorder.recording(f.session.id)).toBeDefined()
       expect(f.store.list()).toHaveLength(1)
     } finally {
-      f.close()
+      await f.close()
     }
   })
 })

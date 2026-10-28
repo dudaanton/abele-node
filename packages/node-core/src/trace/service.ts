@@ -62,6 +62,35 @@ const fail = (error: unknown): never => {
 }
 
 export class TraceService {
+  /** Worker-only read facade; no NodeCore, debugger, recorder or credentials. */
+  static readOperation(store: TraceStore, method: string, p: Record<string, any>): unknown {
+    const service = Object.create(TraceService.prototype) as TraceService
+    Object.assign(service, {
+      store: () => store,
+      shapes: new Lru<TraceShapeNode>(64),
+      leaves: new Lru<TraceLeaf[]>(16),
+    })
+    if (method === 'list') return store.list().map(summary)
+    if (method === 'value') return service.value(p)
+    if (method === 'find') return { hits: service.find('', p.run_id, p) }
+    if (method === 'follow') return service.follow('', p.run_id, p.value, p.loose)
+    if (method === 'mark') {
+      const step = store.read(p.run_id).steps.find((s) => s.id === p.step)
+      if (!step) throw new ChannelError('trace_step_not_found')
+      if (p.name && !step.values.some((v) => v.name === p.name))
+        throw new ChannelError('trace_value_not_found')
+      return {
+        mark: store.mark(p.run_id, {
+          step: p.step,
+          comment: p.comment,
+          ...(p.name ? { name: p.name } : {}),
+          ...(p.path ? { path: p.path } : {}),
+          ...(p.tags ? { tags: p.tags } : {}),
+        }),
+      }
+    }
+    throw new Error('trace_invalid_operation')
+  }
   readonly points: TracePoints
   readonly recorder: TraceRecorder
   private readonly stores = new Map<string, TraceStore>()
@@ -92,6 +121,7 @@ export class TraceService {
   }
   close() {
     this.recorder.close()
+    for (const store of this.stores.values()) void store.close()
   }
 
   private root(project: string): string {
@@ -124,6 +154,7 @@ export class TraceService {
     mkdirSync(join(this.core.stateDir, 'trace'), { recursive: true, mode: 0o700 })
     writeFileSync(`${this.settingsFile}.tmp`, JSON.stringify(all, null, 2), { mode: 0o600 })
     renameSync(`${this.settingsFile}.tmp`, this.settingsFile)
+    void this.stores.get(project)?.close()
     this.stores.delete(project)
     return this.folder(project)
   }
@@ -131,6 +162,7 @@ export class TraceService {
     const { folder } = this.folder(project)
     const cached = this.stores.get(project)
     if (cached?.root === folder) return cached
+    void cached?.close()
     const store = new TraceStore(folder)
     // Runs in a project folder never show up as files to commit: the folder ignores itself.
     try {
@@ -155,7 +187,8 @@ export class TraceService {
     const parsed = TraceMethodSchemas[method as TraceMethod].safeParse(raw)
     if (!parsed.success) throw new ChannelError('invalid_params')
     try {
-      return this.handle(method as TraceMethod, parsed.data as Record<string, any>)
+      const result = this.handle(method as TraceMethod, parsed.data as Record<string, any>)
+      return result instanceof Promise ? result.catch(fail) : result
     } catch (error) {
       return fail(error)
     }
@@ -181,17 +214,36 @@ export class TraceService {
       case 'trace.v1.folder.set':
         return this.setFolder(p.project_id, p.folder)
       case 'trace.v1.runs':
+        if (this.store(p.project_id).hasLargeTimeline())
+          return this.store(p.project_id)
+            .readOperation('list', {})
+            .then((runs) => ({ runs, ...this.folder(p.project_id) }))
         return { runs: this.store(p.project_id).list().map(summary), ...this.folder(p.project_id) }
       case 'trace.v1.run':
         return this.run(p.project_id, p.run_id, p.from ?? 0, p.limit ?? 5000, p.kind, p.through)
       case 'trace.v1.value':
+        if (
+          this.store(p.project_id).large(p.run_id) ||
+          this.store(p.project_id)
+            .read(p.run_id)
+            .steps.some(
+              (step) => step.id === p.step && step.values.some((value) => value.bytes > 65536)
+            )
+        )
+          return this.store(p.project_id).readOperation('value', p)
         return this.value(p)
       case 'trace.v1.find':
         if (p.value === undefined && p.key === undefined) throw new ChannelError('invalid_params')
+        if (this.store(p.project_id).large(p.run_id))
+          return this.store(p.project_id).readOperation('find', p)
         return { hits: this.find(p.project_id, p.run_id, p) }
       case 'trace.v1.follow':
+        if (this.store(p.project_id).large(p.run_id))
+          return this.store(p.project_id).readOperation('follow', p)
         return this.follow(p.project_id, p.run_id, p.value, p.loose)
       case 'trace.v1.mark': {
+        if (this.store(p.project_id).large(p.run_id))
+          return this.store(p.project_id).readOperation('mark', p)
         const { steps } = this.store(p.project_id).read(p.run_id)
         const step = steps.find((s) => s.id === p.step)
         if (!step) throw new ChannelError('trace_step_not_found')
@@ -224,78 +276,11 @@ export class TraceService {
     limit: number,
     kinds?: string[],
     through?: number
-  ): TraceRunResult {
+  ): TraceRunResult | Promise<TraceRunResult> {
     const store = this.store(project)
-    const { run, steps: written } = store.read(id)
-    if (through !== undefined && through > written.length)
-      throw new ChannelError('trace_prefix_unavailable')
-    const prefix = through === undefined ? written : written.slice(0, through)
-    // Freeze the written prefix before chronological sorting. Later completed
-    // exchanges may have earlier timestamps and must not shift existing pages.
-    if (through !== undefined) run.steps = prefix.length
-    // A sent request is written when its answer is in, at the time it went: in time it heads the
-    // steps it caused. The sort is stable, so everything else keeps the order it was written in.
-    const steps = [...prefix].sort((a, b) => a.at - b.at)
-    const requests = steps.filter(
-      (s) => s.kind === 'http' && s.direction && s.duration_ms !== undefined
-    )
-    const parents = new Set(steps.filter((s) => s.kind === 'http').map((s) => s.chain))
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i]!
-      if (step.kind !== 'probe' || (step.chain && parents.has(step.chain))) continue
-      const request = requests
-        .filter((r) => r.at <= step.at && r.at + r.duration_ms! >= step.at)
-        .sort((a, b) =>
-          a.direction === b.direction ? b.at - a.at : a.direction === 'incoming' ? -1 : 1
-        )[0]
-      if (request?.chain) steps[i] = { ...step, chain: request.chain, by_time: true }
-      else if (step.chain) {
-        const { chain: _chain, by_time: _byTime, ...unlinked } = step
-        steps[i] = unlinked
-      }
-    }
-    const marks = store.marks(id)
-    const marked = new Set(marks.map((m) => m.step))
-    const lastBy = new Map<string, string>()
-    const hits = new Map<string, number>()
-    const last = new Map<string, string>()
-    const all: TraceStep[] = steps.map((s) => {
-      if (s.point) {
-        hits.set(s.point, (hits.get(s.point) ?? 0) + 1)
-        last.set(
-          s.point,
-          s.values
-            .map((v) => (v.failed ? `${v.name} ✕` : `${v.name} ${v.brief ?? ''}`.trim()))
-            .join(' · ')
-        )
-      }
-      return {
-        ...stepOut(s, lastBy),
-        ...(marked.has(s.id) ? { marked: true } : {}),
-      }
-    })
-    const shown = kinds?.length ? all.filter((s) => kinds.includes(s.kind)) : all
-    const out: TraceStep[] = []
-    let bytes = 0
-    let i = from
-    for (; i < shown.length && out.length < limit; i++) {
-      const size = Buffer.byteLength(JSON.stringify(shown[i]))
-      if (bytes + size > PAGE_BYTES && out.length) break
-      out.push(shown[i]!)
-      bytes += size
-    }
-    return {
-      run: summary(run),
-      points: run.points.map((p) => ({
-        ...p,
-        hits: hits.get(p.breakpoint_id) ?? 0,
-        ...(last.has(p.breakpoint_id) ? { last: last.get(p.breakpoint_id)! } : {}),
-      })),
-      steps: out,
-      ...(i < shown.length ? { next: i } : {}),
-      marks,
-      folder: store.root,
-    }
+    return store.large(id)
+      ? store.page(id, from, limit, kinds, through)
+      : traceRunPage(store, id, from, limit, kinds, through)
   }
 
   private stored(project: string, run: string, step: string, name: string) {
@@ -472,5 +457,85 @@ function stepOut(s: TraceStoredStep, lastBy: Map<string, string>): TraceStep {
     ...(s.by_time ? { by_time: true } : {}),
     ...(s.sent ? { sent: true } : {}),
     values,
+  }
+}
+
+export function traceRunPage(
+  store: TraceStore,
+  id: string,
+  from: number,
+  limit: number,
+  kinds?: string[],
+  through?: number
+): TraceRunResult {
+  const { run, steps: written } = store.read(id)
+  if (through !== undefined && through > written.length)
+    throw new ChannelError('trace_prefix_unavailable')
+  const prefix = through === undefined ? written : written.slice(0, through)
+  // Freeze the written prefix before chronological sorting. Later completed
+  // exchanges may have earlier timestamps and must not shift existing pages.
+  if (through !== undefined) run.steps = prefix.length
+  // A sent request is written when its answer is in, at the time it went: in time it heads the
+  // steps it caused. The sort is stable, so everything else keeps the order it was written in.
+  const steps = [...prefix].sort((a, b) => a.at - b.at)
+  const requests = steps.filter(
+    (s) => s.kind === 'http' && s.direction && s.duration_ms !== undefined
+  )
+  const parents = new Set(steps.filter((s) => s.kind === 'http').map((s) => s.chain))
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]!
+    if (step.kind !== 'probe' || (step.chain && parents.has(step.chain))) continue
+    const request = requests
+      .filter((r) => r.at <= step.at && r.at + r.duration_ms! >= step.at)
+      .sort((a, b) =>
+        a.direction === b.direction ? b.at - a.at : a.direction === 'incoming' ? -1 : 1
+      )[0]
+    if (request?.chain) steps[i] = { ...step, chain: request.chain, by_time: true }
+    else if (step.chain) {
+      const { chain: _chain, by_time: _byTime, ...unlinked } = step
+      steps[i] = unlinked
+    }
+  }
+  const marks = store.marks(id)
+  const marked = new Set(marks.map((m) => m.step))
+  const lastBy = new Map<string, string>()
+  const hits = new Map<string, number>()
+  const last = new Map<string, string>()
+  const all: TraceStep[] = steps.map((s) => {
+    if (s.point) {
+      hits.set(s.point, (hits.get(s.point) ?? 0) + 1)
+      last.set(
+        s.point,
+        s.values
+          .map((v) => (v.failed ? `${v.name} ✕` : `${v.name} ${v.brief ?? ''}`.trim()))
+          .join(' · ')
+      )
+    }
+    return {
+      ...stepOut(s, lastBy),
+      ...(marked.has(s.id) ? { marked: true } : {}),
+    }
+  })
+  const shown = kinds?.length ? all.filter((s) => kinds.includes(s.kind)) : all
+  const out: TraceStep[] = []
+  let bytes = 0
+  let i = from
+  for (; i < shown.length && out.length < limit; i++) {
+    const size = Buffer.byteLength(JSON.stringify(shown[i]))
+    if (bytes + size > PAGE_BYTES && out.length) break
+    out.push(shown[i]!)
+    bytes += size
+  }
+  return {
+    run: summary(run),
+    points: run.points.map((p) => ({
+      ...p,
+      hits: hits.get(p.breakpoint_id) ?? 0,
+      ...(last.has(p.breakpoint_id) ? { last: last.get(p.breakpoint_id)! } : {}),
+    })),
+    steps: out,
+    ...(i < shown.length ? { next: i } : {}),
+    marks,
+    folder: store.root,
   }
 }

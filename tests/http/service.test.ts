@@ -103,6 +103,56 @@ const doc = (over: Record<string, unknown> = {}) => ({
 })
 
 describe('saved requests on the node', () => {
+  it('keeps a file environment display label in send history while saved names stay strict', async () => {
+    const s = await setup()
+    const label = 'http-client.env.json · local'
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('ok', { status: 200 }))
+    try {
+      const p = { project_id: s.project_id }
+      for (const name of [label, '../escape', 'reserved.local']) {
+        for (const method of ['http.v1.env.get', 'http.v1.env.delete'])
+          expect(() => s.request(method, { ...p, name })).toThrow('invalid_params')
+        expect(() =>
+          s.request('http.v1.env.save', {
+            ...p,
+            environment: { name, vars: [] },
+          })
+        ).toThrow('invalid_params')
+      }
+      for (const environment of ['', 'x'.repeat(513)])
+        expect(() =>
+          s.request('http.v1.send', {
+            ...p,
+            environment,
+            method: 'GET',
+            url: 'https://example.invalid/',
+            headers: [],
+            secrets: [],
+          })
+        ).toThrow('invalid_params')
+      const { send_id } = s.request('http.v1.send', {
+        ...p,
+        request_id: 'Project.http',
+        environment: label,
+        method: 'GET',
+        url: 'https://example.invalid/',
+        headers: [],
+        secrets: [],
+      })
+      await s.core.http.settled()
+      expect(s.request('http.v1.send.status', { ...p, send_id }).outcome.state).toBe('answered')
+      expect(s.request('http.v1.history', { ...p, id: 'Project.http' }).sends).toEqual([
+        expect.objectContaining({ id: send_id, environment: label }),
+      ])
+      ;(s.core.http as any).sends.clear()
+      expect(s.request('http.v1.send.status', { ...p, send_id }).send.environment).toBe(label)
+    } finally {
+      fetch.mockRestore()
+      s.core.close()
+    }
+  })
   it('reads transport status promptly while stopped and recording completion is blocked', async () => {
     const s = await setup(true)
     let arrived = 0

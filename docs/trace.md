@@ -5,6 +5,12 @@ stops on record points only, the node takes each value whole, writes a step to t
 the program go on. A stop on any ordinary breakpoint stays a stop. There is no separate record
 switch: a debugger session records a run whenever it has a record point.
 
+Large timelines are indexed incrementally in an isolated reader thread. Page, value,
+find and follow requests over those timelines do not parse the complete recording on
+the node's main event loop. Recording uses asynchronous blob compression and writes;
+closing a run drains accepted values and steps before writing its final metadata.
+The on-disk run, JSONL and blob formats remain version 1.
+
 Changing record-point configuration updates the active run's `run.json` points in
 place, retaining its identity and earlier steps. Newly installed breakpoint ids
 are correlated before their hits are published; unchanged source sets retain

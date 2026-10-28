@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { realpath } from 'node:fs/promises'
+import { realpath, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { inspectorProbeToken } from '../trace/program-http.js'
@@ -7,11 +7,13 @@ import { inspectorProbeToken } from '../trace/program-http.js'
 export type LoadedSourceEvidence = Map<string, string> & {
   scripts: Set<string>
   mapped: Set<string>
+  stale: Set<string>
 }
 export const emptySourceEvidence = (): LoadedSourceEvidence =>
   Object.assign(new Map<string, string>(), {
     scripts: new Set<string>(),
     mapped: new Set<string>(),
+    stale: new Set<string>(),
   })
 
 /** Read-only evidence from V8, before the adapter attaches. No evaluation, pause,
@@ -143,6 +145,44 @@ async function runtimeDigests(
   const local = new Map<string, string>()
   // A TS URL names the original, but getScriptSource returns its generated JS.
   if (/\.[cm]?js$/.test(canonical)) local.set(canonical, hash(source))
+  // An external map belongs to the disk build. It proves running source only
+  // when that generated file is byte-identical to V8's loaded script.
+  try {
+    const url = mapURL || [...source.matchAll(/\/\/[#@]\s*sourceMappingURL=(\S+)/g)].at(-1)?.[1]
+    if (url && !url.startsWith('data:') && /\.[cm]?js$/.test(canonical)) {
+      const address = new URL(url, pathToFileURL(canonical))
+      if (address.protocol === 'file:') {
+        const mapPath = await realpath(fileURLToPath(address))
+        const rel = relative(root, mapPath)
+        if (
+          rel &&
+          rel !== '..' &&
+          !rel.startsWith('..' + sep) &&
+          !isAbsolute(rel) &&
+          (await stat(mapPath)).size <= 8 * 1024 * 1024
+        ) {
+          const text = await readFile(mapPath, 'utf8')
+          const mapped = await inlineSourceDigests(
+            root,
+            mapPath,
+            '',
+            'data:application/json;base64,' + Buffer.from(text).toString('base64')
+          )
+          const matches =
+            (await stat(canonical)).size <= 8 * 1024 * 1024 &&
+            hash(await readFile(canonical, 'utf8')) === hash(source)
+          for (const [path, digest] of mapped) {
+            if (matches) {
+              local.set(path, digest)
+              digests.mapped.add(path)
+            } else digests.stale.add(path)
+          }
+        }
+      }
+    }
+  } catch {
+    // Missing or untrusted external metadata proves nothing.
+  }
   for (const [path, digest] of await inlineSourceDigests(root, script, source, mapURL)) {
     digests.mapped.add(path)
     local.set(path, digest)

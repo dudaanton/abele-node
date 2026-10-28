@@ -20,6 +20,7 @@
     "@abele/provider-codex": "0.0.0",
     "@abele/provider-contract": "0.0.0",
     "@abele/provider-pi": "0.0.0",
-    "zod": "4.6.6"
+    "zod": "4.6.6",
+    "typescript": "5.9.3"
   }
 }
