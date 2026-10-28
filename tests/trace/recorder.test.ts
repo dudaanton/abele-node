@@ -72,6 +72,52 @@ async function fixture(frame: () => Record<string, unknown>) {
 }
 
 describe('a run recorded over a debugger session', () => {
+  it('resumes a record point reached before the user Continue reply', async () => {
+    const f = await fixture(() => ({ value: 42 }))
+    try {
+      await f.breakpoint('user', 3)
+      const record = await f.breakpoint('record', 4)
+      const user = record - 1 // The second setBreakpoints replaces both adapter ids.
+      f.points.set(f.session.id, [{ breakpoint_id: 'record', take: ['value'] }], [])
+      f.recorder.attach(f.session)
+      await f.recorder.settled(f.session.id)
+      const run = f.recorder.recording(f.session.id)!.run_id
+      f.fake.hit([user])
+      expect(f.session.snapshot.threads[0]!.stop!.hit_breakpoint_ids).toEqual(['user'])
+      const reply = f.w.reply
+      let first = true
+      vi.spyOn(f.w, 'reply').mockImplementation((request, body = {}, success = true) => {
+        if (request.command === 'continue' && first) {
+          first = false
+          f.fake.hit([record])
+          setTimeout(() => reply(request, body, success), 30)
+          return true
+        }
+        return reply(request, body, success)
+      })
+      let revision = f.session.snapshot.state_revision
+      const guard = Object.assign(
+        () => {
+          if (f.session.snapshot.state_revision !== revision) throw new Error('stale_state')
+        },
+        {
+          advanceIntent() {
+            revision = f.session.snapshot.state_revision
+          },
+        }
+      )
+      await f.session.coordinated(guard, () => f.session.continue(1))
+      await f.until(() => f.store.read(run).steps.length === 1)
+      await f.recorder.settled(f.session.id)
+      expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(2)
+      expect(f.session.snapshot.execution).toBe('running')
+      expect(f.fake.running).toBe(true)
+      expect(f.store.read(run).steps[0]!.values).toMatchObject([{ name: 'value', inline: '42' }])
+    } finally {
+      vi.restoreAllMocks()
+      await f.close()
+    }
+  })
   it('continues a provisional record point without reading unconfirmed code', async () => {
     const f = await fixture(() => ({ secret: 1 }))
     try {

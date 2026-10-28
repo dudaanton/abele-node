@@ -23,6 +23,11 @@ const SERIALIZE = `function (v) {
     stack.push(x);
     try {
       var tag = Object.prototype.toString.call(x);
+      if (tag === '[object Response]') {
+        var headers = {};
+        x.headers.forEach(function (value, key) { headers[key] = value; });
+        return { '@class': 'Response', status: x.status, statusText: x.statusText, url: x.url, headers: headers };
+      }
       if (tag === '[object Date]') return isNaN(x.getTime()) ? 'Invalid Date' : x.toISOString();
       if (typeof Buffer !== 'undefined' && Buffer.isBuffer(x))
         return { '[Buffer]': x.length, base64: x.length <= 65536 ? x.toString('base64') : undefined };

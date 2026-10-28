@@ -11,6 +11,27 @@ import { target } from '../debugger/helpers.js'
 import { adapter } from './adapter.js'
 
 const dirs: string[] = []
+it('places a late-written request before its probe when timestamps share a millisecond', async () => {
+  const s = await setup(() => ({}))
+  try {
+    const store = s.core.trace.store(s.project_id)
+    const writer = store.create({ session: 'session', points: [], started: new Date() })
+    writer.append({ kind: 'probe', at: 10, label: 'handler', chain: 'request', values: [] })
+    writer.append({
+      kind: 'http',
+      at: 10,
+      label: 'request',
+      chain: 'request',
+      sent: true,
+      values: [],
+    })
+    const run = s.request('trace.v1.run', { project_id: s.project_id, run_id: writer.id })
+    expect(run.steps.map((step: any) => step.label)).toEqual(['request', 'handler'])
+    writer.close('done', 10)
+  } finally {
+    s.core.close()
+  }
+})
 it('pages a fixed written prefix while older-timestamped traffic is appended', async () => {
   const s = await setup(() => ({}))
   try {

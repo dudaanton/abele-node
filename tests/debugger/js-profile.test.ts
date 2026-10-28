@@ -61,6 +61,8 @@ it.each([undefined, true, false])(
     const profile = new JsDebugProfile(core.debugger, { stateDirectory: dir, enabled: true })
     vi.spyOn(processes.OwnedDebugProcess, 'spawn').mockResolvedValue({
       on: () => {},
+      once: () => {},
+      off: () => {},
       waitForText: async () => ['ws://127.0.0.1:9229/test', '9229'],
       evidence: {},
       terminate: vi.fn(),

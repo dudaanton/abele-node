@@ -27,6 +27,44 @@ function fixture(trace?: unknown) {
     service.request(actor, method, { project_id: 'project', ...params }) as any
   return { service, request, check }
 }
+it('keeps a late answer after the caller deadline without resending', async () => {
+  vi.useFakeTimers()
+  let answer!: (response: Response) => void
+  let signal!: AbortSignal
+  const fetch = vi.fn(
+    (_url: string, options: RequestInit) =>
+      new Promise<Response>((resolve) => {
+        answer = resolve
+        signal = options.signal!
+      })
+  )
+  vi.stubGlobal('fetch', fetch)
+  const { service, request } = fixture()
+  try {
+    const { send_id } = request('http.v1.send', {
+      request_id: 'Orders/Slow.http',
+      method: 'GET',
+      url: 'https://service.invalid/slow',
+      headers: [],
+      secrets: [],
+      timeout_ms: 1000,
+    })
+    await vi.advanceTimersByTimeAsync(1001)
+    expect(request('http.v1.send.status', { send_id }).outcome.state).toBe('unknown')
+    expect(signal.aborted).toBe(false)
+    answer(new Response('late answer', { status: 201 }))
+    await service.settled()
+    expect(request('http.v1.send.status', { send_id }).outcome).toMatchObject({
+      state: 'answered',
+      response: { status: 201, body: 'late answer' },
+    })
+    expect(request('http.v1.history', { id: 'Orders/Slow.http' }).sends[0].status).toBe(201)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  } finally {
+    service.close()
+    vi.useRealTimers()
+  }
+})
 it('aborts a send by id, preserves uncertain delivery in status/history, and never resends', async () => {
   let signal!: AbortSignal
   const fetch = vi.fn(

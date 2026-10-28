@@ -15,6 +15,61 @@ vi.mock('../../packages/node-core/src/debugger/js-startup.js', () => ({
   holdJsStartup: async () => () => {},
 }))
 
+it('forwards owned program pipes to the program session until detach', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'launch-output-'))
+  await writeFile(join(dir, 'main.js'), '')
+  const owner = Object.assign(new EventEmitter(), {
+    evidence: {},
+    waitForText: async () => ['ws://127.0.0.1:1234/id', '1234'],
+    terminate: vi.fn(async () => {}),
+  })
+  const spawn = vi.spyOn(OwnedDebugProcess, 'spawn').mockResolvedValue(owner as any)
+  const profile = new JsDebugProfile({ enabled: true, assertEffectsAvailable() {} } as any, {
+    stateDirectory: dir,
+    enabled: true,
+  })
+  const closeListeners = new Set<() => void>()
+  const session = {
+    snapshot: { threads: [{ status: 'stopped' }] },
+    markEntryPause: vi.fn(),
+    recordOutput: vi.fn(),
+    dap: {
+      onEvent: () => () => {},
+      onClose: (listener: () => void) => {
+        closeListeners.add(listener)
+        return () => closeListeners.delete(listener)
+      },
+    },
+  }
+  vi.spyOn(profile as any, 'open').mockResolvedValue({ program: async () => session })
+  try {
+    await profile.launch(
+      {
+        cwd: dir,
+        executable: process.execPath,
+        program: join(dir, 'main.js'),
+        argv: [],
+        env: {},
+        stop_on_entry: true,
+      },
+      target
+    )
+    owner.emit('output', 'hello\n', 'stdout')
+    owner.emit('output', 'warning\n', 'stderr')
+    expect(session.recordOutput.mock.calls).toEqual([
+      ['hello\n', 'stdout'],
+      ['warning\n', 'stderr'],
+    ])
+    for (const listener of closeListeners) listener()
+    owner.emit('output', 'detached\n', 'stdout')
+    expect(session.recordOutput).toHaveBeenCalledTimes(2)
+    expect(owner.listenerCount('output')).toBe(0)
+  } finally {
+    spawn.mockRestore()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 it.each(['debugger_startup_handoff_lost', 'debugger_program_ended'])(
   'retains owned stderr through cleanup: %s',
   async (reason) => {

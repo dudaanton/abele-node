@@ -108,6 +108,11 @@ Outcomes:
 - `unknown`: no answer in time (30 s unless `timeout_ms` says otherwise, up to 5 minutes), or the
   connection went mid-way. It may have gone through, and the node never sends it again.
 
+The send deadline ends the caller's wait, not the outgoing request. After a deadline, status
+can change from `unknown` to `answered` when a late answer arrives; its body and history are
+then kept normally. Only explicit cancellation, node shutdown or a transport failure ends the
+outgoing request. A send still waiting for its late answer occupies one of the 16 send slots.
+
 Redirects are followed within the origin as a browser follows them. A redirect to another origin
 is followed only when the send came with no key at all, in whatever form: a key is allowed for one
 origin, so a request that carries one stops at the redirect and that is the answer, its `Location`

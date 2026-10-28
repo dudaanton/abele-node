@@ -49,6 +49,8 @@ export interface SendInput {
   headers: { key: string; value: string }[]
   body?: string
   timeoutMs?: number
+  /** Service-owned sends keep the transport alive to retain a late answer. */
+  retainLateAnswer?: boolean
   /** Key values in the request: a redirect to another origin does not carry them on. */
   secrets?: string[]
 }
@@ -141,7 +143,11 @@ export async function sendRequest(input: SendInput, signal?: AbortSignal): Promi
   const timeout = input.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const elapsed = () => Math.round(performance.now() - started)
   const timer = AbortSignal.timeout(timeout)
-  const aborted = signal ? AbortSignal.any([signal, timer]) : timer
+  const aborted = input.retainLateAnswer
+    ? (signal ?? new AbortController().signal)
+    : signal
+      ? AbortSignal.any([signal, timer])
+      : timer
   let scheme = ''
   try {
     scheme = new URL(input.url).protocol
@@ -158,7 +164,7 @@ export async function sendRequest(input: SendInput, signal?: AbortSignal): Promi
     response = await follow(input, aborted)
   } catch (error) {
     const { code, message } = where(error)
-    if (timer.aborted)
+    if (timer.aborted && !input.retainLateAnswer)
       return {
         outcome: {
           state: 'unknown',
@@ -219,11 +225,12 @@ export async function sendRequest(input: SendInput, signal?: AbortSignal): Promi
     return {
       outcome: {
         state: 'unknown',
-        reason: timer.aborted
-          ? `The answer did not finish in ${Math.round(timeout / 1000)} s.`
-          : signal?.aborted
-            ? 'Stopped before the answer finished.'
-            : `The answer broke off: ${message}`,
+        reason:
+          timer.aborted && !input.retainLateAnswer
+            ? `The answer did not finish in ${Math.round(timeout / 1000)} s.`
+            : signal?.aborted
+              ? 'Stopped before the answer finished.'
+              : `The answer broke off: ${message}`,
         after_ms: elapsed(),
       },
       ms: elapsed(),

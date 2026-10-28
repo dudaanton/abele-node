@@ -86,6 +86,7 @@ export class OwnedDebugProcess extends EventEmitter implements DebugProcessOwner
           this.stderr = bytes.subarray(start).toString('utf8')
         }
         this.emit('text')
+        this.emit('output', chunk.toString('utf8'), stream === child.stderr ? 'stderr' : 'stdout')
       })
     ownedDebugPids.add(evidence.pid)
     child.on('exit', () => {

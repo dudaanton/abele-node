@@ -190,6 +190,11 @@ export class JsDebugProfile {
       { cwd: config.cwd, env: config.env }
     )
     let programSession: DapSession | undefined
+    const output = (text: string, category: 'stdout' | 'stderr') => {
+      programSession?.recordOutput(text, category)
+    }
+    owner.on('output', output)
+    owner.once('close', () => owner.off('output', output))
     owner.on('close', (diagnostics) => {
       debuggerLog('Program exited', () => ({ target: target.target_id, ...diagnostics }))
       try {
@@ -230,6 +235,7 @@ export class JsDebugProfile {
         try {
           const session = await run.program()
           programSession = session
+          session.dap.onClose(() => owner.off('output', output))
           await new Promise<void>((resolve, reject) => {
             const timer = setTimeout(
               () => finish(new Error('debugger_startup_handoff_timeout')),

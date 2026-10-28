@@ -561,6 +561,8 @@ export class TraceRecorder {
     chain?: [string, { steps: number }]
   ) {
     if (!current()) return retry()
+    await l.session.waitForIdle()
+    if (!current()) return retry()
     if (!writer && confirmed) {
       this.ensureRun(l)
       writer = l.writer

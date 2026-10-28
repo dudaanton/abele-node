@@ -61,6 +61,42 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it.each(['before', 'after', 'probe-timeout'])(
+    'keeps a throwing watch stopped when continued arrives %s its reply',
+    async (timing) =>
+      fixture(async (f) => {
+        await ready(f)
+        const stack = f.session.stack(1)
+        f.w.reply(f.w.messages.at(-1), {
+          stackFrames: [{ id: 7, name: 'main', line: 4, column: 1, source: { path: f.path } }],
+        })
+        const frame = (await stack).items[0]!.handle
+        const before = f.session.snapshot
+        const evaluation = f.session.evaluate(frame, 'missingName.field', 'watch')
+        const request = f.w.messages.at(-1)
+        const continued = () =>
+          f.w.send({
+            type: 'event',
+            event: 'continued',
+            body: { threadId: 1, allThreadsContinued: true },
+          })
+        if (timing !== 'after') continued()
+        f.w.reply(request, {}, false)
+        if (timing === 'after') {
+          await expect(evaluation).rejects.toThrow()
+          continued()
+        }
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(f.w.messages.at(-1).command).toBe('stackTrace')
+        if (timing !== 'probe-timeout')
+          f.w.reply(f.w.messages.at(-1), {
+            stackFrames: [{ id: 7, name: 'main', line: 4, column: 1 }],
+          })
+        await expect(evaluation).rejects.toThrow()
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(f.session.snapshot).toEqual(before)
+      })
+  )
   it('keeps a step stop when the adapter sends continued before completing the same request', async () =>
     fixture(async (f) => {
       await ready(f)
@@ -547,6 +583,11 @@ describe('internal DAP session driver', () => {
         body: { threadId: 1, allThreadsContinued: true },
       })
       f.w.reply(result, { result: '1' })
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(f.w.messages.at(-1).command).toBe('stackTrace')
+      // A continued event during evaluation is ambiguous; this adapter confirms
+      // the frame really went away. Keep the original stale-watch guarantee.
+      f.w.reply(f.w.messages.at(-1), { stackFrames: [] })
       await expect(pending).rejects.toThrow('stale_state')
       expect(f.session.snapshot.execution).toBe('running')
     }))

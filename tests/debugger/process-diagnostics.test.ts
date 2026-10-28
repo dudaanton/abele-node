@@ -38,12 +38,19 @@ describe('adapter subprocess diagnostics', () => {
     })
     const process = new (OwnedDebugProcess as any)(child, { pid: 999999 }, async () => 'fixture')
     const closed: unknown[] = []
+    const output: unknown[] = []
+    process.on('output', (text: string, category: string) => output.push({ text, category }))
     process.on('close', (diagnostics: unknown) => closed.push(diagnostics))
     child.stdout.write('listening at 127.0.0.1:1234\n')
     child.stderr.write('x'.repeat(20000) + 'fatal adapter failure')
     child.exitCode = 17
     child.emit('exit', 17, null)
     child.stderr.write('\nfinal stderr')
+    expect(output).toEqual([
+      { text: 'listening at 127.0.0.1:1234\n', category: 'stdout' },
+      { text: 'x'.repeat(20000) + 'fatal adapter failure', category: 'stderr' },
+      { text: '\nfinal stderr', category: 'stderr' },
+    ])
     child.emit('close', 17, null)
     expect(closed).toHaveLength(1)
     expect(process.diagnostics).toMatchObject({ pid: 999999, exit_code: 17, signal: null })

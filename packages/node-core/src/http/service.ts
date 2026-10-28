@@ -13,7 +13,7 @@ import {
 import type { NodeCore } from '../index.js'
 import { applicationListeners } from '../debugger/programs.js'
 import type { TraceChain } from '../trace/recorder.js'
-import { masker, sendRequest, MASK } from './send.js'
+import { masker, sendRequest, MASK, DEFAULT_TIMEOUT_MS } from './send.js'
 import { HttpStore, newSendId, type HttpSendRecord } from './store.js'
 
 /** The start of a body that travels with an answer; the rest is read in pages of this size. */
@@ -195,6 +195,18 @@ export class HttpService {
       }),
     }
     this.sends.set(id, entry)
+    const timeout = p.timeout_ms ?? DEFAULT_TIMEOUT_MS
+    // A caller deadline limits waiting. Keep this send alive for its late answer.
+    const deadline = setTimeout(() => {
+      if (entry.transportOutcome) return
+      entry.outcome = {
+        state: 'unknown',
+        reason: `No answer in ${Math.round(timeout / 1000)} s.`,
+        after_ms: timeout,
+      }
+      entry.summary = { ...summary, unknown: true, ms: timeout }
+    }, timeout)
+    deadline.unref()
     entry.done = sendRequest(
       {
         method: p.method,
@@ -202,6 +214,7 @@ export class HttpService {
         headers,
         body: p.body,
         timeoutMs: p.timeout_ms,
+        retainLateAnswer: true,
         secrets: p.secrets,
       },
       abort.signal
@@ -222,6 +235,7 @@ export class HttpService {
         // the legacy recording-aware read while negotiated transport reads can
         // show the actual answer without waiting for instrumentation to drain.
         entry.transportOutcome = outcome
+        clearTimeout(deadline)
         entry.transportSummary = { ...done }
         transportSettled()
         if (chain) {
@@ -283,6 +297,7 @@ export class HttpService {
         transportSettled()
       })
       .finally(() => {
+        clearTimeout(deadline)
         entry.endedAt = Date.now()
       })
     return { send_id: id, ...(chain ? { run_id: chain.runId } : {}) }

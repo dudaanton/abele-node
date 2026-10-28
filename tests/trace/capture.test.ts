@@ -34,6 +34,18 @@ function takeWhole(
 }
 
 describe('taking a value whole from the paused program', () => {
+  it('captures Response metadata without consuming its body', () => {
+    const response = new Response('kept body', { status: 201, headers: { 'x-result': 'ok' } })
+    Object.defineProperty(response, 'url', { value: 'https://example.test/created' })
+    expect(JSON.parse(takeWhole({ response }, 'response').text)).toEqual({
+      '@class': 'Response',
+      status: 201,
+      statusText: '',
+      url: 'https://example.test/created',
+      headers: { 'content-type': 'text/plain;charset=UTF-8', 'x-result': 'ok' },
+    })
+    expect(response.bodyUsed).toBe(false)
+  })
   it('keeps a long string exactly, across chunk borders and multi-byte characters', () => {
     const xml = `<?xml version="1.0"?><doc>${'é𝄞x'.repeat(200_000)}</doc>`
     const taken = takeWhole({ xmlText: xml }, 'xmlText', 1000)

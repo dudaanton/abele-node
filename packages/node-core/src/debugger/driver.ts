@@ -119,6 +119,63 @@ export class DapSession {
   private initialized = false
   private traceHttpInstalled = false
   private admission: DebuggerDispatchGuard | undefined
+  private readonly idleWaiters = new Set<() => void>()
+  private evaluations = 0
+  private evaluatedEpoch?: number
+  private evaluationContinued?: { event: DebugProtocol.Event; epoch: number }
+  private async reconcileEvaluation() {
+    const pending = this.evaluationContinued
+    if (!pending || this.evaluations) return
+    this.evaluationContinued = undefined
+    const before = this.snapshot
+    if (before.stop_epoch !== pending.epoch) return
+    const body = pending.event.body ?? {}
+    const threads = before.threads.filter(
+      (t) =>
+        t.status === 'stopped' &&
+        (body.allThreadsContinued === true ||
+          body.threadId === undefined ||
+          (dapThread(body.threadId) && fromDap(body.threadId) === t.thread_id))
+    )
+    let paused = threads.length > 0
+    for (const thread of threads) {
+      try {
+        const stack = await this.dap.requestWhenAvailable(
+          'stackTrace',
+          {
+            threadId: toDap(thread.thread_id),
+            startFrame: 0,
+            levels: 1,
+          },
+          {
+            timeoutMs: 500,
+            signal: this.closedSignal,
+            beforeDispatch: () => this.service.assertEffectsAvailable(),
+          }
+        )
+        if (!list(stack.stackFrames, 1024).length) paused = false
+      } catch {
+        // An unavailable probe is not evidence that evaluation resumed the
+        // program. Keep the last physical stop rather than lose it on timeout.
+        return
+      }
+    }
+    // Successful stack reads prove the stop survived the adapter's temporary
+    // evaluation resume. A real resume still expires watches and frame handles.
+    if (!paused && this.snapshot.stop_epoch === pending.epoch) {
+      this.evaluatedEpoch = undefined
+      this.event(pending.event)
+    }
+  }
+  /** Recording must not inherit the expired guard of the command that reached its stop. */
+  async waitForIdle(): Promise<void> {
+    while (!this.dap.closed && (this.admission || this.executing.size))
+      await new Promise<void>((resolve) => this.idleWaiters.add(resolve))
+  }
+  private wakeIdle() {
+    for (const resolve of this.idleWaiters) resolve()
+    this.idleWaiters.clear()
+  }
   /** Only the shared coordinator may install this trusted dispatch fence. */
   async coordinated<T>(
     guard: DebuggerDispatchGuard,
@@ -131,6 +188,7 @@ export class DapSession {
       return await work()
     } finally {
       if (this.admission === guard) this.admission = undefined
+      this.wakeIdle()
     }
   }
   private readonly sourcePaths = new Map<string, string>()
@@ -169,6 +227,7 @@ export class DapSession {
     dap.onClose((error) => {
       this.settleStartup(error)
       this.lifetime.abort()
+      this.wakeIdle()
       clearTimeout(this.proofRetry)
       this.pendingProofs.clear()
       debuggerLog('DAP closed', () => ({
@@ -193,6 +252,10 @@ export class DapSession {
   recordExit(code: number) {
     if (!Number.isSafeInteger(code)) return
     this.observe({ kind: 'exited', exit_code: code })
+  }
+  recordOutput(text: string, category: 'stdout' | 'stderr') {
+    if (this.ending || !live(this.snapshot)) return
+    this.observe({ kind: 'output', text: boundedText(text, 256 * 1024), category })
   }
   markEntryPause() {
     const before = this.current()
@@ -222,7 +285,16 @@ export class DapSession {
     if (this.ending) return Promise.reject(new Error('dap_cancelled'))
     this.service.assertEffectsAvailable()
     this.admission?.()
-    return this.dap.request(command, args, options)
+    if (command !== 'evaluate') return this.dap.request(command, args, options)
+    // js-debug announces continued while temporarily evaluating a paused frame.
+    // Failed watches do not resume the program.
+    this.evaluations++
+    if (this.snapshot.threads.some((thread) => thread.status === 'stopped'))
+      this.evaluatedEpoch = this.snapshot.stop_epoch
+    return this.dap.request(command, args, options).finally(async () => {
+      this.evaluations--
+      await this.reconcileEvaluation()
+    })
   }
   private current(cleanup = false) {
     if (this.ending && !cleanup) throw new Error('dap_cancelled')
@@ -1073,6 +1145,7 @@ export class DapSession {
       throw error
     } finally {
       this.executing.delete(thread)
+      this.wakeIdle()
     }
     return this.snapshot
   }
@@ -1271,6 +1344,14 @@ export class DapSession {
         break
       }
       case 'continued':
+        if (
+          !this.executing.size &&
+          (this.evaluations || this.evaluatedEpoch === this.snapshot.stop_epoch)
+        ) {
+          this.evaluationContinued = { event, epoch: this.snapshot.stop_epoch }
+          if (!this.evaluations) void this.reconcileEvaluation().catch(() => {})
+          break
+        }
         // A resume announcement can arrive after the resulting pause.
         // While that request is still in flight, its newer stop is authoritative.
         if (

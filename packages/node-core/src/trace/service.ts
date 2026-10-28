@@ -476,8 +476,11 @@ export function traceRunPage(
   // exchanges may have earlier timestamps and must not shift existing pages.
   if (through !== undefined) run.steps = prefix.length
   // A sent request is written when its answer is in, at the time it went: in time it heads the
-  // steps it caused. The sort is stable, so everything else keeps the order it was written in.
-  const steps = [...prefix].sort((a, b) => a.at - b.at)
+  // steps it caused, even if the first probe shares its millisecond. Otherwise
+  // equal-time steps keep their write order.
+  const steps = [...prefix].sort(
+    (a, b) => a.at - b.at || Number(b.kind === 'http') - Number(a.kind === 'http')
+  )
   const requests = steps.filter(
     (s) => s.kind === 'http' && s.direction && s.duration_ms !== undefined
   )
