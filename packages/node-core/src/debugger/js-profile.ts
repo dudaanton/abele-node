@@ -388,7 +388,7 @@ export class NativeJsRun {
   /** js-debug attaches to the program in a child of the root it was asked for: the first one. */
   program(timeout = 10000): Promise<DapSession> {
     const first = this.tree.children.values().next().value
-    if (first) return Promise.resolve(first)
+    if (first) return first.ready().then(() => first)
     if (this.root.dap.closed) return Promise.reject(new Error('debugger_program_ended'))
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => finish(new Error('debugger_program_not_attached')), timeout)
@@ -396,7 +396,7 @@ export class NativeJsRun {
         clearTimeout(timer)
         off()
         closed()
-        if (session) resolve(session)
+        if (session) session.ready().then(() => resolve(session), reject)
         else reject(error)
       }
       const off = this.tree.onChild((session) => finish(undefined, session))

@@ -187,7 +187,10 @@ export class DapTransport {
         if (this.supportsCancellation && command !== 'cancel' && !this.closed)
           void this.request('cancel', { requestId: seq }).catch(() => {})
       }
-      const timer = setTimeout(() => finish(new Error('dap_timeout')), timeout)
+      const timer = setTimeout(() => {
+        debuggerLog('DAP request timed out', () => ({ command, timeout_ms: timeout }))
+        finish(new Error('dap_timeout'))
+      }, timeout)
       options.signal?.addEventListener('abort', abort, { once: true })
       this.pending.set(seq, {
         command,
@@ -221,6 +224,13 @@ export class DapTransport {
   private nextSeq() {
     if (this.seq >= Number.MAX_SAFE_INTEGER) throw new Error('dap_sequence_exhausted')
     return ++this.seq
+  }
+  /** Release queued work before the owner's disconnect request. Late replies
+   * remain correlated tombstones, so they cannot revive cancelled operations. */
+  cancelPending() {
+    const error = new Error('dap_cancelled')
+    for (const waiter of this.slotWaiters) waiter.reject(error)
+    for (const seq of this.pending.keys()) this.take(seq)?.reject(error)
   }
   private write(message: object) {
     if (this.failure) throw this.failure

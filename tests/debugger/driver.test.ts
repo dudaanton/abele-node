@@ -1039,6 +1039,7 @@ describe('internal DAP session driver', () => {
       })
       f.w.reply(request, { breakpoints: [{ id: 7, verified: false }] })
       await p
+      expect(f.session.snapshot.breakpoints[0]?.status).toBe('pending')
       f.w.send({
         type: 'event',
         event: 'breakpoint',
@@ -1053,6 +1054,119 @@ describe('internal DAP session driver', () => {
       expect(f.w.messages.at(-1).arguments.breakpoints).toEqual([])
       f.w.reply(f.w.messages.at(-1), { breakpoints: [] })
       await clear
+    }))
+  it.each(['matched', 'changed', 'no_map', 'superseded'])(
+    'proves a delayed source before accepting a %s verification and hit',
+    async (mode) =>
+      fixture(async (f) => {
+        await ready(f)
+        let provisional = true
+        f.session.provisionalSource = () => provisional
+        let release!: () => void
+        f.session.verifyBreakpointSource = () =>
+          new Promise<void>((resolve, reject) => {
+            release = () => {
+              if (mode === 'matched' || mode === 'superseded') {
+                provisional = false
+                resolve()
+              } else reject(new Error('debugger_source_' + mode))
+            }
+          })
+        f.core.debugger.patchBreakpoints(
+          f.session.id,
+          0,
+          [{ breakpoint_id: 'late', source_id: 'source', line: 3 }],
+          []
+        )
+        const sync = f.session.syncBreakpoints()
+        f.w.reply(f.w.messages.at(-1), { breakpoints: [{ id: 9, verified: false }] })
+        await sync
+        expect(f.session.snapshot.breakpoints[0]?.status).toBe('pending')
+        f.w.send({
+          type: 'event',
+          event: 'breakpoint',
+          body: { breakpoint: { id: 9, verified: true, line: 3 } },
+        })
+        await Promise.resolve()
+        f.w.send({
+          type: 'event',
+          event: 'stopped',
+          body: {
+            threadId: 1,
+            reason: 'breakpoint',
+            allThreadsStopped: true,
+            hitBreakpointIds: [9],
+          },
+        })
+        expect(f.session.snapshot.breakpoints[0]?.status).toBe('pending')
+        if (mode === 'superseded')
+          f.w.send({
+            type: 'event',
+            event: 'breakpoint',
+            body: { breakpoint: { id: 9, verified: false, message: 'not loaded' } },
+          })
+        release()
+        await vi.waitFor(() =>
+          expect(f.session.snapshot.breakpoints[0]?.status).toBe(
+            mode === 'matched' ? 'verified' : mode === 'superseded' ? 'pending' : 'rejected'
+          )
+        )
+        await vi.waitFor(() =>
+          expect(f.session.snapshot.threads[0]?.stop?.hit_breakpoint_ids).toEqual(
+            mode === 'matched' ? ['late'] : []
+          )
+        )
+      })
+  )
+  it('keeps expressions off provisional sources', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.provisionalSource = () => true
+      const before = f.w.messages.length
+      await expect(
+        f.session.patchBreakpoints(
+          0,
+          [{ breakpoint_id: 'late', source_id: 'source', line: 3, condition: 'sideEffect()' }],
+          []
+        )
+      ).rejects.toThrow('debugger_source_pending')
+      expect(f.w.messages.length).toBe(before)
+    }))
+  it('drops deferred source verification and stops when the transport closes', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.provisionalSource = () => true
+      let release!: () => void
+      f.session.verifyBreakpointSource = () =>
+        new Promise<void>((resolve) => {
+          release = resolve
+        })
+      f.core.debugger.patchBreakpoints(
+        f.session.id,
+        0,
+        [{ breakpoint_id: 'late', source_id: 'source', line: 3 }],
+        []
+      )
+      const sync = f.session.syncBreakpoints()
+      f.w.reply(f.w.messages.at(-1), { breakpoints: [{ id: 9, verified: false }] })
+      await sync
+      f.w.send({
+        type: 'event',
+        event: 'breakpoint',
+        body: { breakpoint: { id: 9, verified: true } },
+      })
+      await Promise.resolve()
+      f.w.send({
+        type: 'event',
+        event: 'stopped',
+        body: { threadId: 1, reason: 'breakpoint', hitBreakpointIds: [9] },
+      })
+      f.w.dap.close()
+      const read = vi.spyOn(f.core.debugger, 'snapshot')
+      release()
+      for (let i = 0; i < 15; i++) await Promise.resolve()
+      expect(read).not.toHaveBeenCalled()
+      read.mockRestore()
     }))
   it('fences older complete-set replies and thread inventories', async () =>
     fixture(async (f) => {
@@ -1223,6 +1337,58 @@ describe('internal DAP session driver', () => {
       f.session.dap.close()
       await detach
       expect(f.session.snapshot.lifecycle).toBe('detached')
+    }))
+  it('completes termination after disconnect timeout only after owned cleanup succeeds', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      let release!: () => void
+      const cleanup = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      f.session.setOwner({
+        evidence: {
+          pid: 123,
+          start_identity: 'fixture',
+          executable_sha256: 'a'.repeat(64),
+          ownership_id: 'owned',
+        },
+        terminate: () => cleanup,
+      })
+      let settled = false
+      const result = f.session.terminate().then(
+        () => {
+          settled = true
+        },
+        (error) => {
+          settled = true
+          throw error
+        }
+      )
+      const assertion = expect(result).resolves.toBeUndefined()
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(settled).toBe(false)
+      release()
+      await assertion
+      expect(f.session.snapshot.lifecycle).toBe('terminated')
+      expect(f.w.dap.closed).toBe(true)
+    }))
+  it('still refuses termination when owned cleanup fails after disconnect timeout', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.setOwner({
+        evidence: {
+          pid: 123,
+          start_identity: 'fixture',
+          executable_sha256: 'a'.repeat(64),
+          ownership_id: 'owned',
+        },
+        terminate: async () => {
+          throw new Error('pid_reused')
+        },
+      })
+      await expect(f.session.terminate()).rejects.toThrow('pid_reused')
+      expect(f.session.snapshot.lifecycle).not.toBe('terminated')
+      expect(f.w.dap.closed).toBe(true)
     }))
   it('does not label a disconnect acknowledgement as proof of process exit', async () =>
     fixture(async (f) => {

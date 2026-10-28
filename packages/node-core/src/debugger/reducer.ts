@@ -249,7 +249,9 @@ export function reduceDebugger(
         bp.resolved_column = result.column ?? null
         bp.message = result.message ?? null
         bp.status = !result.verified
-          ? 'rejected'
+          ? /^debugger_source_(changed|no_map)$/.test(result.message ?? '')
+            ? 'rejected'
+            : 'pending'
           : (result.line !== undefined && result.line !== bp.line) ||
               (result.column !== undefined &&
                 bp.column !== undefined &&

@@ -76,6 +76,88 @@ async function request(w: ReturnType<typeof wire>, command: string) {
   throw new Error('missing_request_' + command)
 }
 describe('authorized typed DAP backend', () => {
+  it('does not dispatch superseded breakpoint intent after source validation', () =>
+    fixture(async ({ core, session, human, w, body }) => {
+      let release!: () => void
+      session.validateSource = () =>
+        new Promise<void>((resolve) => {
+          release = resolve
+        })
+      const pending = core.debuggerControl.command(human, 'breakpoints.patch', {
+        ...body('superseded-source'),
+        expected_breakpoint_revision: 0,
+        upsert: [{ breakpoint_id: 'bp', source_id: 'source', line: 2 }],
+        remove: [],
+      })
+      for (let i = 0; i < 30 && !release; i++) await Promise.resolve()
+      expect(release).toBeTypeOf('function')
+      core.debugger.patchBreakpoints(session.id, 1, [], ['bp'])
+      release()
+      expect(await pending).toMatchObject({ outcome: 'outcome_unknown', code: 'stale_state' })
+      expect(w.messages.some((m: any) => m.command === 'setBreakpoints')).toBe(false)
+    }))
+  it.each(['stopped', 'continued'])(
+    'installs source breakpoints when %s arrives during source validation',
+    (event) =>
+      fixture(async ({ core, session, human, w, body }) => {
+        let release!: () => void
+        session.validateSource = () =>
+          new Promise<void>((resolve) => {
+            release = resolve
+          })
+        const pending = core.debuggerControl.command(human, 'breakpoints.patch', {
+          ...body('source-race'),
+          expected_breakpoint_revision: 0,
+          upsert: [{ breakpoint_id: 'bp', source_id: 'source', line: 2 }],
+          remove: [],
+        })
+        for (let i = 0; i < 30 && !release; i++) await Promise.resolve()
+        expect(release).toBeTypeOf('function')
+        w.send({
+          type: 'event',
+          event,
+          body: {
+            threadId: 1,
+            allThreadsStopped: true,
+            allThreadsContinued: true,
+            reason: 'pause',
+          },
+        })
+        release()
+        for (let i = 0; i < 30; i++) await Promise.resolve()
+        const dispatched = w.messages.find((m: any) => m.command === 'setBreakpoints')
+        if (dispatched) w.reply(dispatched, { breakpoints: [{ verified: true, line: 2 }] })
+        expect(await pending).toMatchObject({ outcome: 'completed' })
+        expect(dispatched).toBeDefined()
+        expect(session.snapshot.breakpoints[0].status).toBe('verified')
+      })
+  )
+  it('detaches without waiting for an in-flight inspection or an adapter reply', () =>
+    fixture(async ({ core, session, human, w, body }) => {
+      const inspection = core.debuggerControl.inspect(human, 'stack', {
+        debug_session_id: session.id,
+        incarnation: session.incarnation,
+        expected_state_revision: session.snapshot.state_revision,
+        thread_id: 1,
+      })
+      const settled = inspection.catch(() => undefined)
+      await request(w, 'stackTrace')
+      const poll = core.debuggerControl.wait(human, 'wait', {
+        debug_session_id: session.id,
+        timeout_ms: 30000,
+        after_event_seq: core.debugger.snapshot(session.id).cursor.event_seq,
+        kinds: ['stopped'],
+      })
+      const started = Date.now()
+      const detach = core.debuggerControl.command(human, 'detach', body('detach'))
+      await request(w, 'disconnect')
+      const result = await detach
+      expect(Date.now() - started).toBeLessThan(1000)
+      expect(result.snapshot.lifecycle).toBe('detached')
+      await settled
+      expect((await poll).reason).toBe('cancelled')
+      expect(w.dap.pendingCount).toBe(0)
+    }))
   it('keeps inspection pages structured when recording state makes snapshots large', () =>
     fixture(async ({ core, session, human, w }) => {
       core.debugger.patchBreakpoints(

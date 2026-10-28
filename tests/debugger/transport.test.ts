@@ -4,6 +4,22 @@ import { DapTransport } from '../../packages/node-core/src/debugger/dap.js'
 import { wire, packet } from './dap-wire.js'
 
 describe('bounded production DAP transport', () => {
+  it('cancels active and capacity-queued work while leaving room for disconnect', async () => {
+    const w = wire({ maxPending: 1 })
+    const active = w.dap.request('stackTrace')
+    const queued = w.dap.requestWhenAvailable('variables')
+    const activeRejected = expect(active).rejects.toThrow('dap_cancelled')
+    const queuedRejected = expect(queued).rejects.toThrow('dap_cancelled')
+    w.dap.cancelPending()
+    await Promise.all([activeRejected, queuedRejected])
+    const disconnect = w.dap.request('disconnect')
+    w.reply(w.messages.at(-1))
+    await disconnect
+    w.reply(w.messages[0])
+    expect(w.dap.closed).toBe(false)
+    expect(w.messages.some((m) => m.command === 'variables')).toBe(false)
+    w.dap.close()
+  })
   it('reports only unfinished body bytes when closing between frames', () => {
     const log = vi.spyOn(console, 'debug').mockImplementation(() => {})
     const w = wire()

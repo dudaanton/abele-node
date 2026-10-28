@@ -156,14 +156,16 @@ describe('native profile resource lifetimes (fake adapter)', () => {
       const run = new NativeJsRun(tree, adapter, owner, () => {})
       try {
         const pending = run.detach()
-        const rejected = expect(pending).rejects.toThrow(
-          kind === 'timeout' ? 'dap_timeout' : kind === 'transport_lost' ? 'lost' : 'dap_rejected'
-        )
+        const settled =
+          kind === 'timeout'
+            ? expect(pending).resolves.toBeUndefined()
+            : expect(pending).rejects.toThrow(kind === 'transport_lost' ? 'lost' : 'dap_rejected')
         await Promise.resolve()
         if (kind === 'root_rejected') w.reply(w.messages[0], {}, false)
         else if (kind === 'child_rejected') childWire.reply(childWire.messages[0], {}, false)
         else if (kind === 'transport_lost') w.dap.close(new Error('lost'))
-        await rejected
+        await settled
+        if (kind === 'timeout') expect(root.snapshot.lifecycle).toBe('detached')
         expect(owner.alive).toBe(true)
         expect(release).toHaveBeenCalledOnce()
         expect(kill).not.toHaveBeenCalled()

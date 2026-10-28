@@ -119,6 +119,12 @@ Links inside `.abele/requests/` are never followed, neither when listing nor whe
 At most 16 sends are out at once. A finished send stays answerable in memory for ten minutes and
 afterwards is read back from `.history/`.
 
+Nodes advertising `http_v1.send_cancel` accept `http.v1.send.cancel` with `project_id` and
+`send_id`. It aborts the outgoing transport and returns the same shape as send status, without
+waiting for debugger recording to flush. Repeating it preserves the result; a completed answer
+stays answered. Cancellation before a complete answer is `unknown` with a stopped reason: the
+service may already have received the request. It does not undo remote changes or resend it.
+
 ## Into a recording
 
 With `debug_session_id`, the send goes into the run that session is recording
@@ -145,6 +151,7 @@ project's files is not the right to send HTTP from the machine.
 | `http.v1.collection.create`                 | a folder                                                                      |
 | `http.v1.env.get` / `.save` / `.delete`     | one environment                                                               |
 | `http.v1.send` / `http.v1.send.status`      | send, follow                                                                  |
+| `http.v1.send.cancel`                       | stop the outgoing transport by send ID                                        |
 | `http.v1.history`                           | a request's sends, the latest first                                           |
 | `http.v1.body`                              | a page of a kept answer's body                                                |
 

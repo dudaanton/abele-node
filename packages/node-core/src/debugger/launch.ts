@@ -16,7 +16,12 @@ import type { DapSession } from './driver.js'
 import type { JsAttach, JsLaunch } from './js-profile.js'
 import { inspectorPrograms, processStartedAt } from './programs.js'
 import { discoverLaunchTargets, resolveNpmScript } from './launch-targets.js'
-import { loadedSourceDigests } from './loaded-sources.js'
+import {
+  emptySourceEvidence,
+  inlineSourceDigests,
+  loadedSourceDigests,
+  type LoadedSourceEvidence,
+} from './loaded-sources.js'
 import { processStartIdentity } from './process.js'
 
 /** What starts a program under a debugger. The native JS profile in production; a scripted one
@@ -73,9 +78,12 @@ type SourceContext = {
   root: string
   program: string
   pid?: number
+  port?: number
   processIdentity?: string
   sources: Map<string, string>
   digests: Map<string, string>
+  candidates?: Map<string, string>
+  inlineRuntime?: boolean
   recipe?: string
   tail?: Promise<unknown>
   pending: number
@@ -230,15 +238,40 @@ export class DebuggerLaunches {
         )
           throw new ChannelError('debugger_session_inactive')
         const next = new Map(context.sources)
+        const candidates = new Map(context.candidates)
         const digests = new Map(context.digests)
-        const knownProgram = context.digests.has(context.program)
+        const knownProgram =
+          context.digests.has(context.program) && !context.candidates?.has(context.program)
+        // Modules may have loaded since attach. Refresh only under the same OS
+        // process identity; a reused inspector port must never prove this run.
+        let runtime =
+          context.port &&
+          context.pid &&
+          context.processIdentity &&
+          (await processStartIdentity(context.pid).catch(() => undefined)) ===
+            context.processIdentity
+            ? await loadedSourceDigests(
+                context.port,
+                root,
+                this.sessions.get(p.debug_session_id)?.closedSignal
+              )
+            : emptySourceEvidence()
+        if (
+          context.pid &&
+          context.processIdentity &&
+          (await processStartIdentity(context.pid).catch(() => undefined)) !==
+            context.processIdentity
+        )
+          runtime = emptySourceEvidence()
+        for (const [path, digest] of runtime) digests.set(path, digest)
         const result = await admitSources(
           context.root,
           next,
           p.sources,
           context.pid,
           context.program,
-          digests
+          digests,
+          context.inlineRuntime ? { runtime, candidates } : undefined
         )
         if (p.require_loaded) {
           const accepted: typeof result.sources = []
@@ -274,9 +307,14 @@ export class DebuggerLaunches {
           const path = next.get(source.source_id)!
           const digest = digests.get(path)
           if (digest) context.digests.set(path, digest)
+          if (runtime.mapped.has(path)) context.candidates?.delete(path)
+          else if (candidates.has(path)) context.candidates?.set(path, candidates.get(path)!)
         }
-        const programProven =
-          knownProgram && result.sources.some((s) => next.get(s.source_id) === context.program)
+        const programProven = result.sources.some(
+          (s) =>
+            runtime.has(next.get(s.source_id)!) ||
+            (knownProgram && next.get(s.source_id) === context.program)
+        )
         for (const [id, owner] of this.sessionRuns) {
           if (owner !== run) continue
           this.sessions.get(id)?.admitSources(next)
@@ -601,6 +639,7 @@ export class DebuggerLaunches {
     if (!inside && !p.outside_folder) throw new ChannelError('debugger_attach_outside_folder')
     const sources = new Map<string, string>()
     const loaded = await loadedSourceDigests(program.port, root)
+    const candidates = new Map<string, string>()
     const script = program.script ? await realpath(program.script).catch(() => null) : null
     const programPath = script ?? join(root, 'program.js')
     // Restore intent only from an ended attachment to this exact script and owner scope.
@@ -636,7 +675,8 @@ export class DebuggerLaunches {
       ],
       program.pid,
       script ?? undefined,
-      loaded
+      new Map(loaded),
+      loaded.mapped.size ? { runtime: loaded, candidates } : undefined
     )
     const target: DebuggerTarget = {
       ...place,
@@ -648,7 +688,7 @@ export class DebuggerLaunches {
       ),
       process_ownership: 'external',
       build_identity:
-        (script && loaded.has(script) && [...sources.values()].includes(script)) ||
+        [...sources.values()].some((path) => loaded.has(path)) ||
         (await loadedAsIs(program.pid, sources.get('s1')))
           ? 'matched'
           : 'unknown',
@@ -666,10 +706,13 @@ export class DebuggerLaunches {
       root,
       program: programPath,
       pid: program.pid,
+      port: program.port,
       processIdentity:
         identityBefore && identityBefore === identityAfter ? identityBefore : undefined,
       sources,
       digests,
+      candidates,
+      inlineRuntime: loaded.mapped.size > 0,
       pending: 0,
     })
     const result = await this.adopt(run, root, sources, false)
@@ -720,6 +763,35 @@ export class DebuggerLaunches {
         const digest = context?.digests.get(path)
         if (!digest || digest !== (await sourceDigest(path).catch(() => undefined)))
           throw new ChannelError('debugger_source_changed')
+      }
+      session.provisionalSource = (path) => context?.candidates?.has(path) ?? false
+      session.verifyBreakpointSource = async (path) => {
+        if (!context?.candidates?.has(path)) return
+        const expected = context.candidates.get(path)!
+        if (expected !== (await sourceDigest(path)))
+          throw new ChannelError('debugger_source_changed')
+        if (
+          !context.port ||
+          !context.pid ||
+          !context.processIdentity ||
+          (await processStartIdentity(context.pid).catch(() => undefined)) !==
+            context.processIdentity
+        )
+          throw new ChannelError('debugger_source_unverified')
+        const runtime = await loadedSourceDigests(context.port, root, session.closedSignal)
+        if (
+          (await processStartIdentity(context.pid).catch(() => undefined)) !==
+          context.processIdentity
+        )
+          throw new ChannelError('debugger_source_unverified')
+        const actual = runtime.get(path)
+        if (!actual)
+          throw new ChannelError(
+            runtime.scripts.has(path) ? 'debugger_source_no_map' : 'debugger_source_pending'
+          )
+        if (actual !== expected) throw new ChannelError('debugger_source_changed')
+        context.digests.set(path, actual)
+        context.candidates.delete(path)
       }
       this.sessions.set(session.id, session)
       this.sessionRuns.set(session.id, run)
@@ -860,7 +932,8 @@ async function admitSources(
   asked: string[],
   pid?: number,
   program?: string,
-  digests?: Map<string, string>
+  digests?: Map<string, string>,
+  provisional?: { runtime: LoadedSourceEvidence; candidates: Map<string, string> }
 ): Promise<Pick<DebuggerAddSourcesResult, 'sources' | 'refused'>> {
   const sources: DebuggerAddSourcesResult['sources'] = []
   const refused: DebuggerAddSourcesResult['refused'] = []
@@ -903,26 +976,42 @@ async function admitSources(
       continue
     }
     const digest = await sourceDigest(full)
+    if (
+      provisional?.candidates.has(full) &&
+      provisional.runtime.scripts.has(full) &&
+      !provisional.runtime.mapped.has(full)
+    ) {
+      refuse('debugger_source_no_map')
+      continue
+    }
     const known = digests?.get(full)
     if (known && known !== digest) {
       refuse('debugger_source_changed')
       continue
     }
     const mapped = !/\.[cm]?js$/.test(full) && !(await unbuilt(root, [full])).size
+    const candidate =
+      !known &&
+      !mapped &&
+      !!digest &&
+      !!provisional &&
+      !provisional.runtime.scripts.has(full) &&
+      /\.[cm]?tsx?$/.test(full)
+    if (!known && !mapped && !candidate && !/\.[cm]?js$/.test(full)) {
+      refuse('debugger_source_no_map')
+      continue
+    }
     if (
       !known &&
       pid !== undefined &&
       !mapped &&
+      !candidate &&
       (!started || Math.floor(info.mtimeMs / 1000) * 1000 >= started)
     ) {
       refuse('debugger_source_changed')
       continue
     }
     let source_id = [...admitted].find(([, existing]) => existing === full)?.[0]
-    if (!known && !mapped && !/\.[cm]?js$/.test(full)) {
-      refuse('debugger_source_no_map')
-      continue
-    }
     if (!source_id) {
       if (admitted.size >= 256) {
         refuse('debugger_source_limit')
@@ -934,6 +1023,7 @@ async function admitSources(
       admitted.set(source_id, full)
     }
     sources.push({ source_id, path: relative(root, full) })
+    if (candidate) provisional!.candidates.set(full, digest!)
     if (digest) digests?.set(full, digest)
   }
   return { sources, refused }
@@ -973,7 +1063,20 @@ async function unbuilt(root: string, sources: string[]) {
       if (entry.isDirectory()) {
         if (depth < MAP_SCAN.depth && entry.name !== 'node_modules' && !entry.name.startsWith('.'))
           await visit(path, depth + 1)
-      } else if (entry.isFile() && entry.name.endsWith('.map')) await readMap(path)
+      } else if (entry.isFile()) {
+        if (entry.name.endsWith('.map')) await readMap(path)
+        else if (/\.[cm]?js$/.test(entry.name)) {
+          try {
+            if ((await stat(path)).size > MAP_SCAN.bytes) continue
+            const digests = await inlineSourceDigests(root, path, await readFile(path, 'utf8'))
+            for (const [source, digest] of digests)
+              if (pending.has(source) && digest === (await sourceDigest(source)))
+                pending.delete(source)
+          } catch {
+            // An unreadable transform proves nothing.
+          }
+        }
+      }
     }
   }
   const readMap = async (path: string) => {

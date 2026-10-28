@@ -98,21 +98,37 @@ export class DapSession {
   private lastEpoch = -1
   private readonly sentSources = new Set<string>()
   private ending: 'detached' | 'terminated' | undefined
+  private readonly lifetime = new AbortController()
+  get closedSignal(): AbortSignal {
+    return this.lifetime.signal
+  }
   private owner: DebugProcessOwner | undefined
   /** A session tree keeps its root transport until its independently connected children end. */
   onTerminated?: () => void
   private started = false
+  private settleStartup!: (error?: unknown) => void
+  private readonly startupDone = new Promise<unknown>((resolve) => {
+    this.settleStartup = resolve
+  })
+  async ready(): Promise<void> {
+    const error = await this.startupDone
+    if (error) throw error
+  }
   private initialized = false
   private traceHttpInstalled = false
   private admission: DebuggerDispatchGuard | undefined
   /** Only the shared coordinator may install this trusted dispatch fence. */
-  async coordinated<T>(guard: DebuggerDispatchGuard, work: () => Promise<T>): Promise<T> {
-    if (this.admission) throw new ChannelError('coordinator_conflict')
+  async coordinated<T>(
+    guard: DebuggerDispatchGuard,
+    work: () => Promise<T>,
+    interrupt = false
+  ): Promise<T> {
+    if (this.admission && !interrupt) throw new ChannelError('coordinator_conflict')
     this.admission = guard
     try {
       return await work()
     } finally {
-      this.admission = undefined
+      if (this.admission === guard) this.admission = undefined
     }
   }
   private readonly sourcePaths = new Map<string, string>()
@@ -120,6 +136,11 @@ export class DapSession {
   private readonly stepping = new Set<number>()
   /** Launch-owned content evidence; admission is not a permanent promise about disk contents. */
   validateSource?: (path: string) => Promise<void>
+  provisionalSource?: (path: string) => boolean
+  verifyBreakpointSource?: (path: string) => Promise<void>
+  private verifyingBreakpoints = 0
+  private breakpointVerification: Promise<void> = Promise.resolve()
+  private readonly breakpointEvents = new Map<number, symbol>()
   resolveFrameSources?: (
     paths: string[]
   ) => Promise<Map<string, { source_id: string; path: string }>>
@@ -143,6 +164,8 @@ export class DapSession {
     this.incarnation = state.incarnation
     dap.onEvent((event) => this.event(event))
     dap.onClose((error) => {
+      this.settleStartup(error)
+      this.lifetime.abort()
       debuggerLog('DAP closed', () => ({
         session: this.id,
         incarnation: this.incarnation,
@@ -191,11 +214,13 @@ export class DapSession {
     args: object = {},
     options: Parameters<DapTransport['request']>[2] = {}
   ) {
+    if (this.ending) return Promise.reject(new Error('dap_cancelled'))
     this.service.assertEffectsAvailable()
     this.admission?.()
     return this.dap.request(command, args, options)
   }
   private current(cleanup = false) {
+    if (this.ending && !cleanup) throw new Error('dap_cancelled')
     this.admission?.()
     if (!cleanup) this.service.assertEffectsAvailable()
     const state = this.snapshot
@@ -270,8 +295,10 @@ export class DapSession {
         if (mode === 'attach') this.observe({ kind: 'continued', all_threads_continued: true })
         else this.observe({ kind: 'lifecycle', lifecycle: 'active' })
       }
+      this.settleStartup()
       return this.snapshot
     } catch (error) {
+      this.settleStartup(error)
       controller.abort()
       try {
         if (live(this.snapshot)) this.observe({ kind: 'lifecycle', lifecycle: 'failed' })
@@ -323,6 +350,13 @@ export class DapSession {
     for (const bp of upsert) {
       if (!this.sources.has(bp.source_id)) throw new ChannelError('unknown_source')
       if (bp.enabled === false) continue
+      if (
+        this.provisionalSource?.(this.sources.get(bp.source_id)!) &&
+        (bp.condition !== undefined ||
+          bp.log_message !== undefined ||
+          bp.hit_condition !== undefined)
+      )
+        throw new ChannelError('debugger_source_pending')
       if (bp.hit_condition !== undefined && !this.capabilities.supportsHitConditionalBreakpoints)
         throw new ChannelError('unsupported_operation')
       if (bp.condition !== undefined && !this.capabilities.supportsConditionalBreakpoints)
@@ -337,6 +371,11 @@ export class DapSession {
   async syncBreakpoints(signal?: AbortSignal) {
     const state = this.current(),
       revision = state.breakpoint_revision
+    if (
+      state.breakpoints.some((bp) => bp.enabled !== false) &&
+      state.target.build_identity !== 'matched'
+    )
+      throw new ChannelError('build_identity_unverified')
     const sourceIds = new Set([...this.sentSources, ...state.breakpoints.map((bp) => bp.source_id)])
     for (const source of sourceIds) if (!this.sources.has(source)) throw new Error('unknown_source')
     if (sourceIds.size > 256) throw new Error('source_limit')
@@ -354,6 +393,18 @@ export class DapSession {
         const requested = state.breakpoints.filter(
           (bp) => bp.source_id === source && bp.enabled !== false
         )
+        if (
+          this.provisionalSource?.(this.sources.get(source)!) &&
+          requested.some(
+            (bp) =>
+              bp.condition !== undefined ||
+              bp.log_message !== undefined ||
+              bp.hit_condition !== undefined
+          )
+        )
+          throw new ChannelError('debugger_source_pending')
+        if (requested.length && this.validateSource)
+          await this.validateSource(this.sources.get(source)!)
         const breakpoints = requested.map((bp) => ({
           line: bp.line,
           ...(bp.column === undefined ? {} : { column: bp.column }),
@@ -387,19 +438,30 @@ export class DapSession {
           results = list(body.breakpoints)
         }
         if (results.length !== requested.length) throw new Error('dap_breakpoint_count')
+        if (
+          results.some((r) => r.verified) &&
+          this.provisionalSource?.(this.sources.get(source)!)
+        ) {
+          const proof = await this.verifyProvisionalSource(this.sources.get(source)!)
+          if (proof)
+            results = results.map((result) => ({ ...result, verified: false, message: proof }))
+        }
         results = results.map((result, i) => ({
           ...this.breakpointResult(requested[i]!.breakpoint_id, result),
           ...(nonnegative(result.id) ? { id: result.id } : {}),
         }))
-        if (!live(this.snapshot)) return
+        if (!live(this.snapshot) || this.ending) return
         if (this.snapshot.breakpoint_revision === revision) {
-          this.installedBreakpoints.set(source, { signature, results })
+          if (!results.some((r) => /^debugger_source_(changed|no_map)$/.test(r.message ?? '')))
+            this.installedBreakpoints.set(source, { signature, results })
           for (const [id, bp] of this.breakpointIds)
             if (
               state.breakpoints.find((r) => r.breakpoint_id === bp.id)?.source_id === source ||
               !state.breakpoints.some((r) => r.breakpoint_id === bp.id)
-            )
+            ) {
               this.breakpointIds.delete(id)
+              this.breakpointEvents.delete(id)
+            }
           results.forEach((result, i) => {
             if (nonnegative(result.id))
               this.breakpointIds.set(result.id, { id: requested[i]!.breakpoint_id, revision })
@@ -423,6 +485,10 @@ export class DapSession {
     try {
       await Promise.all(workers)
     } catch (error) {
+      debuggerLog('Breakpoint synchronization failed', () => ({
+        session: this.id,
+        reason: error instanceof Error ? error.message.slice(0, 256) : 'unknown',
+      }))
       controller.abort()
       await Promise.allSettled(workers)
       throw error
@@ -1032,19 +1098,31 @@ export class DapSession {
   private async end(lifecycle: 'detached' | 'terminated') {
     this.current(true)
     this.ending = lifecycle
+    this.lifetime.abort()
+    this.dap.cancelPending()
     try {
       // An externally owned program can keep running after disconnect.
-      if (this.traceHttpInstalled) await this.traceHttp('stop').catch(() => {})
+      if (this.traceHttpInstalled)
+        await this.dap
+          .request('evaluate', { expression: programHttpStop, context: 'repl' }, { timeoutMs: 150 })
+          .catch(() => {})
       // Never let an adapter choose what to kill. Direct node-owned OS evidence,
       // not disconnect/terminate success, establishes process termination.
       let disconnectError: unknown
       try {
-        await this.dap.request('disconnect', { terminateDebuggee: false, suspendDebuggee: false })
+        await this.dap.request(
+          'disconnect',
+          { terminateDebuggee: false, suspendDebuggee: false },
+          { timeoutMs: 250 }
+        )
       } catch (error) {
         // Closed while it was asked to let go: that is the detach. js-debug ends a run's root as
         // its program's session goes, and the root closes the session before it answers.
         const closed = this.dap.closed && error instanceof Error && error.message === 'dap_closed'
-        if (!(lifecycle === 'detached' && closed)) disconnectError = error
+        const timedOut = error instanceof Error && error.message === 'dap_timeout'
+        // A bounded disconnect timeout cannot undo successful owned-process
+        // termination below. Other adapter errors remain visible.
+        if (!(timedOut || (lifecycle === 'detached' && closed))) disconnectError = error
       }
       // Owned cleanup is independent of transport success and journal availability.
       if (lifecycle === 'terminated') await this.owner!.terminate()
@@ -1066,11 +1144,19 @@ export class DapSession {
     const points = raw.slice(0, 256).map((id) => this.breakpointIds.get(id))
     // Unknown or mixed hits remain ordinary stops. A numeric adapter id must
     // never impersonate a logical record-point id with the same spelling.
-    return points.every((bp) => bp?.revision === this.snapshot.breakpoint_revision)
+    return points.every(
+      (bp) =>
+        bp?.revision === this.snapshot.breakpoint_revision &&
+        this.snapshot.breakpoints.some(
+          (point) =>
+            point.breakpoint_id === bp.id && ['verified', 'relocated'].includes(point.status)
+        )
+    )
       ? points.map((bp) => bp!.id)
       : []
   }
   private event(event: DebugProtocol.Event) {
+    if (this.dap.closed) return
     // An actual target exit remains evidence even while disconnect is in flight.
     // DAP terminated alone describes the debugging session, not process death.
     if (event.event === 'exited' && this.ending && Number.isSafeInteger(event.body?.exitCode)) {
@@ -1084,6 +1170,14 @@ export class DapSession {
         this.initialized = true
         break
       case 'stopped': {
+        if (this.verifyingBreakpoints) {
+          void this.breakpointVerification
+            .then(() => this.event(event))
+            .catch((error) =>
+              this.dap.close(error instanceof Error ? error : new Error('debugger_event_failed'))
+            )
+          break
+        }
         this.deferredStops.delete(body.threadId)
         if (
           this.breakpointSyncs &&
@@ -1210,16 +1304,49 @@ export class DapSession {
         const breakpoint = body.breakpoint,
           mapped = this.breakpointIds.get(breakpoint?.id)
         if (mapped && this.snapshot.breakpoint_revision === mapped.revision) {
-          const result = this.breakpointResult(mapped.id, breakpoint)
-          for (const installed of this.installedBreakpoints.values())
-            installed.results = installed.results.map((entry) =>
-              entry.id === breakpoint.id ? { ...result, id: breakpoint.id } : entry
-            )
-          this.observe({
-            kind: 'breakpoints_result',
-            revision: mapped.revision,
-            results: [result],
-          })
+          this.breakpointResult(mapped.id, breakpoint)
+          const token = Symbol()
+          this.breakpointEvents.set(breakpoint.id, token)
+          const logical = this.snapshot.breakpoints.find((bp) => bp.breakpoint_id === mapped.id)
+          const path = logical && this.sources.get(logical.source_id)
+          if (breakpoint.verified && path && this.provisionalSource?.(path)) {
+            if (this.verifyingBreakpoints >= 256) throw new Error('dap_pending_breakpoints_limit')
+            this.verifyingBreakpoints++
+            this.breakpointVerification = this.breakpointVerification
+              .then(async () => {
+                if (
+                  this.dap.closed ||
+                  this.ending ||
+                  !live(this.snapshot) ||
+                  this.snapshot.breakpoint_revision !== mapped.revision ||
+                  this.breakpointEvents.get(breakpoint.id) !== token
+                )
+                  return
+                const proof = await this.verifyProvisionalSource(path)
+                const result = proof
+                  ? { ...breakpoint, verified: false, message: proof }
+                  : breakpoint
+                // Verification can outlive detach or a replacement breakpoint set.
+                if (
+                  !this.dap.closed &&
+                  live(this.snapshot) &&
+                  !this.ending &&
+                  this.snapshot.breakpoint_revision === mapped.revision &&
+                  this.breakpointEvents.get(breakpoint.id) === token
+                )
+                  this.applyBreakpointEvent(mapped, result)
+              })
+              .catch((error) =>
+                this.dap.close(
+                  error instanceof Error ? error : new Error('debugger_source_unverified')
+                )
+              )
+              .finally(() => {
+                this.verifyingBreakpoints--
+              })
+            break
+          }
+          this.applyBreakpointEvent(mapped, breakpoint)
         }
         break
       }
@@ -1236,6 +1363,34 @@ export class DapSession {
         }
         break
       // A process event is not execution or OS ownership proof.
+    }
+  }
+  private applyBreakpointEvent(mapped: { id: string; revision: number }, breakpoint: any) {
+    const result = this.breakpointResult(mapped.id, breakpoint)
+    for (const installed of this.installedBreakpoints.values())
+      installed.results = installed.results.map((entry) =>
+        entry.id === breakpoint.id ? { ...result, id: breakpoint.id } : entry
+      )
+    this.observe({ kind: 'breakpoints_result', revision: mapped.revision, results: [result] })
+  }
+  private async verifyProvisionalSource(path: string): Promise<string | undefined> {
+    try {
+      if (!this.verifyBreakpointSource) return 'debugger_source_unverified'
+      await this.verifyBreakpointSource(path)
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'debugger_source_unverified'
+      if (/^debugger_source_(changed|no_map)$/.test(code)) {
+        for (const [id, source] of this.sources)
+          if (source === path) this.installedBreakpoints.delete(id)
+        await this.dap
+          .requestWhenAvailable(
+            'setBreakpoints',
+            { source: { path }, breakpoints: [] },
+            { timeoutMs: 250, signal: this.closedSignal }
+          )
+          .catch(() => {})
+      }
+      return code
     }
   }
 }

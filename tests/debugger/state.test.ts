@@ -265,7 +265,7 @@ describe('debugger reducer, handles, replay and persistence', () => {
       core.db.prepare('DELETE FROM debug_events WHERE event_seq=?').run(pair.cursor.event_seq + 1)
       expect(d.replay(pair.cursor).kind).toBe('fresh_snapshot_required')
     }, true))
-  it('stores requested/verified/relocated/rejected/pending intent and ignores superseded replies', () =>
+  it('stores requested/verified/relocated/pending intent and ignores superseded replies', () =>
     withCore((core) => {
       const d = core.debugger
       const s = d.create(target)
@@ -306,7 +306,7 @@ describe('debugger reducer, handles, replay and persistence', () => {
         revision: 2,
         results: [{ breakpoint_id: 'bp', verified: false, message: 'unavailable' }],
       })
-      expect(d.snapshot(s.debug_session_id).snapshot.breakpoints[0]?.status).toBe('rejected')
+      expect(d.snapshot(s.debug_session_id).snapshot.breakpoints[0]?.status).toBe('pending')
       d.observe(s.debug_session_id, s.incarnation, {
         kind: 'breakpoints_result',
         revision: 2,

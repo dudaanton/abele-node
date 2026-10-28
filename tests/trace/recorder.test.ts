@@ -126,15 +126,20 @@ describe('a run recorded over a debugger session', () => {
     const f = await fixture(() => ({}))
     try {
       await f.breakpoint('unbound', 4)
-      const result = (verified: boolean) =>
+      const result = (verified: boolean, message?: string) =>
         f.core.debugger.observe(f.session.id, f.session.incarnation, {
           kind: 'breakpoints_result',
           revision: f.session.snapshot.breakpoint_revision,
-          results: [{ breakpoint_id: 'unbound', verified, line: 4 }],
+          results: [{ breakpoint_id: 'unbound', verified, line: 4, message }],
         })
       result(false)
       f.points.set(f.session.id, [{ breakpoint_id: 'unbound', take: [] }], [])
       f.recorder.attach(f.session)
+      expect(f.recorder.recording(f.session.id)).toBeUndefined()
+      expect(f.store.list()).toEqual([])
+      expect(f.session.snapshot.breakpoints[0]!.status).toBe('pending')
+      result(false, 'debugger_source_no_map')
+      expect(f.session.snapshot.breakpoints[0]!.status).toBe('rejected')
       expect(f.recorder.recording(f.session.id)).toBeUndefined()
       expect(f.store.list()).toEqual([])
       result(true)
@@ -146,6 +151,10 @@ describe('a run recorded over a debugger session', () => {
       })
       expect(f.recorder.recording(f.session.id)?.run_id).toBe(run)
       result(false)
+      expect(f.session.snapshot.breakpoints[0]!.status).toBe('pending')
+      expect(f.recorder.recording(f.session.id)?.run_id).toBe(run)
+      result(false, 'debugger_source_no_map')
+      expect(f.session.snapshot.breakpoints[0]!.status).toBe('rejected')
       expect(f.recorder.recording(f.session.id)).toBeUndefined()
       f.core.debugger.observe(f.session.id, f.session.incarnation, {
         kind: 'breakpoints_pending',

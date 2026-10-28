@@ -1,11 +1,21 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as programs from '../../packages/node-core/src/debugger/programs.js'
+import * as processes from '../../packages/node-core/src/debugger/process.js'
 import { NodeCore, type LaunchProfile } from '../../packages/node-core/src/index.js'
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
+import { JsDebugProfile } from '../../packages/node-core/src/debugger/js-profile.js'
 import {
   inspectorPrograms,
   processStartedAt,
@@ -44,8 +54,13 @@ function folder(files: Record<string, string>) {
 const SERVE = 'setInterval(() => {}, 1000)\n'
 
 /** Starts node in `cwd` with `args` and resolves once it prints what `ready` matches. */
-async function node(cwd: string, args: string[], ready: RegExp) {
-  const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+async function node(cwd: string, args: string[], ready: RegExp, wrapped = false) {
+  const child = wrapped
+    ? spawn('/bin/sh', ['-c', 'exec "$@"', 'fixture-wrapper', process.execPath, ...args], {
+        cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    : spawn(process.execPath, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
   children.push(child)
   let text = ''
   const match = await new Promise<RegExpExecArray>((resolve, reject) => {
@@ -192,6 +207,174 @@ async function setup(profile: (core: NodeCore) => LaunchProfile, chatFolder: str
 }
 
 describe('attaching the debugger to a running program', () => {
+  for (const native of [false, true])
+    for (const wrapped of [false, true])
+      it.skipIf(native && process.env.ABELE_DEBUGGER_LOCAL_TEST !== '1')(
+        `admits real tsx originals on wrapped=${wrapped}, native=${native} attach and refreshes late modules`,
+        async () => {
+          const entry = `import { increment } from '@lib/helper';
+import { createInterface } from 'node:readline';
+import { runInThisContext } from 'node:vm';
+runInThisContext('globalThis.synthetic = 1', {filename: new URL('./missing.ts', import.meta.url).pathname});
+const n: number = increment;
+console.log('app ready', n);
+setInterval(() => {}, 1000);
+createInterface({input: process.stdin}).on('line', async () => {
+  const {value} = await import('./packages/sample/src/late.js');
+  value();
+  console.log('late ready');
+});\n`
+          const late =
+            'export function value() {\n  const result: number = 42;\n  return result;\n}\n'
+          const dir = folder({
+            'package.json': '{"type":"module"}',
+            'tsconfig.json': JSON.stringify({
+              compilerOptions: { baseUrl: '.', paths: { '@lib/*': ['packages/sample/src/*'] } },
+            }),
+            'index.ts': entry,
+            'packages/sample/src/helper.ts': 'export const increment: number = 1;\n',
+            'packages/sample/src/late.ts': late,
+            'missing.ts': 'export const missing: number = 1;\n',
+          })
+          const program = await node(
+            dir,
+            [
+              '--inspect=127.0.0.1:0',
+              '--import=' + import.meta.resolve('tsx'),
+              'index.ts',
+              '--debug',
+            ],
+            /ws:\/\/127\.0\.0\.1:(\d+)\/[\s\S]*app ready/,
+            wrapped
+          )
+          const discovery = vi.spyOn(programs, 'inspectorPrograms').mockResolvedValue([
+            {
+              pid: program.pid,
+              port: program.port,
+              command: 'node --import=tsx index.ts --debug',
+              cwd: dir,
+              script: wrapped ? null : join(dir, 'index.ts'),
+            },
+          ])
+          const started = vi
+            .spyOn(programs, 'processStartedAt')
+            .mockResolvedValue(Date.now() + 5000)
+          const identity = vi
+            .spyOn(processes, 'processStartIdentity')
+            .mockResolvedValue('fixture-start')
+          try {
+            const profile = scriptedProfile()
+            const s = await setup(
+              native
+                ? (core) => {
+                    const stateDirectory = join(
+                      process.cwd(),
+                      '.scratch/debugger-integration/state'
+                    )
+                    if (!existsSync(stateDirectory))
+                      throw new Error('install pinned js-debug in scratch first')
+                    const js = new JsDebugProfile(core.debugger, { stateDirectory, enabled: true })
+                    return {
+                      profiles: () => js.profiles(),
+                      launch: (...args) => js.launch(...args),
+                      attach: async (...args) => {
+                        profile.attached.push({
+                          config: args[0],
+                          target: args[1],
+                          sources: new Map(args[2]),
+                          root: args[3],
+                        })
+                        return js.attach(...args)
+                      },
+                    }
+                  }
+                : profile.make,
+              dir
+            )
+            const attached = await s.request('debugger.v1.attachProgram', {
+              operation_id: 'tsx-attach',
+              conversation_id: s.chat.session_id,
+              pid: program.pid,
+              port: program.port,
+              sources: ['index.ts', 'packages/sample/src/helper.ts'],
+            })
+            expect(attached.sources.map((source: any) => source.path)).toContain('index.ts')
+            expect(attached.sources.map((source: any) => source.path)).toContain(
+              'packages/sample/src/helper.ts'
+            )
+            expect(profile.attached[0]!.target.build_identity).toBe('matched')
+            const add = (sources: string[]) =>
+              s.request('debugger.v1.addSources', {
+                operation_id: crypto.randomUUID(),
+                debug_session_id: attached.debug_session_id,
+                sources,
+              })
+            const candidate = await add(['packages/sample/src/late.ts'])
+            expect(candidate.sources).toEqual([
+              { source_id: expect.any(String), path: 'packages/sample/src/late.ts' },
+            ])
+            if (native) {
+              const snapshot = s.core.debugger.snapshot(attached.debug_session_id).snapshot
+              const patched = await s.request('debugger.v1.breakpoints.patch', {
+                operation_id: 'late-breakpoint',
+                debug_session_id: attached.debug_session_id,
+                incarnation: snapshot.incarnation,
+                expected_state_revision: snapshot.state_revision,
+                expected_breakpoint_revision: snapshot.breakpoint_revision,
+                upsert: [
+                  { breakpoint_id: 'late', source_id: candidate.sources[0].source_id, line: 2 },
+                ],
+                remove: [],
+              })
+              expect(patched).toMatchObject({ outcome: 'completed' })
+              expect(patched.snapshot.breakpoints[0].status).toBe('pending')
+            }
+            writeFileSync(join(dir, 'index.ts'), entry + '// changed\n')
+            expect((await add(['index.ts'])).refused).toEqual([
+              { path: 'index.ts', code: 'debugger_source_changed' },
+            ])
+            writeFileSync(join(dir, 'index.ts'), entry)
+            const ready = new Promise<void>((resolve) =>
+              program.child.stdout!.on('data', (chunk) => {
+                if (String(chunk).includes('late ready')) resolve()
+              })
+            )
+            program.child.stdin!.write('load\n')
+            if (native) {
+              await vi.waitFor(
+                () => {
+                  const snapshot = s.core.debugger.snapshot(attached.debug_session_id).snapshot
+                  expect(snapshot.breakpoints[0]?.status).toBe('verified')
+                  expect(
+                    snapshot.threads.some((thread) =>
+                      thread.stop?.hit_breakpoint_ids.includes('late')
+                    )
+                  ).toBe(true)
+                },
+                { timeout: 12000 }
+              )
+              const snapshot = s.core.debugger.snapshot(attached.debug_session_id).snapshot
+              const continued = await s.request('debugger.v1.continue', {
+                operation_id: 'continue-tsx',
+                debug_session_id: attached.debug_session_id,
+                incarnation: snapshot.incarnation,
+                expected_state_revision: snapshot.state_revision,
+                thread_id: snapshot.selected_thread_id,
+              })
+              expect(continued.outcome).toBe('completed')
+            }
+            await ready
+            expect((await add(['packages/sample/src/late.ts'])).sources).toEqual([
+              { source_id: expect.any(String), path: 'packages/sample/src/late.ts' },
+            ])
+            expect((await add(['missing.ts'])).refused[0]?.code).toBe('debugger_source_no_map')
+          } finally {
+            discovery.mockRestore()
+            started.mockRestore()
+            identity.mockRestore()
+          }
+        }
+      )
   it('attaches to a program of the chat’s folder as one the node does not own', async () => {
     const dir = folder({ 'app.js': SERVE, 'lib/util.js': 'module.exports = 1\n' })
     const before = new Date(Date.now() - 5000)

@@ -480,7 +480,9 @@ export class DebuggerCoordinator {
     if ((this.queued.get(session) ?? 0) >= 128)
       return Promise.resolve(this.finish(i, 'rejected', 'debugger_queue_limit'))
     this.queued.set(session, (this.queued.get(session) ?? 0) + 1)
-    const promise = (this.tails.get(session) ?? Promise.resolve())
+    const promise = (
+      i.method === 'detach' ? Promise.resolve() : (this.tails.get(session) ?? Promise.resolve())
+    )
       .catch(() => {})
       .then(() => this.dispatch(i, onPossibleDispatch))
     this.inflight.set(liveKey, promise)
@@ -541,8 +543,11 @@ export class DebuggerCoordinator {
         () => {
           const s = authorize()
           if (
-            s.state_revision !== fence.state_revision ||
-            s.stop_epoch !== fence.stop_epoch ||
+            // Source breakpoint intent is independent of the current pause.
+            // Adapter thread/stop events can arrive while source hashes are read.
+            // Keep execution fences for frame-bound and execution operations.
+            (i.method !== 'breakpoints.patch' &&
+              (s.state_revision !== fence.state_revision || s.stop_epoch !== fence.stop_epoch)) ||
             s.breakpoint_revision !== fence.breakpoint_revision
           )
             throw new DebuggerStateError('stale_state', s)

@@ -31,6 +31,7 @@ export const HTTP_V1_CAPABILITY = {
   recording_correlation: true,
   destination_owner: true,
   transport_status: true,
+  send_cancel: true,
   status: 'supported' as const,
   evidence:
     'requests-as-files; environments; send-and-poll; history-on-node; keys-per-send-never-written; optional-into-recording; owner-only',
@@ -261,6 +262,8 @@ export const HttpMethodSchemas = {
   'http.v1.send.status': z
     .object({ ...project, send_id: sendId, transport_only: z.boolean().optional() })
     .strict(),
+  /** Stops local transport; an unknown outcome cannot promise remote rollback. */
+  'http.v1.send.cancel': z.object({ ...project, send_id: sendId }).strict(),
   'http.v1.history': z
     .object({ ...project, id: requestId, limit: z.number().int().min(1).max(200).optional() })
     .strict(),

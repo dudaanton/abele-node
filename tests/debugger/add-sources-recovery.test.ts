@@ -8,18 +8,22 @@ import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { wire } from './dap-wire.js'
 import { adapter } from '../trace/adapter.js'
 
-it('retains added paths across node recovery and restores breakpoints by path after re-admission', async () => {
+async function recovery(kind: string) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'debug-sources-recovery-')))
   writeFileSync(join(dir, 'app.js'), 'console.log(1)\n')
   writeFileSync(join(dir, 'first.ts'), 'const n: number = 1\n')
   writeFileSync(join(dir, 'late.js'), 'console.log(2)\n')
-  writeFileSync(
-    join(dir, 'app.js.map'),
-    JSON.stringify({
-      sources: ['first.ts'],
-      sourcesContent: ['const n: number = 1\n'],
-    })
-  )
+  const map = JSON.stringify({
+    sources: ['first.ts'],
+    sourcesContent: ['const n: number = 1\n'],
+  })
+  if (kind === 'external') writeFileSync(join(dir, 'app.js.map'), map)
+  else
+    writeFileSync(
+      join(dir, 'app.js'),
+      'console.log(1)\n//# sourceMappingURL=data:application/json;base64,' +
+        Buffer.from(map).toString('base64')
+    )
   const profile = (core: NodeCore): LaunchProfile => ({
     profiles: () => [{ id: 'js-ts-native', version: 'fixture', inspection: 'explicit-only' }],
     async launch(_config, target, sources) {
@@ -60,7 +64,9 @@ it('retains added paths across node recovery and restores breakpoints by path af
   }
   try {
     const project = await current.request('project.register', { path: dir, trust: 'trusted' })
-    const [workspace] = await current.request('workspace.list', { project_id: project.project_id })
+    const [workspace] = await current.request('workspace.list', {
+      project_id: project.project_id,
+    })
     const folder = { kind: 'workspace', workspace_id: workspace.workspace_id }
     await current.request('project.execution', {
       project_id: project.project_id,
@@ -92,7 +98,8 @@ it('retains added paths across node recovery and restores breakpoints by path af
     )
     await close()
     // This source no longer has proof when the node starts again.
-    rmSync(join(dir, 'app.js.map'))
+    if (kind === 'external') rmSync(join(dir, 'app.js.map'))
+    else writeFileSync(join(dir, 'app.js'), 'console.log(1)\n')
     current = open()
     expect(
       await current.request('debugger.v1.sources', { debug_session_id: first.debug_session_id })
@@ -123,4 +130,9 @@ it('retains added paths across node recovery and restores breakpoints by path af
     await close()
     rmSync(dir, { recursive: true, force: true })
   }
-})
+}
+
+it.each(['external', 'inline'])(
+  'retains %s mapped paths across recovery and restores breakpoints after re-admission',
+  recovery
+)

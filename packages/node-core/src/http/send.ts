@@ -221,7 +221,9 @@ export async function sendRequest(input: SendInput, signal?: AbortSignal): Promi
         state: 'unknown',
         reason: timer.aborted
           ? `The answer did not finish in ${Math.round(timeout / 1000)} s.`
-          : `The answer broke off: ${message}`,
+          : signal?.aborted
+            ? 'Stopped before the answer finished.'
+            : `The answer broke off: ${message}`,
         after_ms: elapsed(),
       },
       ms: elapsed(),

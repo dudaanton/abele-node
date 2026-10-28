@@ -53,6 +53,7 @@ interface InFlight {
   abort: AbortController
   endedAt?: number
   done: Promise<void>
+  transportDone: Promise<void>
 }
 
 const SENSITIVE = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key)$/i
@@ -130,6 +131,8 @@ export class HttpService {
         return p.route_by_destination ? this.routeSend(p) : this.send(p)
       case 'http.v1.send.status':
         return this.status(p.project_id, p.send_id, p.transport_only)
+      case 'http.v1.send.cancel':
+        return this.cancel(p.project_id, p.send_id)
       case 'http.v1.history': {
         const store = this.store(p.project_id)
         return { sends: store.history(p.id, p.limit) }
@@ -148,7 +151,7 @@ export class HttpService {
   private send(p: Record<string, any>) {
     const store = this.store(p.project_id)
     this.sweep()
-    if ([...this.sends.values()].filter((s) => !s.endedAt).length >= MAX_IN_FLIGHT)
+    if ([...this.sends.values()].filter((s) => !s.transportOutcome).length >= MAX_IN_FLIGHT)
       throw new ChannelError('http_too_many_sends')
     const mask = masker(p.secrets)
     const id = newSendId(p.request_id)
@@ -179,6 +182,7 @@ export class HttpService {
       ...(chain ? { run: { run_id: chain.runId } } : {}),
     }
     const abort = new AbortController()
+    let transportSettled!: () => void
     const entry: InFlight = {
       project: p.project_id,
       summary,
@@ -186,6 +190,9 @@ export class HttpService {
       abort,
       ...(chain ? { chain } : {}),
       done: Promise.resolve(),
+      transportDone: new Promise<void>((resolve) => {
+        transportSettled = resolve
+      }),
     }
     this.sends.set(id, entry)
     entry.done = sendRequest(
@@ -216,6 +223,7 @@ export class HttpService {
         // show the actual answer without waiting for instrumentation to drain.
         entry.transportOutcome = outcome
         entry.transportSummary = { ...done }
+        transportSettled()
         if (chain) {
           // Recording availability must not turn a received answer into an unknown send.
           await this.core.trace.recorder.flushHttp(p.debug_session_id).catch((error) => {
@@ -271,11 +279,29 @@ export class HttpService {
           reason: 'The node lost track of this send.',
           after_ms: 0,
         }
+        entry.transportOutcome = entry.outcome
+        transportSettled()
       })
       .finally(() => {
         entry.endedAt = Date.now()
       })
     return { send_id: id, ...(chain ? { run_id: chain.runId } : {}) }
+  }
+  private async cancel(project: string, sendId: string) {
+    this.root(project)
+    const live = this.sends.get(sendId)
+    if (live && live.project !== project) throw new ChannelError('http_send_not_found')
+    if (!live) return this.status(project, sendId, true)
+    if (!live.transportOutcome) {
+      live.abort.abort()
+      // Recording may still be flushing against a paused debugger. Cancellation
+      // waits only for outgoing transport, never adapter progress.
+      await live.transportDone
+    }
+    // Stop must also end legacy status polling while recording is paused.
+    live.outcome = live.transportOutcome!
+    live.summary = live.transportSummary ?? live.summary
+    return this.status(project, sendId, true)
   }
   async destination(project: string, raw: string) {
     this.root(project)
