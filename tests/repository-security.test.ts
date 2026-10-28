@@ -275,8 +275,14 @@ it('does not recurse into a real submodule even when repository configuration re
   })
   const working = (await s.request('repository.v1.observe', { worktree_id: s.worktree_id }))
     .revision
+  const includingIgnored = (
+    await s.request('repository.v1.observe', {
+      worktree_id: s.worktree_id,
+      include_ignored: true,
+    })
+  ).revision
   expect(existsSync(t.marker)).toBe(false)
-  for (const revision of [committed, working]) {
+  for (const revision of [committed, working, includingIgnored]) {
     expect(
       (
         await s.request('repository.v1.tree', { worktree_id: s.worktree_id, revision })

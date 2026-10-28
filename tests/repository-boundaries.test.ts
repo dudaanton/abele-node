@@ -1,6 +1,14 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, renameSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  renameSync,
+  symlinkSync,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
 import { parseWorktrees, GitRunner } from '../packages/node-core/src/git.js'
@@ -84,6 +92,42 @@ it('reads unborn worktrees without inventing HEAD or historical attribution', as
   await expect(s.request('repository.v1.resolve', { ...p, ref: 'HEAD' })).rejects.toThrow(
     'git_failed'
   )
+})
+it('lists and reads ignored source with an explicit observation, including empty directories', async () => {
+  const s = await setup(),
+    p = { worktree_id: s.worktree_id }
+  writeFileSync(join(s.repo, '.gitignore'), 'data/\n')
+  mkdirSync(join(s.repo, 'packages/pkg/src/data/empty'), { recursive: true })
+  const path = 'packages/pkg/src/data'
+  writeFileSync(join(s.repo, path, 'generated.ts'), 'export const generated = true\n')
+  symlinkSync(s.dir, join(s.repo, path, 'escape'))
+  const ordinary = (await s.request('repository.v1.observe', p)).revision
+  await expect(s.request('repository.v1.tree', { ...p, revision: ordinary, path })).rejects.toThrow(
+    'unsafe_path'
+  )
+  const { revision } = await s.request('repository.v1.observe', { ...p, include_ignored: true })
+  const tree = await s.request('repository.v1.tree', { ...p, revision, path })
+  expect(tree.entries).toContainEqual(
+    expect.objectContaining({ path: path + '/generated.ts', kind: 'file' })
+  )
+  expect(tree.entries).toContainEqual(
+    expect.objectContaining({ path: path + '/empty', kind: 'directory' })
+  )
+  expect(
+    (await s.request('repository.v1.tree', { ...p, revision, path: path + '/empty' })).entries
+  ).toEqual([])
+  const blob = await s.request('repository.v1.blob', {
+    ...p,
+    revision,
+    path: path + '/generated.ts',
+  })
+  expect(blob).toMatchObject({ size: Buffer.byteLength('export const generated = true\n') })
+  const content = await s.request('repository.v1.content', { ...p, content_id: blob.content_id })
+  expect(Buffer.from(content.base64, 'base64').toString()).toBe('export const generated = true\n')
+  for (const unsafe of [path + '/escape/state', '../outside', '.git/config'])
+    await expect(
+      s.request('repository.v1.blob', { ...p, revision, path: unsafe })
+    ).rejects.toThrow()
 })
 it('makes ignored-file scans explicit and supports changed-file and wildcard searches', async () => {
   const s = await setup(),

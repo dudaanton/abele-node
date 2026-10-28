@@ -331,7 +331,15 @@ export const RepositoryMethodSchemas = {
   'repository.v1.refs': z.object({ ...target, ...paging }).strict(),
   'repository.v1.resolve': z.object({ ...target, ref }).strict(),
   'repository.v1.observe': z
-    .object({ ...target, include_ignored: z.boolean().default(false) })
+    .object({
+      ...target,
+      include_ignored: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Include git-ignored files and directories for tree, blob and search reads using this observation; grants still apply.'
+        ),
+    })
     .strict(),
   'repository.v1.status': z
     .object({ ...revision, include_change_details: z.boolean().optional(), ...paging })

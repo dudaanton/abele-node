@@ -1866,8 +1866,8 @@ export class RepositoryService {
       }
     )
     if (paths.size > 250000) throw new ChannelError('scan_limit')
-    // Git's directory mode exposes empty untracked directories, while retaining its
-    // excludes policy. Walk only the untracked directories Git collapses, never symlinks.
+    // Default views retain Git's excludes policy. Explicit ignored observations
+    // also walk ignored directories (including empty ones), never symlinks.
     const pendingDirectories = ['']
     const directories = new Set<string>()
     while (pendingDirectories.length) {
@@ -1878,8 +1878,8 @@ export class RepositoryService {
         .filter((entry) => entry.isDirectory() && safePath(entry.name))
         .map((entry) => entry.name)
       if (entries.length > 4096) throw new ChannelError('scan_limit')
-      let raw = ''
-      for (let offset = 0; offset < entries.length; offset += 100)
+      let raw = includeIgnored ? entries.map((name) => name + '/\0').join('') : ''
+      for (let offset = 0; !includeIgnored && offset < entries.length; offset += 100)
         raw += decodeGit(
           await this.r.git.run(target.path, {
             kind: 'visible.directories',
@@ -1889,7 +1889,8 @@ export class RepositoryService {
         )
       for (const name of raw.split('\0').filter((name) => name.endsWith('/'))) {
         const path = (parent ? parent + '/' : '') + name.slice(0, -1)
-        if (!safePath(path) || directories.has(path)) continue
+        if (!safePath(path) || directories.has(path) || paths.get(path)?.kind === 'submodule')
+          continue
         if (path.split('/').length > 32 || directories.size >= 4096)
           throw new ChannelError('scan_limit')
         const full = this.checked(target, path)

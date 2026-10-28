@@ -169,6 +169,15 @@ capture cannot admit old visible paths under new rules. System/global Git config
 remains disabled; this does not disable Git's default XDG ignore file. Changed observations return `stale_revision`; refresh intentionally to
 get another revision. Ignored files are excluded unless an observation explicitly
 requests `include_ignored: true`. Submodule contents and symlinks are never read.
+For explicitly requested ignored source, obtain an observation with
+`repository.v1.observe({ worktree_id, include_ignored: true })`, then pass its
+`revision` to `repository.v1.tree` (with the directory `path`) or
+`repository.v1.blob` (with the file `path`). This includes ignored empty
+directories. The flag belongs to the observation, not the tree/blob call;
+an ordinary observation still hides ignored paths, even when addressed directly.
+Clients implementing `node_ls`/`node_read` must opt in when accessing ignored
+source. Ignore rules control visibility, not authority: folder grants, read/edit
+levels, `.git` exclusions, traversal checks and symlink fences still apply.
 Unborn observations can be browsed, read, searched, and blamed without inventing
 HEAD or history; endpoint comparisons still require a selected real commit base.
 
