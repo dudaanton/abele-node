@@ -169,6 +169,23 @@ capture cannot admit old visible paths under new rules. System/global Git config
 remains disabled; this does not disable Git's default XDG ignore file. Changed observations return `stale_revision`; refresh intentionally to
 get another revision. Ignored files are excluded unless an observation explicitly
 requests `include_ignored: true`. Submodule contents and symlinks are never read.
+
+Ignored observations accept an optional `path` prefix. Use the exact file path for
+a read, or the directory path for browsing and search, so unrelated trees are not
+enumerated. Without a prefix, dependency, build and cache directories (including
+`node_modules`, `dist`, `build`, `target`, `.cache` and `.next`) are listed but not
+descended into. To search one, request a new observation with that directory as
+`path`; a search glob alone does not enable traversal. Explicit blob reads and
+directory listings resolve the requested path directly with the usual path and
+symlink checks.
+
+An ignored observation returns `truncated: true` when its bounded walk reaches a
+limit, with the collected entries still available. Narrow `path` to obtain fuller
+coverage. Tree and search pages based on a truncated observation set `incomplete`
+and explain the omission. Default observations keep their existing behavior and
+omit `truncated`. Scoped ignored observations contain no repository-wide status;
+use a default observation for status and change details.
+
 For explicitly requested ignored source, obtain an observation with
 `repository.v1.observe({ worktree_id, include_ignored: true })`, then pass its
 `revision` to `repository.v1.tree` (with the directory `path`) or

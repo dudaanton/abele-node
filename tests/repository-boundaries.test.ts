@@ -114,9 +114,15 @@ it('searches ignored source but excludes dependencies and builds by default', as
   const result = await s.request('repository.v1.search', { ...p, revision, query: 'needle' })
   expect(result.entries.map((e: any) => e.path)).toEqual(['generated/source.ts'])
   expect(result.incomplete).toBe(false)
+  // Dependency traversal now requires explicitly scoping the observation.
+  const dependencies = await s.request('repository.v1.observe', {
+    ...p,
+    include_ignored: true,
+    path: 'node_modules',
+  })
   const explicit = await s.request('repository.v1.search', {
     ...p,
-    revision,
+    revision: dependencies.revision,
     query: 'needle',
     path_glob: 'node_modules/**',
   })

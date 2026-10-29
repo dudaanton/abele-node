@@ -45,7 +45,7 @@ export type GitCommand =
   | { kind: 'tree'; object: string; recursive?: boolean }
   | { kind: 'blob.size'; object: string }
   | { kind: 'blob'; object: string }
-  | { kind: 'tracked' }
+  | { kind: 'tracked'; path?: string; paths?: string[] }
   | { kind: 'visible.untracked' }
   | { kind: 'visible.directories'; path: string; entries: string[] }
   | { kind: 'history'; commit: string; offset: number; limit: number; path?: string }
@@ -287,6 +287,8 @@ export class GitRunner {
         break
       case 'tracked':
         args = ['ls-files', '--stage', '-z']
+        if (command.path) args.push('--', command.path)
+        else if (command.paths) args.push('--', ...command.paths)
         break
       case 'visible.untracked':
         args = ['ls-files', '--others', '--exclude-standard', '-z']

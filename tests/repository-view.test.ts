@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import {
   mkdirSync,
   mkdtempSync,
@@ -11,15 +12,197 @@ import {
 } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { NodeCore } from '../packages/node-core/src/index.js'
+import { WatchService } from '../packages/node-core/src/watch-service.js'
 
 const dirs: string[] = [],
   cores: NodeCore[] = []
+const gitExecutable = existsSync('/Library/Developer/CommandLineTools/usr/bin/git')
+  ? '/Library/Developer/CommandLineTools/usr/bin/git'
+  : '/usr/bin/git'
+it('bounds ignored scans beside oversized dependencies', async () => {
+  const s = await setup()
+  const worktree_id = (await s.catalog()).entries.find((e: any) => e.kind === 'root').worktree_id
+  mkdirSync(join(s.repo, 'src'))
+  writeFileSync(join(s.repo, 'src/tracked.ts'), 'tracked source')
+  git(s.repo, 'add', 'src')
+  git(s.repo, 'commit', '-m', 'tracked source fixture')
+  writeFileSync(join(s.repo, '.gitignore'), 'ignored\nnode_modules/\n')
+  writeFileSync(join(s.repo, 'ignored'), 'generated')
+  mkdirSync(join(s.repo, 'node_modules'))
+  for (let i = 0; i < 4097; i++) mkdirSync(join(s.repo, 'node_modules', String(i)))
+  writeFileSync(join(s.repo, 'node_modules', 'explicit'), 'dependency')
+  const root = await s.request('repository.v1.observe', { worktree_id, include_ignored: true })
+  const scans = vi.spyOn(s.core.resources.repository as any, 'workingState')
+  const tree = await s.request('repository.v1.tree', { worktree_id, revision: root.revision })
+  expect(tree.entries).toContainEqual(expect.objectContaining({ path: 'ignored' }))
+  const listing = await s.request('repository.v1.tree', {
+    worktree_id,
+    revision: root.revision,
+    path: 'node_modules',
+  })
+  expect(listing.incomplete).toBe(true)
+  expect(listing.entries).toContainEqual(expect.objectContaining({ path: 'node_modules/0' }))
+  expect(
+    await s.request('repository.v1.blob', {
+      worktree_id,
+      revision: root.revision,
+      path: 'node_modules/explicit',
+    })
+  ).toMatchObject({ size: 10 })
+  expect(scans).not.toHaveBeenCalled()
+  const ordinary = await s.request('repository.v1.observe', { worktree_id })
+  scans.mockClear()
+  expect(
+    await s.request('repository.v1.blob', {
+      worktree_id,
+      revision: ordinary.revision,
+      path: 'node_modules/explicit',
+      include_ignored: true,
+    })
+  ).toMatchObject({ size: 10 })
+  expect(scans).not.toHaveBeenCalled()
+  const records = vi.spyOn(s.core.resources.git, 'records')
+  const run = vi.spyOn(s.core.resources.git, 'run')
+  const scoped = await s.request('repository.v1.observe', {
+    worktree_id,
+    include_ignored: true,
+    path: 'node_modules/explicit',
+  })
+  expect(
+    records.mock.calls.every(
+      ([, command]) =>
+        command.kind === 'tracked' &&
+        (command.path === 'node_modules/explicit' || command.paths?.join('/') === 'node_modules')
+    )
+  ).toBe(true)
+  expect(run.mock.calls.some(([, command]) => command.kind === 'status')).toBe(false)
+  const blob = await s.request('repository.v1.blob', {
+    worktree_id,
+    revision: scoped.revision,
+    path: 'node_modules/explicit',
+  })
+  expect(blob.size).toBe(10)
+  const source = await s.request('repository.v1.observe', {
+    worktree_id,
+    include_ignored: true,
+    path: 'src/tracked.ts',
+  })
+  expect(
+    await s.request('repository.v1.blob', {
+      worktree_id,
+      revision: source.revision,
+      path: 'src/tracked.ts',
+    })
+  ).toMatchObject({ size: 14 })
+  const large = await s.request('repository.v1.observe', {
+    worktree_id,
+    include_ignored: true,
+    path: 'node_modules',
+  })
+  expect(large.truncated).toBe(true)
+  const partial = await s.request('repository.v1.tree', {
+    worktree_id,
+    revision: large.revision,
+    path: 'node_modules',
+  })
+  expect(partial.incomplete).toBe(true)
+  expect(partial.entries).toContainEqual(expect.objectContaining({ path: 'node_modules/0' }))
+  expect(
+    await s.request('repository.v1.search', {
+      worktree_id,
+      revision: large.revision,
+      query: 'missing',
+      mode: 'filename',
+    })
+  ).toMatchObject({ incomplete: true })
+})
+it('keeps uninitialized submodules opaque for direct ignored reads and scoped observations', async () => {
+  const s = await setup()
+  const worktree_id = (await s.catalog()).entries.find((e: any) => e.kind === 'root').worktree_id
+  git(
+    s.repo,
+    'update-index',
+    '--add',
+    '--cacheinfo',
+    `160000,${git(s.repo, 'rev-parse', 'HEAD')},module`
+  )
+  mkdirSync(join(s.repo, 'module'))
+  writeFileSync(join(s.repo, 'module/secret'), 'private')
+  const { revision } = await s.request('repository.v1.observe', {
+    worktree_id,
+    include_ignored: true,
+  })
+  const tree = await s.request('repository.v1.tree', { worktree_id, revision })
+  expect(tree.entries).toContainEqual(
+    expect.objectContaining({ path: 'module', kind: 'submodule' })
+  )
+  await expect(
+    s.request('repository.v1.blob', {
+      worktree_id,
+      revision,
+      path: 'module/secret',
+      include_ignored: true,
+    })
+  ).rejects.toThrow('unsafe_path')
+  await expect(
+    s.request('repository.v1.observe', {
+      worktree_id,
+      include_ignored: true,
+      path: 'module/secret',
+    })
+  ).rejects.toThrow('unsafe_path')
+})
 function git(cwd: string, ...args: string[]) {
-  const r = spawnSync('/usr/bin/git', args, { cwd, encoding: 'utf8' })
+  const r = spawnSync(gitExecutable, args, { cwd, encoding: 'utf8' })
   if (r.status) throw new Error(r.stderr)
   return r.stdout.trim()
 }
-async function setup() {
+it('keeps visible observations quiet but fences ignored observations after a reliable hint without rescanning', async () => {
+  const s = await setup(true)
+  const worktree_id = (await s.catalog()).entries.find((e: any) => e.kind === 'root').worktree_id
+  const runs = join(s.repo, '.abele/runs')
+  mkdirSync(join(runs, 'recording'), { recursive: true })
+  writeFileSync(join(runs, '.gitignore'), '*\n')
+  const timeline = join(runs, 'recording/timeline.jsonl')
+  writeFileSync(timeline, '{}\n')
+  await s.request('repository.v1.observe', { worktree_id })
+  const monitor = (s.core.resources.repository as any).monitors.get(worktree_id)
+  expect(monitor.reliable).toBe(true)
+  const run = s.core.resources.git.run.bind(s.core.resources.git)
+  let writes = 0
+  const spy = vi.spyOn(s.core.resources.git, 'run').mockImplementation(async (...args) => {
+    const result = await run(...args)
+    if (args[1].kind === 'status') {
+      writeFileSync(timeline, JSON.stringify({ record: ++writes }))
+      monitor.changed(s.repo, '.abele/runs/recording/timeline.jsonl')
+    }
+    return result
+  })
+  monitor.generation++
+  const visible = await s.request('repository.v1.observe', { worktree_id })
+  expect(
+    (await s.request('repository.v1.tree', { worktree_id, revision: visible.revision })).entries
+  ).toContainEqual(expect.objectContaining({ path: 'sample.txt' }))
+  expect(writes).toBeGreaterThan(0)
+  spy.mockRestore()
+  const hidden = await s.request('repository.v1.observe', { worktree_id, include_ignored: true })
+  writeFileSync(timeline, 'changed')
+  monitor.changed(s.repo, '.abele/runs/recording/timeline.jsonl')
+  const scans = vi.spyOn(s.core.resources.repository as any, 'workingState')
+  for (const [method, path] of [
+    ['tree', ''],
+    ['blob', 'sample.txt'],
+  ])
+    await expect(
+      s.request('repository.v1.' + method, {
+        worktree_id,
+        revision: hidden.revision,
+        path,
+      })
+    ).rejects.toThrow('stale_revision')
+  expect(scans).not.toHaveBeenCalled()
+})
+async function setup(fakeWatch = false) {
   mkdirSync('.scratch', { recursive: true })
   const dir = mkdtempSync(resolve('.scratch/repository-'))
   dirs.push(dir)
@@ -35,6 +218,22 @@ async function setup() {
   git(repo, 'commit', '-m', 'initial')
   git(repo, 'worktree', 'add', '-b', 'side', linked)
   const core = new NodeCore(join(dir, 'state'))
+  if (fakeWatch)
+    Object.defineProperty(core.resources, 'watchers', {
+      value: new WatchService({
+        platform: 'linux',
+        native: () => {
+          const handle = new EventEmitter()
+          return Object.assign(handle, {
+            ready: true,
+            close() {
+              handle.removeAllListeners()
+            },
+          })
+        },
+      }),
+    })
+  Object.defineProperty(core.resources.git, 'executable', { value: gitExecutable })
   cores.push(core)
   const actor = core.authority.authenticate(core.createToken('fixture').token)
   let op = 0

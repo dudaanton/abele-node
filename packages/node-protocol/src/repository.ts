@@ -191,7 +191,11 @@ export const RepositoryBlobSchema = z
   })
   .strict()
 export const RepositoryObservationSchema = z
-  .object({ revision: RepositoryRevisionSchema, atomic: z.literal(false) })
+  .object({
+    revision: RepositoryRevisionSchema,
+    atomic: z.literal(false),
+    truncated: z.boolean().optional(),
+  })
   .strict()
 export const RepositoryBlameSchema = z
   .object({ content_id: id, entries: z.array(RepositoryBlameLineSchema).max(1500), ...page })
@@ -333,6 +337,7 @@ export const RepositoryMethodSchemas = {
   'repository.v1.observe': z
     .object({
       ...target,
+      path: path.optional().describe('Scope an include_ignored observation to this path prefix.'),
       include_ignored: z
         .boolean()
         .default(false)

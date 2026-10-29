@@ -119,6 +119,8 @@ interface Target {
   readGeneration?: number
 }
 interface WorkingSnapshot {
+  scope?: string
+  truncated?: boolean
   head: string | null
   files: TreeEntry[]
   status: Status[]
@@ -244,6 +246,8 @@ export class RepositoryService {
   private snapshots = new Map<string, WorkingSnapshot>()
   private retainedSizes = new WeakMap<object, number>()
   private rowSnapshots = new WeakMap<object, WorkingSnapshot>()
+  private directTreeStamps = new WeakMap<object, string | null>()
+  private directTreeParents = new WeakMap<object, { path: string; stamp: string | null }>()
   private observations = new Map<string, Observation>()
   private cursors = new Map<string, Continuation>()
   private comparisons = new Map<string, Comparison>()
@@ -883,8 +887,8 @@ export class RepositoryService {
     }
     this.monitors.get(id)?.close()
     this.monitors.delete(id)
-    this.snapshots.delete(id + ':false')
-    this.snapshots.delete(id + ':true')
+    for (const key of this.snapshots.keys())
+      if (key.startsWith(id + ':')) this.snapshots.delete(key)
   }
   releaseWatchers(path: string) {
     const rows = this.r.core.db
@@ -1050,7 +1054,10 @@ export class RepositoryService {
       this.cursors.set(cursor, continuation)
       this.prune()
     }
-    return { ...extra, entries, cursor, incomplete: omissions.length > 0, omissions }
+    const result = { ...extra, entries, cursor, incomplete: omissions.length > 0, omissions }
+    const parent = this.directTreeParents.get(rows)
+    if (parent) this.directTreeParents.set(result, parent)
+    return result
   }
   private continuation(actor: AuthorityContext, method: string, p: Record<string, unknown>) {
     if (!p.cursor) return undefined
@@ -1747,6 +1754,26 @@ export class RepositoryService {
       if (fd !== undefined) closeSync(fd)
     }
   }
+  private checkedWorkingPath(target: Target, path: string) {
+    const full = this.checked(target, path)
+    const parts = path.split('/').filter(Boolean)
+    for (let i = 1; i < parts.length; i++)
+      if (pathMetadata(join(target.path, ...parts.slice(0, i), '.git')) !== null)
+        throw new ChannelError('unsafe_path')
+    return full
+  }
+  private async checkWorkingBoundary(target: Target, path: string) {
+    this.checkedWorkingPath(target, path)
+    const parts = path.split('/').filter(Boolean)
+    const parents = parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'))
+    if (!parents.length) return
+    // An uninitialized gitlink can lack .git. Check its index identity too;
+    // these pathspecs read index metadata, never enumerate untracked files.
+    await this.r.git.records(target.path, { kind: 'tracked', paths: parents }, (row) => {
+      const match = row.match(/^160000 [a-f0-9]+ \d\t([\s\S]*)$/)
+      if (match && parents.includes(match[1]!)) throw new ChannelError('unsafe_path')
+    })
+  }
   private async head(target: Target) {
     try {
       return await this.r.git.text(target.path, { kind: 'resolve', ref: 'HEAD' })
@@ -1810,13 +1837,14 @@ export class RepositoryService {
   private async workingState(
     target: Target,
     includeIgnored = false,
-    retries = 2
+    retries = 2,
+    scope = ''
   ): Promise<WorkingSnapshot> {
     const monitor = await this.monitor(target)
     await this.configureMonitor(target, monitor)
     const signature = monitor.signature(includeIgnored)
     const started = Date.now()
-    const key = target.worktree_id + ':' + includeIgnored
+    const key = target.worktree_id + ':' + includeIgnored + (scope ? ':' + scope : '')
     const cached = this.snapshots.get(key)
     if (monitor.reliable && cached?.signature === signature) {
       // Explicitly creating a fresh repository observation reconciles its known
@@ -1833,42 +1861,138 @@ export class RepositoryService {
       )
       if (membershipUnchanged && ignoresUnchanged) return cached
       monitor.generation++
-      return this.workingState(target, includeIgnored, retries)
+      return this.workingState(target, includeIgnored, retries, scope)
+    }
+    let truncated = false
+    const readStatus = async () => {
+      const rows = this.parseStatus(await this.r.git.run(target.path, { kind: 'status' }))
+      if (!includeIgnored) return rows
+      const kept: Status[] = []
+      let bytes = 0
+      for (const row of rows) {
+        bytes += Buffer.byteLength(JSON.stringify(row))
+        if (kept.length >= 4096 || bytes > 256 * 1024) {
+          truncated = true
+          break
+        }
+        kept.push(row)
+      }
+      return kept
     }
     const head = await this.head(target),
-      status = this.parseStatus(await this.r.git.run(target.path, { kind: 'status' }))
+      status = scope ? [] : await readStatus()
     const paths = new Map<string, { kind: TreeEntry['kind']; oid: string | null }>()
     const tracked = new Map<string, string[]>()
     const untracked = new Set<string>()
-    await this.r.git.records(target.path, { kind: 'tracked' }, (f) => {
-      const m = f.match(/^(\d+) ([a-f0-9]+) \d\t([\s\S]*)$/)
-      if (!m) throw new ChannelError('git_failed')
-      if (safePath(m[3]!)) {
-        const rows = tracked.get(m[3]!) ?? []
-        rows.push(f)
-        tracked.set(m[3]!, rows)
-        paths.set(m[3]!, {
-          kind: m[1] === '160000' ? 'submodule' : m[1] === '120000' ? 'symlink' : 'file',
-          oid: m[2]!,
-        })
-      }
-      if (paths.size > 250000) throw new ChannelError('scan_limit')
-    })
-    await this.r.git.records(
-      target.path,
-      { kind: includeIgnored ? 'untracked' : 'visible.untracked' },
-      (path) => {
+    let pathBytes = Buffer.byteLength(scope)
+    if (scope) await this.checkWorkingBoundary(target, scope)
+    await this.r.git
+      .records(target.path, scope ? { kind: 'tracked', path: scope } : { kind: 'tracked' }, (f) => {
+        const m = f.match(/^(\d+) ([a-f0-9]+) \d\t([\s\S]*)$/)
+        if (!m) throw new ChannelError('git_failed')
+        const size = Buffer.byteLength(m[3]!)
+        if (includeIgnored && (paths.size >= 20000 || pathBytes + size > 256 * 1024)) {
+          throw new ChannelError('scan_limit')
+        }
+        if (safePath(m[3]!)) {
+          if (!paths.has(m[3]!)) pathBytes += size
+          const rows = tracked.get(m[3]!) ?? []
+          rows.push(f)
+          tracked.set(m[3]!, rows)
+          paths.set(m[3]!, {
+            kind: m[1] === '160000' ? 'submodule' : m[1] === '120000' ? 'symlink' : 'file',
+            oid: m[2]!,
+          })
+        }
+        if (paths.size > 250000) throw new ChannelError('scan_limit')
+      })
+      .catch((error) => {
+        if (
+          !includeIgnored ||
+          !(error instanceof ChannelError) ||
+          !['scan_limit', 'output_limit'].includes(error.code)
+        )
+          throw error
+        truncated = true
+      })
+    if (!includeIgnored)
+      await this.r.git.records(target.path, { kind: 'visible.untracked' }, (path) => {
         if (safePath(path)) {
           untracked.add(path)
           paths.set(path, { kind: 'file', oid: null })
         }
         if (paths.size > 250000) throw new ChannelError('scan_limit')
-      }
-    )
+      })
     if (paths.size > 250000) throw new ChannelError('scan_limit')
     // Default views retain Git's excludes policy. Explicit ignored observations
     // also walk ignored directories (including empty ones), never symlinks.
-    const pendingDirectories = ['']
+    if (includeIgnored) {
+      // Enumerate the requested subtree ourselves: Git's --others without
+      // excludes walks every ignored dependency before we can apply a budget.
+      const pending = [scope]
+      const heavy = new Set([
+        'node_modules',
+        'dist',
+        'build',
+        'out',
+        'coverage',
+        '.next',
+        '.nuxt',
+        '.output',
+        'target',
+        '.cache',
+        '.turbo',
+        '.parcel-cache',
+        '__pycache__',
+        '.venv',
+        'venv',
+      ])
+      while (pending.length) {
+        const path = pending.shift()!
+        if (paths.size >= 20000) {
+          truncated = true
+          break
+        }
+        const full = this.checkedWorkingPath(target, path)
+        const stat = lstatSync(full)
+        if (!stat.isDirectory()) {
+          if (path && !paths.has(path)) paths.set(path, { kind: 'file', oid: null })
+          continue
+        }
+        if (
+          paths.get(path)?.kind === 'submodule' ||
+          (path && pathMetadata(join(full, '.git')) !== null)
+        ) {
+          paths.set(path, { kind: 'submodule', oid: null })
+          continue
+        }
+        if (path) paths.set(path, { kind: 'directory', oid: null })
+        if (path !== scope && heavy.has(path.split('/').at(-1)!)) continue
+        const entries = readdirSync(full, { withFileTypes: true })
+          .filter((entry) => safePath(entry.name))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        if (entries.length > 4096) truncated = true
+        for (const entry of entries.slice(0, 4096)) {
+          const child = path ? path + '/' + entry.name : entry.name
+          const size = Buffer.byteLength(child)
+          if (paths.size >= 20000 || pathBytes + size > 256 * 1024) {
+            truncated = true
+            break
+          }
+          pathBytes += size
+          if (!paths.has(child))
+            paths.set(child, {
+              kind: entry.isSymbolicLink() ? 'symlink' : entry.isDirectory() ? 'directory' : 'file',
+              oid: null,
+            })
+          if (entry.isDirectory()) {
+            if (child.split('/').length >= 32) truncated = true
+            else pending.push(child)
+          }
+        }
+      }
+    }
+    const pendingDirectories = includeIgnored ? [] : ['']
     const directories = new Set<string>()
     while (pendingDirectories.length) {
       const parent = pendingDirectories.shift()!
@@ -1974,23 +2098,20 @@ export class RepositoryService {
     // Ignore files may change before their first dependency stamp is discovered.
     // Confirm the enumeration while those stamps are pinned; never cache a mixed
     // old visible-path list with new rules (even if a filesystem hint is delayed).
-    const confirmedStatus = this.parseStatus(await this.r.git.run(target.path, { kind: 'status' }))
+    const confirmedStatus = scope ? [] : await readStatus()
     const confirmedUntracked = new Set<string>()
-    await this.r.git.records(
-      target.path,
-      { kind: includeIgnored ? 'untracked' : 'visible.untracked' },
-      (path) => {
+    if (!includeIgnored)
+      await this.r.git.records(target.path, { kind: 'visible.untracked' }, (path) => {
         if (safePath(path)) confirmedUntracked.add(path)
         if (confirmedUntracked.size > 250000) throw new ChannelError('scan_limit')
-      }
-    )
+      })
     if (
       JSON.stringify(confirmedStatus) !== JSON.stringify(status) ||
       confirmedUntracked.size !== untracked.size ||
       [...untracked].some((path) => !confirmedUntracked.has(path)) ||
       [...ignoreStamps].some(([path, stamp]) => sourceMetadata(path) !== stamp)
     ) {
-      if (retries) return this.workingState(target, includeIgnored, retries - 1)
+      if (retries) return this.workingState(target, includeIgnored, retries - 1, scope)
       throw new ChannelError('stale_revision')
     }
     const boundaries = files
@@ -2000,7 +2121,7 @@ export class RepositoryService {
     if (monitor.reliable && monitor.signature(includeIgnored) !== signature) {
       if (retries) {
         try {
-          return await this.workingState(target, includeIgnored, retries - 1)
+          return await this.workingState(target, includeIgnored, retries - 1, scope)
         } catch (error) {
           this.restoreBaseline(monitor)
           throw error
@@ -2010,6 +2131,8 @@ export class RepositoryService {
       throw new ChannelError('stale_revision')
     }
     const snapshot: WorkingSnapshot = {
+      scope,
+      truncated,
       head,
       files,
       status,
@@ -2179,7 +2302,12 @@ export class RepositoryService {
       throw new ChannelError('git_failed')
     return { ...result, behind: counts[0], ahead: counts[1], reason: 'ok' }
   }
-  private async observation(actor: AuthorityContext, target: Target, revision: RepositoryRevision) {
+  private async observation(
+    actor: AuthorityContext,
+    target: Target,
+    revision: RepositoryRevision,
+    directIgnored = false
+  ) {
     if (revision.kind !== 'working') throw new ChannelError('invalid_revision')
     this.prune()
     const o = this.observations.get(revision.observation_id)
@@ -2192,10 +2320,16 @@ export class RepositoryService {
       throw new ChannelError('stale_revision')
     o.snapshot.monitor.touched = Date.now()
     if (o.snapshot.monitor.closed) throw new ChannelError('stale_revision')
+    // Reliable hints still fence the observation. Exact ignored reads only skip
+    // the full-scan fallback when watchers are broken; they fence path metadata below.
     if (o.snapshot.monitor.reliable) {
       if (o.snapshot.monitor.signature(o.includeIgnored) !== o.snapshot.signature)
         throw new ChannelError('stale_revision')
-    } else if ((await this.workingState(target, o.includeIgnored)).fingerprint !== o.fingerprint)
+    } else if (
+      !directIgnored &&
+      (await this.workingState(target, o.includeIgnored, 2, o.snapshot.scope)).fingerprint !==
+        o.fingerprint
+    )
       throw new ChannelError('stale_revision')
     return o
   }
@@ -2335,9 +2469,22 @@ export class RepositoryService {
     includeIgnored = false
   ) {
     if (revision.kind === 'working') {
-      const o = await this.observation(actor, target, revision)
-      const snapshot =
-        includeIgnored && !o.includeIgnored ? await this.workingState(target, true) : o.snapshot
+      const directIgnored =
+        includeIgnored || Boolean(this.observations.get(revision.observation_id)?.includeIgnored)
+      const o = await this.observation(actor, target, revision, directIgnored)
+      if ((includeIgnored || o.includeIgnored) && !o.snapshot.byPath.has(path)) {
+        try {
+          await this.checkWorkingBoundary(target, path)
+        } catch (error) {
+          if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? ''))
+            throw new ChannelError('not_found')
+          throw error
+        }
+        const result = this.readFile(target, path, limit)
+        await this.observation(actor, target, revision, directIgnored)
+        return result
+      }
+      const snapshot = o.snapshot
       const entry = snapshot.byPath.get(path)
       if (!entry) {
         try {
@@ -2353,12 +2500,7 @@ export class RepositoryService {
       this.checkObservedPath(target, snapshot, path)
       const result = this.readFile(target, path, limit)
       this.checkObservedPath(target, snapshot, path)
-      if (
-        snapshot !== o.snapshot &&
-        (await this.workingState(target, true)).fingerprint !== snapshot.fingerprint
-      )
-        throw new ChannelError('stale_revision')
-      await this.observation(actor, target, revision)
+      await this.observation(actor, target, revision, directIgnored)
       return result
     }
     const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
@@ -2763,7 +2905,9 @@ export class RepositoryService {
         : (await this.observation(actor, target, revision)).files)
     // Explicit globs opt into dependency/build paths. Default searches reserve
     // their bounded scan budget for source, including ignored generated source.
-    if (!saved && !p.path_glob)
+    const working =
+      revision.kind === 'working' ? await this.observation(actor, target, revision) : undefined
+    if (!saved && !p.path_glob && !working?.snapshot.scope)
       files = files.filter(
         (f) =>
           !f.path
@@ -2810,6 +2954,8 @@ export class RepositoryService {
     const start = Date.now(),
       omissions = new Set<string>(),
       rows: unknown[] = []
+    if (working?.snapshot.truncated)
+      omissions.add('observation truncated; narrow the observed path')
     let next = saved?.scan?.next ?? 0,
       line = saved?.scan?.line ?? 0,
       bytes = 0
@@ -3427,7 +3573,13 @@ export class RepositoryService {
       else {
         const target = await this.validate(this.get(String(p.worktree_id)))
         const revision = p.revision as RepositoryRevision | undefined
-        if (revision?.kind === 'working') await this.observation(actor, target, revision)
+        const directIgnored =
+          revision?.kind === 'working' &&
+          ['repository.v1.blob', 'repository.v1.tree'].includes(method) &&
+          (Boolean(p.include_ignored) ||
+            Boolean(this.observations.get(revision.observation_id)?.includeIgnored))
+        if (revision?.kind === 'working')
+          await this.observation(actor, target, revision, directIgnored)
         switch (method) {
           case 'repository.v1.editing.get': {
             let enabled = true
@@ -3454,8 +3606,9 @@ export class RepositoryService {
             break
           case 'repository.v1.observe': {
             const includeIgnored = Boolean(p.include_ignored)
-            const before = await this.workingState(target, includeIgnored),
-              after = await this.workingState(target, includeIgnored)
+            const scope = includeIgnored ? String(p.path ?? '') : ''
+            const before = await this.workingState(target, includeIgnored, 2, scope),
+              after = await this.workingState(target, includeIgnored, 2, scope)
             if (before.fingerprint !== after.fingerprint) throw new ChannelError('stale_revision')
             this.prune()
             const revision = {
@@ -3485,7 +3638,11 @@ export class RepositoryService {
             if (this.leaseSize(observation) > 8 * 1024 * 1024) throw new ChannelError('scan_limit')
             this.observations.set(revision.observation_id, observation)
             this.prune(after)
-            result = { revision, atomic: false }
+            result = {
+              revision,
+              atomic: false,
+              ...(includeIgnored ? { truncated: Boolean(after.truncated) } : {}),
+            }
             break
           }
           case 'repository.v1.status':
@@ -3514,16 +3671,67 @@ export class RepositoryService {
               break
             }
             let entries: TreeEntry[]
+            const omissions: string[] = []
             if (revision!.kind === 'commit')
               entries = await this.commitTree(target, revision!.commit, String(p.path))
             else {
-              const o = await this.observation(actor, target, revision!)
+              const o = await this.observation(actor, target, revision!, directIgnored)
               const path = String(p.path ?? '')
-              if (path && o.snapshot.byPath.get(path)?.kind !== 'directory')
+              if (
+                path &&
+                o.snapshot.byPath.get(path)?.kind !== 'directory' &&
+                (!o.includeIgnored || o.snapshot.byPath.has(path))
+              )
                 throw new ChannelError('unsafe_path')
               this.checked(target, path)
-              this.checkObservedPath(target, o.snapshot, path)
+              if (o.snapshot.stamps.has(path)) this.checkObservedPath(target, o.snapshot, path)
               entries = o.snapshot.children.get(path) ?? []
+              if (o.snapshot.truncated)
+                omissions.push('observation truncated; narrow the observed path')
+              // An explicit directory listing reads only its immediate children,
+              // including a dependency directory deliberately pruned at observe.
+              if (o.includeIgnored && path && path !== o.snapshot.scope) {
+                await this.checkWorkingBoundary(target, path)
+                const full = this.checkedWorkingPath(target, path)
+                if (pathMetadata(join(full, '.git')) !== null) throw new ChannelError('unsafe_path')
+                const parentStamp = pathMetadata(full)
+                const children = readdirSync(full, { withFileTypes: true })
+                  .filter((entry) => safePath(entry.name))
+                  .sort((a, b) => a.name.localeCompare(b.name))
+                if (children.length > 4096)
+                  omissions.push('directory truncated; narrow the observed path')
+                let bytes = 0
+                const selected = children.slice(0, 4096).filter((entry) => {
+                  bytes += Buffer.byteLength(path + '/' + entry.name)
+                  if (bytes <= 256 * 1024) return true
+                  if (!omissions.includes('directory byte limit; narrow the observed path'))
+                    omissions.push('directory byte limit; narrow the observed path')
+                  return false
+                })
+                entries = selected.map((entry) => {
+                  const child = path + '/' + entry.name
+                  const stat = lstatSync(join(full, entry.name))
+                  const row: TreeEntry = {
+                    path: child,
+                    name: entry.name,
+                    kind: entry.isSymbolicLink()
+                      ? 'symlink'
+                      : entry.isDirectory()
+                        ? pathMetadata(join(full, entry.name, '.git')) !== null
+                          ? 'submodule'
+                          : 'directory'
+                        : 'file',
+                    oid: null,
+                    size: stat.isDirectory() ? null : stat.size,
+                  }
+                  this.directTreeStamps.set(
+                    row,
+                    `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.mode}`
+                  )
+                  return row
+                })
+                this.directTreeParents.set(entries, { path, stamp: parentStamp })
+              }
             }
             result = this.page(
               actor,
@@ -3531,7 +3739,9 @@ export class RepositoryService {
               p,
               revision!.kind === 'working'
                 ? entries
-                : entries.sort((a, b) => a.path.localeCompare(b.path))
+                : entries.sort((a, b) => a.path.localeCompare(b.path)),
+              {},
+              omissions
             )
             break
           }
@@ -3589,11 +3799,15 @@ export class RepositoryService {
             throw new ChannelError('unsupported_method')
         }
         if (revision?.kind === 'working') {
-          const o = await this.observation(actor, target, revision)
+          const o = await this.observation(actor, target, revision, directIgnored)
           if (method === 'repository.v1.tree') {
             const path = String(p.path ?? '')
             this.checked(target, path)
-            this.checkObservedPath(target, o.snapshot, path)
+            const direct = this.directTreeParents.get(result as object)
+            if (direct) {
+              if (pathMetadata(join(target.path, direct.path)) !== direct.stamp)
+                throw new ChannelError('stale_revision')
+            } else this.checkObservedPath(target, o.snapshot, path)
           }
           if (method === 'repository.v1.blame') {
             this.checked(target, String(p.path))
@@ -3602,8 +3816,14 @@ export class RepositoryService {
           if (
             ['repository.v1.tree', 'repository.v1.status', 'repository.v1.search'].includes(method)
           )
-            for (const entry of (result as { entries: { path: string }[] }).entries)
-              this.checkObservedPath(target, o.snapshot, entry.path)
+            for (const entry of (result as { entries: { path: string }[] }).entries) {
+              if (method === 'repository.v1.tree' && this.directTreeStamps.has(entry)) {
+                if (
+                  pathMetadata(join(target.path, entry.path)) !== this.directTreeStamps.get(entry)
+                )
+                  throw new ChannelError('stale_revision')
+              } else this.checkObservedPath(target, o.snapshot, entry.path)
+            }
         }
         await this.validate(target)
       }
