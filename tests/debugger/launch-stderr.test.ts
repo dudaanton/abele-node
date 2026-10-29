@@ -33,6 +33,7 @@ it('forwards owned program pipes to the program session until detach', async () 
     snapshot: { threads: [{ status: 'stopped' }] },
     markEntryPause: vi.fn(),
     recordOutput: vi.fn(),
+    useProgramOutputPipes: vi.fn(),
     dap: {
       onEvent: () => () => {},
       onClose: (listener: () => void) => {
@@ -55,6 +56,7 @@ it('forwards owned program pipes to the program session until detach', async () 
       target
     )
     owner.emit('output', 'hello\n', 'stdout')
+    expect(session.useProgramOutputPipes).toHaveBeenCalledOnce()
     owner.emit('output', 'warning\n', 'stderr')
     expect(session.recordOutput.mock.calls).toEqual([
       ['hello\n', 'stdout'],
@@ -94,6 +96,7 @@ it.each(['debugger_startup_handoff_lost', 'debugger_program_ended'])(
         if (reason === 'debugger_program_ended') throw new Error(reason)
         return {
           snapshot: { threads: [] },
+          useProgramOutputPipes: vi.fn(),
           dap: {
             onEvent: () => () => {},
             onClose: (listener: () => void) => {

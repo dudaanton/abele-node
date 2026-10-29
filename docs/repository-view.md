@@ -173,11 +173,22 @@ For explicitly requested ignored source, obtain an observation with
 `repository.v1.observe({ worktree_id, include_ignored: true })`, then pass its
 `revision` to `repository.v1.tree` (with the directory `path`) or
 `repository.v1.blob` (with the file `path`). This includes ignored empty
-directories. The flag belongs to the observation, not the tree/blob call;
+directories. Alternatively, for a person opening an explicit file path (including
+a debugger source location), pass `include_ignored: true` to
+`repository.v1.blob` with the current working revision. This reads the ignored
+file without widening the observation's tree listing. Without either opt-in,
 an ordinary observation still hides ignored paths, even when addressed directly.
+The blob flag has no effect on commit revisions. Missing working paths return
+`not_found`; existing excluded paths still return `unsafe_path`.
 Clients implementing `node_ls`/`node_read` must opt in when accessing ignored
 source. Ignore rules control visibility, not authority: folder grants, read/edit
 levels, `.git` exclusions, traversal checks and symlink fences still apply.
+
+Searches without `path_glob` skip directories named `node_modules`, `dist`,
+`build`, `out`, `coverage`, `.next`, `.nuxt`, `.output`, and `target` at any depth
+before consuming the scan budget, including with an ignored-file observation.
+Other ignored source, such as generated code, remains searchable. Supply an
+explicit `path_glob` to search dependency or build directories intentionally.
 Unborn observations can be browsed, read, searched, and blamed without inventing
 HEAD or history; endpoint comparisons still require a selected real commit base.
 

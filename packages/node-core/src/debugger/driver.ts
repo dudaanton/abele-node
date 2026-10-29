@@ -105,6 +105,10 @@ export class DapSession {
     return this.lifetime.signal
   }
   private owner: DebugProcessOwner | undefined
+  private outputFromPipes = false
+  useProgramOutputPipes() {
+    this.outputFromPipes = true
+  }
   /** A session tree keeps its root transport until its independently connected children end. */
   onTerminated?: () => void
   private started = false
@@ -129,6 +133,9 @@ export class DapSession {
     this.evaluationContinued = undefined
     const before = this.snapshot
     if (before.stop_epoch !== pending.epoch) return
+    // A repl evaluation invalidates handles before dispatch. Its final stack
+    // probe below owns reconciliation, including when the expression throws.
+    if (before.execution === 'unknown') return
     const body = pending.event.body ?? {}
     const threads = before.threads.filter(
       (t) =>
@@ -194,6 +201,159 @@ export class DapSession {
   private readonly sourcePaths = new Map<string, string>()
   readonly sources: ReadonlyMap<string, string> = this.sourcePaths
   private readonly stepping = new Set<number>()
+  /** Installed by the recorder; ordinary debugging does not need step probes. */
+  isRecordPoint?: (id: string) => boolean
+  private readonly recordSteps = new Map<
+    number,
+    {
+      kind: 'over' | 'in' | 'out'
+      depth: number
+      singleThread: boolean
+      origin: { path?: string; line: number }
+      caller?: { path?: string; line: number }
+      skipping?: boolean
+      resume?: 'next' | 'stepOut'
+    }
+  >()
+  private readonly classifiedSteps = new WeakMap<DebugProtocol.Event, boolean>()
+  private readonly stopClassifications = new Map<number, symbol>()
+  private async stepDepth(
+    thread: number,
+    beforeDispatch = () => this.service.assertEffectsAvailable()
+  ) {
+    const body = await this.dap.requestWhenAvailable(
+      'stackTrace',
+      {
+        threadId: toDap(thread),
+        startFrame: 0,
+        levels: 100,
+      },
+      {
+        timeoutMs: 1000,
+        signal: this.closedSignal,
+        beforeDispatch,
+      }
+    )
+    const frames = list(body.stackFrames, 1024)
+    const depth = positive(body.totalFrames)
+      ? body.totalFrames
+      : frames.length < 100
+        ? frames.length
+        : undefined
+    if (!frames.length || !depth) throw new Error('dap_step_depth_unavailable')
+    return {
+      depth,
+      origin: { path: frames[0].source?.path, line: frames[0].line, column: frames[0].column },
+      caller: frames[1] ? { path: frames[1].source?.path, line: frames[1].line } : undefined,
+      skipped:
+        frames[0].presentationHint === 'subtle' ||
+        frames[0].source?.presentationHint === 'deemphasize',
+    }
+  }
+  private async classifyRecordStep(event: DebugProtocol.Event, thread: number) {
+    const plan = this.recordSteps.get(thread)!
+    const epoch = this.snapshot.stop_epoch
+    const token = Symbol()
+    this.stopClassifications.set(thread, token)
+    let hits = this.hitBreakpoints(event.body?.hitBreakpointIds)
+    let complete = true
+    let recordOnly = hits.length > 0 && hits.every((id) => this.isRecordPoint?.(id))
+    let current: Awaited<ReturnType<DapSession['stepDepth']>> | undefined
+    if (
+      plan.kind === 'in' &&
+      event.body?.reason === 'breakpoint' &&
+      event.body.hitBreakpointIds === undefined
+    ) {
+      try {
+        current = await this.stepDepth(thread)
+        // js-debug can label a step into a skipped source as a breakpoint
+        // without ids. Only unconditional, confirmed record points at the exact
+        // physical position can be attributed here; unknown ids stay stops.
+        const points = this.snapshot.breakpoints.filter(
+          (bp) =>
+            bp.enabled !== false &&
+            this.sources.get(bp.source_id) === current!.origin.path &&
+            bp.resolved_line === current!.origin.line &&
+            bp.resolved_column === current!.origin.column
+        )
+        if (
+          current.skipped &&
+          points.length &&
+          points.every(
+            (bp) =>
+              ['verified', 'relocated'].includes(bp.status) &&
+              this.isRecordPoint?.(bp.breakpoint_id) &&
+              bp.condition === undefined &&
+              bp.hit_condition === undefined &&
+              bp.log_message === undefined
+          )
+        ) {
+          const ids = [...this.breakpointIds]
+            .filter(
+              ([, bp]) =>
+                bp.revision === this.snapshot.breakpoint_revision &&
+                points.some((point) => point.breakpoint_id === bp.id)
+            )
+            .map(([id]) => id)
+          if (ids.length === points.length) {
+            event = { ...event, body: { ...event.body, hitBreakpointIds: ids } }
+            hits = this.hitBreakpoints(ids)
+            recordOnly = hits.length > 0
+          }
+        }
+      } catch {
+        // Without exact position evidence this remains an ordinary stop.
+      }
+    }
+    if (recordOnly || (!event.body?.hitBreakpointIds?.length && event.body?.reason === 'step')) {
+      try {
+        current ??= await this.stepDepth(thread)
+        complete =
+          plan.kind === 'over'
+            ? current.depth <= plan.depth
+            : plan.kind === 'out'
+              ? current.depth < plan.depth
+              : !current.skipped
+        plan.resume = 'stepOut'
+        if (plan.kind === 'in' && current.skipped) plan.skipping = true
+        const target = plan.kind === 'out' ? plan.caller : plan.skipping ? plan.origin : undefined
+        if (
+          target &&
+          current.depth < plan.depth + (plan.kind === 'in' ? 1 : 0) &&
+          current.origin.path === target.path &&
+          current.origin.line === target.line
+        ) {
+          complete = false
+          plan.resume = 'next'
+        }
+      } catch {
+        // Missing stack evidence must leave an inspectable stop, never run on.
+      }
+    }
+    if (
+      token !== this.stopClassifications.get(thread) ||
+      this.snapshot.stop_epoch !== epoch ||
+      this.recordSteps.get(thread) !== plan ||
+      !live(this.snapshot)
+    )
+      return
+    this.classifiedSteps.set(event, complete)
+    if (!recordOnly && event.body?.reason !== 'step') this.stepping.delete(thread)
+    if (complete) this.recordSteps.delete(thread)
+    this.event(event)
+    if (!complete && !recordOnly) {
+      const stopped = this.snapshot.stop_epoch
+      await this.waitForIdle()
+      if (this.snapshot.stop_epoch === stopped && this.recordSteps.get(thread) === plan)
+        await this.continueRecordedStop(thread)
+    }
+  }
+  /** A record point may interrupt a step without satisfying its original target. */
+  async continueRecordedStop(thread: number, beforeDispatch?: () => void) {
+    const plan = this.recordSteps.get(thread)
+    if (!plan) return this.continue(thread, false, beforeDispatch)
+    return this.execute(thread, plan.resume ?? 'stepOut', 'step', plan.singleThread, beforeDispatch)
+  }
   private readonly executing = new Set<number>()
   /** Launch-owned content evidence; admission is not a permanent promise about disk contents. */
   validateSource?: (path: string) => Promise<void>
@@ -225,6 +385,8 @@ export class DapSession {
     this.incarnation = state.incarnation
     dap.onEvent((event) => this.event(event))
     dap.onClose((error) => {
+      this.recordSteps.clear()
+      this.stopClassifications.clear()
       this.settleStartup(error)
       this.lifetime.abort()
       this.wakeIdle()
@@ -899,6 +1061,7 @@ export class DapSession {
   private expressionIntent() {
     const before = this.current()
     this.service.executionIntent(this.id, this.incarnation, before.state_revision, 'evaluate')
+    this.evaluatedEpoch = this.snapshot.stop_epoch
     this.admission?.advanceIntent()
     this.frameThreads.clear()
     this.objectThreads.clear()
@@ -921,35 +1084,41 @@ export class DapSession {
       }
     }
     const before = this.expressionIntent()
-    const body = await this.request('evaluate', { frameId, expression, context: 'repl' })
-    if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
-    // A successful stack read is positive evidence that this thread remains paused.
-    // Never overwrite a stop/continue event that overtook the evaluation or probe.
-    const intent = this.current()
-    if (thread && intent.execution === 'unknown' && intent.stop_epoch === before.stop_epoch + 1) {
-      try {
-        const probe = await this.request('stackTrace', {
-          threadId: toDap(thread),
-          startFrame: 0,
-          levels: 1,
-        })
-        const now = this.current()
-        if (
-          list(probe.stackFrames, 1024).length &&
-          now.stop_epoch === intent.stop_epoch &&
-          now.thread_inventory_revision === intent.thread_inventory_revision &&
-          now.execution === 'unknown'
-        ) {
-          this.observe({
-            kind: 'stopped',
-            thread_id: thread,
-            all_threads_stopped: before.all_threads_status === 'stopped',
-            reason: before.threads.find((t) => t.thread_id === thread)?.stop?.reason ?? 'pause',
-            hit_breakpoint_ids: [],
+    let body: any
+    try {
+      body = await this.request('evaluate', { frameId, expression, context: 'repl' })
+      if (typeof body.result !== 'string') throw new Error('dap_invalid_body')
+    } finally {
+      this.evaluatedEpoch = undefined
+      // A successful stack read is positive evidence that this thread remains paused.
+      // Never overwrite a stop/continue event that overtook the evaluation or probe.
+      const intent = this.current()
+      if (thread && intent.execution === 'unknown' && intent.stop_epoch === before.stop_epoch + 1) {
+        try {
+          const probe = await this.request('stackTrace', {
+            threadId: toDap(thread),
+            startFrame: 0,
+            levels: 1,
           })
+          const now = this.current()
+          if (
+            list(probe.stackFrames, 1024).length &&
+            now.stop_epoch === intent.stop_epoch &&
+            now.thread_inventory_revision === intent.thread_inventory_revision &&
+            now.execution === 'unknown'
+          ) {
+            this.observe({
+              kind: 'stopped',
+              thread_id: thread,
+              all_threads_stopped: before.all_threads_status === 'stopped',
+              reason: before.threads.find((t) => t.thread_id === thread)?.stop?.reason ?? 'pause',
+              hit_breakpoint_ids: [],
+            })
+            this.evaluatedEpoch = this.snapshot.stop_epoch
+          }
+        } catch {
+          // A failed probe proves neither running nor stopped; keep execution unknown.
         }
-      } catch {
-        // A failed probe proves neither running nor stopped; keep execution unknown.
       }
     }
     return {
@@ -1120,6 +1289,26 @@ export class DapSession {
   async step(thread: number, kind: 'over' | 'in' | 'out', singleThread = false) {
     const command = { over: 'next', in: 'stepIn', out: 'stepOut' }[kind]
     if (!command) throw new Error('invalid_step')
+    this.recordSteps.delete(thread)
+    if (
+      this.isRecordPoint &&
+      this.snapshot.breakpoints.some(
+        (bp) => bp.enabled !== false && this.isRecordPoint!(bp.breakpoint_id)
+      )
+    ) {
+      const before = this.stopped(thread)
+      const origin = await this.stepDepth(thread, () => {
+        this.current()
+      })
+      this.fence(before)
+      this.recordSteps.set(thread, {
+        kind,
+        depth: origin.depth,
+        origin: origin.origin,
+        caller: origin.caller,
+        singleThread,
+      })
+    }
     return this.execute(thread, command, 'step', singleThread)
   }
   private async execute(
@@ -1130,6 +1319,7 @@ export class DapSession {
     beforeDispatch?: () => void
   ) {
     const before = this.stopped(thread)
+    if (action === 'continue') this.recordSteps.clear()
     this.service.executionIntent(this.id, this.incarnation, before.state_revision, action)
     this.admission?.advanceIntent()
     this.frameThreads.clear()
@@ -1141,6 +1331,7 @@ export class DapSession {
       this.executing.add(thread)
       await this.request(command, { threadId: toDap(thread), singleThread }, { beforeDispatch })
     } catch (error) {
+      this.recordSteps.delete(thread)
       this.stepping.delete(thread)
       throw error
     } finally {
@@ -1152,6 +1343,7 @@ export class DapSession {
   async pause(thread?: number | null) {
     this.current()
     this.stepping.clear()
+    this.recordSteps.clear()
     if (thread == null) {
       // Discover a target without publishing an inventory change mid-command:
       // that would invalidate the coordinator's physical dispatch fence.
@@ -1275,21 +1467,45 @@ export class DapSession {
           })
           break
         }
+        if (
+          dapThread(body.threadId) &&
+          this.recordSteps.has(fromDap(body.threadId)) &&
+          !this.classifiedSteps.has(event)
+        ) {
+          if (['step', 'breakpoint'].includes(body.reason)) {
+            void this.classifyRecordStep(event, fromDap(body.threadId)).catch((error) =>
+              this.dap.close(error instanceof Error ? error : new Error('debugger_event_failed'))
+            )
+            break
+          }
+          this.recordSteps.delete(fromDap(body.threadId))
+        }
+        const hits = this.hitBreakpoints(body.hitBreakpointIds)
+        const pendingStep =
+          dapThread(body.threadId) &&
+          this.classifiedSteps.get(event) !== false &&
+          this.stepping.delete(fromDap(body.threadId))
         const stepped =
           dapThread(body.threadId) &&
-          this.stepping.delete(fromDap(body.threadId)) &&
-          ['breakpoint', 'step', 'pause'].includes(body.reason) &&
-          !body.hitBreakpointIds?.length
-        if (body.allThreadsStopped === true) this.stepping.clear()
+          (!body.hitBreakpointIds?.length ||
+            body.reason !== 'breakpoint' ||
+            (hits.length > 0 && hits.every((id) => this.isRecordPoint?.(id)))) &&
+          pendingStep &&
+          ['breakpoint', 'step', 'pause'].includes(body.reason)
+        if (body.allThreadsStopped === true && this.classifiedSteps.get(event) !== false)
+          this.stepping.clear()
         this.observe({
           kind: 'stopped',
           ...(dapThread(body.threadId) ? { thread_id: fromDap(body.threadId) } : {}),
           all_threads_stopped: body.allThreadsStopped === true,
-          reason: stepped
-            ? 'step'
-            : typeof body.reason === 'string'
-              ? boundedText(body.reason, 256)
-              : 'unknown',
+          reason:
+            this.classifiedSteps.get(event) === false && hits.length
+              ? 'breakpoint'
+              : stepped
+                ? 'step'
+                : typeof body.reason === 'string'
+                  ? boundedText(body.reason, 256)
+                  : 'unknown',
           ...(stepped
             ? { description: 'Paused after a step' }
             : typeof body.text === 'string' || typeof body.description === 'string'
@@ -1300,7 +1516,7 @@ export class DapSession {
                   ),
                 }
               : {}),
-          hit_breakpoint_ids: this.hitBreakpoints(body.hitBreakpointIds),
+          hit_breakpoint_ids: hits,
         })
         if (
           this.capabilities.supportsExceptionInfoRequest &&
@@ -1375,6 +1591,10 @@ export class DapSession {
         break
       case 'thread':
         if (body.reason === 'exited' && dapThread(body.threadId))
+          this.recordSteps.delete(fromDap(body.threadId))
+        if (body.reason === 'exited' && dapThread(body.threadId))
+          this.stopClassifications.delete(fromDap(body.threadId))
+        if (body.reason === 'exited' && dapThread(body.threadId))
           this.stepping.delete(fromDap(body.threadId))
         if (body.reason === 'exited') this.deferredStops.delete(body.threadId)
         if (!dapThread(body.threadId) || !['started', 'exited'].includes(body.reason))
@@ -1383,6 +1603,13 @@ export class DapSession {
         break
       case 'output':
         if (typeof body.output !== 'string') throw new Error('dap_invalid_body')
+        // Owned Node programs already supply their actual console and direct
+        // writes through pipes. Keep adapter diagnostics, not the second copy.
+        if (
+          this.outputFromPipes &&
+          ['console', 'stdout', 'stderr'].includes(body.category ?? 'console')
+        )
+          break
         this.observe({
           kind: 'output',
           text: boundedText(body.output, 256 * 1024),
@@ -1398,6 +1625,8 @@ export class DapSession {
           this.observe({ kind: 'exited', exit_code: body.exitCode })
         break
       case 'terminated':
+        this.recordSteps.clear()
+        this.stopClassifications.clear()
         this.stepping.clear()
         this.deferredStops.clear()
         this.observe({ kind: 'lifecycle', lifecycle: 'terminated' })

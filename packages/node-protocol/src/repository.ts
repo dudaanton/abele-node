@@ -346,7 +346,17 @@ export const RepositoryMethodSchemas = {
     .strict(),
   'repository.v1.tree': z.object({ ...revision, path: path.default(''), ...paging }).strict(),
   'repository.v1.blob': z
-    .object({ ...revision, path: file, larger: z.boolean().default(false) })
+    .object({
+      ...revision,
+      path: file,
+      larger: z.boolean().default(false),
+      include_ignored: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Read an explicit ignored working file without changing tree visibility; folder grants and path safety still apply.'
+        ),
+    })
     .strict(),
   'repository.v1.content': z
     .object({
@@ -391,7 +401,13 @@ export const RepositoryMethodSchemas = {
       scope: z.enum(['repository', 'changed']).default('repository'),
       mode: z.enum(['literal', 'regex', 'filename']).default('literal'),
       case_sensitive: z.boolean().default(false),
-      path_glob: z.string().max(256).optional(),
+      path_glob: z
+        .string()
+        .max(256)
+        .optional()
+        .describe(
+          'Explicit search glob; when absent, dependency and build directories are excluded by default.'
+        ),
       cursor: id.optional(),
       limit: z.number().int().min(1).max(100).default(100),
     })

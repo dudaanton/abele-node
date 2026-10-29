@@ -147,6 +147,7 @@ export class TraceRecorder {
 
   /** Watches one live DAP session for as long as it lives. */
   attach(session: DapSession): () => void {
+    session.isRecordPoint = (id) => !!this.host.points.get(session.id, id)
     const l: Live = {
       session,
       startedAt: this.now(),
@@ -344,6 +345,7 @@ export class TraceRecorder {
   private detach(l: Live, state: 'done' | 'cut') {
     if (this.live.get(l.session.id) !== l) return
     this.live.delete(l.session.id)
+    l.session.isRecordPoint = undefined
     l.off()
     this.finish(l, state)
   }
@@ -484,12 +486,14 @@ export class TraceRecorder {
       const hits = thread.stop.hit_breakpoint_ids
       // Ownership belongs to this physical stop. Removing a trace point during
       // capture must not turn its already-owned stop into a permanent pause.
-      const points = hits.map(
+      const matched = hits.map(
         (id) =>
           this.host.points.get(l.session.id, id) ??
           l.ownedStops.get(key)?.find((point) => point.breakpoint_id === id)
       )
-      if (hits.length && points.every(Boolean)) {
+      const points = matched.filter((point): point is TracePoint => !!point)
+      const resume = points.length === hits.length && thread.stop.reason === 'breakpoint'
+      if (points.length) {
         l.ownedStops.set(key, points as TracePoint[])
         const stoppedAt = this.now()
         const id = thread.thread_id
@@ -497,11 +501,13 @@ export class TraceRecorder {
         const chain = [...l.chains.entries()].pop()
         if (chain) chain[1].steps++
         const configuration = l.configuration
-        const confirmed = hits.every(
-          (hit) =>
-            this.host.points.get(l.session.id, hit) &&
+        const confirmed = points.every(
+          (point) =>
+            this.host.points.get(l.session.id, point.breakpoint_id) &&
             snapshot.breakpoints.some(
-              (bp) => bp.breakpoint_id === hit && ['verified', 'relocated'].includes(bp.status)
+              (bp) =>
+                bp.breakpoint_id === point.breakpoint_id &&
+                ['verified', 'relocated'].includes(bp.status)
             )
         )
         const retry = () => {
@@ -533,6 +539,7 @@ export class TraceRecorder {
               current,
               retry,
               confirmed,
+              resume,
               writer,
               chain
             )
@@ -557,6 +564,7 @@ export class TraceRecorder {
     current: (resuming?: boolean) => boolean,
     retry: () => void,
     confirmed: boolean,
+    resume: boolean,
     writer?: TraceRunWriter,
     chain?: [string, { steps: number }]
   ) {
@@ -591,14 +599,15 @@ export class TraceRecorder {
     }
     const resumedAt = this.now()
     if (!current()) return retry()
-    try {
-      await l.session.continue(thread, false, () => {
-        if (!current(true)) throw new Error('trace_capture_stale')
-      })
-    } catch (error) {
-      // Left stopped: whoever looks at the session sees where it stands.
-      this.host.log?.('[trace] Could not let the program go on', error)
-    }
+    if (resume)
+      try {
+        await l.session.continueRecordedStop(thread, () => {
+          if (!current(true)) throw new Error('trace_capture_stale')
+        })
+      } catch (error) {
+        // Left stopped: whoever looks at the session sees where it stands.
+        this.host.log?.('[trace] Could not let the program go on', error)
+      }
     const skipped = !writer && !confirmed
     if (skipped)
       writer = this.host.storeFor(l.session.snapshot).create({

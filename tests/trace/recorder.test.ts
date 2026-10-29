@@ -72,6 +72,97 @@ async function fixture(frame: () => Record<string, unknown>) {
 }
 
 describe('a run recorded over a debugger session', () => {
+  it.each(['record', 'conditional', 'mixed', 'unknown'])(
+    'attributes an id-less skipped step only with exact unconditional record evidence: %s',
+    async (kind) => {
+      const f = await fixture(() => ({ value: 42 }))
+      try {
+        if (kind === 'mixed') await f.breakpoint('user', 4)
+        await f.breakpoint('record', 4, kind === 'conditional' ? 'value > 0' : undefined)
+        f.points.set(f.session.id, [{ breakpoint_id: 'record', take: ['value'] }], [])
+        f.recorder.attach(f.session)
+        await f.recorder.settled(f.session.id)
+        const run = f.recorder.recording(f.session.id)!.run_id
+        f.fake.hit([], 'pause')
+        await f.session.step(1, 'in')
+        f.fake.stackDepth(3, true)
+        f.fake.hit(kind === 'unknown' ? [999] : undefined)
+        if (kind === 'record') {
+          await f.until(() => f.store.read(run).steps.length === 1)
+          await f.recorder.settled(f.session.id)
+          f.fake.stackDepth(2, false, 5)
+          f.fake.hit([], 'step')
+        }
+        await f.until(() => f.session.snapshot.execution === 'stopped')
+        await f.recorder.settled(f.session.id)
+        expect(f.store.read(run).steps).toHaveLength(kind === 'record' ? 1 : 0)
+        expect(f.w.messages.filter((m) => m.command === 'stepOut')).toHaveLength(
+          kind === 'record' ? 1 : 0
+        )
+      } finally {
+        await f.close()
+      }
+    }
+  )
+  it.each(['over', 'out', 'in', 'over-step'] as const)(
+    'records an intervening point and completes the original step %s',
+    async (kind) => {
+      const f = await fixture(() => ({ value: 42 }))
+      try {
+        const record = await f.breakpoint('record', 4)
+        f.points.set(f.session.id, [{ breakpoint_id: 'record', take: ['value'] }], [])
+        f.recorder.attach(f.session)
+        await f.recorder.settled(f.session.id)
+        const run = f.recorder.recording(f.session.id)!.run_id
+        f.fake.hit([], 'pause')
+        await f.session.step(1, kind === 'over-step' ? 'over' : kind)
+        f.fake.stackDepth(kind === 'out' ? 2 : 3, kind === 'in')
+        f.fake.hit([record], kind === 'over-step' ? 'step' : 'breakpoint')
+        await f.until(() => f.store.read(run).steps.length === 1)
+        await f.recorder.settled(f.session.id)
+        const resumes = f.w.messages.filter((m) => m.command === 'stepOut')
+        expect(resumes).toHaveLength(kind === 'out' ? 2 : 1)
+        f.fake.stackDepth(kind === 'out' ? 1 : 2, false, 5)
+        f.fake.hit([], 'step')
+        await f.until(() => f.session.snapshot.execution === 'stopped')
+        await f.recorder.settled(f.session.id)
+        expect(f.store.read(run).steps).toHaveLength(1)
+        expect(f.store.read(run).steps[0]!.values).toMatchObject([{ name: 'value', inline: '42' }])
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+      } finally {
+        await f.close()
+      }
+    }
+  )
+  it.each(['over', 'in', 'out', 'shared'] as const)(
+    'records once and stays paused at a conditional record point: %s',
+    async (kind) => {
+      const f = await fixture(() => ({ value: 42 }))
+      try {
+        if (kind === 'shared') await f.breakpoint('user', 4)
+        const record = await f.breakpoint('record', 4, 'value === 42')
+        f.points.set(f.session.id, [{ breakpoint_id: 'record', take: ['value'] }], [])
+        f.recorder.attach(f.session)
+        await f.recorder.settled(f.session.id)
+        const run = f.recorder.recording(f.session.id)!.run_id
+        if (kind !== 'shared') {
+          f.fake.hit([], 'pause')
+          if (kind === 'out') f.fake.stackDepth(3)
+          await f.session.step(1, kind)
+          f.fake.stackDepth(2)
+        }
+        f.fake.hit(kind === 'shared' ? [record - 1, record] : [record])
+        await f.until(() => f.session.snapshot.execution === 'stopped')
+        await f.recorder.settled(f.session.id)
+        expect(f.session.snapshot.execution).toBe('stopped')
+        expect(f.w.messages.filter((m) => m.command === 'continue')).toHaveLength(0)
+        expect(f.store.read(run).steps).toHaveLength(1)
+        expect(f.store.read(run).steps[0]!.values).toMatchObject([{ name: 'value', inline: '42' }])
+      } finally {
+        await f.close()
+      }
+    }
+  )
   it('resumes a record point reached before the user Continue reply', async () => {
     const f = await fixture(() => ({ value: 42 }))
     try {

@@ -61,6 +61,62 @@ async function ready(f: Parameters<Parameters<typeof fixture>[0]>[0], clipboard 
   stopped(f.w)
 }
 describe('internal DAP session driver', () => {
+  it.each(['missingName.field', 'object.throwingGetter'])(
+    'keeps a failed default-context evaluation stopped: %s',
+    async (expression) =>
+      fixture(async (f) => {
+        await ready(f)
+        const stack = f.session.stack(1)
+        f.w.reply(f.w.messages.at(-1), {
+          stackFrames: [{ id: 7, name: 'main', line: 4, column: 1 }],
+        })
+        const frame = (await stack).items[0]!.handle
+        const evaluation = f.session.evaluate(frame, expression)
+        const rejected = expect(evaluation).rejects.toThrow()
+        f.w.send({
+          type: 'event',
+          event: 'continued',
+          body: { threadId: 1, allThreadsContinued: true },
+        })
+        f.w.reply(f.w.messages.at(-1), {}, false)
+        await new Promise((resolve) => setImmediate(resolve))
+        if (f.w.messages.at(-1).command === 'stackTrace')
+          f.w.reply(f.w.messages.at(-1), { stackFrames: [{ id: 7 }] })
+        await rejected
+        expect(f.session.snapshot.execution).toBe('stopped')
+        const step = f.session.step(1, 'over')
+        f.w.reply(f.w.messages.at(-1))
+        stopped(f.w)
+        await step
+        expect(f.session.snapshot.execution).toBe('stopped')
+      })
+  )
+  it('uses owned pipes once while retaining adapter diagnostics', async () =>
+    fixture(async (f) => {
+      await ready(f)
+      f.session.useProgramOutputPipes()
+      const output = vi.spyOn(f.core.debugger, 'observe')
+      f.session.recordOutput('hello\n', 'stdout')
+      f.session.recordOutput('direct error\n', 'stderr')
+      f.w.send({ type: 'event', event: 'output', body: { category: 'console', output: 'hello\n' } })
+      f.w.send({
+        type: 'event',
+        event: 'output',
+        body: { category: 'stderr', output: 'direct error\n' },
+      })
+      f.w.send({
+        type: 'event',
+        event: 'output',
+        body: { category: 'important', output: 'adapter diagnostic\n' },
+      })
+      expect(
+        output.mock.calls.map((call) => call[2]).filter((event) => event.kind === 'output')
+      ).toMatchObject([
+        { text: 'hello\n', category: 'stdout' },
+        { text: 'direct error\n', category: 'stderr' },
+        { text: 'adapter diagnostic\n', category: 'important' },
+      ])
+    }))
   it.each(['before', 'after', 'probe-timeout'])(
     'keeps a throwing watch stopped when continued arrives %s its reply',
     async (timing) =>
@@ -260,6 +316,7 @@ describe('internal DAP session driver', () => {
         },
       })
       await next
+      // An ordinary breakpoint interrupts a step and remains a breakpoint stop.
       expect(f.session.snapshot.threads[0]?.stop?.reason).toBe('breakpoint')
       const runningStep = f.session.step(1, 'out')
       f.w.reply(f.w.messages.at(-1))

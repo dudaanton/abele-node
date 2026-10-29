@@ -12,6 +12,9 @@ export function adapter(
   const sandbox = frame()
   let stopped = true
   let threads = [1]
+  let depth = 2
+  let subtle = false
+  let topLine = 4
   const answered = new Set<number>()
   const tick = () => {
     for (const m of w.messages) {
@@ -31,6 +34,7 @@ export function adapter(
               id: ++breakpointId,
               verified: true,
               line: b.line,
+              column: 1,
             })),
           })
           break
@@ -40,9 +44,10 @@ export function adapter(
               {
                 id: 7,
                 name: 'parsePage',
-                line: 4,
+                line: topLine,
                 column: 1,
                 source: { path: `${root}/src/page.ts` },
+                ...(subtle ? { presentationHint: 'subtle' } : {}),
               },
               {
                 id: 8,
@@ -52,7 +57,7 @@ export function adapter(
                 source: { path: `${root}/src/service.ts` },
               },
             ],
-            totalFrames: 2,
+            totalFrames: depth,
           })
           break
         case 'evaluate':
@@ -91,7 +96,7 @@ export function adapter(
     get running() {
       return !stopped
     },
-    hit(dapIds: number[], reason = 'breakpoint', description?: string) {
+    hit(dapIds: number[] | undefined, reason = 'breakpoint', description?: string) {
       stopped = true
       w.send({
         type: 'event',
@@ -109,6 +114,11 @@ export function adapter(
     /** The threads it lists when asked. */
     threads(ids: number[]) {
       threads = ids
+    },
+    stackDepth(value: number, skipped = false, line = 4) {
+      depth = value
+      subtle = skipped
+      topLine = line
     },
   }
 }

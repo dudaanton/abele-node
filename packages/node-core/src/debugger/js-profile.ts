@@ -234,6 +234,7 @@ export class JsDebugProfile {
         )
         try {
           const session = await run.program()
+          session.useProgramOutputPipes()
           programSession = session
           session.dap.onClose(() => owner.off('output', output))
           await new Promise<void>((resolve, reject) => {

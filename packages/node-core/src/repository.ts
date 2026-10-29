@@ -2331,15 +2331,33 @@ export class RepositoryService {
     target: Target,
     revision: RepositoryRevision,
     path: string,
-    limit: number
+    limit: number,
+    includeIgnored = false
   ) {
     if (revision.kind === 'working') {
       const o = await this.observation(actor, target, revision)
-      const entry = o.snapshot.byPath.get(path)
-      if (!entry || entry.kind !== 'file') throw new ChannelError('unsafe_path')
-      this.checkObservedPath(target, o.snapshot, path)
+      const snapshot =
+        includeIgnored && !o.includeIgnored ? await this.workingState(target, true) : o.snapshot
+      const entry = snapshot.byPath.get(path)
+      if (!entry) {
+        try {
+          this.checked(target, path)
+        } catch (error) {
+          if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? ''))
+            throw new ChannelError('not_found')
+          throw error
+        }
+        throw new ChannelError('unsafe_path')
+      }
+      if (entry.kind !== 'file') throw new ChannelError('unsafe_path')
+      this.checkObservedPath(target, snapshot, path)
       const result = this.readFile(target, path, limit)
-      this.checkObservedPath(target, o.snapshot, path)
+      this.checkObservedPath(target, snapshot, path)
+      if (
+        snapshot !== o.snapshot &&
+        (await this.workingState(target, true)).fingerprint !== snapshot.fingerprint
+      )
+        throw new ChannelError('stale_revision')
       await this.observation(actor, target, revision)
       return result
     }
@@ -2361,7 +2379,8 @@ export class RepositoryService {
       target,
       p.revision as RepositoryRevision,
       String(p.path),
-      p.larger ? 16 * 1024 * 1024 : 1024 * 1024
+      p.larger ? 16 * 1024 * 1024 : 1024 * 1024,
+      Boolean(p.include_ignored)
     )
     if ((p.revision as RepositoryRevision).kind === 'working') {
       const probe = this.watchProbe(target.worktree_id)
@@ -2742,6 +2761,28 @@ export class RepositoryService {
       (revision.kind === 'commit'
         ? await this.commitTree(target, revision.commit, '', true)
         : (await this.observation(actor, target, revision)).files)
+    // Explicit globs opt into dependency/build paths. Default searches reserve
+    // their bounded scan budget for source, including ignored generated source.
+    if (!saved && !p.path_glob)
+      files = files.filter(
+        (f) =>
+          !f.path
+            .split('/')
+            .slice(0, -1)
+            .some((part) =>
+              [
+                'node_modules',
+                'dist',
+                'build',
+                'out',
+                'coverage',
+                '.next',
+                '.nuxt',
+                '.output',
+                'target',
+              ].includes(part)
+            )
+      )
     if (!saved && p.scope === 'changed') {
       let paths: Set<string>
       if (revision.kind === 'working')

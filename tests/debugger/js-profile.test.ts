@@ -56,6 +56,7 @@ it.each([undefined, true, false])(
       dap: { onEvent: () => () => {}, onClose: () => () => {} },
       continue: resume,
       markEntryPause: vi.fn(),
+      useProgramOutputPipes: vi.fn(),
     }
     const run = { program: async () => session, close: vi.fn() }
     const profile = new JsDebugProfile(core.debugger, { stateDirectory: dir, enabled: true })

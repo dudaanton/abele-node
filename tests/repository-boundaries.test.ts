@@ -59,6 +59,69 @@ afterEach(async () => {
   }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
+it('opens ignored files explicitly while keeping ordinary trees hidden', async () => {
+  const s = await setup(),
+    p = { worktree_id: s.worktree_id }
+  writeFileSync(join(s.repo, 'ignored'), 'generated source\n')
+  const { revision } = await s.request('repository.v1.observe', p)
+  expect(
+    await s.request('repository.v1.blob', {
+      ...p,
+      revision,
+      path: 'ignored',
+      include_ignored: true,
+    })
+  ).toMatchObject({ size: 17 })
+  expect(
+    (await s.request('repository.v1.tree', { ...p, revision })).entries.map((e: any) => e.path)
+  ).not.toContain('ignored')
+  await expect(
+    s.request('repository.v1.blob', { ...p, revision, path: 'ignored' })
+  ).rejects.toThrow('unsafe_path')
+  symlinkSync(s.dir, join(s.repo, 'escape'))
+  const fresh = (await s.request('repository.v1.observe', p)).revision
+  for (const path of ['escape/state', '../outside', '.git/config'])
+    await expect(
+      s.request('repository.v1.blob', { ...p, revision: fresh, path, include_ignored: true })
+    ).rejects.toThrow()
+})
+it('reports missing working paths as not found', async () => {
+  const s = await setup(),
+    p = { worktree_id: s.worktree_id }
+  for (const include_ignored of [false, true]) {
+    const { revision } = await s.request('repository.v1.observe', { ...p, include_ignored })
+    await expect(
+      s.request('repository.v1.blob', { ...p, revision, path: 'src/nope.ts' })
+    ).rejects.toThrow('not_found')
+  }
+})
+it('searches ignored source but excludes dependencies and builds by default', async () => {
+  const s = await setup(),
+    p = { worktree_id: s.worktree_id }
+  writeFileSync(join(s.repo, '.gitignore'), 'generated/\nnode_modules/\ndist/\nbuild/\n')
+  for (const dir of [
+    'generated',
+    'node_modules/pkg',
+    'dist',
+    'build',
+    'packages/pkg/node_modules/dep',
+    'packages/pkg/dist',
+  ]) {
+    mkdirSync(join(s.repo, dir), { recursive: true })
+    writeFileSync(join(s.repo, dir, 'source.ts'), 'needle\n')
+  }
+  const { revision } = await s.request('repository.v1.observe', { ...p, include_ignored: true })
+  const result = await s.request('repository.v1.search', { ...p, revision, query: 'needle' })
+  expect(result.entries.map((e: any) => e.path)).toEqual(['generated/source.ts'])
+  expect(result.incomplete).toBe(false)
+  const explicit = await s.request('repository.v1.search', {
+    ...p,
+    revision,
+    query: 'needle',
+    path_glob: 'node_modules/**',
+  })
+  expect(explicit.entries.map((e: any) => e.path)).toEqual(['node_modules/pkg/source.ts'])
+})
 it('represents bare, detached, locked and prunable records without requiring a HEAD for bare repositories', () => {
   expect(
     parseWorktrees(
