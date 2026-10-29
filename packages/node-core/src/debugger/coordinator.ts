@@ -18,6 +18,7 @@ import { boundedPayload } from './storage.js'
 import { DebuggerHistoryStore } from './history.js'
 import { DebuggerWaits } from './wait.js'
 import { DapDebuggerBackend } from './dap-backend.js'
+import { DapRejectedError } from './dap.js'
 
 export type { DebuggerPrincipal } from './permissions.js'
 type Params = Record<string, any>
@@ -561,6 +562,14 @@ export class DebuggerCoordinator {
       onPossibleDispatch?.() // survives a failed final journal/receipt write
       result = await backend.dispatch(i.method, i.params, guard)
     } catch (e) {
+      if (i.method === 'evaluate' && e instanceof DapRejectedError && e.command === 'evaluate') {
+        i.receipt.dispatch = 'dispatched'
+        i.receipt.message = e.adapterMessage
+        return this.finish(i, 'failed', 'adapter_rejected', {
+          code: 'adapter_rejected',
+          message: e.adapterMessage,
+        })
+      }
       return this.finish(i, 'outcome_unknown', errorCode(e))
     }
     i.receipt.dispatch = 'dispatched'
@@ -574,7 +583,9 @@ export class DebuggerCoordinator {
         ? 'rejected'
         : outcome === 'outcome_unknown'
           ? 'outcome_unknown'
-          : 'completed',
+          : outcome === 'failed'
+            ? 'failed'
+            : 'completed',
       data
     )
     i.receipt = {

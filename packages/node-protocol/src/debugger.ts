@@ -384,6 +384,7 @@ export const DebuggerReceiptSchema = z
     dispatch: z.enum(['not_dispatched', 'dispatched', 'possible']),
     outcome: z.enum(['pending', 'completed', 'rejected', 'failed', 'timed_out', 'outcome_unknown']),
     code: id.optional(),
+    message: z.string().max(256).optional(),
     proposal_hash: z
       .string()
       .max(16 * 1024 * 1024)

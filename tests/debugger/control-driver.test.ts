@@ -544,6 +544,78 @@ describe('authorized typed DAP backend', () => {
       await f.core.debuggerControl.command(f.human, 'step', p)
       expect(f.w.messages.filter((m: any) => m.command === 'next')).toHaveLength(1)
     }))
+  it.each(['missingSample is not defined', 'x'.repeat(1000), 'structured', null])(
+    'returns bounded evaluate errors and keeps transport loss uncertain (%s)',
+    (message) =>
+      fixture(async (f) => {
+        const stack = f.session.stack(1)
+        f.w.reply(await request(f.w, 'stackTrace'), {
+          stackFrames: [{ id: 42, name: 'main', line: 1, column: 1 }],
+          totalFrames: 1,
+        })
+        const handle = (await stack).items[0]!.handle
+        const p = {
+          ...f.body('failed-watch'),
+          frame_handle: handle,
+          expression: 'missingSample',
+          context: 'watch',
+        }
+        const before = f.session.snapshot
+        const proposal = await f.core.debuggerControl.command(f.human, 'evaluate', p)
+        const pending = f.core.debuggerControl.approve(f.owner, {
+          principal_key: f.core.debuggerControl.principalKey(f.human),
+          operation_id: p.operation_id,
+          proposal_hash: proposal.proposal_hash,
+          decision: 'approve',
+        })
+        const m = await request(f.w, 'evaluate')
+        if (message === null) f.w.dap.close(new Error('transport lost'))
+        else
+          f.w.send({
+            type: 'response',
+            request_seq: m.seq,
+            command: m.command,
+            success: false,
+            ...(message === 'structured'
+              ? {
+                  body: {
+                    error: {
+                      id: 9222,
+                      format: '{name} is not defined',
+                      variables: { name: 'missingSample' },
+                    },
+                  },
+                }
+              : { message }),
+          })
+        const receipt = await pending
+        if (message === null) {
+          expect(receipt).toMatchObject({
+            outcome: 'outcome_unknown',
+            dispatch: 'possible',
+            code: 'dispatch_uncertain',
+          })
+          expect(receipt).not.toHaveProperty('message')
+          return
+        }
+        const expected =
+          message === 'structured' ? 'missingSample is not defined' : message.slice(0, 256)
+        expect(receipt).toMatchObject({
+          outcome: 'failed',
+          dispatch: 'dispatched',
+          code: 'adapter_rejected',
+          message: expected,
+          snapshot: { execution: 'stopped', stop_epoch: before.stop_epoch },
+        })
+        expect(f.core.debugger.resolveHandle(f.session.id, handle, 'frame')).toBeDefined()
+        expect(f.core.debugger.history(f.session.id).entries.at(-1)).toMatchObject({
+          outcome: 'failed',
+          requested_data: { code: 'adapter_rejected', message: expected },
+        })
+        expect(await f.core.debuggerControl.command(f.human, 'evaluate', p)).toEqual(receipt)
+        expect(f.w.messages.filter((m: any) => m.command === 'evaluate')).toHaveLength(1)
+      })
+  )
   it('requires exact approval, fences handles and returns only requested expression data', () =>
     fixture(async (f) => {
       const handle = f.core.debugger.issueHandle(f.session.id, 'frame', 42, 1)

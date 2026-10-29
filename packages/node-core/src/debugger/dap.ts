@@ -23,6 +23,19 @@ export type DapOptions = {
   reverse?: (request: DebugProtocol.Request, signal: AbortSignal) => Promise<object>
 }
 type RequestOptions = { signal?: AbortSignal; timeoutMs?: number; beforeDispatch?: () => void }
+/** A correlated negative response, distinct from losing the transport/result. */
+export class DapRejectedError extends Error {
+  readonly adapterMessage: string
+  constructor(
+    readonly command: string,
+    message: string
+  ) {
+    const bounded = message.slice(0, 256)
+    super('dap_rejected:' + bounded)
+    this.adapterMessage = bounded
+  }
+}
+
 type SlotWaiter = { dispatch: () => void; reject: (error: Error) => void }
 type Pending = {
   command: string
@@ -322,10 +335,20 @@ export class DapTransport {
       const pending = this.take(message.request_seq)
       if (!pending) return // bounded tombstones allow late timeout/cancellation replies
       if (message.success) pending.resolve(message.body ?? {})
-      else
-        pending.reject(
-          new Error('dap_rejected:' + String(message.message ?? 'adapter_failure').slice(0, 256))
-        )
+      else {
+        const detail = record(message.body) && message.body.error
+        const text =
+          record(detail) && typeof detail.format === 'string'
+            ? detail.format
+                .slice(0, 256)
+                .replace(/\{([^{}]+)\}/g, (placeholder, key) =>
+                  record(detail.variables) && typeof detail.variables[key] === 'string'
+                    ? detail.variables[key].slice(0, 256)
+                    : placeholder
+                )
+            : String(message.message ?? 'adapter_failure')
+        pending.reject(new DapRejectedError(command, text))
+      }
     } else if (message.type === 'request') {
       if (
         typeof message.command !== 'string' ||

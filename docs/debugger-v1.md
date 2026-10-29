@@ -1,5 +1,13 @@
 # Debugger v1 infrastructure (B1–B5)
 
+Evaluate receipts expose optional `message` (up to 256 characters) for a confirmed
+adapter rejection: `outcome: failed`, `dispatch: dispatched`,
+`code: adapter_rejected`. Clients can display this text for failed watches;
+`commandResult` retains it for receipt lookup. The failed history entry also
+contains `requested_data: { code, message }`. Transport loss remains
+`outcome_unknown` with `dispatch_uncertain`; see the
+[control guide](debugger-control.md) for receipt and retry rules.
+
 This is **gated infrastructure, not a usable debugger**. B3 exposes only explicitly
 enabled, authorized coordinator RPCs. B5 adds gated agent tools, cursor waits and
 current-state delivery; target startup and plugin UI remain unavailable. See

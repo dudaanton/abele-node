@@ -233,6 +233,12 @@ promise. Lost results, backend exceptions and restart after pending intent becom
 `outcome_unknown`, never a replayable target effect. Even pending asks are settled
 conservatively on restart, including when the capability is now disabled.
 
+A correlated adapter rejection of `evaluate` returns `outcome: failed`,
+`dispatch: dispatched`, `code: adapter_rejected` and optional receipt `message`
+(adapter text bounded to 256 characters). Its history outcome is `failed`, with
+`requested_data: { code, message }`. A failed watch keeps the current stop.
+Transport loss still returns `outcome_unknown` / `dispatch_uncertain`.
+
 Startup rotates target incarnations, expires live references and marks live state
 unknown/connection-lost. It restores metadata/settings/history only, not drivers,
 processes or timers. Completed receipts survive history/payload eviction. Ordinary

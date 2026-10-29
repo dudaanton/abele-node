@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { OwnedDebugProcess } from '../../packages/node-core/src/debugger/process.js'
-import { NodeCore } from '../../packages/node-core/src/index.js'
+import { NodeCore, DapDebuggerBackend } from '../../packages/node-core/src/index.js'
 import { JsDebugProfile } from '../../packages/node-core/src/debugger/js-profile.js'
 import { jsAdapterInstalled } from '../../packages/node-core/src/debugger/js-install.js'
 import { target } from './helpers.js'
@@ -67,6 +67,33 @@ it.skipIf(process.env.ABELE_DEBUGGER_LOCAL_TEST !== '1' || !jsAdapterInstalled(s
       let epoch = session.snapshot.stop_epoch
       await session.continue(thread)
       await until(epoch)
+      const owner = core.authority.authenticate(core.createToken('failed-watch').token)
+      const human = { kind: 'human' as const, authority: owner }
+      core.debuggerControl.registerBackend(session.id, new DapDebuggerBackend(session))
+      const stack = await session.stack(thread)
+      const watchEpoch = session.snapshot.stop_epoch
+      const proposal = await core.debuggerControl.command(human, 'evaluate', {
+        operation_id: 'undefined-watch',
+        debug_session_id: session.id,
+        incarnation: session.incarnation,
+        expected_state_revision: session.snapshot.state_revision,
+        frame_handle: stack.items[0]!.handle,
+        expression: 'missingSample',
+        context: 'watch',
+      })
+      const failed = await core.debuggerControl.approve(owner, {
+        principal_key: core.debuggerControl.principalKey(human),
+        operation_id: 'undefined-watch',
+        proposal_hash: proposal.proposal_hash,
+        decision: 'approve',
+      })
+      expect(failed).toMatchObject({
+        outcome: 'failed',
+        dispatch: 'dispatched',
+        code: 'adapter_rejected',
+        snapshot: { execution: 'stopped', stop_epoch: watchEpoch },
+      })
+      expect(failed.message).toContain('missingSample is not defined')
       for (const context of ['watch', 'repl'] as const) {
         for (const expression of ['missingName.field', 'object.throwingGetter']) {
           const stack = await session.stack(thread)
