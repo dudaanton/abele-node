@@ -341,6 +341,18 @@ environments for that exact marker. Only matching process identities are retaine
 environment contents are not returned or journaled. Private per-run scope files
 support the same sweep after restart.
 
+Live samples retire exited child identities, including a child PID already reused
+by an unrelated process. A replacement is tracked only with fresh descendant or
+marker evidence. The app-server's own birth identity and all pre-signal identity
+checks remain fenced. Inventory updates persist removals and group changes together;
+a failed probe leaves the previous inventory intact.
+
+The 500 ms sampler tolerates two consecutive unavailable probes and resets this
+budget after a successful sample. A third consecutive unavailable probe ends the
+transport with `codex_process_inventory_unavailable:<original error>`. Changed root
+identity or persistence failures still end it immediately, retaining their cause.
+Cleanup confirmation remains mandatory; unavailable inventory never proves absence.
+
 This is sampled process ownership, not exhaustive kernel containment. A process
 that removes its marker and detaches or reparents before a sample can escape the
 inventory. Protected or unreadable environments cannot supply sweep evidence.

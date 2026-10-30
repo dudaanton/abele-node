@@ -118,7 +118,7 @@ export async function startCodexLiveSession(
     try {
       await peer.close()
     } catch {
-      return { reason: 'process_cleanup_unconfirmed' }
+      return { reason: 'process_cleanup_unconfirmed', failure_reason: stopReason ?? reason }
     }
     return {
       reason: stopReason ?? reason,

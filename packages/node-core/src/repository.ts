@@ -500,8 +500,15 @@ export class RepositoryService {
     this.checkRead(target)
     if (!target.active || this.targetFingerprint(target.path) !== target.fingerprint)
       throw new ChannelError('stale_resource')
-    if (target.workspace_id && this.r.workspaces.get(target.workspace_id).state !== 'ready')
-      throw new ChannelError('resource_busy')
+    if (target.workspace_id) {
+      const workspace = this.r.workspaces.get(target.workspace_id)
+      if (workspace.state !== 'ready')
+        throw new ChannelError(
+          'resource_busy',
+          `This folder's workspace record is not ready: ${workspace.state}`,
+          { workspace_id: workspace.workspace_id, state: workspace.state }
+        )
+    }
     return { project_id: target.project_id, path: target.path, fingerprint: target.fingerprint }
   }
   async executionTarget(id: string) {
@@ -1070,7 +1077,7 @@ export class RepositoryService {
     await this.r.projects.available(project)
     if (!project.git_common_dir) throw new ChannelError('git_required')
     const known = this.r.core.db.prepare(
-      "SELECT body FROM workspaces WHERE project_id=? AND json_extract(body,'$.path')=? AND state!='removed' LIMIT 1"
+      "SELECT body FROM workspaces WHERE project_id=? AND json_extract(body,'$.path')=? AND state!='removed' ORDER BY (state='ready') DESC, rowid ASC LIMIT 1"
     )
     const records = parseWorktrees(await this.r.git.run(project.root_path, { kind: 'worktrees' }))
     if (records.length > 1024) throw new ChannelError('scan_limit')
@@ -1084,7 +1091,6 @@ export class RepositoryService {
       const row = known.get(project.project_id, record.path) as { body: string } | undefined
       const w = row ? WorkspaceSchema.parse(JSON.parse(row.body)) : undefined
       const kind = w?.kind ?? 'external'
-      if (kind === 'external' && !config.external_read) continue
       let availability: WorktreeEntry['availability'] = record.bare ? 'bare' : 'available',
         fingerprint = ''
       try {
@@ -1106,6 +1112,7 @@ export class RepositoryService {
         target = undefined
       }
       if (!target) {
+        if (kind === 'external' && !config.external_read) continue
         target = {
           worktree_id: randomUUID(),
           project_id: project.project_id,
@@ -1126,7 +1133,16 @@ export class RepositoryService {
             target.fingerprint,
             1
           )
+      } else if (target.workspace_id !== (w?.workspace_id ?? null) || target.kind !== kind) {
+        // Workspace state can change without changing the directory's fingerprint.
+        // Repair old links too, including catalogues created before duplicate creates were fenced.
+        target.workspace_id = w?.workspace_id ?? null
+        target.kind = kind
+        this.r.core.db
+          .prepare('UPDATE repository_targets SET workspace_id=?,kind=? WHERE worktree_id=?')
+          .run(target.workspace_id, target.kind, target.worktree_id)
       }
+      if (kind === 'external' && !config.external_read) continue
       let dirty: boolean | null = null
       if (availability === 'available' && dirtyChecks++ < 64) {
         try {

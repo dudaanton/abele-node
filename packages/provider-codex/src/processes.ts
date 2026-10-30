@@ -123,22 +123,43 @@ export class CodexProcessInventory {
     }
     if (changed) this.persist([...this.evidence.values()])
   }
-  refresh() {
+  /** Live sampling may retire recycled children; pre-signal refresh stays strict. */
+  refresh(root?: ProcessIdentity) {
+    const refreshed = new Map(this.evidence)
+    let changed = false
     for (const expected of this.evidence.values()) {
       const actual = this.probe.identity(expected.pid)
-      if (!actual) continue
+      if (
+        !actual ||
+        (root && expected.pid !== root.pid && actual.fingerprint !== expected.fingerprint)
+      ) {
+        refreshed.delete(expected.pid)
+        changed = true
+        continue
+      }
       if (actual.fingerprint !== expected.fingerprint) throw new Error('process_identity_changed')
       // A same-birth process can change its group by detaching; retain its new group.
-      this.add([actual])
+      if (actual.group !== expected.group) {
+        refreshed.set(actual.pid, actual)
+        changed = true
+      }
+    }
+    // A failed probe cannot commit a partially refreshed inventory.
+    if (changed) {
+      this.persist([...refreshed.values()])
+      this.evidence = refreshed
     }
   }
   sample(root: ProcessIdentity) {
     const actual = this.probe.identity(root.pid)
-    if (!actual) return
-    if (actual.fingerprint !== root.fingerprint) throw new Error('process_identity_changed')
-    this.add([actual])
-    if (this.probe === systemProcessProbe) this.add(descendants(root.pid))
-    this.refresh()
+    if (actual) {
+      if (actual.fingerprint !== root.fingerprint) throw new Error('process_identity_changed')
+      this.add([actual])
+    }
+    // Discard old child births before admitting freshly observed descendants at
+    // the same PID. A replacement is never adopted solely because its PID matches.
+    this.refresh(root)
+    if (actual && this.probe === systemProcessProbe) this.add(descendants(root.pid))
   }
   async cleanup() {
     for (let pass = 0; pass < 3; pass++) {

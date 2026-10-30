@@ -34,6 +34,22 @@ accepts arbitrary results, so describe additions are safe for existing clients.
 Updated welcome and claim readers retain future optional response fields while
 still validating known identity fields; authority-bearing requests stay strict.
 
+## Process termination
+
+If a live provider exits during a turn, `turn.completed` keeps the compatible
+`outcome: interrupted` and `subtype: process_exited`. Its existing `terminal_reason`
+field now carries the actual cause: `stopped_by_owner` for an owner Stop, a provider
+or node error for an unexpected exit, or `process_lost` / `node_restart` for recovery.
+Clients should show "Stopped by you" only for explicit owner intent; an interrupted
+outcome by itself does not identify who stopped the turn. For older records with a
+null reason, consult the matching run's `session.process` exit reason or show a
+neutral interrupted status.
+
+`session.process.reason` still reports `process_cleanup_unconfirmed` when cleanup
+cannot be proved, preserving quarantine semantics. The original cause survives in
+the terminal turn event and the accompanying `session.error` message. No new event
+fields or outcome values are required by this change.
+
 ## Rename
 
 `session.rename` takes `{ session_id, title }` and requires an `operation_id`.

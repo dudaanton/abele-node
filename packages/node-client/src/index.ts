@@ -720,6 +720,10 @@ export class NodeClient {
   async removeWorkspace(workspace_id: string) {
     return WorkspaceJobResultSchema.parse(await this.mutation('workspace.remove', { workspace_id }))
   }
+  /** Retire a failed create record without changing the worktree or its files. */
+  async retireWorkspace(workspace_id: string) {
+    return WorkspaceSchema.parse(await this.mutation('workspace.retire', { workspace_id }))
+  }
   async workspaceStatus(workspace_id: string, offset = 0, limit = 256) {
     return WorkspaceStatusSchema.parse(
       await this.request('workspace.status', { workspace_id, offset, limit })

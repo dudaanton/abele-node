@@ -836,6 +836,19 @@ export class ResourceServices {
         operation_id: operation,
       },
     })
+    // Preparation awaits Git and may race another request. Fence the path in the
+    // same transaction that inserts the record/job, across all creation callers.
+    const existing = this.core.db
+      .prepare(
+        "SELECT workspace_id,state FROM workspaces WHERE json_extract(body,'$.path')=? AND state!='removed' LIMIT 1"
+      )
+      .get(workspace.path) as { workspace_id: string; state: string } | undefined
+    if (existing)
+      throw new ChannelError(
+        'resource_busy',
+        `This folder already has a live workspace record: ${existing.state}`,
+        existing
+      )
     this.core.db
       .prepare('INSERT INTO workspaces VALUES(?,?,?,?)')
       .run(workspace_id, workspace.project_id, workspace.state, JSON.stringify(workspace))
@@ -1055,6 +1068,38 @@ export class ResourceServices {
           this.reserveWorkspace(actor, operation!, prepared)
         )
       }
+      if (method === 'workspace.retire')
+        return this.core.commitOperation(actor, method, p, operation!, () => {
+          const workspace = this.workspaces.get(String(p.workspace_id))
+          this.projects.get(workspace.project_id)
+          if (workspace.kind !== 'managed') throw new ChannelError('unmanaged_workspace')
+          const job = this.core.db
+            .prepare('SELECT body FROM jobs WHERE workspace_id=? ORDER BY rowid DESC LIMIT 1')
+            .get(workspace.workspace_id) as { body: string } | undefined
+          const latest = job && JobSchema.parse(JSON.parse(job.body))
+          if (
+            workspace.state !== 'needs_attention' ||
+            this.workspaces.leased(workspace.workspace_id) ||
+            !latest ||
+            latest.kind !== 'workspace.create' ||
+            !['needs_attention', 'failed'].includes(latest.state) ||
+            this.core.db
+              .prepare("SELECT 1 FROM jobs WHERE workspace_id=? AND state IN ('queued','running')")
+              .get(workspace.workspace_id)
+          )
+            throw new ChannelError(
+              'resource_busy',
+              'Only an idle failed create record can be retired'
+            )
+          // Retire metadata only. This path may belong to a successful sibling
+          // record; never release its bindings, run Git or touch its files.
+          workspace.state = 'removed'
+          this.workspaces.save(workspace, {
+            kind: 'installation',
+            installation_id: actor.installation_id,
+          })
+          return workspace
+        })
       if (method === 'workspace.remove') {
         const workspace = this.workspaces.get(String(p.workspace_id)),
           project = this.projects.get(workspace.project_id)

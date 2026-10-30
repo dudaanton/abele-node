@@ -123,6 +123,7 @@ export const ResourceMethodSchemas = {
   'workspace.list': z.object({ project_id: id, ...page }).strict(),
   'workspace.get': z.object({ workspace_id: id }).strict(),
   'workspace.remove': z.object({ workspace_id: id }).strict(),
+  'workspace.retire': z.object({ workspace_id: id }).strict(),
   'workspace.status': z
     .object({
       workspace_id: id,
@@ -141,4 +142,5 @@ export const RESOURCE_MUTATIONS = [
   'project.codex_permissions',
   'workspace.create',
   'workspace.remove',
+  'workspace.retire',
 ] as const

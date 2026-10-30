@@ -147,7 +147,13 @@ export interface LiveSessionSink {
 /** One provider process that outlives turns. Turns are reported as events, not as calls. */
 export interface LiveSession {
   /** Settles when the process is gone and its cleanup is confirmed (or not). */
-  done: Promise<{ reason?: string; exit_code?: number | null; signal?: string | null }>
+  done: Promise<{
+    reason?: string
+    /** Original termination cause when cleanup itself could not be confirmed. */
+    failure_reason?: string
+    exit_code?: number | null
+    signal?: string | null
+  }>
   /** Writes one user message into the running process; the CLI queues it. */
   send(input: LiveInput): void
   /** Stops the current turn and keeps the process. */

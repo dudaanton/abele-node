@@ -218,11 +218,23 @@ export class RpcPeer {
       }
       if (!peer.evidence.length) throw new Error('codex_process_identity_unconfirmed')
       peer.inventory.add(peer.evidence)
+      let inventoryFailures = 0
       peer.sampler = setInterval(() => {
         try {
           peer.inventory.sample(peer.evidence[0]!)
-        } catch {
-          peer.fail('codex_process_inventory_unavailable')
+          inventoryFailures = 0
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          // A slow/failed ps is not proof of lost containment. Keep the last
+          // persisted identities and retry, bounded to three consecutive samples.
+          // Identity and persistence failures still fence the run immediately.
+          const transient = [
+            'process_probe_unavailable',
+            'process_inventory_unavailable',
+            'codex_process_inventory_unavailable',
+          ].includes(reason)
+          if (!transient || ++inventoryFailures >= 3)
+            peer.fail(`codex_process_inventory_unavailable:${reason}`.slice(0, 256))
         }
       }, 500)
       if (peer.reason) throw new Error(peer.reason)

@@ -39,6 +39,22 @@ managed workspace. Every target returns:
 - available, missing, unavailable, or bare availability;
 - locked/prunable flags and observed dirty state (`null` means not observed).
 
+When legacy workspace records share a path, discovery prefers a `ready` record
+and refreshes the target's workspace link on every catalogue read, preserving its
+`worktree_id` and filesystem fingerprint. Execution preparation reports
+`resource_busy` with a readable workspace state when the linked record is not ready.
+
+`workspace.create` reserves its destination in the state transaction. A second
+request for a live path fails with `resource_busy`, including while provisioning
+or awaiting attention; retries with the same operation ID retain their receipt.
+An owner can retire an idle failed create with `workspace.retire { workspace_id }`
+(`NodeClient.retireWorkspace(workspace_id)`). This operation requires an operation
+ID and returns the workspace with `state: removed`. It preserves jobs and history,
+never runs Git, and never changes files or another workspace at the same path.
+Ready/provisioning workspaces, leased records, active jobs and failed removals
+cannot be retired. Retiring metadata does not delete any partially created branch
+or worktree; ordinary ready-worktree deletion still uses `workspace.remove`.
+
 Call `repository.v1.worktrees` with `include_identity: true` to receive an
 `identity: { canonical_path, fingerprint }` on available entries. The fingerprint
 is an opaque pin of the target directory and its `.git` inode identity. Save both

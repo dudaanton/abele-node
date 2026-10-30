@@ -409,7 +409,7 @@ export class LiveSessions {
         num_turns: null,
         duration_ms: null,
         total_cost_usd: null,
-        terminal_reason: null,
+        terminal_reason: row.live ? 'process_lost' : 'node_restart',
       })
     this.core.append(row.session_id, 'session.process', actor, {
       run_id: row.run_id,
@@ -920,7 +920,7 @@ export class LiveSessions {
       until: Date.now() + Math.min(this.retryMs * 2 ** (count - 1), 10 * 60000),
     })
   }
-  private exited(slot: Slot, result: { reason?: string; exit_code?: number | null }) {
+  private exited(slot: Slot, result: Awaited<LiveSession['done']>) {
     const { session_id, run_id } = slot
     if (slot.detaching && result.reason === 'detached') {
       // Still running: the run, its lease and its inputs stay as they are for the next node.
@@ -936,6 +936,8 @@ export class LiveSessions {
     } catch {}
     const unconfirmed = result.reason === 'process_cleanup_unconfirmed'
     const expected = !!slot.stopReason
+    const reason = (slot.stopReason ?? result.reason ?? 'process_exited').slice(0, 256)
+    const terminalReason = (slot.stopReason ?? result.failure_reason ?? reason).slice(0, 256)
     this.core.transaction(() => {
       // In-flight inputs: the process is gone, whether they took effect is unknown.
       for (const input of this.core.db
@@ -957,13 +959,13 @@ export class LiveSessions {
           num_turns: null,
           duration_ms: null,
           total_cost_usd: null,
-          terminal_reason: null,
+          terminal_reason: terminalReason,
         })
       this.owner.invalidate(run_id)
       this.core.append(session_id, 'session.process', actor, {
         run_id,
         state: 'exited',
-        reason: (slot.stopReason ?? result.reason ?? 'process_exited').slice(0, 256),
+        reason,
         exit_code: result.exit_code ?? null,
         ...(slot.tasks.length ? { lost_tasks: slot.tasks } : {}),
       })
@@ -979,7 +981,7 @@ export class LiveSessions {
       this.core.append(session_id, 'session.error', actor, {
         run_id,
         code: 'process_cleanup_unconfirmed',
-        message: 'Provider cleanup is unconfirmed; this execution target remains busy.',
+        message: `Provider cleanup is unconfirmed; this execution target remains busy. Reason: ${terminalReason}`,
       })
     } else if (this.slots.get(session_id) === slot) this.slots.delete(session_id)
   }
