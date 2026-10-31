@@ -50,7 +50,7 @@ For a specific release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dudaanton/abele-node/main/install.sh | \
-  sh -s -- --version 0.4.74
+  sh -s -- --version 0.4.75
 ```
 
 Only releases with installer assets can be installed this way. The installer
@@ -796,15 +796,15 @@ model inference. Runtime diagnostics can contain local paths; redact before shar
 Checking for a release (30 s request timeout)
 Pausing agent turns (2 sessions kept alive)
 Downloading the installer and checksums
-Downloading AbeleNode 0.4.74 (linux-arm64; size reported when known)
-Downloading AbeleNode 0.4.74: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
+Downloading AbeleNode 0.4.75 (linux-arm64; size reported when known)
+Downloading AbeleNode 0.4.75: 12.0 MiB / 24.0 MiB (50%), 3.0 MiB/s, 4 s left
 Downloading checksums
 Verifying archive and checksums
 Installing (validating runtime before service stop)
 Waiting for service stop (45 s polling timeout)
 Restarting the service
 Waiting for health (15 attempts, 1 s between attempts)
-Done: 0.4.32 → 0.4.74
+Done: 0.4.32 → 0.4.75
 ```
 
 Terminal downloads update in place. Pipes receive a line approximately every 10%
@@ -834,7 +834,7 @@ installers without progress support show a waiting heartbeat during the handoff.
 
    ```sh
    git fetch --tags origin
-   git checkout v0.4.74  # example; select an existing release
+   git checkout v0.4.75  # example; select an existing release
    npm ci --ignore-scripts
    npm run types
    npm test
@@ -851,6 +851,20 @@ older code. Migration 9 refuses legacy recovery rows/old mutation intents requir
 manual inspection rather than deleting their evidence; see [editing](editing.md). Downgrades require the stopped pre-upgrade backup, not deleting migration
 markers. Provider version updates need separate compatibility verification; no
 permission-bypass fallback exists.
+
+### Coordinated local-handshake upgrade
+
+Upgrade the daemon and the plugin's bundled node client together. Local admission
+now requires `local-proof-v1` server proof before the saved token is sent; old
+clients sending `auth` first and old servers without this proof are incompatible.
+There is no insecure compatibility fallback. If admission fails immediately after
+an upgrade, verify both component versions rather than creating another token or
+removing the existing node registration.
+
+Existing random local tokens, node/installation IDs, client-store namespaces,
+receipts and cursors remain valid. No re-enrollment or remote-access enablement is
+required. The private node identity is persisted in the existing protected state
+database. See [server proof and its threat model](security.md#server-proof-before-local-token-disclosure).
 
 ## Uninstall
 

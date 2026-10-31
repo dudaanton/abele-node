@@ -22,6 +22,11 @@ on Linux and Windows is unavailable. Windows deployment is untested. See
 Language intelligence (definition, diagnostics, and private server installation) is available
 through the node API; see [language servers](docs/lsp.md).
 
+Local admission verifies a fresh server proof before disclosing the saved token.
+Upgrade daemon and plugin/client together; auth-first legacy admission is refused.
+Existing registrations and tokens need no reconfiguration. See the
+[local handshake and threat model](docs/security.md#server-proof-before-local-token-disclosure).
+
 ## What works today
 
 - Durable sessions, event history, queued follow-ups, reconnect/replay and

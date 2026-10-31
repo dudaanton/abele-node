@@ -35,6 +35,36 @@ leave the scheduler. Tokens confer **node-wide** authority, not project-scoped A
 A stolen token can control the node's projects/sessions, so store it separately in
 a device-local secret adapter, not URLs, cookies, synced settings or notes.
 
+### Server proof before local token disclosure
+
+Every local connection, including first enrollment and reconnect, starts with
+`local.begin` using `local-proof-v1`, a fresh client nonce and a domain-separated
+selector derived from the saved token hash. The selector is not an authentication
+credential. The server returns a fresh connection-bound P-256 challenge signed by
+its persisted node identity, plus an HMAC keyed through a separate derivation from
+the existing token hash. The authenticated transcript binds the protocol/profile,
+node, installation, selector, both nonces, expiry and node-key fingerprint; the MAC
+also binds the signature. The client verifies both proofs and its expected node ID
+before sending the reusable token on the same transport. A self-signed key, port
+ownership or an unverified node ID is not enough. Client freshness uses the nonce
+and a monotonic deadline, not synchronized wall clocks. The server bounds pre-auth
+records and time, then rechecks identity, expiry and revocation before admission.
+
+This bootstrap uses existing protected database hashes and device-local tokens;
+it requires no TOFU, new manual fingerprint, token rotation or installation ID
+change. The `local-token-v1` stored target/authority namespace is retained, so
+receipts, cursors and outbox identity do not change. The node identity is generated
+lazily even when remote access is disabled. Both daemon and plugin/client must be
+upgraded together: auth-first admission and insecure legacy fallback are refused.
+
+**The stored token hash now also authorizes server proofs.** Treat a database copy
+as server-impersonation authority, not merely an offline token verifier. No hash,
+MAC key or token is included in the begin/challenge messages. This handshake stops
+an unrelated process occupying the loopback port from simply collecting the saved
+token. It does not encrypt loopback traffic, establish an end-to-end channel, stop
+a transparent live relay to the real daemon, or protect against code running as
+the same OS user. Such code can already read the protected database/client secrets.
+
 A client store pins node and installation identities before outbox replay. New
 credentials require a fresh installation namespace. Production plugin persistence
 must be transactional/device-local; `MemoryClientStore` is only a simulation.

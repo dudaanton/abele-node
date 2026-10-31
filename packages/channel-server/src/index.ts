@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import {
   FrameCodec,
+  LOCAL_PROOF_PROFILE,
+  localTranscript,
+  randomNonce,
+  signProof,
+  fingerprint,
+  type LocalChallenge,
   LIMITS,
   ChannelError,
   type RecordTransport,
@@ -115,6 +121,8 @@ export async function serveChannel(
     closed = false,
     last = Date.now(),
     pumping = false
+  let localChallenge: LocalChallenge | undefined
+  const localDeadline = performance.now() + LIMITS.auth_ms
   const subscriptions = new Map<string, Subscription>()
   // A followed session stream keeps its long-lived process from idling out.
   const watches = new Map<string, () => void>()
@@ -220,8 +228,48 @@ export async function serveChannel(
       if (!actor && bytes.byteLength > LIMITS.auth_bytes) throw new ChannelError('auth_too_large')
       const frame = FrameCodec.decode(bytes)
       if (!actor) {
-        if (frame.kind !== 'auth') throw new ChannelError('authentication_required')
+        if (!localChallenge) {
+          if (frame.kind !== 'local.begin') throw new ChannelError('local_upgrade_required')
+          const identity = await core.pairing.identity.load()
+          const prepared = await core.authority.localChallenge(frame.selector, {
+            kind: 'local.challenge',
+            profile: LOCAL_PROOF_PROFILE,
+            client_nonce: frame.client_nonce,
+            selector: frame.selector,
+            connection_id: randomNonce(),
+            node_id: core.node_id,
+            expires_at: Date.now() + LIMITS.auth_ms,
+            node_key: identity.public_key,
+          })
+          const challenge = prepared.challenge
+          challenge.signature = await signProof(
+            identity.private_key,
+            await localTranscript(challenge)
+          )
+          challenge.mac = await prepared.mac(challenge)
+          if (closed || performance.now() >= localDeadline)
+            throw new ChannelError('authentication_timeout')
+          localChallenge = challenge
+          await send(challenge)
+          continue
+        }
+        if (
+          frame.kind !== 'auth' ||
+          closed ||
+          performance.now() >= localDeadline ||
+          Date.now() >= localChallenge.expires_at
+        )
+          throw new ChannelError('authentication_required')
+        if (
+          (await fingerprint((await core.pairing.identity.load()).public_key)) !==
+          (await fingerprint(localChallenge.node_key))
+        )
+          throw new ChannelError('node_identity_changed')
+        if (closed || performance.now() >= localDeadline)
+          throw new ChannelError('authentication_timeout')
         actor = core.authority.authenticate(frame.token)
+        if (actor.installation_id !== localChallenge.installation_id)
+          throw new ChannelError('unauthorized')
         await send({ kind: 'authenticated', installation_id: actor.installation_id })
         continue
       }

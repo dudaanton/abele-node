@@ -1,3 +1,5 @@
+import { LocalBeginSchema, LocalChallengeSchema } from './local.js'
+export * from './local.js'
 import { WireTimestampSchema } from './timestamp.js'
 export { WireTimestampSchema, WireOffsetTimestampSchema } from './timestamp.js'
 import { z } from 'zod'
@@ -95,6 +97,8 @@ export const WelcomeSchema = z
   .passthrough()
 export const RecordSchema = z.union([
   ...PairedRecordSchemas,
+  LocalBeginSchema,
+  LocalChallengeSchema,
   z
     .object({
       kind: z.literal('auth'),

@@ -6,6 +6,9 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import {
+  localSelector,
+  localBootstrapMac,
+  type LocalChallenge,
   ChannelError,
   LIMITS,
   type JournalEvent,
@@ -135,6 +138,35 @@ export class AuthorityService {
       .get(digest(token)) as Row | undefined
     if (!row) throw new ChannelError('unauthorized')
     return { installation_id: String(row.installation_id), profile: 'local-token-v1' }
+  }
+  /** Hashes never leave this boundary; a selector is not accepted as authority. */
+  async localChallenge(
+    selector: string,
+    challenge: Omit<LocalChallenge, 'installation_id' | 'mac' | 'signature'>
+  ) {
+    const rows = this.db
+      .prepare('SELECT installation_id,token_hash FROM installations WHERE revoked=0')
+      .all() as Row[]
+    for (const row of rows) {
+      const hash = String(row.token_hash)
+      // Paired-only installations have a non-token sentinel in this column.
+      if (!/^[a-f0-9]{64}$/.test(hash)) continue
+      if ((await localSelector(hash)) !== selector) continue
+      const c: LocalChallenge = {
+        ...challenge,
+        installation_id: String(row.installation_id),
+        signature: '',
+        mac: '',
+      }
+      return {
+        challenge: c,
+        mac: async (signed: LocalChallenge) => {
+          this.check({ installation_id: c.installation_id, profile: 'local-token-v1' }, 'admit')
+          return localBootstrapMac(hash, signed)
+        },
+      }
+    }
+    throw new ChannelError('unauthorized')
   }
   /** Resolve an installation's current controller authority, retaining the exact paired key. */
   forInstallation(installation_id: string): AuthorityContext {

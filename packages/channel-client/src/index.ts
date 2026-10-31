@@ -1,5 +1,12 @@
 import {
   FrameCodec,
+  LOCAL_PROOF_PROFILE,
+  localTokenHash,
+  localSelector,
+  localTranscript,
+  verifyLocalBootstrap,
+  randomNonce,
+  verifyProof,
   LIMITS,
   ChannelError,
   assertLocalEndpoint,
@@ -131,8 +138,12 @@ export class LocalChannelConnector implements ChannelConnector {
   async connect(target: NodeConnection): Promise<AuthenticatedChannel> {
     assertLocalEndpoint(target)
     if (target.profile !== 'local-token-v1') throw new ChannelError('endpoint_refused')
+    const deadline = performance.now() + LIMITS.auth_ms
     let transport: RecordTransport | undefined
     let abandoned = false
+    const checkDeadline = () => {
+      if (abandoned || performance.now() >= deadline) throw new ChannelError('connection_timeout')
+    }
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       return await Promise.race([
@@ -148,22 +159,61 @@ export class LocalChannelConnector implements ChannelConnector {
             if (row.done) throw new ChannelError('connection_closed')
             return FrameCodec.decode(row.value)
           }
+          const tokenHash = await localTokenHash(target.token)
+          const selector = await localSelector(tokenHash)
+          const nonce = randomNonce()
+          checkDeadline()
+          await transport.send(
+            FrameCodec.encode({
+              kind: 'local.begin',
+              profile: LOCAL_PROOF_PROFILE,
+              selector,
+              client_nonce: nonce,
+            })
+          )
+          const challenge = await next()
+          checkDeadline()
+          if (challenge.kind !== 'local.challenge') throw new ChannelError('local_upgrade_required')
+          if (
+            challenge.client_nonce !== nonce ||
+            challenge.selector !== selector ||
+            (target.expected_node_id && challenge.node_id !== target.expected_node_id) ||
+            !(await verifyLocalBootstrap(tokenHash, challenge)) ||
+            !(await verifyProof(
+              challenge.node_key,
+              await localTranscript(challenge),
+              challenge.signature
+            ))
+          )
+            throw new ChannelError('node_identity_mismatch')
+          // Crypto may finish after the deadline/close. Never send a credential then.
+          checkDeadline()
           await transport.send(
             FrameCodec.encode({ kind: 'auth', profile: 'local-token-v1', token: target.token })
           )
           const auth = await next()
-          if (auth.kind !== 'authenticated') throw new ChannelError('unauthorized')
+          checkDeadline()
+          if (auth.kind !== 'authenticated' || auth.installation_id !== challenge.installation_id)
+            throw new ChannelError('unauthorized')
           await transport.send(
             FrameCodec.encode({ kind: 'hello', version: { major: 0, minor: 0 } })
           )
           const welcome = await next()
           if (welcome.kind !== 'welcome') throw new ChannelError('negotiation_failed')
-          if (target.expected_node_id && welcome.node_id !== target.expected_node_id)
+          checkDeadline()
+          if (
+            welcome.node_id !== challenge.node_id ||
+            welcome.installation_id !== challenge.installation_id ||
+            (target.expected_node_id && welcome.node_id !== target.expected_node_id)
+          )
             throw new ChannelError('node_identity_mismatch')
           return { transport, authority: { installation_id: auth.installation_id }, welcome }
         })(),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new ChannelError('connection_timeout')), LIMITS.auth_ms)
+          timer = setTimeout(() => {
+            abandoned = true
+            reject(new ChannelError('connection_timeout'))
+          }, LIMITS.auth_ms)
         }),
       ])
     } catch (error) {

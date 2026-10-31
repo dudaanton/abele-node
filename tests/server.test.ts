@@ -1,12 +1,45 @@
 import { expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { setImmediate } from 'node:timers'
 import { NodeCore } from '@abele/node-core'
 import { RecordQueue, LocalChannelConnector } from '@abele/channel-client'
 import { NodeClient, MemoryClientStore } from '@abele/node-client'
 import { serveChannel, RecordScheduler } from '../packages/channel-server/src/index.js'
-import { FrameCodec, LIMITS, type RecordTransport, type RecordFrame } from '@abele/channel-protocol'
+import {
+  localSelector,
+  localTokenHash,
+  FrameCodec,
+  LIMITS,
+  type RecordTransport,
+  type RecordFrame,
+} from '@abele/channel-protocol'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+// Real crypto is not driven by Vitest's fake clock. Observe the challenge before auth.
+async function authenticate(queue: RecordQueue, frames: RecordFrame[], token: string) {
+  queue.push(
+    FrameCodec.encode({
+      kind: 'local.begin',
+      profile: 'local-proof-v1',
+      client_nonce: '1'.repeat(64),
+      selector: await localSelector(await localTokenHash(token)),
+    })
+  )
+  for (let tries = 0; !frames.some((f) => f.kind === 'local.challenge'); tries++) {
+    if (tries > 10000) throw new Error('challenge_not_received')
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  const challenge = frames.find((f) => f.kind === 'local.challenge')!
+  expect(challenge.kind).toBe('local.challenge')
+  // Keep the original assertions about authenticated application traffic unchanged.
+  frames.splice(frames.indexOf(challenge), 1)
+  queue.push(FrameCodec.encode({ kind: 'auth', profile: 'local-token-v1', token }))
+  // The server rechecks its identity asynchronously before admitting the token.
+  for (let tries = 0; !frames.some((f) => f.kind === 'authenticated'); tries++) {
+    if (tries > 10000) throw new Error('authentication_not_received')
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+}
 
 it('control replies outrank queued artifact traffic and scheduler memory is bounded', async () => {
   const order: string[] = []
@@ -88,9 +121,7 @@ it('authentication deadline and heartbeat dead-connection timer close idle clien
       core
     )
     const token = core.createToken('heartbeat')
-    authenticatedQueue.push(
-      FrameCodec.encode({ kind: 'auth', profile: 'local-token-v1', token: token.token })
-    )
+    await authenticate(authenticatedQueue, sent, token.token)
     await vi.advanceTimersByTimeAsync(0)
     authenticatedQueue.push(FrameCodec.encode({ kind: 'hello', version: { major: 0, minor: 0 } }))
     await vi.advanceTimersByTimeAsync(0)
@@ -190,7 +221,8 @@ it('revocation fences queued publication records, not only the start of a replay
   const firstEvent = new Promise<void>((r) => {
       started = r
     }),
-    events: RecordFrame[] = []
+    events: RecordFrame[] = [],
+    admission: RecordFrame[] = []
   const transport: RecordTransport = {
     receive: () => incoming,
     close: async () => {
@@ -199,6 +231,7 @@ it('revocation fences queued publication records, not only the start of a replay
     },
     send: async (bytes) => {
       const frame = FrameCodec.decode(bytes)
+      if (frame.kind !== 'event') admission.push(frame)
       if (frame.kind === 'event') {
         events.push(frame)
         if (events.length === 1) {
@@ -212,9 +245,7 @@ it('revocation fences queued publication records, not only the start of a replay
   }
   const server = serveChannel(transport, core)
   try {
-    incoming.push(
-      FrameCodec.encode({ kind: 'auth', profile: 'local-token-v1', token: token.token })
-    )
+    await authenticate(incoming, admission, token.token)
     await sleep(5)
     incoming.push(FrameCodec.encode({ kind: 'hello', version: { major: 0, minor: 0 } }))
     await sleep(5)
@@ -312,7 +343,7 @@ it('a no-ack slow consumer is bounded across all streams and cannot stall anothe
 
     vi.useFakeTimers()
     server = serveChannel(transport, core)
-    push({ kind: 'auth', profile: 'local-token-v1', token: token.token })
+    await authenticate(queue, sent, token.token)
     await vi.advanceTimersByTimeAsync(0)
     expect(sent.map((frame) => frame.kind)).toEqual(['authenticated'])
     push({ kind: 'hello', version: { major: 0, minor: 0 } })
@@ -391,7 +422,7 @@ it('malformed/oversized first records, unknown versions and text-shaped records 
       close: async () => queue.end(),
     }
     const server = serveChannel(transport, core)
-    queue.push(FrameCodec.encode({ kind: 'auth', profile: 'local-token-v1', token: token.token }))
+    await authenticate(queue, frames, token.token)
     await sleep(5)
     queue.push(
       new TextEncoder().encode(JSON.stringify({ kind: 'hello', version: { major: 1, minor: 0 } }))

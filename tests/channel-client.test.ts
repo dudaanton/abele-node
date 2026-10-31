@@ -38,3 +38,26 @@ it('a transport completing after the auth deadline is closed without sending cre
     vi.useRealTimers()
   }
 })
+
+// Security regression: a loopback listener is not an authenticated node.
+it('does not disclose a saved token to an unauthenticated local server', async () => {
+  const sent: Uint8Array[] = []
+  const connector = new LocalChannelConnector(async () => ({
+    send: async (bytes) => {
+      sent.push(bytes)
+    },
+    receive: async function* () {},
+    close: async () => {},
+  }))
+  await expect(
+    connector.connect({
+      url: 'ws://127.0.0.1:7777/channel',
+      profile: 'local-token-v1',
+      expected_node_id: 'sample-node',
+      token: 'a'.repeat(64),
+    })
+  ).rejects.toThrow()
+  const wire = sent.map((bytes) => new TextDecoder().decode(bytes)).join('\n')
+  expect(wire).not.toContain('a'.repeat(64))
+  expect(JSON.parse(new TextDecoder().decode(sent[0]!)).kind).toBe('local.begin')
+})
