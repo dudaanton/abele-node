@@ -1,5 +1,6 @@
 import { LspTools } from './lsp/tools.js'
 import { randomUUID } from 'node:crypto'
+import { statSync } from 'node:fs'
 import { ChannelError } from '@abele/channel-protocol'
 import {
   SessionSchema,
@@ -57,7 +58,7 @@ const LIFECYCLE: Record<string, string> = {
   'pi.compact.summary': 'claude.compact.summary',
 }
 export interface LiveOptions {
-  /** Idle time after the last watcher left before a process with nothing running is ended; 0 never. */
+  /** Idle grace after work finishes, independent of stream watchers; default 5 minutes, 0 never. */
   idleMs?: number
   /** Processes kept at once; the least recently used idle one makes room. */
   maxLive?: number
@@ -129,7 +130,7 @@ export class LiveSessions {
     private owner: ProviderSessions,
     options: LiveOptions = {}
   ) {
-    this.idleMs = options.idleMs ?? 30 * 60000
+    this.idleMs = options.idleMs ?? 5 * 60_000
     this.maxLive = options.maxLive ?? 12
     this.retryMs = options.retryMs ?? 5000
   }
@@ -531,7 +532,10 @@ export class LiveSessions {
   private reapable(slot: Slot, now: number) {
     return (
       slot.state === 'idle' &&
+      !slot.turn &&
       !slot.compacting &&
+      !slot.compaction &&
+      !slot.continueAfterTurn &&
       slot.tasks.length === 0 &&
       slot.crons === 0 &&
       now >= slot.wakeUntil &&
@@ -542,6 +546,14 @@ export class LiveSessions {
         .get(slot.session_id) &&
       !this.core.hasPendingPrompt(slot.session_id)
     )
+  }
+  private workspaceMissing(cwd: string) {
+    try {
+      return !statSync(cwd).isDirectory()
+    } catch (error) {
+      // An inaccessible filesystem is not proof that the workspace was removed.
+      return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+    }
   }
   private deleted(session_id: string) {
     return !!this.core.db
@@ -580,12 +592,8 @@ export class LiveSessions {
             .get(slot.session_id, slot.run_id)
         )
           reason = 'target_switch'
-        else if (
-          this.idleMs > 0 &&
-          this.core.watching(slot.session_id) === 0 &&
-          now - Math.max(slot.idleSince, this.core.unwatchedAt(slot.session_id)) >= this.idleMs
-        )
-          reason = 'idle'
+        else if (this.workspaceMissing(slot.cwd)) reason = 'workspace_missing'
+        else if (this.idleMs > 0 && now - slot.idleSince >= this.idleMs) reason = 'idle'
       }
       if (reason) void this.stop(slot.session_id, reason).catch(() => {})
     }

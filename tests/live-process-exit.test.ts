@@ -1,16 +1,21 @@
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { LiveSession } from '@abele/provider-contract'
+import type { LiveSessionSink, LiveSession } from '@abele/provider-contract'
 import { NodeCore, GitRunner, type ProviderAdapter } from '../packages/node-core/src/index.js'
 import { LiveEventPayloads } from '../packages/node-protocol/src/live.js'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => {
+  vi.restoreAllMocks()
   for (const cleanup of cleanups.splice(0)) await cleanup()
 })
-async function fixture() {
+async function fixture(idleMs?: number) {
+  let events!: LiveSessionSink
+  let inputId = ''
+  let starts = 0
+  const stops: string[] = []
   const dir = mkdtempSync(resolve('.scratch/live-process-exit-'))
   let finish!: (result: { reason: string; failure_reason?: string }) => void
   const adapter: ProviderAdapter = {
@@ -31,18 +36,22 @@ async function fixture() {
       throw new Error('unexpected bounded turn')
     },
     startSession: async (_context, sink) => {
+      events = sink
+      starts++
       const done = new Promise<{ reason: string; failure_reason?: string }>((resolve) => {
         finish = resolve
       })
       const session: LiveSession = {
         done,
         send: (input) => {
+          inputId = input.input_id
           sink.event({ type: 'live.input.delivered', data: { input_id: input.input_id } })
           sink.event({ type: 'live.turn.started', data: { trigger: 'input' } })
         },
         interrupt: async () => {},
         control: async () => ({}),
         stop: async (reason) => {
+          stops.push(reason ?? 'stopped')
           finish({ reason: reason ?? 'stopped' })
         },
       }
@@ -51,6 +60,7 @@ async function fixture() {
   }
   const core = new NodeCore(join(dir, 'state'), {
     codex: adapter,
+    live: { idleMs },
     git: new GitRunner(1000, 1024, '/usr/bin/false'),
   })
   cleanups.push(async () => {
@@ -76,6 +86,15 @@ async function fixture() {
     core.read(session.session_id, 0).find((e) => e.type === 'turn.completed')?.data
   return {
     core,
+    folder,
+    stops,
+    starts: () => starts,
+    event: (event: Parameters<LiveSessionSink['event']>[0]) => events.event(event),
+    complete: () =>
+      events.event({
+        type: 'live.turn.completed',
+        data: { outcome: 'success', input_ids: [inputId] },
+      }),
     request,
     session,
     completed,
@@ -122,3 +141,78 @@ it('preserves the original node failure on the turn when cleanup must remain qua
     reason: 'process_cleanup_unconfirmed',
   })
 })
+
+it('ends a finished process after five idle minutes even while the chat is watched, and restarts on input', async () => {
+  const f = await fixture()
+  const unwatch = f.core.watch(f.session.session_id)
+  try {
+    f.complete()
+    const completedAt = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(completedAt + 299_000)
+    await f.core.execution.drain()
+    expect(f.stops).toEqual([])
+    clock.mockReturnValue(completedAt + 301_000)
+    await f.core.execution.drain()
+    await Promise.resolve()
+    expect(f.stops).toEqual(['idle'])
+    await f.request('session.send', {
+      session_id: f.session.session_id,
+      text: 'again',
+      observed_seq: f.core.read(f.session.session_id, 0).at(-1)!.seq,
+    })
+    await f.core.execution.drain()
+    expect(f.starts()).toBe(2)
+  } finally {
+    unwatch()
+  }
+})
+
+it('closes a finished provider whose workspace folder was removed, even with idle expiry disabled', async () => {
+  const f = await fixture(0)
+  f.complete()
+  rmSync(f.folder, { recursive: true })
+  await f.core.execution.drain()
+  await Promise.resolve()
+  expect(f.stops).toEqual(['workspace_missing'])
+})
+
+it('does not reap an ongoing turn when its folder disappears or the idle grace expires', async () => {
+  const f = await fixture(1)
+  rmSync(f.folder, { recursive: true })
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_000)
+  await f.core.execution.drain()
+  expect(f.stops).toEqual([])
+})
+
+it.each(['queue', 'prompt', 'tasks', 'cron', 'wake', 'compaction', 'quarantine'])(
+  'preserves %s work beyond the idle grace',
+  async (kind) => {
+    const f = await fixture(1)
+    f.complete()
+    if (kind === 'queue')
+      await f.request('session.send', {
+        session_id: f.session.session_id,
+        text: 'next',
+        observed_seq: f.core.head(f.session.session_id),
+      })
+    if (kind === 'prompt')
+      f.core.db
+        .prepare('INSERT INTO prompts VALUES (?, ?, ?, ?)')
+        .run('prompt', f.session.session_id, 'run', JSON.stringify({ state: 'pending' }))
+    if (kind === 'tasks') f.event({ type: 'claude.tasks', data: { tasks: [{ task_id: 'task' }] } })
+    if (kind === 'cron') f.event({ type: 'claude.tool.call', data: { name: 'CronCreate' } })
+    if (kind === 'wake')
+      f.event({
+        type: 'claude.tool.call',
+        data: { name: 'ScheduleWakeup', input: { delaySeconds: 3600 } },
+      })
+    if (kind === 'compaction') f.event({ type: 'pi.compact.started', data: {} })
+    if (kind === 'quarantine') {
+      f.finish({ reason: 'process_cleanup_unconfirmed' })
+      await Promise.resolve()
+    }
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_000)
+    await f.core.execution.drain()
+    expect(f.stops).toEqual([])
+  }
+)

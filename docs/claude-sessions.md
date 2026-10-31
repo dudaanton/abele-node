@@ -115,12 +115,16 @@ compaction.
 A process is ended by the node only when it is idle, has no background task, cron,
 scheduled wake-up, queued input or open question, and either:
 
-- nobody has followed its stream for `--claude-idle-ms` (30 minutes by default, `0` never);
+- it has been idle for `--claude-idle-ms` (5 minutes by default, `0` disables expiry),
+  even if a client is still following the chat stream;
+- its workspace directory no longer exists;
 - its effort or account changed, or its chat was moved to another target;
 - more than `--claude-max-live` processes (12 by default) are needed, or another chat needs
   its target, and it is the longest idle.
 
-A session with background work is never ended by this policy. Ending it only costs a
+This idle policy applies to all live owner providers, including Codex. Active turns,
+compaction and pending continuations are protected too. A session with background work
+is never ended by this policy. Ending it only costs a
 restart with `--resume` on the next message. The node also ends a process when its chat is
 deleted or the authority of a device with input in it is revoked.
 
@@ -128,6 +132,12 @@ A process that fails to start or dies within 30 seconds is not restarted at once
 doubles from 5 seconds up to 10 minutes.
 
 ## Node restarts and updates
+
+Update admission reads a consistent SQLite snapshot without migrating or reconciling the
+running owner's database. Non-adoptable live providers with proven idle saved state and
+no pending input, prompt or cleanup do not block updates. Missing or malformed state and
+legacy bounded runs remain conservative blockers. Adoptable sessions retain their
+existing restart handoff behavior.
 
 Each long-lived process runs under a small host process of its own, in its own process
 group, with no channel to the daemon that started it. When the node stops (a restart, a

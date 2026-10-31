@@ -250,7 +250,56 @@ async function downloadOnce(
   }
   throw new Error('Too many update download redirects.')
 }
-function activeRuns(state: string): {
+/** Only positive evidence of idleness may relax the update fence. Never mutate owner state. */
+function idleRun(
+  db: DatabaseSync,
+  row: { run_id: string; session_id: string; live_state: string | null }
+) {
+  try {
+    const saved = JSON.parse(row.live_state ?? 'null')
+    if (
+      !saved ||
+      saved.turn != null ||
+      saved.compaction != null ||
+      saved.continueAfterTurn != null ||
+      saved.compacting !== false ||
+      !Array.isArray(saved.tasks) ||
+      saved.tasks.length !== 0 ||
+      saved.crons !== 0 ||
+      typeof saved.wakeUntil !== 'number' ||
+      !Number.isFinite(saved.wakeUntil) ||
+      saved.wakeUntil > Date.now()
+    )
+      return false
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM inputs WHERE session_id=? AND state IN ('accepted','queued','dispatching','delivered') LIMIT 1"
+        )
+        .get(row.session_id)
+    )
+      return false
+    // An exited process with an active row is awaiting cleanup, not an idle session.
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM events WHERE stream_id=? AND json_extract(body,'$.type')='session.process' AND json_extract(body,'$.data.run_id')=? AND json_extract(body,'$.data.state')='exited' LIMIT 1"
+        )
+        .get(row.session_id, row.run_id)
+    )
+      return false
+    // Parse all prompt states: malformed/older schemas remain conservative blockers.
+    const prompts = db
+      .prepare('SELECT body FROM prompts WHERE session_id=?')
+      .all(row.session_id) as { body: string }[]
+    return prompts.every((p) =>
+      ['resolved', 'expired', 'invalidated'].includes(JSON.parse(p.body).state)
+    )
+  } catch {
+    return false
+  }
+}
+export function activeRuns(state: string): {
   runs: { run_id: string; session_id: string }[]
   kept: { run_id: string; session_id: string }[]
 } {
@@ -260,21 +309,25 @@ function activeRuns(state: string): {
   // the schema, reconcile processes, or take a second write owner.
   const db = new DatabaseSync(file, { readOnly: true })
   try {
+    db.exec('BEGIN') // One consistent read snapshot across runs, inputs, prompts and lifecycle events.
     // Long-lived sessions keep running through the restart; an older schema has none.
-    const live = (db.prepare('PRAGMA table_info(provider_runs)').all() as { name: string }[]).some(
-      (c) => c.name === 'live'
+    const columns = new Set(
+      (db.prepare('PRAGMA table_info(provider_runs)').all() as { name: string }[]).map(
+        (c) => c.name
+      )
     )
+    const live = columns.has('live')
     const rows = db
       .prepare(
-        `SELECT run_id, session_id, ${live ? 'live IS NOT NULL' : '0'} AS kept FROM provider_runs WHERE state='active' ORDER BY run_id`
+        `SELECT run_id, session_id, ${live ? 'live IS NOT NULL' : '0'} AS kept, ${columns.has('live_state') ? 'live_state' : 'NULL'} AS live_state FROM provider_runs WHERE state='active' ORDER BY run_id`
       )
-      .all() as { run_id: string; session_id: string; kept: number }[]
+      .all() as { run_id: string; session_id: string; kept: number; live_state: string | null }[]
     const strip = ({ run_id, session_id }: { run_id: string; session_id: string }) => ({
       run_id,
       session_id,
     })
     return {
-      runs: rows.filter((r) => !r.kept).map(strip),
+      runs: rows.filter((r) => !r.kept && !idleRun(db, r)).map(strip),
       kept: rows.filter((r) => r.kept).map(strip),
     }
   } finally {
