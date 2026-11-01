@@ -2,13 +2,14 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DapDebuggerBackend, NodeCore } from '../../packages/node-core/src/index.js'
 import { DapSession } from '../../packages/node-core/src/debugger/driver.js'
 import { TraceClient } from '../../packages/node-client/src/trace.js'
 import { wire } from '../debugger/dap-wire.js'
 import { target } from '../debugger/helpers.js'
 import { adapter } from './adapter.js'
+import { TraceRunWriter } from '../../packages/node-core/src/trace/store.js'
 
 const dirs: string[] = []
 it('places a late-written request before its probe when timestamps share a millisecond', async () => {
@@ -114,7 +115,9 @@ async function live(s: Awaited<ReturnType<typeof setup>>) {
     session,
     until,
     point,
-    close() {
+    async close() {
+      // Drain captures and the writer finalizer before detaching hides the session's queue.
+      await s.core.trace.recorder.close()
       off()
       fake.stop()
       w.dap.close()
@@ -123,6 +126,51 @@ async function live(s: Awaited<ReturnType<typeof setup>>) {
 }
 
 describe('recorded runs through the node', () => {
+  it('waits for the run finalizer before closing the live fixture', async () => {
+    const s = await setup(() => ({ value: 1 }))
+    const l = await live(s)
+    let release!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const started = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const original = TraceRunWriter.prototype.closeAsync
+    const finalizer = vi
+      .spyOn(TraceRunWriter.prototype, 'closeAsync')
+      .mockImplementation(async function (this: TraceRunWriter, ...args) {
+        entered()
+        await gate
+        return original.apply(this, args)
+      })
+    let closing: Promise<void> | undefined
+    try {
+      const dapId = await l.point('bp-1', 4, ['value'])
+      l.fake.hit([dapId])
+      await l.until(() => s.core.trace.recorder.recording(l.session.id)?.steps === 1)
+      const [run] = s.request('trace.v1.runs', { project_id: s.project_id }).runs
+      let closed = false
+      closing = Promise.resolve(l.close()).then(() => {
+        closed = true
+      })
+      await started
+      await Promise.resolve()
+      expect(closed).toBe(false)
+      release()
+      await closing
+      expect(s.core.trace.store(s.project_id).read(run.id).run.state).toBe('cut')
+    } finally {
+      release()
+      await closing
+      await s.core.trace.recorder.close()
+      finalizer.mockRestore()
+      await l.close()
+      s.core.close()
+    }
+  })
+
   it('links a handler step when its request completes later, including the HTTP-only view', async () => {
     const s = await setup(() => ({}))
     try {
@@ -181,7 +229,7 @@ describe('recorded runs through the node', () => {
       await s.core.trace.recorder.settled(l.session.id)
       expect(s.request('trace.v1.runs', { project_id: s.project_id }).runs).toEqual([])
     } finally {
-      l.close()
+      await l.close()
       s.core.close()
     }
   })
@@ -312,7 +360,7 @@ describe('recorded runs through the node', () => {
       expect(marked.steps[1].marked).toBe(true)
       expect(marked.marks[0]).toMatchObject({ comment: 'amounts shift here', tags: ['question'] })
     } finally {
-      l.close()
+      await l.close()
       s.core.close()
     }
   })
@@ -352,14 +400,14 @@ describe('recorded runs through the node', () => {
       expect(s.request('trace.v1.runs', { project_id: s.project_id }).runs[0].name).toBe(
         'Toggle on'
       )
-      l.close()
+      await l.close()
       s.request('trace.v1.delete', { project_id: s.project_id, run_id: run.id })
       expect(existsSync(join(chosen, run.id))).toBe(false)
       expect(
         s.request('trace.v1.folder.set', { project_id: s.project_id, folder: '' }).chosen
       ).toBe(false)
     } finally {
-      l.close()
+      await l.close()
       s.core.close()
     }
   })

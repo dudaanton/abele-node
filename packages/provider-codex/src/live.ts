@@ -24,7 +24,7 @@ export interface CodexLiveOptions {
   context: LiveSessionContext & { native_binding?: NativeBinding }
   probe?: ProcessProbe
 }
-const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+const EFFORTS = new Set(['default', 'low', 'medium', 'high', 'xhigh'])
 const COMPACT = /^\/compact(\s|$)/
 interface Turn {
   id?: string
@@ -277,7 +277,7 @@ export async function startCodexLiveSession(
       const accepted = await request('turn/start', {
         ...turnParams,
         threadId: thread,
-        effort: context.settings.effort,
+        ...(context.settings.effort === 'default' ? {} : { effort: context.settings.effort }),
         input: taken.flatMap((i) => input(i.content)),
       })
       if (turn === started) announce(accepted?.turn?.id)

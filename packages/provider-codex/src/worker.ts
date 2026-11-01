@@ -215,7 +215,7 @@ export async function startCodexTurn(
         ...params,
         threadId: native.thread_id,
         input: [{ type: 'text', text: turn.text, text_elements: [] }],
-        effort: 'low',
+        ...(turn.effort && turn.effort !== 'default' ? { effort: turn.effort } : {}),
       })
       mapper.accepted(accepted?.turn?.id)
       await Promise.race([

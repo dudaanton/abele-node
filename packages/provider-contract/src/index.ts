@@ -33,6 +33,8 @@ export interface Answer {
   delivered(): boolean | void
 }
 export interface TurnContext {
+  /** Codex reasoning effort; unset/default leaves the choice to Codex. */
+  effort?: string
   codex_network_enabled?: boolean
   permission_mode?: string
   durable_permissions?: boolean

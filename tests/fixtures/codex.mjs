@@ -245,7 +245,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       !thread ||
       p.threadId !== thread.id ||
       p.permissions !== 'abele' ||
-      !['low', 'medium', 'high', 'xhigh'].includes(p.effort) ||
+      (p.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(p.effort)) ||
       (p.model !== undefined && p.model !== 'fixture-small' && p.model !== 'fixture-user-default')
     )
       process.exit(70)

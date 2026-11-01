@@ -142,7 +142,7 @@ export class CodexProviderAdapter {
     // The model is Codex's own selection unless the node overrides it; a thread keeps it.
     return {
       model: this.options.model ?? 'default',
-      effort: 'low',
+      effort: 'default',
       account: 'default',
       permission_mode: 'manual',
     }
@@ -152,7 +152,7 @@ export class CodexProviderAdapter {
     if (
       (settings.model !== undefined && settings.model !== defaults.model) ||
       (settings.effort !== undefined &&
-        !['low', 'medium', 'high', 'xhigh'].includes(settings.effort)) ||
+        !['default', 'low', 'medium', 'high', 'xhigh'].includes(settings.effort)) ||
       (settings.account !== undefined && settings.account !== 'default') ||
       (settings.permission_mode !== undefined &&
         !this.configuration.permission_modes.includes(settings.permission_mode))

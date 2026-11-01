@@ -504,6 +504,7 @@ export class ProviderSessions {
             durable_permissions: this.core.delegations.isActive(session.session_id),
             permission_mode: toolPermissions.permission_mode,
             codex_network_enabled: project.codex_network_enabled,
+            ...(session.provider === 'codex' ? { effort: session.settings?.effort } : {}),
             native_session_id: session.native_session_id,
             native_session_file: session.native_session_file,
             ...(session.provider === 'codex' && session.native_session_id
