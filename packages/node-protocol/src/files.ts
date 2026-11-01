@@ -115,10 +115,23 @@ export const FileWriteSchema = z
     workspace_id: id,
     path: path.refine((p) => !p.split('/').some((s) => s.toLowerCase() === '.git')),
     expected_content_id: contentId.nullable(),
+    // Optional snippet mode keeps the ordinary write identity, permission and recovery journal.
+    // 2 * 16384 worst-case JSON-escaped characters still fit a 256 KiB record.
+    patch: z
+      .object({
+        old_text: z.string().min(1).max(16384),
+        new_text: z.string().max(16384),
+        all: z.boolean(),
+      })
+      .strict()
+      .optional(),
     // Fits a record even when every character needs JSON escaping. No binary editor in this slice.
     text: z
       .string()
-      .max(32768)
+      .max(
+        32768,
+        'Full write is limited to 32768 characters; use node_edit with a small unique snippet'
+      )
       .refine(
         (t) =>
           !t.includes('\0') &&

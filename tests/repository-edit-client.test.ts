@@ -103,6 +103,17 @@ it('persists exact repository saves offline and replays receipts across daemon r
     recovery_path: saved!.recovery_path!,
   })
   expect((await client.repository.mutationResult(restored.operation_id))?.state).toBe('saved')
+  const large = '\ufeff' + 'sample line\n'.repeat(6000) + 'unique old'
+  writeFileSync(join(linked, 'file'), large)
+  const patch = await client.repository.write({
+    worktree_id,
+    path: 'file',
+    expected_content_id: hash(large),
+    text: '',
+    patch: { old_text: 'unique old', new_text: 'unique new', all: false },
+  })
+  expect((await client.repository.mutationResult(patch.operation_id))?.state).toBe('saved')
+  expect(readFileSync(join(linked, 'file'), 'utf8')).toBe(large.replace('unique old', 'unique new'))
   await client.repository.editing({ worktree_id, enabled: false })
   const rejected = await client.repository.write({ ...params, text: 'no approval\n' })
   await expect(client.repository.mutationResult(rejected.operation_id)).rejects.toThrow(

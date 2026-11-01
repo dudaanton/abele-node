@@ -3,7 +3,10 @@ import { z } from 'zod'
 const id = z.string().min(1).max(128)
 const argument = z
   .string()
-  .max(32768)
+  .max(
+    32768,
+    'Command or argument exceeds 32768 characters; split the command into smaller calls or use node_edit for file changes'
+  )
   .refine((s) => !s.includes('\0'))
 const text = argument.refine((s) => s.length > 0)
 const session = { session_id: id }

@@ -23,6 +23,7 @@ import {
 import { BrowserRecordTransport } from '../packages/channel-client/src/index.js'
 import {
   FrameCodec,
+  LIMITS,
   type PairingInvite,
   type RecordTransport,
 } from '../packages/channel-protocol/src/index.js'
@@ -90,7 +91,23 @@ async function setup(acceptedRoutes?: string[]) {
       ws.once('open', resolve)
       ws.once('error', reject)
     })
-    return transport
+    return {
+      send: async (bytes) => {
+        expect(bytes.byteLength).toBeLessThanOrEqual(16 * 1024)
+        await transport.send(bytes)
+      },
+      close: (reason) => transport.close(reason),
+      receive: async function* () {
+        for await (const bytes of transport.receive()) {
+          const frame = FrameCodec.decode(bytes)
+          if (frame.kind === 'welcome') {
+            expect(LIMITS.auth_bytes).toBe(16 * 1024)
+            expect(bytes.byteLength).toBeLessThanOrEqual(16 * 1024)
+          }
+          yield bytes
+        }
+      },
+    }
   }
   return { dir, local, daemon, open }
 }

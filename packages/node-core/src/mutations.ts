@@ -908,6 +908,45 @@ export class FileMutationCoordinator {
       bytes = this.copyBytes(copy)
     } else bytes = Buffer.from((params as FileWrite).text)
     const initial = current()
+    const patch = (params as FileWrite).patch
+    if (patch) {
+      if ((params as FileWrite).text !== '' || !params.expected_content_id)
+        throw new ChannelError('invalid_params')
+      // Derive only from the immutable observed bytes, never from an unguarded path read.
+      // A stale version returns conflict below without attempting to match another version.
+      if (
+        initial?.content_id === params.expected_content_id &&
+        !initial.binary &&
+        !initial.too_large
+      ) {
+        const before = this.r.files
+          .bytes(workspace, initial.content_id, repository)
+          .toString('utf8')
+        const parts = before.split(patch.old_text)
+        if (parts.length < 2 || (!patch.all && parts.length !== 2))
+          throw new ChannelError(
+            'invalid_params',
+            'Edit must match exactly; use a unique old_text snippet'
+          )
+        if (
+          before.length + (parts.length - 1) * (patch.new_text.length - patch.old_text.length) >
+          2 * 1024 * 1024
+        )
+          throw new ChannelError('file_too_large')
+        const after = parts.join(patch.new_text)
+        if (after.length > 2 * 1024 * 1024 || Buffer.byteLength(after) > 2 * 1024 * 1024)
+          throw new ChannelError(
+            'file_too_large',
+            'Edited file exceeds 2 MiB; split the file before editing'
+          )
+        if (
+          after.includes('\0') ||
+          /[\uD800-\uDFFF]/u.test(after.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ''))
+        )
+          throw new ChannelError('invalid_params')
+        bytes = Buffer.from(after)
+      }
+    }
     if (initial?.too_large) throw new ChannelError('file_too_large')
     if ((method === 'workspace.write' || method === 'repository.v1.write') && initial?.binary)
       throw new ChannelError('invalid_params')

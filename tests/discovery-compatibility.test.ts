@@ -79,7 +79,11 @@ function setup(paired: boolean) {
           seen.push(raw)
           // Reproduce the vendored 0.4.2 decoders before the updated client sees
           // each changed server record. No normalization or key removal is allowed.
-          if (raw.kind === 'welcome') Welcome042Schema.parse(raw)
+          if (raw.kind === 'welcome') {
+            // Older paired clients apply the fixed auth bound to welcome too.
+            expect(bytes.byteLength).toBeLessThanOrEqual(16 * 1024)
+            Welcome042Schema.parse(raw)
+          }
           if (raw.kind === 'paired.claimed') Claimed042Schema.parse(raw)
           if (raw.kind === 'response') Response042Schema.parse(raw)
           yield bytes
@@ -326,6 +330,19 @@ it.each([false, true])(
     }
     expect(description).toMatchObject(core.discovery())
     expect(welcome.capabilities).toMatchObject(core.discovery())
+    expect(welcome.capabilities).toMatchObject({
+      capabilities: { node_file_snippet_v1: { status: 'supported', evidence: '' } },
+    })
+    expect(description).toMatchObject({
+      capabilities: {
+        capabilities: {
+          node_file_snippet_v1: {
+            status: 'supported',
+            evidence: 'bounded-snippets; expected-content; write-journal; replay; recovery',
+          },
+        },
+      },
+    })
     expect(description.supported_capabilities).toEqual(
       expect.arrayContaining(['expected_target', 'session.rename', 'session.delete'])
     )

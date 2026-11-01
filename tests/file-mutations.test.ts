@@ -65,6 +65,7 @@ async function setup(stateThroughAlias = false) {
     path: string
     expected_content_id: string | null
     text: string
+    patch?: { old_text: string; new_text: string; all: boolean }
   } = {
     workspace_id: w!.workspace_id,
     path: 'sample.txt',
@@ -806,4 +807,63 @@ it('rejects symlinks, metadata, traversal, binary and excessive writes before mu
   s.core.revokeToken(s.actor.installation_id)
   await expect(s.save()).rejects.toThrow('unauthorized')
   expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe('before')
+})
+
+it('patches a bounded large text file with replay and stale-content protection', async () => {
+  const s = await setup()
+  const text = 'sample line\n'.repeat(6000)
+  writeFileSync(join(s.repo, 'sample.txt'), text)
+  const params = {
+    ...s.params,
+    text: '',
+    expected_content_id: hash(text),
+    patch: { old_text: 'sample line', new_text: 'changed line', all: true },
+  }
+  const saved = await s.save('large-save', params)
+  expect(saved).toMatchObject({
+    state: 'saved',
+    content_id: hash(text.replaceAll('sample line', 'changed line')),
+  })
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe(
+    text.replaceAll('sample line', 'changed line')
+  )
+  writeFileSync(join(s.repo, 'sample.txt'), 'external change')
+  expect(await s.save('large-save', params)).toEqual(saved)
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe('external change')
+  expect(await s.save('large-stale', params)).toMatchObject({ state: 'conflict' })
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe('external change')
+})
+
+it.each([
+  { old_text: 'missing', new_text: 'new', all: false },
+  { old_text: 'old', new_text: 'new', all: false },
+  { old_text: 'old', new_text: '\0', all: true },
+  { old_text: 'old', new_text: 'x'.repeat(16385), all: true },
+])('refuses an invalid snippet without changing the file: %j', async (patch) => {
+  const s = await setup()
+  const before = 'old old'
+  writeFileSync(join(s.repo, 'sample.txt'), before)
+  await expect(
+    s.save('bad-patch', { ...s.params, text: '', expected_content_id: hash(before), patch })
+  ).rejects.toThrow()
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe(before)
+})
+
+it('patches one unique snippet and retains its recovery baseline', async () => {
+  const s = await setup()
+  const before = 'sample line\n'.repeat(6000) + 'unique old'
+  const after = before.replace('unique old', 'unique new')
+  writeFileSync(join(s.repo, 'sample.txt'), before)
+  chmodSync(join(s.repo, 'sample.txt'), 0o750)
+  const metadata = posixMetadata(join(s.repo, 'sample.txt'))
+  const result = (await s.save('unique-patch', {
+    ...s.params,
+    text: '',
+    expected_content_id: hash(before),
+    patch: { old_text: 'unique old', new_text: 'unique new', all: false },
+  })) as Receipt
+  expect(result).toMatchObject({ state: 'saved', predecessor_content_id: hash(before) })
+  expect(result.recovery_path).toBeTruthy()
+  expect(posixMetadata(join(s.repo, 'sample.txt'))).toEqual(metadata)
+  expect(readFileSync(join(s.repo, 'sample.txt'), 'utf8')).toBe(after)
 })

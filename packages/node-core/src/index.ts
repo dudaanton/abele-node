@@ -974,6 +974,10 @@ export class NodeCore implements JournalStore, OperationStore, SessionQueue, Pro
           status: 'supported',
           evidence: 'named-branch-create; owner-selection; preconditioned-nonforce-external-delete',
         },
+        node_file_snippet_v1: {
+          status: 'supported',
+          evidence: 'bounded-snippets; expected-content; write-journal; replay; recovery',
+        },
         node_path_file_operations: {
           status: 'supported',
           evidence:

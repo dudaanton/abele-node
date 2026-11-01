@@ -33,6 +33,13 @@ function welcomeCapabilities(core: NodeCore) {
   const capabilities = core.capabilities()
   return {
     ...capabilities,
+    // Evidence is available in node.describe; repeat only the feature gates here.
+    capabilities: Object.fromEntries(
+      Object.entries(capabilities.capabilities ?? {}).map(([name, gate]) => [
+        name,
+        { ...gate, evidence: '' },
+      ])
+    ),
     providers: capabilities.providers.map((p) => {
       const { provider, provider_version, available, diagnostic } = p as Record<string, unknown>
       return {
