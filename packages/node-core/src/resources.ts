@@ -72,6 +72,17 @@ function boundedPage<T>(rows: T[]): T[] {
   return page
 }
 
+/** Only a confirmed absent path may release retained catalogue bindings. Links and access
+ * failures are not evidence of deletion; execution leases are checked independently. */
+function missingDirectory(path: string): boolean {
+  try {
+    lstatSync(path)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
 export class ProjectService {
   constructor(private resources: ResourceServices) {}
   get(id: string): Project {
@@ -1038,8 +1049,9 @@ export class ResourceServices {
             workspaces.some((row) => {
               const w = WorkspaceSchema.parse(JSON.parse(row.body))
               return (
-                (w.kind === 'managed' && w.state !== 'removed') ||
-                this.workspaces.leased(w.workspace_id) ||
+                (((w.kind === 'managed' && w.state !== 'removed') ||
+                  this.workspaces.leased(w.workspace_id)) &&
+                  !missingDirectory(w.path)) ||
                 this.targets.leasedPath(w.path)
               )
             })

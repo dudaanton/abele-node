@@ -1207,10 +1207,12 @@ export class RepositoryService {
       throw new ChannelError('unauthorized')
     entries.sort((a, b) => (a.kind === 'root' ? 0 : 1) - (b.kind === 'root' ? 0 : 1))
     const resumed = this.continuation(actor, method, p)
-    // Catalogue cursors must not silently publish stale authority/discovery results.
+    // Pages retain a catalogue snapshot. Volatile metadata must not invalidate it;
+    // only membership or ordering changes do. Authority is checked independently.
     if (resumed) {
       const saved = this.cursors.get(String(p.cursor))!
-      if (hash(JSON.stringify(saved.rows)) !== hash(JSON.stringify(entries)))
+      const ids = (rows: unknown[]) => rows.map((row) => (row as WorktreeEntry).worktree_id)
+      if (JSON.stringify(ids(saved.rows)) !== JSON.stringify(ids(entries)))
         throw new ChannelError('stale_cursor')
       return resumed
     }

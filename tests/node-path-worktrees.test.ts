@@ -391,3 +391,21 @@ it('refuses valuable ignored files appearing after the asynchronous deletion che
   ).rejects.toThrow('stale_revision')
   expect(existsSync(join(external, 'ignored'))).toBe(true)
 })
+
+it('unregisters a vanished project with retained managed workspace provenance', async () => {
+  const s = await setup()
+  const created = await s.request('workspace.create', {
+    project_id: s.project.project_id,
+    branch: 'vanished-project',
+  })
+  await s.core.resources.jobs.drain()
+  const work = await s.request('workspace.get', { workspace_id: created.workspace_id })
+  rmSync(work.path, { recursive: true })
+  rmSync(s.folder, { recursive: true })
+  await expect(s.request('project.remove', { project_id: s.project.project_id })).resolves.toEqual({
+    project_id: s.project.project_id,
+    removed: true,
+  })
+  expect(s.core.resources.workspaces.get(work.workspace_id).workspace_id).toBe(work.workspace_id)
+  expect(await s.request('project.list', {})).toEqual([])
+})
