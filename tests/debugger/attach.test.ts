@@ -308,9 +308,14 @@ createInterface({input: process.stdin}).on('line', async () => {
                 operation_id: crypto.randomUUID(),
                 debug_session_id: attached.debug_session_id,
                 sources,
+                include_pending: true,
               })
             const candidate = await add(['packages/sample/src/late.ts'])
-            expect(candidate.sources).toEqual([
+            expect(candidate.sources).toEqual([])
+            expect(candidate.refused).toEqual([
+              { path: 'packages/sample/src/late.ts', code: 'debugger_source_no_map' },
+            ])
+            expect(candidate.pending).toEqual([
               { source_id: expect.any(String), path: 'packages/sample/src/late.ts' },
             ])
             if (native) {
@@ -322,7 +327,7 @@ createInterface({input: process.stdin}).on('line', async () => {
                 expected_state_revision: snapshot.state_revision,
                 expected_breakpoint_revision: snapshot.breakpoint_revision,
                 upsert: [
-                  { breakpoint_id: 'late', source_id: candidate.sources[0].source_id, line: 2 },
+                  { breakpoint_id: 'late', source_id: candidate.pending[0].source_id, line: 2 },
                 ],
                 remove: [],
               })

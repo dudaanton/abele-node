@@ -1,6 +1,23 @@
 import { it, expect } from 'vitest'
 import { DebuggerControlMethodSchemas, DebuggerAddSourcesResultSchema } from '../src/index.js'
 
+it('accepts opt-in pending-source identities alongside the legacy no-map refusal', () => {
+  const input = {
+    operation_id: 'add',
+    debug_session_id: 'session',
+    sources: ['src/unmapped.ts'],
+    include_pending: true,
+  }
+  expect(DebuggerControlMethodSchemas['debugger.v1.addSources'].parse(input)).toEqual(input)
+  const result = {
+    incarnation: 'i',
+    sources: [],
+    refused: [{ path: 'src/unmapped.ts', code: 'debugger_source_no_map' }],
+    pending: [{ source_id: 's3', path: 'src/unmapped.ts' }],
+  }
+  expect(DebuggerAddSourcesResultSchema.parse(result)).toEqual(result)
+})
+
 it('preserves optional attachment and requested-file map diagnostics', () => {
   const result = {
     incarnation: 'i',

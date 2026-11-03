@@ -220,6 +220,7 @@ export class DebuggerLaunches {
     sources: string[]
     require_loaded?: boolean
     include_diagnostics?: boolean
+    include_pending?: boolean
   }): Promise<DebuggerAddSourcesResult> {
     const run = this.sessionRuns.get(p.debug_session_id)
     const context = run && this.sourceContexts.get(run)
@@ -285,9 +286,19 @@ export class DebuggerLaunches {
             ? { runtime, candidates }
             : undefined
         )
+        const isPending = (source: DebuggerAddSourcesResult['sources'][number]) => {
+          const path = next.get(source.source_id)!
+          return candidates.has(path) && !runtime.mapped.has(path)
+        }
         if (p.require_loaded) {
           const accepted: typeof result.sources = []
           for (const source of result.sources) {
+            // Keep provisional intent internally, but never expose it as a
+            // loaded/admitted source. Its public result remains no_map below.
+            if (isPending(source)) {
+              accepted.push(source)
+              continue
+            }
             const path = next.get(source.source_id)!
             const evidence = await this.sessions.get(p.debug_session_id)!.runtimeSource(path)
             if (evidence === 'loaded') accepted.push(source)
@@ -297,6 +308,18 @@ export class DebuggerLaunches {
             }
           }
           result.sources = accepted
+        }
+        const pending = result.sources.filter(isPending)
+        const pendingPaths = new Set(pending.map((source) => next.get(source.source_id)!))
+        const pendingRefusals: DebuggerAddSourcesResult['refused'] = []
+        if (pendingPaths.size) {
+          for (const path of p.sources) {
+            const lexical = resolve(root, path)
+            if (isAbsolute(path) || !within(root, lexical)) continue
+            const full = await realpath(lexical).catch(() => undefined)
+            if (full && pendingPaths.has(full))
+              pendingRefusals.push({ path, code: 'debugger_source_no_map' })
+          }
         }
         // Filesystem checks yield: recheck permission and lifetime before publishing any additions.
         await this.ownerFolder(recipe.params)
@@ -343,6 +366,12 @@ export class DebuggerLaunches {
         return {
           incarnation: state.incarnation,
           ...result,
+          // Legacy clients must still explain an unproven TS file as no_map.
+          // The source id and provisional digest remain in the session so an
+          // opted-in client can install a breakpoint that binds after proof.
+          sources: result.sources.filter((source) => !isPending(source)),
+          refused: [...result.refused, ...pendingRefusals],
+          ...(p.include_pending ? { pending } : {}),
           ...(p.include_diagnostics
             ? {
                 attachment: {

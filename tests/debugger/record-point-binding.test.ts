@@ -109,12 +109,52 @@ it.each(['attach', 'add', 'start'])(
           operation_id: crypto.randomUUID(),
           debug_session_id: attached.debug_session_id,
           sources: ['lazy.ts'],
-          ...(diagnostics ? { include_diagnostics: true } : {}),
+          ...(diagnostics ? { include_diagnostics: true, include_pending: true } : {}),
         })
+      const refusal = [{ path: 'lazy.ts', code: 'debugger_source_no_map' }]
+      expect(await add(false)).toEqual({
+        incarnation: session.snapshot.incarnation,
+        sources: [],
+        refused: refusal,
+      })
       const pending = await add()
-      expect(await add(false)).not.toHaveProperty('attachment')
-      expect(pending.refused).toEqual([])
-      expect(pending.sources).toEqual([{ source_id: expect.any(String), path: 'lazy.ts' }])
+      expect(pending.refused).toEqual(refusal)
+      expect(pending.sources).toEqual([])
+      expect(pending.pending).toEqual([{ source_id: expect.any(String), path: 'lazy.ts' }])
+      const sourceId = pending.pending[0].source_id
+      expect(session.sources.get(sourceId)).toBe(source)
+      expect(session.provisionalSource?.(source)).toBe(true)
+      const legacyDiagnostics = await request('debugger.v1.addSources', {
+        operation_id: crypto.randomUUID(),
+        debug_session_id: attached.debug_session_id,
+        sources: ['lazy.ts'],
+        include_diagnostics: true,
+      })
+      expect(legacyDiagnostics).toMatchObject({ sources: [], refused: refusal })
+      expect(legacyDiagnostics).not.toHaveProperty('pending')
+      const loadedOnly = await request('debugger.v1.addSources', {
+        operation_id: crypto.randomUUID(),
+        debug_session_id: attached.debug_session_id,
+        sources: ['./lazy.ts'],
+        include_pending: true,
+        require_loaded: true,
+      })
+      expect(loadedOnly.sources).toEqual([])
+      expect(loadedOnly.refused).toEqual([{ path: './lazy.ts', code: 'debugger_source_no_map' }])
+      expect(loadedOnly.pending).toEqual([{ source_id: sourceId, path: 'lazy.ts' }])
+      runtime.stale.add(source)
+      expect((await add()).refused).toEqual([
+        {
+          path: 'lazy.ts',
+          code: 'debugger_build_changed',
+          message:
+            'The build on disk differs from the running program. Restart the program to use this build.',
+        },
+      ])
+      runtime.stale.clear()
+      writeFileSync(source, original + '// edited')
+      expect((await add()).refused).toEqual([{ path: 'lazy.ts', code: 'debugger_source_changed' }])
+      writeFileSync(source, original)
       expect(pending.attachment).toEqual({
         name: 'app.js',
         pid: 42,
@@ -125,7 +165,7 @@ it.each(['attach', 'add', 'start'])(
       })
       await session.patchBreakpoints(
         0,
-        [{ breakpoint_id: 'lazy', source_id: pending.sources[0].source_id, line: 1 }],
+        [{ breakpoint_id: 'lazy', source_id: sourceId, line: 1 }],
         []
       )
       expect(session.snapshot.breakpoints[0]?.status).toBe('pending')
@@ -145,7 +185,11 @@ it.each(['attach', 'add', 'start'])(
         },
       })
       await vi.waitFor(() => expect(session.snapshot.breakpoints[0]?.status).toBe('verified'))
-      expect((await add()).attachment).toEqual({
+      const proven = await add()
+      expect(proven.sources).toEqual([{ source_id: sourceId, path: 'lazy.ts' }])
+      expect(proven.refused).toEqual([])
+      expect(proven.pending).toEqual([])
+      expect(proven.attachment).toEqual({
         name: 'app.js',
         pid: 42,
         folder: dir,

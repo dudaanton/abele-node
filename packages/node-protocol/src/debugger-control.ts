@@ -135,6 +135,7 @@ export const DebuggerAddSourcesSchema = z
     debug_session_id: id,
     require_loaded: z.boolean().optional(),
     include_diagnostics: z.boolean().optional(),
+    include_pending: z.boolean().optional(),
     sources: z
       .array(
         z
@@ -171,6 +172,7 @@ export const DebuggerAddSourcesResultSchema = z
       .optional(),
     incarnation: id,
     sources: DebuggerStartResultSchema.shape.sources,
+    pending: DebuggerStartResultSchema.shape.sources.optional(),
     refused: z
       .array(
         z
