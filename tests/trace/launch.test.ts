@@ -386,7 +386,9 @@ describe('starting a program under the debugger', () => {
         debug_session_id: started.debug_session_id,
         sources: ['src/late.ts'],
       })
-    expect((await add()).refused).toEqual([{ path: 'src/late.ts', code: 'debugger_source_no_map' }])
+    const unmapped = await add()
+    expect(unmapped.refused).toEqual([{ path: 'src/late.ts', code: 'debugger_source_no_map' }])
+    expect(unmapped.sources).toEqual([])
     const map = { version: 3, sources: ['late.ts'], mappings: '' }
     const mapPath = join(s.folder, 'src/page.js.map')
     writeFileSync(mapPath, JSON.stringify(map))
@@ -408,6 +410,11 @@ describe('starting a program under the debugger', () => {
       remove: [],
     })
     expect(receipt.outcome).toBe('completed')
+    // The admitted source must still match the map's original content.
+    writeFileSync(source, 'export const total = 2\n')
+    expect((await add()).refused).toEqual([
+      { path: 'src/late.ts', code: 'debugger_source_changed' },
+    ])
   })
 
   it('keeps every path inside the chat’s folder', async () => {

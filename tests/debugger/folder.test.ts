@@ -169,6 +169,7 @@ it('starts without a chat, lists chat and folder sessions together, and restarts
       ],
     })
     expect(runs[0]!.sources.get('s2')).toBe(join(dir, 'late.js'))
+    expect([...runs[0]!.sources.values()]).not.toContain(join(dir, 'late.ts'))
     expect(
       (
         await request('debugger.v1.addSources', {

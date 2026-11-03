@@ -3,14 +3,26 @@ import { realpath, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { inspectorProbeToken } from '../trace/program-http.js'
+import { compilerBuildProof } from './build-proof.js'
+import { mappedSourcePath } from './source-map-paths.js'
 
 export type LoadedSourceEvidence = Map<string, string> & {
+  available: boolean
+  truncated: boolean
+  scriptCount: number
+  sourceMaps: boolean
+  mapSources: Set<string>
   scripts: Set<string>
   mapped: Set<string>
   stale: Set<string>
 }
 export const emptySourceEvidence = (): LoadedSourceEvidence =>
   Object.assign(new Map<string, string>(), {
+    available: false,
+    truncated: false,
+    scriptCount: 0,
+    sourceMaps: false,
+    mapSources: new Set<string>(),
     scripts: new Set<string>(),
     mapped: new Set<string>(),
     stale: new Set<string>(),
@@ -21,7 +33,8 @@ export const emptySourceEvidence = (): LoadedSourceEvidence =>
 export async function loadedSourceDigests(
   port: number,
   root: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  proofSources: readonly string[] = []
 ): Promise<LoadedSourceEvidence> {
   const digests = emptySourceEvidence()
   if (signal?.aborted) return digests
@@ -65,6 +78,7 @@ export async function loadedSourceDigests(
       const finish = () => {
         if (finished) return
         finished = true
+        if (pending.size) digests.truncated = true
         clearTimeout(timer)
         signal?.removeEventListener('abort', finish)
         socket.close()
@@ -89,8 +103,14 @@ export async function loadedSourceDigests(
           if (finished || typeof event.data !== 'string' || event.data.length > 16 * 1024 * 1024)
             return finish()
           const message = JSON.parse(event.data)
-          if (message.method === 'Debugger.scriptParsed' && scripts.size < 256) {
+          if (message.method === 'Debugger.scriptParsed') {
             const { url, scriptId, sourceMapURL } = message.params
+            digests.scriptCount++
+            if (sourceMapURL) digests.sourceMaps = true
+            if (scripts.size >= 256) {
+              digests.truncated = true
+              return
+            }
             if (typeof url !== 'string' || typeof scriptId !== 'string' || !url.startsWith('file:'))
               return
             const path = resolve(fileURLToPath(url))
@@ -98,6 +118,7 @@ export async function loadedSourceDigests(
             if (rel && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel))
               scripts.set(scriptId, { path, map: sourceMapURL })
           } else if (message.id === 1) {
+            digests.available = !message.error
             for (const [scriptId, path] of scripts) {
               const id = next++
               pending.set(id, path)
@@ -115,7 +136,9 @@ export async function loadedSourceDigests(
               Buffer.byteLength(source) <= 8 * 1024 * 1024 &&
               (sourceBytes += Buffer.byteLength(source)) <= 32 * 1024 * 1024
             )
-              evidence.push(runtimeDigests(root, script.path, source, script.map, digests))
+              evidence.push(
+                runtimeDigests(root, script.path, source, script.map, digests, proofSources)
+              )
             if (!pending.size) finish()
           }
         } catch {
@@ -137,7 +160,8 @@ async function runtimeDigests(
   script: string,
   source: string,
   mapURL: string | undefined,
-  digests: LoadedSourceEvidence
+  digests: LoadedSourceEvidence,
+  proofSources: readonly string[]
 ) {
   const hash = (text: string) => createHash('sha256').update(text).digest('hex')
   const canonical = await realpath(script).catch(() => script)
@@ -149,6 +173,7 @@ async function runtimeDigests(
   // when that generated file is byte-identical to V8's loaded script.
   try {
     const url = mapURL || [...source.matchAll(/\/\/[#@]\s*sourceMappingURL=(\S+)/g)].at(-1)?.[1]
+    if (url) digests.sourceMaps = true
     if (url && !url.startsWith('data:') && /\.[cm]?js$/.test(canonical)) {
       const address = new URL(url, pathToFileURL(canonical))
       if (address.protocol === 'file:') {
@@ -171,6 +196,23 @@ async function runtimeDigests(
           const matches =
             (await stat(canonical)).size <= 8 * 1024 * 1024 &&
             hash(await readFile(canonical, 'utf8')) === hash(source)
+          const map = JSON.parse(text)
+          if (Array.isArray(map.sources)) {
+            for (const [i, name] of map.sources.slice(0, 256).entries()) {
+              if (typeof name !== 'string') continue
+              const path = await mappedSourcePath(root, mapPath, map.sourceRoot ?? '', name)
+              if (path) digests.mapSources.add(path)
+              if (path && !matches) digests.stale.add(path)
+              if (
+                path &&
+                matches &&
+                proofSources.includes(path) &&
+                typeof map.sourcesContent?.[i] !== 'string' &&
+                (await compilerBuildProof(root, path, mapPath))
+              )
+                mapped.set(path, hash(await readFile(path, 'utf8')))
+            }
+          }
           for (const [path, digest] of mapped) {
             if (matches) {
               local.set(path, digest)
@@ -184,6 +226,7 @@ async function runtimeDigests(
     // Missing or untrusted external metadata proves nothing.
   }
   for (const [path, digest] of await inlineSourceDigests(root, script, source, mapURL)) {
+    digests.mapSources.add(path)
     digests.mapped.add(path)
     local.set(path, digest)
   }
@@ -212,14 +255,10 @@ export async function inlineSourceDigests(
     if (Buffer.byteLength(text) > 8 * 1024 * 1024) return digests
     const map = JSON.parse(text)
     if (!Array.isArray(map.sources) || !Array.isArray(map.sourcesContent)) return digests
-    const base = new URL('.', pathToFileURL(script))
     const sourceRoot = typeof map.sourceRoot === 'string' ? map.sourceRoot : ''
-    const prefix = sourceRoot ? new URL(sourceRoot.replace(/\/?$/, '/'), base) : base
     for (let i = 0; i < Math.min(map.sources.length, 256); i++) {
       if (typeof map.sources[i] !== 'string' || typeof map.sourcesContent[i] !== 'string') continue
-      const address = new URL(map.sources[i], prefix)
-      if (address.protocol !== 'file:') continue
-      const path = await realpath(fileURLToPath(address)).catch(() => undefined)
+      const path = await mappedSourcePath(root, script, sourceRoot, map.sources[i])
       if (!path) continue
       const rel = relative(root, path)
       if (rel && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel))

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, expect, it, vi } from 'vitest'
+import ts from 'typescript'
 import { loadedSourceDigests } from '../../packages/node-core/src/debugger/loaded-sources.js'
 
 const dirs: string[] = []
@@ -12,6 +13,78 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+it.each([false, true])(
+  'proves a compiled file-URL map without embedded source content (config=%s)',
+  async (config) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'compiler-url-map-')))
+    dirs.push(root)
+    const path = join(root, 'main.ts'),
+      script = join(root, 'main.js')
+    const original = 'const n: number = 1; console.log(n)'
+    writeFileSync(path, original)
+    if (config)
+      writeFileSync(
+        join(root, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: { sourceMap: true, target: 'ES2022', module: 'CommonJS', types: [] },
+          files: ['main.ts'],
+        })
+      )
+    const output = ts.transpileModule(original, {
+      fileName: 'main.ts',
+      compilerOptions: {
+        sourceMap: true,
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.CommonJS,
+      },
+    })
+    writeFileSync(script, output.outputText)
+    writeFileSync(
+      script + '.map',
+      JSON.stringify({
+        ...JSON.parse(output.sourceMapText!),
+        sources: [pathToFileURL(path).href],
+      })
+    )
+    inspector([
+      { url: pathToFileURL(script).href, source: output.outputText, sourceMapURL: 'main.js.map' },
+    ])
+    expect((await loadedSourceDigests(9229, root, undefined, [path])).get(path)).toBe(
+      hash(original)
+    )
+    const { unbuilt } = await import('../../packages/node-core/src/debugger/launch.js')
+    expect(await unbuilt(root, [path])).toEqual(new Set())
+  }
+)
+it.each([
+  { sources: ['../src/main.ts'] },
+  { sourceRoot: '../src', sources: ['main.ts'] },
+  { sources: ['webpack:///./src/main.ts'] },
+  { sourceRoot: 'webpack://app/', sources: ['./src/main.ts'] },
+  { sources: ['file:///old/checkout/src/main.ts'] },
+  { sourceRoot: 'file:///old/checkout/src', sources: ['main.ts'] },
+  { sourceRoot: '/old/checkout/src', sources: ['main.ts'] },
+  { sources: ['/old/checkout/src/main.ts'] },
+])('binds compiled maps with $sources and $sourceRoot', async (shape) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'compiled-map-')))
+  dirs.push(root)
+  mkdirSync(join(root, 'src'))
+  mkdirSync(join(root, 'dist'))
+  const path = join(root, 'src/main.ts')
+  writeFileSync(path, 'original')
+  const script = join(root, 'dist/main.js')
+  writeFileSync(script, 'compiled')
+  writeFileSync(script + '.map', JSON.stringify({ ...shape, sourcesContent: ['original'] }))
+  inspector([{ url: pathToFileURL(script).href, source: 'compiled', sourceMapURL: 'main.js.map' }])
+  const evidence = await loadedSourceDigests(9229, root)
+  expect(evidence.available).toBe(true)
+  expect(evidence.scriptCount).toBe(1)
+  expect(evidence.sourceMaps).toBe(true)
+  expect(evidence.get(path)).toBe(hash('original'))
+  expect(evidence.mapped.has(path)).toBe(true)
+  const { unbuilt } = await import('../../packages/node-core/src/debugger/launch.js')
+  expect(await unbuilt(root, [path])).toEqual(new Set())
+})
 it('proves external maps by loaded build bytes and identifies a replaced build', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'external-map-')))
   dirs.push(root)

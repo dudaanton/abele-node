@@ -12,6 +12,29 @@ import {
 import { emptySourceEvidence } from '../../packages/node-core/src/debugger/loaded-sources.js'
 import ts from 'typescript'
 
+it('admits unloaded compiled TypeScript as pending without inline-runtime evidence', async () => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'pending-compiled-')))
+  try {
+    await writeFile(join(dir, 'lazy.ts'), 'export const n: number = 1')
+    const result = await admitSources(
+      dir,
+      new Map(),
+      ['lazy.ts'],
+      undefined,
+      undefined,
+      new Map(),
+      {
+        runtime: emptySourceEvidence(),
+        candidates: new Map(),
+      }
+    )
+    expect(result.refused).toEqual([])
+    expect(result.sources).toEqual([{ source_id: 's1', path: 'lazy.ts' }])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 it('proves a standalone transpile build with a relocated map and no tsconfig', async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'standalone-proof-')))
   try {

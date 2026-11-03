@@ -1,10 +1,31 @@
 import { it, expect } from 'vitest'
 import { DebuggerControlMethodSchemas, DebuggerAddSourcesResultSchema } from '../src/index.js'
 
+it('preserves optional attachment and requested-file map diagnostics', () => {
+  const result = {
+    incarnation: 'i',
+    sources: [],
+    refused: [],
+    attachment: {
+      name: 'app.js',
+      pid: 42,
+      folder: '/repo',
+      loaded_scripts: 12,
+      source_maps: true,
+      files: [{ path: 'src/lazy.ts', loaded: false, mapped: false }],
+    },
+  }
+  expect(DebuggerAddSourcesResultSchema.parse(result)).toEqual(result)
+})
+
 it('accepts bounded addSources requests with a session owner', () => {
   const schema = DebuggerControlMethodSchemas['debugger.v1.addSources']
   const input = { operation_id: 'add', debug_session_id: 'session', sources: ['late.js'] }
   expect(schema.parse(input)).toEqual(input)
+  expect(schema.parse({ ...input, include_diagnostics: true })).toEqual({
+    ...input,
+    include_diagnostics: true,
+  })
   expect(schema.safeParse({ ...input, sources: Array(257).fill('a.js') }).success).toBe(false)
   expect(schema.safeParse({ ...input, sources: [''] }).success).toBe(false)
   expect(schema.safeParse({ ...input, operation_id: '' }).success).toBe(false)

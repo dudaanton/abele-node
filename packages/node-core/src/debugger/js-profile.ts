@@ -10,6 +10,7 @@ import { OwnedDebugProcess, processStartIdentity } from './process.js'
 import { installedJsAdapter, jsAdapterInstalled, requireJsPin } from './js-install.js'
 import { debuggerLog } from './log.js'
 import { holdJsStartup } from './js-startup.js'
+import { sourceMapPathOverrides } from './source-map-paths.js'
 
 export type JsLaunch = {
   cwd: string
@@ -220,6 +221,9 @@ export class JsDebugProfile {
             port: Number(match[1]),
             cwd: config.cwd,
             sourceMaps: true,
+            sourceMapPathOverrides: await sourceMapPathOverrides(
+              config.workspace_root ?? config.cwd
+            ),
             restart: false,
             continueOnAttach: false,
             // The pinned adapter otherwise injects its child bootloader through
@@ -302,6 +306,7 @@ export class JsDebugProfile {
         cwd: root ?? this.options.workspaceRoot,
         port: config.port,
         sourceMaps: true,
+        sourceMapPathOverrides: await sourceMapPathOverrides(root ?? this.options.workspaceRoot),
         restart: false,
         continueOnAttach: false,
       },
@@ -369,7 +374,13 @@ export class JsDebugProfile {
       rootDap.setReverseHandler((request, signal) => tree!.reverse(request, signal))
       await root.start('attach', configuration)
       phase = 'active'
-      const run = new NativeJsRun(tree, adapter, owner, () => this.runs.delete(run))
+      const run = new NativeJsRun(
+        tree,
+        adapter,
+        owner,
+        () => this.runs.delete(run),
+        typeof configuration.port === 'number' ? configuration.port : undefined
+      )
       this.runs.add(run)
       return run
     } catch (error) {
@@ -421,7 +432,8 @@ export class NativeJsRun {
     readonly tree: JsSessionTree,
     private readonly adapter: OwnedDebugProcess,
     private readonly owner: OwnedDebugProcess | undefined,
-    private readonly remove: () => void
+    private readonly remove: () => void,
+    readonly inspectorPort?: number
   ) {}
   get root() {
     return this.tree.root

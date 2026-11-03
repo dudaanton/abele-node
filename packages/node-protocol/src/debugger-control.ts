@@ -134,6 +134,7 @@ export const DebuggerAddSourcesSchema = z
     operation_id: id,
     debug_session_id: id,
     require_loaded: z.boolean().optional(),
+    include_diagnostics: z.boolean().optional(),
     sources: z
       .array(
         z
@@ -147,6 +148,27 @@ export const DebuggerAddSourcesSchema = z
   .strict()
 export const DebuggerAddSourcesResultSchema = z
   .object({
+    attachment: z
+      .object({
+        name: z.string().max(4096),
+        pid: z.number().int().positive().optional(),
+        folder: z.string().max(4096),
+        loaded_scripts: z.number().int().nonnegative().optional(),
+        source_maps: z.boolean().optional(),
+        files: z
+          .array(
+            z
+              .object({
+                path: z.string().max(4096),
+                loaded: z.boolean().optional(),
+                mapped: z.boolean().optional(),
+              })
+              .strict()
+          )
+          .max(256),
+      })
+      .strict()
+      .optional(),
     incarnation: id,
     sources: DebuggerStartResultSchema.shape.sources,
     refused: z

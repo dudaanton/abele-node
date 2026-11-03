@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -43,6 +43,38 @@ const archive = () =>
     'js-debug/src/dapDebugServer.js': '/* fake adapter */',
     'js-debug/LICENSE': 'MIT License\nCopyright fixture',
   })
+it('gives the adapter repo-relative overrides before compiled lazy modules load', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'attach-map-overrides-'))
+  mkdirSync(join(dir, 'src'))
+  mkdirSync(join(dir, 'packages'))
+  const core = new NodeCore(join(dir, 'state'), { debuggerEnabled: true })
+  const profile = new JsDebugProfile(core.debugger, { stateDirectory: dir, enabled: true })
+  vi.spyOn(processes, 'processStartIdentity').mockResolvedValue('fixture-process')
+  const open = vi.spyOn(profile as any, 'open').mockResolvedValue({})
+  try {
+    await profile.attach(
+      { address: '127.0.0.1', port: 9229, target_pid: 42 },
+      {} as any,
+      new Map(),
+      dir
+    )
+    expect(open.mock.calls[0]![0]).toMatchObject({
+      sourceMapPathOverrides: {
+        'webpack:///./*': dir + '/*',
+      },
+    })
+    const patterns = Object.keys((open.mock.calls[0]![0] as any).sourceMapPathOverrides)
+    expect(
+      patterns.some(
+        (key) => key.startsWith('(?!') && key.includes('src/.*') && key.includes('packages/.*')
+      )
+    ).toBe(true)
+  } finally {
+    vi.restoreAllMocks()
+    core.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 it.each([undefined, true, false])(
   'resumes startup only for explicit stop_on_entry=false (%s)',
   async (stop_on_entry) => {
@@ -269,6 +301,9 @@ describe('explicit JS adapter installation and gated native profile', () => {
   it('requires capability + explicit switch + an installed adapter, never exposes control RPC', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'js-profile-')),
       core = new NodeCore(dir, { debuggerEnabled: true })
+    const identity = vi
+      .spyOn(processes, 'processStartIdentity')
+      .mockResolvedValue('fixture-process')
     try {
       const profile = new JsDebugProfile(core.debugger, { stateDirectory: dir })
       expect(profile.profiles()).toEqual([])
@@ -280,6 +315,7 @@ describe('explicit JS adapter installation and gated native profile', () => {
       await expect(
         requested.attach({ port: 12345, address: '127.0.0.1', target_pid: process.pid }, {} as any)
       ).rejects.toThrow('js_debug_not_installed')
+      expect(identity).toHaveBeenCalledWith(process.pid)
       for (const method of ['debugger.v1.launch', 'debugger.v1.attach', 'debugger.v1.terminate']) {
         const token = core.createToken('fixture')
         expect(() => core.request(core.authority.authenticate(token.token), method, {})).toThrow(
@@ -287,6 +323,7 @@ describe('explicit JS adapter installation and gated native profile', () => {
         )
       }
     } finally {
+      identity.mockRestore()
       core.close()
       rmSync(dir, { recursive: true, force: true })
     }

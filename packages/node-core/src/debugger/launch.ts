@@ -22,6 +22,7 @@ import {
   loadedSourceDigests,
   type LoadedSourceEvidence,
 } from './loaded-sources.js'
+import { mappedSourcePath } from './source-map-paths.js'
 import { processStartIdentity } from './process.js'
 import { compilerBuildProof } from './build-proof.js'
 
@@ -44,6 +45,7 @@ export interface LaunchProfile {
 }
 export interface LaunchedRun {
   readonly root: DapSession
+  readonly inspectorPort?: number
   /** Every session of the run: the root at once, then each child as the adapter starts it. */
   onSession(listener: (session: DapSession) => void): () => void
   /** The session the program's own code runs in, when the adapter starts it under the root. */
@@ -87,7 +89,6 @@ type SourceContext = {
   sources: Map<string, string>
   digests: Map<string, string>
   candidates?: Map<string, string>
-  inlineRuntime?: boolean
   recipe?: string
   tail?: Promise<unknown>
   pending: number
@@ -218,6 +219,7 @@ export class DebuggerLaunches {
     debug_session_id: string
     sources: string[]
     require_loaded?: boolean
+    include_diagnostics?: boolean
   }): Promise<DebuggerAddSourcesResult> {
     const run = this.sessionRuns.get(p.debug_session_id)
     const context = run && this.sourceContexts.get(run)
@@ -257,7 +259,8 @@ export class DebuggerLaunches {
             ? await loadedSourceDigests(
                 context.port,
                 root,
-                this.sessions.get(p.debug_session_id)?.closedSignal
+                this.sessions.get(p.debug_session_id)?.closedSignal,
+                p.sources.map((path) => resolve(root, path))
               )
             : emptySourceEvidence()
         if (
@@ -275,7 +278,12 @@ export class DebuggerLaunches {
           context.pid,
           context.program,
           digests,
-          context.inlineRuntime ? { runtime, candidates } : undefined
+          // A provisional source is safe only when this session can later
+          // verify its loaded map under the same process identity. Profiles
+          // without runtime evidence retain the normal no-map refusal.
+          context.port && context.pid && context.processIdentity
+            ? { runtime, candidates }
+            : undefined
         )
         if (p.require_loaded) {
           const accepted: typeof result.sources = []
@@ -332,7 +340,48 @@ export class DebuggerLaunches {
               })
           }
         }
-        return { incarnation: state.incarnation, ...result }
+        return {
+          incarnation: state.incarnation,
+          ...result,
+          ...(p.include_diagnostics
+            ? {
+                attachment: {
+                  name: basename(context.program),
+                  ...(context.pid ? { pid: context.pid } : {}),
+                  folder: context.root,
+                  ...(runtime.available
+                    ? {
+                        loaded_scripts: runtime.scriptCount,
+                        ...(runtime.sourceMaps || !runtime.truncated
+                          ? { source_maps: runtime.sourceMaps }
+                          : {}),
+                      }
+                    : {}),
+                  files: await Promise.all(
+                    p.sources.map(async (path) => {
+                      const lexical = resolve(context.root, path)
+                      const physical = within(context.root, lexical)
+                        ? await realpath(lexical).catch(() => undefined)
+                        : undefined
+                      const full = physical && within(context.root, physical) ? physical : undefined
+                      const mapped =
+                        !!full && (runtime.mapSources.has(full) || runtime.mapped.has(full))
+                      const loaded = mapped || (!!full && runtime.scripts.has(full))
+                      return {
+                        path,
+                        ...(runtime.available
+                          ? {
+                              ...(loaded || !runtime.truncated ? { loaded } : {}),
+                              ...(mapped || !runtime.truncated ? { mapped } : {}),
+                            }
+                          : {}),
+                      }
+                    })
+                  ),
+                },
+              }
+            : {}),
+        }
       })
     context.tail = work
     try {
@@ -550,6 +599,8 @@ export class DebuggerLaunches {
       program,
       sources,
       digests,
+      candidates: new Map(),
+      port: run.inspectorPort,
       pending: 0,
       ...(evidence ? { pid: evidence.pid, processIdentity: evidence.start_identity } : {}),
     })
@@ -644,7 +695,12 @@ export class DebuggerLaunches {
     // A program of another folder is the owner's to name: the chat's own trust does not reach it.
     if (!inside && !p.outside_folder) throw new ChannelError('debugger_attach_outside_folder')
     const sources = new Map<string, string>()
-    const loaded = await loadedSourceDigests(program.port, root)
+    const loaded = await loadedSourceDigests(
+      program.port,
+      root,
+      undefined,
+      p.sources.map((path) => resolve(root, path))
+    )
     const candidates = new Map<string, string>()
     const script = program.script ? await realpath(program.script).catch(() => null) : null
     const programPath = script ?? join(root, 'program.js')
@@ -682,7 +738,7 @@ export class DebuggerLaunches {
       program.pid,
       script ?? undefined,
       new Map(loaded),
-      loaded.mapped.size || loaded.stale.size ? { runtime: loaded, candidates } : undefined
+      { runtime: loaded, candidates }
     )
     const target: DebuggerTarget = {
       ...place,
@@ -718,7 +774,6 @@ export class DebuggerLaunches {
       sources,
       digests,
       candidates,
-      inlineRuntime: loaded.mapped.size > 0 || loaded.stale.size > 0,
       pending: 0,
     })
     const result = await this.adopt(run, root, sources, false)
@@ -784,7 +839,7 @@ export class DebuggerLaunches {
             context.processIdentity
         )
           throw new ChannelError('debugger_source_unverified')
-        const runtime = await loadedSourceDigests(context.port, root, session.closedSignal)
+        const runtime = await loadedSourceDigests(context.port, root, session.closedSignal, [path])
         if (
           (await processStartIdentity(context.pid).catch(() => undefined)) !==
           context.processIdentity
@@ -1121,10 +1176,14 @@ export async function unbuilt(root: string, sources: string[]) {
       if (info.size > MAP_SCAN.bytes) return
       const map = JSON.parse(await readFile(path, 'utf8'))
       if (!Array.isArray(map.sources)) return
-      const base = resolve(dirname(path), typeof map.sourceRoot === 'string' ? map.sourceRoot : '')
       for (const [i, name] of map.sources.entries()) {
         if (typeof name !== 'string') continue
-        const source = await realpath(resolve(base, name)).catch(() => undefined)
+        const source = await mappedSourcePath(
+          root,
+          path,
+          typeof map.sourceRoot === 'string' ? map.sourceRoot : '',
+          name
+        )
         if (!source) continue
         if (!pending.has(source)) continue
         const text = Array.isArray(map.sourcesContent) ? map.sourcesContent[i] : undefined

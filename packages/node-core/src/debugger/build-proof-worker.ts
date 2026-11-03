@@ -1,9 +1,11 @@
 import { parentPort, workerData } from 'node:worker_threads'
+import { isDeepStrictEqual } from 'node:util'
 import { readFileSync, realpathSync } from 'node:fs'
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, relative, sep } from 'node:path'
 import ts from 'typescript'
+import { mappedSourcePath } from './source-map-paths.js'
 
-function prove() {
+async function prove() {
   const { root, source, map } = workerData as { root: string; source: string; map: string }
   const inside = (path: string) => {
     const rel = relative(root, path)
@@ -23,21 +25,48 @@ function prove() {
     composite: false,
   }
   const program = ts.createProgram(parsed.fileNames, options)
-  let jsMatches = false,
-    mapMatches = false
-  const expectedMap = readFileSync(map, 'utf8')
+  let jsMatches = false
+  let emittedMap: string | undefined
+  const expectedMap = JSON.parse(readFileSync(map, 'utf8'))
   const expectedJs = readFileSync(map.slice(0, -4), 'utf8')
   program.emit(undefined, (path, text) => {
-    if (path === map) mapMatches = text === expectedMap
+    if (path === map) emittedMap = text
     if (path === map.slice(0, -4)) jsMatches = text === expectedJs
   })
-  return jsMatches && mapMatches
+  if (!jsMatches || !emittedMap) return false
+  const actualMap = JSON.parse(emittedMap)
+  if (
+    !Array.isArray(expectedMap.sources) ||
+    !Array.isArray(actualMap.sources) ||
+    expectedMap.sources.length !== actualMap.sources.length
+  )
+    return false
+  for (let i = 0; i < expectedMap.sources.length; i++) {
+    const expected = await mappedSourcePath(
+      root,
+      map,
+      expectedMap.sourceRoot ?? '',
+      expectedMap.sources[i]
+    )
+    const actual = await mappedSourcePath(
+      root,
+      map,
+      actualMap.sourceRoot ?? '',
+      actualMap.sources[i]
+    )
+    if (!expected || expected !== actual) return false
+  }
+  // URL spelling and checkout prefixes are incidental; mappings and emitted
+  // bytes still have to match the compiler exactly.
+  const { sources: _expectedSources, sourceRoot: _expectedRoot, ...expected } = expectedMap
+  const { sources: _actualSources, sourceRoot: _actualRoot, ...actual } = actualMap
+  return isDeepStrictEqual(expected, actual)
 }
 
 /** Standalone compiler APIs do not leave a tsconfig. Prove their output with
  * bounded compiler recipes, never by assuming one of those recipes was used.
  * Relocating a map and changing its final URL does not change its mappings. */
-function proveStandalone(source: string, mapPath: string) {
+async function proveStandalone(source: string, mapPath: string) {
   const expectedMap = JSON.parse(readFileSync(mapPath, 'utf8'))
   if (
     !Array.isArray(expectedMap.sources) ||
@@ -46,9 +75,12 @@ function proveStandalone(source: string, mapPath: string) {
   )
     return false
   if (
-    realpathSync(
-      resolve(dirname(mapPath), expectedMap.sourceRoot ?? '', expectedMap.sources[0])
-    ) !== realpathSync(source)
+    (await mappedSourcePath(
+      workerData.root,
+      mapPath,
+      expectedMap.sourceRoot ?? '',
+      expectedMap.sources[0]
+    )) !== realpathSync(source)
   )
     return false
   const text = readFileSync(source, 'utf8'),
@@ -78,7 +110,7 @@ function proveStandalone(source: string, mapPath: string) {
   return false
 }
 try {
-  parentPort!.postMessage(prove())
+  parentPort!.postMessage(await prove())
 } catch {
   parentPort!.postMessage(false)
 }
