@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createRunIpc, cleanupRunIpc, isRunIpc, verifyRunIpc, HOST_PROTOCOL } from './ipc.js'
 import { ClaudeStreamDecoder, ClaudeEventMapper } from './stream.js'
+import { ClaudeContext } from './context.js'
 import { ProcessSupervisor, type ProcessIdentity, type ProcessProbe } from './supervisor.js'
 import type {
   LiveInput,
@@ -285,32 +286,8 @@ export async function startLiveSession(
         reject(error as Error)
       }
     })
-  const refreshContext = () => {
-    void control('get_context_usage')
-      .then((u) => {
-        const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
-        emit('claude.context', {
-          total_tokens: n(u.totalTokens),
-          max_tokens: n(u.maxTokens),
-          percentage: n(u.percentage),
-          auto_compact_threshold: n(u.autoCompactThreshold),
-          auto_compact_enabled:
-            typeof u.isAutoCompactEnabled === 'boolean' ? u.isAutoCompactEnabled : null,
-          model: typeof u.model === 'string' ? u.model : null,
-          categories: Array.isArray(u.categories)
-            ? u.categories
-                .filter((c: any) => typeof c?.name === 'string' && typeof c?.tokens === 'number')
-                .slice(0, 32)
-                .map((c: any) => ({
-                  name: String(c.name).slice(0, 128),
-                  tokens: c.tokens,
-                  ...(c.isDeferred === true ? { deferred: true } : {}),
-                }))
-            : [],
-        })
-      })
-      .catch(() => {})
-  }
+  const usage = new ClaudeContext((data) => emit('claude.context', data))
+  const refreshContext = () => void usage.refresh(() => control('get_context_usage'))
   const answerPermission = async (request_id: string, request: Record<string, any>) => {
     const input = request.input && typeof request.input === 'object' ? request.input : {}
     const tool_name = typeof request.tool_name === 'string' ? request.tool_name : 'unknown'
@@ -442,9 +419,13 @@ export async function startLiveSession(
         emit('claude.compact.summary', { text })
       }
     }
-    if (r.type === 'system' && r.subtype === 'compact_boundary') awaitingSummary = true
+    if (r.type === 'system' && r.subtype === 'compact_boundary' && !r.parent_tool_use_id) {
+      awaitingSummary = true
+    }
+    usage.observe(r)
     for (const event of mapper.map(r)) sink.event(event)
-    if (r.type === 'system' && r.subtype === 'compact_boundary') refreshContext()
+    if (r.type === 'system' && r.subtype === 'compact_boundary' && !r.parent_tool_use_id)
+      refreshContext()
     if (r.type === 'result') {
       // Nothing waits in the CLI's queue: inputs written before this turn were consumed by it.
       if (r.queued_turn_count === 0)

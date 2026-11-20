@@ -109,6 +109,11 @@ message of the same owner. The input is marked `continuation: true` in `input.ac
 `session.context { run_id, total_tokens, max_tokens, percentage, auto_compact_threshold,
 auto_compact_enabled, model, categories }` is appended after every turn and every
 compaction.
+The count is the latest main assistant's input usage, including cache creation and
+cache reads, rather than cumulative billing usage or the control API's estimate.
+At a compaction boundary, `total_tokens` and `percentage` become `null` until the
+next main assistant usage report. Subagent usage does not affect this meter.
+Estimated categories are included only when their reported total matches the measured count.
 
 ## Idle processes
 

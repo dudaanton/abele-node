@@ -1,0 +1,10 @@
+{"type":"assistant","message":{"usage":{"input_tokens":10000,"cache_creation_input_tokens":20000,"cache_read_input_tokens":120000,"output_tokens":5000}}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":150000}}
+{"type":"assistant","message":{"usage":{"input_tokens":2000,"cache_creation_input_tokens":10000,"cache_read_input_tokens":0}}}
+{"type":"assistant","parent_tool_use_id":"sample-child","message":{"usage":{"input_tokens":180000}}}
+{"type":"result","usage":{"input_tokens":300000,"cache_read_input_tokens":400000}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":160000}}
+{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_creation_input_tokens":3000,"cache_read_input_tokens":5000}}}
+{"type":"assistant","message":{"usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000}}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":175000}}
+{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":4000}}}

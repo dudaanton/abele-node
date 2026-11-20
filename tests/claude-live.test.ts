@@ -354,6 +354,7 @@ it('compacts on request, journals boundary and summary, and continues afterwards
   const quiet = s.request('session.compact', { session_id: id, continue: false }).input_id
   await until(() => s.input(quiet).state === 'completed')
   await until(() => s.events(id, 'session.context').length >= 5)
+  expect(s.request('session.state', { session_id: id }).context.total_tokens).toBeNull()
   expect(s.replies(id).filter((r) => r === 'reply:продолжай')).toHaveLength(1)
   expect(s.events(id, 'input.accepted')).toHaveLength(4)
 })

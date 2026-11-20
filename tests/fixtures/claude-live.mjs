@@ -35,7 +35,15 @@ const effort = arg('--effort')
 let turns = 0
 const emit = (r) => process.stdout.write(JSON.stringify({ ...r, session_id }) + '\n')
 const say = (id, text) =>
-  emit({ type: 'assistant', message: { id, role: 'assistant', content: [{ type: 'text', text }] } })
+  emit({
+    type: 'assistant',
+    message: {
+      id,
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      usage: { input_tokens: 1000 + (turns + 1) * 100 },
+    },
+  })
 const result = (text, extra = {}) => {
   turns++
   emit({
